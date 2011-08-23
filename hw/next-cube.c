@@ -12,8 +12,6 @@
 
 #include "hw.h"
 #include "next-cube.h"
-#include "next-fb.h"
-//#include "next-net.h"
 #include "exec-all.h"
 #include "monitor.h"
 #include "sysemu.h"
@@ -491,7 +489,7 @@ static void next_cube_init(ram_addr_t ram_size,
     //  	qemu_ram_alloc(NULL, "nex.rom", 0x20000) | IO_MEM_ROM);
 
     /* Ethernet */
-    //nextnet_init((void *)env);
+    nextnet_init((void *)env);
     
     /* SCSI */
    	//void *espdma;i
