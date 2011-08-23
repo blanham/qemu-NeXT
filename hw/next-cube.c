@@ -32,7 +32,10 @@
 #define RAM_SIZE 0x4000000
 #define ROM_FILE "rom66.bin"
 
+/* would like to dynamically allocate these later */
 next_state_t next_state;
+nextfb_state_t nextfb_state;
+
 /* debug NeXT */
 #define DEBUG_NEXT
 
@@ -442,7 +445,7 @@ static void next_cube_init(ram_addr_t ram_size,
         qemu_ram_alloc(NULL, "next-cube.ram", RAM_SIZE) | IO_MEM_RAM);
   
     /* Framebuffer */
-    //nextfb_init(&nextfb_state);
+    nextfb_init(&nextfb_state);
  
     /* MMIO */
     cpu_register_physical_memory((uint32_t)0x2000000,0xD0000,

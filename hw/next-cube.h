@@ -76,4 +76,19 @@ extern next_state_t next_state;
 void nextkbd_init(void *opaque);
 /* next-net.c */
 void nextnet_init(void *opaque);
+/* next-fb.c */
+typedef struct {
+	DisplayState *ds;
+	uint32_t base;
+	uint32_t pitch;
+	uint32_t cols;
+	uint32_t rows;
+	int invalidate;
 
+
+} nextfb_state_t;
+
+extern nextfb_state_t nextfb_state;
+void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s, int width, int pitch);
+
+void nextfb_init(nextfb_state_t *s);
