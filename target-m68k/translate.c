@@ -1822,7 +1822,7 @@ DISAS_INSN(arith_im)
         tcg_gen_addi_i32(dest, dest, im);
         gen_update_cc_add(dest, tcg_const_i32(im));
         SET_X_FLAG(opsize, dest, tcg_const_i32(im));
-	SET_CC_OP(opsize, ADD);
+    SET_CC_OP(opsize, ADD);
         break;
     case 5: /* eori */
         tcg_gen_xori_i32(dest, src1, im);
@@ -3847,8 +3847,8 @@ DISAS_INSN(fpu)
     case 0x33: case 0x34: case 0x35:
     case 0x36: case 0x37:
         gen_helper_sincos_FP0_FP1(cpu_env);
-        gen_op_store_fpr_FP0(REG(ext, 7));	/* sin */
-        gen_op_store_fpr_FP1(REG(ext, 0));	/* cos */
+        gen_op_store_fpr_FP0(REG(ext, 7));  /* sin */
+        gen_op_store_fpr_FP1(REG(ext, 0));  /* cos */
         break;
     case 0x38: /* fcmp */
         gen_op_load_fpr_FP1(REG(ext, 7));
@@ -4380,6 +4380,11 @@ register_opcode (disas_proc proc, uint16_t opcode, uint16_t mask)
           opcode_table[i] = proc;
   }
 }
+/* my instructions start here */
+DISAS_INSN(cinva)
+{
+/* Cache invalidate (NOP)*/
+}
 
 /* Register m68k opcode handlers.  Order is important.
    Later insn override earlier ones.  */
@@ -4614,7 +4619,12 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(frestore,  f340, ffc0, FPU);
     INSN(fsave,     f340, ffc0, FPU);
     INSN(intouch,   f340, ffc0, CF_ISA_A);
+
+    /* MMU */
     INSN(cpushl,    f428, ff38, CF_ISA_A);
+    INSN(cpushl,    f478, ff78, M68000);
+    INSN(cinva,     f4d8, f4d8, M68000);
+    
     INSN(wddata,    fb00, ff00, CF_ISA_A);
     INSN(wdebug,    fbc0, ffc0, CF_ISA_A);
 #ifdef CONFIG_EMULOP
@@ -4702,7 +4712,7 @@ gen_intermediate_code_internal(CPUState *env, TranslationBlock *tb,
         if (num_insns + 1 == max_insns && (tb->cflags & CF_LAST_IO))
             gen_io_start();
         dc->insn_pc = dc->pc;
-	disas_m68k_insn(env, dc);
+    disas_m68k_insn(env, dc);
         num_insns++;
     } while (!dc->is_jmp && gen_opc_ptr < gen_opc_end &&
              !env->singlestep_enabled &&
