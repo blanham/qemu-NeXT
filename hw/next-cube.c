@@ -32,6 +32,7 @@
 #define RAM_SIZE 0x4000000
 #define ROM_FILE "rom66.bin"
 
+next_state_t next_state;
 /* debug NeXT */
 #define DEBUG_NEXT
 
