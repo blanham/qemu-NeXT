@@ -4407,6 +4407,46 @@ DISAS_INSN(pflush)
 	
 
 }
+/*TODO: add other two addressing modes */
+DISAS_INSN(move16)
+{
+	TCGv src;
+	TCGv s_addr;
+	TCGv d_addr;
+	uint16_t im;
+	if(insn & 0x8){
+		
+				vm_stop(VMSTOP_DEBUG);
+        //abort();
+	}else if(insn & 0x10){
+
+				vm_stop(VMSTOP_DEBUG);
+		//abort();
+
+	}else{
+      
+        d_addr = tcg_temp_new();
+        s_addr = tcg_temp_new();	
+		
+        s_addr = AREG(insn,0);
+        src = gen_load(s, OS_LONG, s_addr, 0); 
+        
+        im = read_im16(s);
+        d_addr = AREG(im,12);
+
+        gen_store(s, OS_LONG, d_addr, src);
+        
+        int i = 0;
+        for(;i <3; i++)
+        {
+            tcg_gen_addi_i32(d_addr,d_addr,4);
+            tcg_gen_addi_i32(s_addr,s_addr,4);
+
+            src = gen_load(s, OS_LONG, s_addr, 0); 
+            gen_store(s, OS_LONG, d_addr, src);
+        }
+	}
+}
 
 /* Register m68k opcode handlers.  Order is important.
    Later insn override earlier ones.  */
@@ -4647,6 +4687,8 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(cpushl,    f478, ff78, M68000);
     INSN(cinva,     f4d8, f4d8, M68000);
 	INSN(pflush,   	f500, f500, M68000);
+    
+    INSN(move16,	f600, f600, M68000);
     
     INSN(wddata,    fb00, ff00, CF_ISA_A);
     INSN(wdebug,    fbc0, ffc0, CF_ISA_A);
