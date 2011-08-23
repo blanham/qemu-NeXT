@@ -13,7 +13,6 @@
 #include "hw.h"
 #include "next-cube.h"
 #include "next-fb.h"
-#include "next-kbd.h"
 //#include "next-net.h"
 #include "exec-all.h"
 #include "monitor.h"
@@ -459,7 +458,7 @@ static void next_cube_init(ram_addr_t ram_size,
              //     0, 0x10000);
 
     /* KBD */
-   	//nextkbd_init((void *)env);
+   	nextkbd_init((void *)env);
 
     /* Serial */
   	//CharDriverState *console = text_console_init(NULL);

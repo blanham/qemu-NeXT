@@ -72,7 +72,8 @@ typedef struct {
     qemu_irq *scsi_irq;
 } next_state_t;
 next_state_t next_state;
-
+/* next-kbd.c  */
+void nextkbd_init(void *opaque);
 /* next-net.c */
 void nextnet_init(void *opaque);
 
