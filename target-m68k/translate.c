@@ -4415,14 +4415,9 @@ DISAS_INSN(move16)
 	TCGv d_addr;
 	uint16_t im;
 	if(insn & 0x8){
-		
-				vm_stop(VMSTOP_DEBUG);
-        //abort();
+        abort();
 	}else if(insn & 0x10){
-
-				vm_stop(VMSTOP_DEBUG);
-		//abort();
-
+		abort();
 	}else{
       
         d_addr = tcg_temp_new();
