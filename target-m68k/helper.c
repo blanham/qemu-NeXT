@@ -29,6 +29,15 @@
 #include "helpers.h"
 #include <math.h>
 
+//#define DEBUG
+
+#ifdef DEBUG
+#define DPRINTF(fmt, ...)                                       \
+    do { printf("helper.c: " fmt , ## __VA_ARGS__); } while (0);
+#else
+#define DPRINTF(fmt, ...)
+#endif
+
 #if 0
 #define DBG_FPUH(...) do { fprintf(stderr, "0x%08x: ", env->pc); fprintf(stderr, __VA_ARGS__); } while(0)
 #define DBG_FPU(...) do { fprintf(stderr, __VA_ARGS__); } while(0)
@@ -476,14 +485,42 @@ set_x:
 void HELPER(movec_to)(CPUM68KState * env, uint32_t reg, uint32_t val)
 {
     switch (reg) {
-    case 0x02: /* CACR */
+    case 0x00: /* SFC */
+		env->sfc = val;
+		DPRINTF("WRITE sfc = %x @ %x\n",val,env->pc);
+		break;
+	case 0x01: /* DFC */
+		env->dfc = val;
+		DPRINTF("WRITE dfc = %x @ %x\n",val,env->pc);
+		break;
+	case 0x02: /* CACR */
         env->cacr = val;
         m68k_switch_sp(env);
         break;
-    case 0x04: case 0x05: case 0x06: case 0x07: /* ACR[0-3] */
-        /* TODO: Implement Access Control Registers.  */
-        break;
-    case 0x801: /* VBR */
+	case 0x03: /* MMU Translation Control */
+		env->mmu.tc = val;
+		break;
+    /* Translation/Access Control Registers */
+	case 0x04:
+		DPRINTF("WRITE itt0 = %x @ %x\n",val,env->pc);
+		env->itt0 = val;
+		return;
+	case 0x05:
+		env->itt1 = val;
+		DPRINTF("WRITE itt1 = %x @ %x\n",val,env->pc);
+		break;
+	case 0x06:
+		env->dtt0 = val;
+		DPRINTF("WRITE dtt0 = %x @ %x\n",val,env->pc);
+		break;
+	case 0x07:
+		env->dtt1 = val;
+		DPRINTF("WRITE dtt1 = %x @ %x\n",val,env->pc);
+		break;
+    case 0x800: /* USP */
+		env->sp[M68K_USP] = val;
+		break;
+	case 0x801: /* VBR */
         env->vbr = val;
         break;
     /* TODO: Implement control registers.  */
@@ -496,14 +533,26 @@ void HELPER(movec_to)(CPUM68KState * env, uint32_t reg, uint32_t val)
 uint32_t HELPER(movec_from)(CPUM68KState * env, uint32_t reg)
 {
     switch (reg) {
+	case 0x00: /* SFC */
+		return env->sfc;
+	case 0x01: /* DFC */
+		return env->dfc;
     case 0x02: /* CACR */
         return env->cacr;
-    case 0x04: case 0x05: case 0x06: case 0x07: /* ACR[0-3] */
-        /* TODO: Implement Access Control Registers.  */
-        return 0;
+	case 0x03: /* MMU TC */
+		return env->mmu.tc;
+    case 0x04: /* ITT0 */
+		return env->itt0;
+	case 0x05: /* ITT1 */
+		return env->itt1;
+	case 0x06: /* DTT0 */
+		return env->dtt0;
+	case 0x07: /* DTT1 */
+		return env->dtt1;
+	case 0x800: /* USP */
+	    return env->sp[M68K_USP];
     case 0x801: /* VBR */
         return env->vbr;
-        break;
     /* TODO: Implement control registers.  */
     default:
         cpu_abort(env, "Unimplemented control register read 0x%x\n",

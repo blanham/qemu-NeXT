@@ -105,6 +105,12 @@ typedef struct CPUM68KState {
     uint32_t cc_dest;
     uint32_t cc_src;
     uint32_t cc_x;
+	
+    /* Control Registers */
+	uint32_t sfc;
+	uint32_t dfc;
+	uint32_t itt0,itt1;
+	uint32_t dtt0,dtt1;
 
     FPReg fregs[8];
     uint32_t fpcr;
@@ -135,7 +141,10 @@ typedef struct CPUM68KState {
 
     /* MMU status.  */
     struct {
-        uint32_t ar;
+        uint32_t pagesize;
+		int enabled;
+		uint32_t ar;
+    	uint32_t tc;
     } mmu;
 
     /* Control registers.  */
