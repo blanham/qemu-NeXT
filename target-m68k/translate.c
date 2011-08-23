@@ -4385,6 +4385,28 @@ DISAS_INSN(cinva)
 {
 /* Cache invalidate (NOP)*/
 }
+/* page flush, going to leave this
+    as is, until work can start on the mmu */
+DISAS_INSN(pflush)
+{
+	int opmode = (insn>>3) & 0x3;
+	switch(opmode)
+	{
+	//	case 0x0:
+
+	//	case 0x1:
+	//	fprintf(stderr,"entry\n");
+	//	break;
+	//	case 0x2:
+	//	case 0x3:
+	//	fprintf(stderr,"all\n");
+	//	break;
+		default:
+		fprintf(stderr, "PFLUSH %X\n",insn);
+	}
+	
+
+}
 
 /* Register m68k opcode handlers.  Order is important.
    Later insn override earlier ones.  */
@@ -4624,6 +4646,7 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(cpushl,    f428, ff38, CF_ISA_A);
     INSN(cpushl,    f478, ff78, M68000);
     INSN(cinva,     f4d8, f4d8, M68000);
+	INSN(pflush,   	f500, f500, M68000);
     
     INSN(wddata,    fb00, ff00, CF_ISA_A);
     INSN(wdebug,    fbc0, ffc0, CF_ISA_A);
