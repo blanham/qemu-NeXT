@@ -1,6 +1,8 @@
 #ifndef QEMU_HW_ESP_H
 #define QEMU_HW_ESP_H
 
+void *esp_g;
+void esp_flush_fifo(void *opaque);
 /* esp.c */
 #define ESP_MAX_DEVS 7
 typedef void (*ESPDMAMemoryReadWriteFunc)(void *opaque, uint8_t *buf, int len);
