@@ -523,6 +523,8 @@ void HELPER(movec_to)(CPUM68KState * env, uint32_t reg, uint32_t val)
 	case 0x801: /* VBR */
         env->vbr = val;
         break;
+    case 0x807:
+        break;
     /* TODO: Implement control registers.  */
     default:
         cpu_abort(env, "Unimplemented control register write 0x%x = 0x%x\n",
