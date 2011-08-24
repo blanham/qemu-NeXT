@@ -58,6 +58,7 @@ enum next_irqs {
     NEXT_ENTX_DMA_I,
     NEXT_ENRX_DMA_I,
     NEXT_SCSI_DMA_I,
+    NEXT_SCC_DMA_I,
     NEXT_SND_I
 };
 void next_irq(void *opaque, int number);
@@ -70,6 +71,9 @@ typedef struct {
     uint8_t scsi_csr_2;
     next_dma dma[10];
     qemu_irq *scsi_irq;
+    qemu_irq scsi_dma;
+    qemu_irq scsi_reset;
+    qemu_irq *fd_irq;
 } next_state_t;
 extern next_state_t next_state;
 /* next-kbd.c  */
