@@ -1298,7 +1298,7 @@ DISAS_INSN(undef_mac)
 
 DISAS_INSN(undef_fpu)
 {
-    gen_exception(s, s->pc - 2, EXCP_LINEF);
+    //gen_exception(s, s->pc - 2, EXCP_LINEF);
 }
 
 DISAS_INSN(undef)
@@ -4018,13 +4018,13 @@ DISAS_INSN(fscc_reg)
 DISAS_INSN(frestore)
 {
     /* TODO: Implement frestore.  */
-    qemu_assert(0, "FRESTORE not implemented");
+    //qemu_assert(0, "FRESTORE not implemented");
 }
 
 DISAS_INSN(fsave)
 {
     /* TODO: Implement fsave.  */
-    qemu_assert(0, "FSAVE not implemented");
+    //qemu_assert(0, "FSAVE not implemented");
 }
 
 static inline TCGv gen_mac_extract_word(DisasContext *s, TCGv val, int upper)
