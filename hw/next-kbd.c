@@ -29,9 +29,9 @@
 #include "hw.h"
 #include "console.h"
 #include "next-cube.h"
-
+#include "sysemu.h"
 /* debug NeXT keyboard */
-//#define DEBUG_KBD
+#define DEBUG_KBD
 
 #ifdef DEBUG_KBD
 #define DPRINTF(fmt, ...)                                       \
@@ -66,7 +66,7 @@ typedef struct {
 typedef struct KBDState {
     KBDQueue queue;
     uint8_t blank;
-    int shift;//make this an unsigned short, and set it to set the modifier value
+    uint16_t shift;//make this an unsigned short, and set it to set the modifier value
 
 } KBDState;
 KBDState *kbd_env;
@@ -121,9 +121,11 @@ static uint32_t kbd_read_byte(void *opaque, target_phys_addr_t addr)
 		return 0x80|0x40|0x20|0x10;
 		
         case 0xe002:
-		return 0x40|0x10|0x2|0x1;
-
-        default:
+		//return 0x40|0x10|0x2|0x1;
+		//returning 0x40 caused mach to hang
+		return 0x10|0x2|0x1;
+        
+		default:
         DPRINTF("RB ADDR %x\n",addr);
         return 0;
     }
@@ -159,11 +161,12 @@ static uint32_t kbd_read_long(void *opaque, target_phys_addr_t addr)
             
           
             if(s->shift)
-            key |= KD_LSHIFT;
-            if(key & 0x80)
-            return 0;
+            	key |= s->shift;
+            
+			if(key & 0x80)
+            	return 0;
             else
-            return 0x10000000 | KD_VALID | key;
+            	return 0x10000000 | KD_VALID | key;
         }
         else
             return 0;
@@ -185,6 +188,7 @@ static void kbd_write_word(void *opaque, target_phys_addr_t addr, uint32_t val)
 static void kbd_write_long(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
 	DPRINTF("WL ADDR %x\n",addr);
+	if(addr == 0xe000)vm_stop(VMSTOP_DEBUG);
 }
 
 
@@ -215,13 +219,30 @@ static void queue_code(void *opaque, int code)
 
     KBDState *s = (KBDState *)opaque;
     KBDQueue *q = &s->queue;
-    int key = code & 0x7F;
+	int key = code & 0x7F;
     int release = code & 0x80;
+   	static int ext = 0; 
+	if(code == 0xE0)
+		ext =1;
+
+	if(code == 0x2A || code == 0x1D || code == 0x36){
+		
+		if(code == 0x2A){
+			s->shift = KD_LSHIFT;
+		}else if(code == 0x36){
+			s->shift = KD_RSHIFT;
+			ext = 0;
+		}else if(code == 0x1D && !ext)
+		{
+			s->shift = KD_LCOMM;
+		}else if(code == 0x1D && ext){
+			ext = 0;
+			s->shift = KD_RCOMM;
+		}       
+		
+		return;
     
-	if(code == 0x2A){
-		s->shift = 1;
-        return;
-    }else if(code == (0x2A | 0x80)){
+	}else if(code == (0x2A | 0x80) || code == (0x1D | 0x80)|| code == (0x36 | 0x80)){
        	s->shift = 0;
         return;
   	}
