@@ -27,7 +27,7 @@
 #include "esp.h"
 
 /* debug ESP card */
-//#define DEBUG_ESP
+#define DEBUG_ESP
 
 /*
  * On Sparc32, this is the ESP (NCR53C90) part of chip STP2000 (Master I/O),
@@ -208,8 +208,11 @@ static uint32_t get_cmd(ESPState *s, uint8_t *buf)
     if (s->dma) {
         dmalen = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
         s->dma_memory_read(s->dma_opaque, buf, dmalen);
+        DPRINTF("DMA read\n");
     } else {
+        /*TODO: find why s->ti_size is set to 451, when the max is 16 */
         dmalen = s->ti_size;
+        DPRINTF("get_cmd s->ti_size %x\n",s->ti_size);
         memcpy(buf, s->ti_buf, dmalen);
         buf[0] = buf[2] >> 5;
     }
@@ -246,7 +249,10 @@ static void do_busid_cmd(ESPState *s, uint8_t *buf, uint8_t busid)
     lun = busid & 7;
     s->current_req = scsi_req_new(s->current_dev, 0, lun, NULL);
     datalen = scsi_req_enqueue(s->current_req, buf);
+    //DPRINTF("datalen: %i\n",datalen);
+    
     s->ti_size = datalen;
+    DPRINTF("do_busid_cmd s->ti_size: %i\n",s->ti_size);
     if (datalen != 0) {
         s->rregs[ESP_RSTAT] = STAT_TC;
         s->dma_left = 0;
@@ -280,6 +286,7 @@ static void handle_satn(ESPState *s)
         return;
     }
     len = get_cmd(s, buf);
+    DPRINTF("HANDLE SATN LEN: %i\n",len);
     if (len)
         do_cmd(s, buf);
 }
@@ -377,10 +384,12 @@ static void esp_do_dma(ESPState *s)
     s->dma_left -= len;
     s->async_buf += len;
     s->async_len -= len;
+    DPRINTF("do_dma: ti_size1 = %i len %x\n",s->ti_size,len);
     if (to_device)
         s->ti_size += len;
     else
         s->ti_size -= len;
+    DPRINTF("do_dma: ti_size2 = %i len %x\n",s->ti_size,len);
     if (s->async_len == 0) {
         scsi_req_continue(s->current_req);
         /* If there is still data to be read from the device then
@@ -440,11 +449,12 @@ static void handle_ti(ESPState *s)
     uint32_t dmalen, minlen;
 
     dmalen = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
+    if(dmalen == 7240) dmalen = 7680;
     if (dmalen==0) {
       dmalen=0x10000;
     }
     s->dma_counter = dmalen;
-
+    DPRINTF("handle_ti dmalen:%x ti_size %i\n",dmalen,s->ti_size);
     if (s->do_cmd)
         minlen = (dmalen < 32) ? dmalen : 32;
     else if (s->ti_size < 0)
@@ -509,7 +519,17 @@ static void esp_gpio_demux(void *opaque, int irq, int level)
         break;
     }
 }
+void esp_flush_fifo(void *opaque)
+{
 
+    ESPState *s = opaque;
+    DPRINTF("Flush FIFO\n");
+    s->ti_size = 0;
+    s->rregs[ESP_RINTR] = INTR_FC;
+    s->rregs[ESP_RSEQ] = 0;
+    s->rregs[ESP_RFLAGS] = 0;
+
+}
 static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
 {
     ESPState *s = opaque;
@@ -519,7 +539,9 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
     DPRINTF("read reg[%d]: 0x%2.2x\n", saddr, s->rregs[saddr]);
     switch (saddr) {
     case ESP_FIFO:
+        DPRINTF("READFIFO: %x\n",s->rregs[saddr]);
         if (s->ti_size > 0) {
+            DPRINTF("mem_readb ti_size = %x\n",s->ti_size);
             s->ti_size--;
             if ((s->rregs[ESP_RSTAT] & STAT_PIO_MASK) == 0) {
                 /* Data out.  */
@@ -571,6 +593,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
             ESP_ERROR("fifo overrun\n");
         } else {
             s->ti_size++;
+            DPRINTF("mem_writeb ti_size = %i\n",s->ti_size);
             s->ti_buf[s->ti_wptr++] = val & 0xff;
         }
         break;
@@ -590,6 +613,8 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
             break;
         case CMD_FLUSH:
             DPRINTF("Flush FIFO (%2.2x)\n", val);
+            /* have a sinking suspicion that this should not
+                have been commented out */
             //s->ti_size = 0;
             s->rregs[ESP_RINTR] = INTR_FC;
             s->rregs[ESP_RSEQ] = 0;
@@ -712,9 +737,10 @@ void esp_init(target_phys_addr_t espaddr, int it_shift,
     DeviceState *dev;
     SysBusDevice *s;
     ESPState *esp;
-
+    
     dev = qdev_create(NULL, "esp");
     esp = DO_UPCAST(ESPState, busdev.qdev, dev);
+    esp_g = (void *)esp;
     esp->dma_memory_read = dma_memory_read;
     esp->dma_memory_write = dma_memory_write;
     esp->dma_opaque = dma_opaque;
