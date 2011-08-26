@@ -297,6 +297,9 @@ void cpu_reset(CPUM68KState *env)
 #else
     env->sr = 0x2700;
 #endif
+    env->mmu.tc = 0;
+
+
     m68k_switch_sp(env);
 
     for (i = 0; i < 8; i++) {
@@ -498,7 +501,7 @@ void HELPER(movec_to)(CPUM68KState * env, uint32_t reg, uint32_t val)
         m68k_switch_sp(env);
         break;
 	case 0x03: /* MMU Translation Control */
-		env->mmu.tc = val;
+		env->mmu.tc = val&0xFFFF;
 		break;
     /* Translation/Access Control Registers */
 	case 0x04:
@@ -523,7 +526,9 @@ void HELPER(movec_to)(CPUM68KState * env, uint32_t reg, uint32_t val)
 	case 0x801: /* VBR */
         env->vbr = val;
         break;
-    case 0x807:
+    case 0x807: /* SRP */
+        env->srp = val;
+		DPRINTF("WRITE srp = %x @ %x\n",val,env->pc);
         break;
     /* TODO: Implement control registers.  */
     default:
@@ -620,22 +625,159 @@ int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
 #else
 
 /* MMU */
-
+/* TC Constants */
+#define MMU_PAGE_SIZE   0x4000 //if set page size = 8K not set 4K
+#define MMU_ENABLE      0x8000
+/* TTR Constants */
+#define MMU_LOG_BASE     0xFF000000
+#define MMU_LOG_MASK(x)  ((0x00FF0000 & x) <<8)
+#define MMU_TTR_ENABLE   0x00008000
+#define MMU_SUPER_ACCESS 0x00001000
+#define MMU_IGN_FC2      0x00002000
+#define MMU_READ_ONLY    0x00000004
+/* MMU Status Register Constants*/
+//TODO
+#define MMU_RI(x) ((0xFE000000 & x)>>25)
+#define MMU_PI(x) ((0x01FC0000 & x)>>18)
+#define MMU_PGI_8K(x) ((0x0003E000 & x)>>13)
+#define MMU_PGI_4K(x) ((0x0003F000 & x)>>12)
+#define MMU_PG_OFF_8K(x) (0x00001FFF & x)
+#define MMU_PG_OFF_4K(x) (0x00000FFF & x)
+#define MMU_PNT_MASK(x)  (0xFFFFFE00 & x)
+#define MMU_8K_MASK(x)  (0xFFFFFF00 & x)
+#define MMU_4K_MASK(x)  (0xFFFFFF10 & x)
+/*
+ldl RI*4 + (PNT_MASK(URP)) -> root level
+ldl PI*4 + (PNT_MASK(root level)) -> pointer level
+if 8k 
+    ldl PGI*4 | 8K_MASK(pointer level) -> page desc
+    ldl(page desc) 
+    
+  */  
 /* TODO: This will need fixing once the MMU is implemented.  */
 target_phys_addr_t cpu_get_phys_page_debug(CPUState *env, target_ulong addr)
 {
     return addr;
 }
+static inline int get_phys_addr(CPUState *env, uint32_t address,
+                                int access_type, int is_user,
+                                uint32_t *phys_ptr, int *prot,
+                                target_ulong *page_size)
+{
+    uint32_t root_pointer;
+    uint32_t rt_pointer;
+    uint32_t ptr_pointer;
+    uint32_t page_desc;
+    uint32_t indirect;
 
-int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
+    /* Handle Transparent Translation first */
+    if(address & ((MMU_LOG_BASE & env->itt0)| (MMU_LOG_MASK(env->itt0)) ))
+    {
+        *phys_ptr = address;
+        return 0; 
+    }else if(address & ((MMU_LOG_BASE & env->itt1)| (MMU_LOG_MASK(env->itt1)) ))
+    {
+        *phys_ptr = address; 
+        return 0;    
+    }
+
+    //if(is_user)
+       // root_pointer = env->urp;
+    //else
+        root_pointer = env->srp;
+
+    fprintf(stderr,"MMU fault @ %x ADDR%x  RP %x access_type %i\n",env->pc,address,root_pointer,access_type);
+    
+    rt_pointer = ldl_phys(MMU_RI(address)*4 | MMU_PNT_MASK(root_pointer));
+    fprintf(stderr,"RT PTR = %x\n", rt_pointer);
+    
+    ptr_pointer = ldl_phys(MMU_PI(address)*4 | MMU_PNT_MASK(rt_pointer));
+    fprintf(stderr,"PTR PTR = %x\n",ptr_pointer );
+    
+    if(env->mmu.tc & MMU_PAGE_SIZE){
+        
+        page_desc = ldl_phys(MMU_PGI_8K(address)*4 | MMU_8K_MASK(ptr_pointer));
+        //*phys_ptr = (page_desc &0xFFFFE000) | (address & 0x1FFF);
+        fprintf(stderr,"page_desc %x\n",page_desc);
+        
+        switch(page_desc&3)
+        {
+            case 0:
+                fprintf(stderr,"PAGE FAULT\n");
+                env->exception_index = EXCP_ACCESS;
+                env->mmu.ar = address;
+                return 1;
+            
+            case 1: case 3:
+                *phys_ptr = (page_desc &0xFFFFE000) | (address & 0x1FFF);
+                if(access_type)
+                    page_desc |= 0x10;
+                if(!(page_desc & 0x8))
+                    page_desc |= 8;
+                stl_phys(MMU_PGI_8K(address)*4 | MMU_8K_MASK(ptr_pointer),page_desc);
+                break;
+            
+            case 2:
+                indirect = ldl_phys(page_desc & 0xFFFFFFFC);
+                fprintf(stderr,"indirect page desc\n"); 
+                *phys_ptr = (indirect &0xFFFFE000) | (address & 0x1FFF);
+
+                break;
+        }
+        fprintf(stderr,"phys ptr = %x\n", *phys_ptr);
+    
+    }else{
+        page_desc = ldl_phys(MMU_PGI_4K(address)*4 + MMU_4K_MASK(ptr_pointer));
+            
+        *phys_ptr = (page_desc &0xFFFFF000) | (address & 0xFFF);
+        fprintf(stderr,"phys ptr = %x\n", *phys_ptr);
+    }
+    //if(*phys_ptr == 0) *phys_ptr = 0x40b24e8;
+    //if(*phys_ptr == 0) return -1;
+    return 0;
+}
+
+
+int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int access_type,
                                int mmu_idx)
 {
-    int prot;
-
-    address &= TARGET_PAGE_MASK;
+    uint32_t phys_addr = 0xdeadbeef;
+    target_ulong page_size = TARGET_PAGE_SIZE;
+    int prot = 0;
+    int ret, is_user;
+    
+    /* these need to be set correctly */
+    is_user = (mmu_idx == MMU_USER_IDX);
     prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
-    tlb_set_page(env, address, address, prot, mmu_idx, TARGET_PAGE_SIZE);
-    return 0;
+    
+    /* If MMU is off do a direct mapping */
+    if(!(env->mmu.tc & MMU_ENABLE))
+    {
+        address &= TARGET_PAGE_MASK;
+        tlb_set_page (env, address, address, prot, mmu_idx, page_size);
+        return 0;
+    }
+
+
+
+    ret = get_phys_addr(env, address, access_type, is_user, &phys_addr, &prot,
+                        &page_size);
+    
+    
+    //fprintf(stderr,"itt0 %x itt1 %x dtt0 %x dtt1 %x\n",env->itt0, env->itt1, env->dtt0,env->dtt1); 
+    
+    if (ret == 0) {
+        /* Map a single [sub]page.  */
+        phys_addr &= TARGET_PAGE_MASK;
+        address &= TARGET_PAGE_MASK;
+        tlb_set_page (env, address, phys_addr, prot, mmu_idx, page_size);
+        return 0;
+    }
+
+
+
+
+    return ret;
 }
 
 /* Notify CPU of a pending interrupt.  Prioritization and vectoring should

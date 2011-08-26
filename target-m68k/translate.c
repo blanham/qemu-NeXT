@@ -33,6 +33,8 @@
 #define GEN_HELPER 1
 #include "helpers.h"
 
+/*RMOVE THIS */ #include "sysemu.h"
+
 //#define DEBUG_DISPATCH 1
 
 #define DEFO32(name, offset) static TCGv QREG_##name;
@@ -1298,6 +1300,8 @@ DISAS_INSN(undef_mac)
 
 DISAS_INSN(undef_fpu)
 {
+    fprintf(stderr,"Illegal fpu instruction: %04x @ %08x\n",
+              insn, s->pc - 2);
     //gen_exception(s, s->pc - 2, EXCP_LINEF);
 }
 
@@ -4390,19 +4394,22 @@ DISAS_INSN(cinva)
 DISAS_INSN(pflush)
 {
 	int opmode = (insn>>3) & 0x3;
-	switch(opmode)
+	uint32_t src = AREG(insn,0);
+    //vm_stop(VMSTOP_DEBUG);
+    switch(opmode)
 	{
-	//	case 0x0:
+		case 0x0:
 
-	//	case 0x1:
-	//	fprintf(stderr,"entry\n");
-	//	break;
-	//	case 0x2:
-	//	case 0x3:
-	//	fprintf(stderr,"all\n");
-	//	break;
+		case 0x1:
+		fprintf(stderr,"entry\n");
+		break;
+		case 0x2:
+		case 0x3:
+		fprintf(stderr,"all\n");
+	    tlb_flush((CPUState *)s->env,1);
+		break;
 		default:
-		fprintf(stderr, "PFLUSH %X\n",insn);
+		fprintf(stderr, "PFLUSH %X for %x\n",insn,src);
 	}
 	
 
@@ -4415,9 +4422,9 @@ DISAS_INSN(move16)
 	TCGv d_addr;
 	uint16_t im;
 	if(insn & 0x8){
-        abort();
+        qemu_assert(0,"move16");
 	}else if(insn & 0x10){
-		abort();
+        qemu_assert(0,"move16");
 	}else{
       
         d_addr = tcg_temp_new();
@@ -4673,8 +4680,8 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(fscc_mem,  f240, ffc0, FPU);
     INSN(fscc_reg,  f240, fff8, FPU);
     INSN(fbcc,      f280, ffc0, FPU);
+    INSN(fsave,     f300, ffc0, FPU);
     INSN(frestore,  f340, ffc0, FPU);
-    INSN(fsave,     f340, ffc0, FPU);
     INSN(intouch,   f340, ffc0, CF_ISA_A);
 
     /* MMU */

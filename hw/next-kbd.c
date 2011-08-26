@@ -31,7 +31,7 @@
 #include "next-cube.h"
 #include "sysemu.h"
 /* debug NeXT keyboard */
-#define DEBUG_KBD
+//#define DEBUG_KBD
 
 #ifdef DEBUG_KBD
 #define DPRINTF(fmt, ...)                                       \
@@ -188,7 +188,7 @@ static void kbd_write_word(void *opaque, target_phys_addr_t addr, uint32_t val)
 static void kbd_write_long(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
 	DPRINTF("WL ADDR %x\n",addr);
-	if(addr == 0xe000)vm_stop(VMSTOP_DEBUG);
+	//if(addr == 0xe000)vm_stop(VMSTOP_DEBUG);
 }
 
 

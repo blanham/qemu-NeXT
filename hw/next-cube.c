@@ -83,7 +83,15 @@ static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr)
             return (scr1 >> 8) & 0xFF;
         case 0xc003:
             return (scr1 >> 0) & 0xFF;
-       	//case 0xc0008:
+       	case 0xd000:
+            return (scr2 >> 24) & 0xFF;
+        case 0xd001:
+            return (scr2 >> 16) & 0xFF;
+        case 0xd002:
+            return (scr2 >> 8) & 0xFF;
+        case 0xd003:
+            return (scr2 >> 0) & 0xFF;
+//case 0xc0008:
       		//return 0xff;//hack to hide memory error
      	//case 0x18000:
      	//case 0x18001:
@@ -207,7 +215,7 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
             	{
                	 	fprintf(stderr,"LED flashing, possible fault, pausing emulation\n");
                 	led = 0;
-                	vm_stop(VMSTOP_DEBUG);
+                	//vm_stop(VMSTOP_DEBUG);
             	}
 
         	}
@@ -361,7 +369,7 @@ static uint32_t scr_readl(void*opaque, target_phys_addr_t addr)
 }
 static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 {
-    CPUState *s = (CPUState *)opaque;
+    //CPUState *s = (CPUState *)opaque;
     switch(addr)
     {
      	//case 0x10000: break;//Screen brightness
@@ -391,35 +399,35 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			#define SCSICSR_INTMASK	0x20//if set, interrupt enabled
 			if(value & SCSICSR_FIFOFL)
 			{
-				DPRINTF("SCSICSR FIFO Flush\n");
+				//DPRINTF("SCSICSR FIFO Flush\n");
 				//esp_flush_fifo(esp_g);
 			}
 			if(value & SCSICSR_ENABLE)
             {
-				DPRINTF("SCSICSR Enable\n");
+				//DPRINTF("SCSICSR Enable\n");
 				//qemu_irq_raise(next_state.scsi_dma);
 				//next_state.scsi_csr_1 = 0xc0;
 			}
 			if(value & SCSICSR_RESET)
 			{
-				DPRINTF("SCSICSR Reset\n");
+				//DPRINTF("SCSICSR Reset\n");
             	//i think this should set DMADIR. CPUDMA and INTMASK to 0 
 				//qemu_irq_pulse(next_state.scsi_reset);
 				//abort();		
 			}
 			if(value & SCSICSR_DMADIR)
 			{	
-				DPRINTF("SCSICSR DMAdir\n");
+				//DPRINTF("SCSICSR DMAdir\n");
 			}
 			if(value & SCSICSR_CPUDMA)
 			{
-				DPRINTF("SCSICSR CPUDMA\n");
+				//DPRINTF("SCSICSR CPUDMA\n");
 			}
 			if(value & SCSICSR_INTMASK)
 			{
-				DPRINTF("SCSICSR INTMASK\n");
+				//DPRINTF("SCSICSR INTMASK\n");
 			}
-			DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
+			//DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
 			//next_state.scsi_csr_1 = value;
 			next_state.scsi_csr_1 = value;
            	return;
@@ -428,7 +436,7 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
       	//case 0x18001:
       	//case 0x18004:
        		//break;
-        
+       case 0x1a000:return; 
         default:
             fprintf(stderr,"BMAP Write B @ %x with %x\n",addr,value);
     }
@@ -466,8 +474,8 @@ static void next_cube_init(ram_addr_t ram_size,
     scr1 = 0x00011102;
     scr2 = 0x00ff0c80;
     
-    int_mask = 0x88027640; 
-    int_status= 0x200;
+    int_mask = 0x0;//88027640; 
+    int_status= 0x0;//200;
     
     /* Load RTC ram,  needs to be in a function probably */
     { 
@@ -478,7 +486,7 @@ static void next_cube_init(ram_addr_t ram_size,
             abort();
         fclose(fp);
         //#endif
-       // memcpy(rtc_ram,rtc_ram2,32);
+       //memcpy(rtc_ram,rtc_ram2,32);
     }
 
 
@@ -510,7 +518,7 @@ static void next_cube_init(ram_addr_t ram_size,
   	CharDriverState *console = serial_hds[0];//text_console_init(NULL);
    	qemu_irq *serial = qemu_allocate_irqs(serial_irq, env, 2);
   	escc_init(0x2118000, serial[0], serial[1],
-        console,console,   (9600*384),1);
+        NULL,console,   (9600*384),1);
 
     
     /* Load ROM here */  
@@ -556,10 +564,10 @@ static void next_cube_init(ram_addr_t ram_size,
   	qemu_irq *fdc = qemu_allocate_irqs(nextfdc_irq, env, 3);
   	memset(fd, 0, sizeof(fd));
  	fd[0] = drive_get(IF_FLOPPY, 0, 0);
-  	//sun4m_fdctrl_init(*fdc, 0x2114100, fd,
-    //                 &fdc_tc);
-  	fdctrl_init_sysbus(*fdc, 1,
-  	                   0x2114100, fd);
+  	sun4m_fdctrl_init(*fdc, 0x2114100, fd,
+                     &fdc_tc);
+  	//fdctrl_init_sysbus(*fdc, 1,
+  	//                   0x2114100, fd);
 
 
   	//sysbus_connect_irq(s, 1, fdc_tc);
@@ -571,14 +579,14 @@ static void next_cube_init(ram_addr_t ram_size,
 
 void nextscsi_read(void *opaque, uint8_t *buf, int len)
 {
-    //next_irq(opaque, NEXT_SCSI_I);
-    fprintf(stderr,"SCSI READ: %x\n",len);
+    next_irq(opaque, NEXT_SCSI_I);
+    //fprintf(stderr,"SCSI READ: %x\n",len);
 	abort();
 }
 
 void nextscsi_write(void *opaque, uint8_t *buf, int size)
 {
-    fprintf(stderr,"SCSI WRITE: %i\n",size);
+    //fprintf(stderr,"SCSI WRITE: %i\n",size);
     
     /* Most DMA is supposedly 16 byte aligned */    
     if((size % 16) != 0)
@@ -633,19 +641,20 @@ void nextscsi_write(void *opaque, uint8_t *buf, int size)
 void nextfdc_irq(void *opaque, int n, int level)
 {
     DPRINTF("FLOPPY IRQ LVL %i %i\n",n,level);
+    //if(level)
     next_irq(opaque, NEXT_FD_I);
 }
 
 void nextscsi_irq(void *opaque, int n, int level)
 {
-    DPRINTF("SCSI IRQ NUM %i %i\n",n,level);
+    //DPRINTF("SCSI IRQ NUM %i %i\n",n,level);
     if(level)
 	next_irq(opaque, NEXT_SCSI_I);
 }
 void serial_irq(void *opaque, int n, int level)
 {
     DPRINTF("SCC IRQ NUM %i\n",n);
-    next_irq(opaque, NEXT_SCC_DMA_I);
+    next_irq(opaque, NEXT_SCC_I);
 }
 #define NEXTDMA_SCSI(x)      0x10 + x
 #define NEXTDMA_FD(x)        0x10 + x
@@ -690,12 +699,12 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
                 
                 if(value & DMA_SETENABLE)
                 {
-                    DPRINTF("SCSI DMA ENABLE\n");
+                    //DPRINTF("SCSI DMA ENABLE\n");
 					next_state.dma[NEXTDMA_ENRX].csr |= DMA_ENABLE;
-                    if(!(next_state.dma[NEXTDMA_ENRX].csr & DMA_DEV2M))
-                        fprintf(stderr,"DMA TO DEVICE\n");
-					else 
-						DPRINTF("DMA TO CPU\n");
+                    //if(!(next_state.dma[NEXTDMA_ENRX].csr & DMA_DEV2M))
+                        //fprintf(stderr,"DMA TO DEVICE\n");
+					//else 
+					//	DPRINTF("DMA TO CPU\n");
 					//if(next_state.scsi_csr_1 & 1<<3)
 					///	DPRINTF("SCSI DIR\n");
                 }
@@ -715,25 +724,25 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
     			}
               //  DPRINTF("RXCSR \tWrite: %x\n",value);
                 break;
-case NEXTDMA_SCSI(NEXTDMA_CSR):
+		case NEXTDMA_SCSI(NEXTDMA_CSR):
                 if(value & DMA_DEV2M)
                     next_state.dma[NEXTDMA_SCSI].csr |= DMA_DEV2M;
                 
                 if(value & DMA_SETENABLE)
                 {
-                    DPRINTF("SCSI DMA ENABLE\n");
+                    //DPRINTF("SCSI DMA ENABLE\n");
 					next_state.dma[NEXTDMA_SCSI].csr |= DMA_ENABLE;
-                    if(!(next_state.dma[NEXTDMA_SCSI].csr & DMA_DEV2M))
-                        fprintf(stderr,"DMA TO DEVICE\n");
-					else 
-						DPRINTF("DMA TO CPU\n");
+                    //if(!(next_state.dma[NEXTDMA_SCSI].csr & DMA_DEV2M))
+                        //fprintf(stderr,"DMA TO DEVICE\n");
+					//else 
+						//DPRINTF("DMA TO CPU\n");
 					//if(next_state.scsi_csr_1 & 1<<3)
 					///	DPRINTF("SCSI DIR\n");
                 }
                 if(value & DMA_SETSUPDATE)
                     {
                         next_state.dma[NEXTDMA_SCSI].csr |= DMA_SUPDATE;   
-                        DPRINTF("DMA SUPDATE\n");
+                        //DPRINTF("DMA SUPDATE\n");
                     }
                 if(value & DMA_CLRCOMPLETE)
                     next_state.dma[NEXTDMA_SCSI].csr&= ~DMA_COMPLETE;
@@ -742,34 +751,34 @@ case NEXTDMA_SCSI(NEXTDMA_CSR):
 				{
                     next_state.dma[NEXTDMA_SCSI].csr &= ~(DMA_COMPLETE | DMA_SUPDATE | DMA_ENABLE | DMA_DEV2M);                
                 
-                    DPRINTF("SCSI DMA RESET\n");
+                    //DPRINTF("SCSI DMA RESET\n");
     			}
               //  DPRINTF("RXCSR \tWrite: %x\n",value);
                 break;
        
         case NEXTDMA_SCSI(NEXTDMA_NEXT):
-            DPRINTF("DMA NEXT WRITE\n");
+            //DPRINTF("DMA NEXT WRITE\n");
             next_state.dma[NEXTDMA_SCSI].next = value;
             break; 
         
         case NEXTDMA_SCSI(NEXTDMA_LIMIT):
             next_state.dma[NEXTDMA_SCSI].limit = value;
-            DPRINTF("DMA LIMIT WRITE\n");
+            //DPRINTF("DMA LIMIT WRITE\n");
             break;
 
         case NEXTDMA_SCSI(NEXTDMA_START):
             next_state.dma[NEXTDMA_SCSI].start = value;
-            DPRINTF("DMA START WRITE\n");
+            //DPRINTF("DMA START WRITE\n");
             break;
     
         case NEXTDMA_SCSI(NEXTDMA_STOP):
             next_state.dma[NEXTDMA_SCSI].stop = value;
-            DPRINTF("DMA STOP WRITE\n");
+            //DPRINTF("DMA STOP WRITE\n");
             break;
         
         case NEXTDMA_SCSI(NEXTDMA_NEXT_INIT):
             next_state.dma[NEXTDMA_SCSI].next_initbuf = value;
-            DPRINTF("DMA INITBUF WRITE\n");
+            //DPRINTF("DMA INITBUF WRITE\n");
             break; 
  
         
@@ -786,13 +795,12 @@ static uint32_t dma_readl(void*opaque, target_phys_addr_t addr)
     switch(addr)
     {
         case NEXTDMA_SCSI(NEXTDMA_CSR):
-            DPRINTF("DMA CSR READ\n");
+            //DPRINTF("DMA CSR READ\n");
             return next_state.dma[NEXTDMA_SCSI].csr;
 		case NEXTDMA_ENRX(NEXTDMA_CSR):
-            DPRINTF("DMA CSR READ\n");
             return next_state.dma[NEXTDMA_ENRX].csr;
         case NEXTDMA_SCSI(NEXTDMA_NEXT):
-            DPRINTF("DMA NEXT READ\n");
+            //DPRINTF("DMA NEXT READ\n");
             return next_state.dma[NEXTDMA_SCSI].next;
 
         default:
@@ -828,7 +836,7 @@ void next_irq(void *opaque, int number)
     CPUM68KState *s = opaque;
     int shift = 0;
     /* first switch sets interupt status */
-    DPRINTF("IRQ %i\n",number);
+    //DPRINTF("IRQ %i\n",number);
 	switch(number)
     {
         /* level 3 - floppy, kbd/mouse, power, 

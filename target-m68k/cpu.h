@@ -144,9 +144,13 @@ typedef struct CPUM68KState {
         uint32_t pagesize;
 		int enabled;
 		uint32_t ar;
-    	uint32_t tc;
+    	uint16_t tc;
     } mmu;
-
+    
+    uint32_t mmusr;
+    uint32_t urp;
+    uint32_t srp;
+    
     /* Control registers.  */
     uint32_t vbr;
     uint32_t mbar;
