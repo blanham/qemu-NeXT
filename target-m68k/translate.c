@@ -4463,7 +4463,6 @@ register_opcode (disas_proc proc, uint16_t opcode, uint16_t mask)
           opcode_table[i] = proc;
   }
 }
-
 /* Register m68k opcode handlers.  Order is important.
    Later insn override earlier ones.  */
 void register_m68k_insns (CPUM68KState *env)
@@ -4702,6 +4701,7 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(cpush,     f420, ff20, M68000);
     INSN(cinv,      f400, ff20, M68000);
     INSN(pflush,    f500, ffe0, M68000);  /* FIXME: 68040 version only*/
+    INSN(move16,    f600, f600, M68000);
     INSN(wddata,    fb00, ff00, CF_ISA_A);
     INSN(wdebug,    fbc0, ffc0, CF_ISA_A);
 #ifdef CONFIG_EMULOP
