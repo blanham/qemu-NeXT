@@ -176,7 +176,7 @@ static void do_interrupt_all(int is_hw)
         stw_kernel(sp, env->sr);
         sp += 2;
         stl_kernel(sp, retaddr);
-        sp +=4;
+        sp += 4;
         if (m68k_feature(env, M68K_FEATURE_QUAD_MULDIV)) {
             /* 680x0, except 68000
              * FIXME: 68060 ?
