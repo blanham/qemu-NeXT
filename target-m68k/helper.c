@@ -329,7 +329,7 @@ CPUM68KState *cpu_m68k_init(const char *cpu_model)
     }
     if (m68k_feature (env, M68K_FEATURE_FPU)) {
         gdb_register_coprocessor(env, m68k_fpu_gdb_get_reg,
-				 m68k_fpu_gdb_set_reg, 11, "m68k-fp.xml", 18);
+                 m68k_fpu_gdb_set_reg, 11, "m68k-fp.xml", 18);
     }
     }
     qemu_init_vcpu(env);
@@ -460,10 +460,10 @@ set_x:
         break;
     case CC_OP_SHIFTB:
         SET_FLAGS_SHIFT(int8_t);
-	break;
+    break;
     case CC_OP_SHIFTW:
         SET_FLAGS_SHIFT(int16_t);
-	break;
+    break;
     case CC_OP_SHIFT:
         SET_FLAGS_SHIFT(int32_t);
         break;
@@ -673,6 +673,29 @@ static int check_TTR(uint32_t ttr, target_phys_addr_t *physical, int *prot,
 
     return 1;
 }
+/* MMU */
+/* TC Constants */
+#define MMU_PAGE_SIZE   0x4000 //if set page size = 8K not set 4K
+#define MMU_ENABLE      0x8000
+/* TTR Constants */
+#define MMU_LOG_BASE     0xFF000000
+#define MMU_LOG_MASK(x)  ((0x00FF0000 & x) <<8)
+#define MMU_TTR_ENABLE   0x00008000
+#define MMU_SUPER_ACCESS 0x00001000
+#define MMU_IGN_FC2      0x00002000
+#define MMU_READ_ONLY    0x00000004
+/* MMU Status Register Constants*/
+//TODO
+#define MMU_RI(x) ((0xFE000000 & x)>>25)
+#define MMU_PI(x) ((0x01FC0000 & x)>>18)
+#define MMU_PGI_8K(x) ((0x0003E000 & x)>>13)
+#define MMU_PGI_4K(x) ((0x0003F000 & x)>>12)
+#define MMU_PG_OFF_8K(x) (0x00001FFF & x)
+#define MMU_PG_OFF_4K(x) (0x00000FFF & x)
+#define MMU_PNT_MASK(x)  (0xFFFFFE00 & x)
+#define MMU_8K_MASK(x)  (0xFFFFFF80 & x)
+#define MMU_4K_MASK(x)  (0xFFFFFF00 & x)
+
 
 static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
                                 int *prot, target_ulong address,
@@ -698,7 +721,101 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
         }
     }
 
-    *physical = address;
+
+    uint32_t rp;
+    uint32_t rt_pointer;
+    uint32_t ptr_pointer;
+    uint32_t page_desc;
+    uint32_t indirect;
+    int wp = 0;
+
+    if(access_type & ACCESS_SUPER)
+        rp = env->mmu.srp;
+    else
+        rp = env->mmu.urp;
+
+    int i = (address >> 23) & 0x1FC;
+    
+    rt_pointer = ldl_phys((rp& 0xfffffe00) | i);
+    
+    if((rt_pointer & 2) == 0){
+        MPRINTF("MMU: invalid ptr for %x rt_pointer %x\n", address,rt_pointer);
+    
+        fprintf(stderr,"itt0 %x itt1 %x dtt0 %x dtt1 %x\n",env->mmu.ittr0, env->mmu.ittr1, env->mmu.dttr0,env->mmu.dttr1); 
+    }
+    
+    wp |= rt_pointer;
+    
+    if((rt_pointer & 8) == 0)
+        stl_phys(MMU_PNT_MASK(rp)| i, rt_pointer | 8);
+    
+    //rt_pointer = ldl_phys(MMU_RI(address)*4 | MMU_PNT_MASK(root_pointer));
+    
+    //fprintf(stderr,"RT PTR = %x\n", rt_pointer);
+    
+    i = (address >> 16) & 0x1fc;
+    
+    ptr_pointer = ldl_phys(MMU_PNT_MASK(rt_pointer) | i);
+    
+   // fprintf(stderr,"PTR PTR = %x\n",ptr_pointer );
+    
+
+    wp |= ptr_pointer; 
+    
+    if((ptr_pointer & 8) == 0)
+        stl_phys((ptr_pointer & 0xfffffe00) | i, ptr_pointer | 8);
+
+    if(env->mmu.tcr & MMU_PAGE_SIZE){
+        
+        i = (address >> 11) & 0x7c;
+        
+        page_desc = ldl_phys(i | MMU_8K_MASK(ptr_pointer));
+        
+        //*phys_ptr = (page_desc &0xFFFFE000) | (address & 0x1FFF);
+        
+        //fprintf(stderr,"page_desc %x\n",page_desc);
+        
+        switch(page_desc&3)
+        {
+            case 0:
+                env->exception_index = EXCP_ACCESS;
+                env->mmu.ar = address;
+                *physical = page_desc;
+                return 1;
+            
+            case 1: case 3:
+                *physical = (page_desc &0xFFFFE000) | (address & 0x1FFF);
+                if(access_type)
+                    page_desc |= 0x10;
+                if(!(page_desc & 0x8))
+                    page_desc |= 8;
+                stl_phys(MMU_PGI_8K(address)*4 | MMU_8K_MASK(ptr_pointer),page_desc);
+                break;
+            
+            case 2:
+                indirect = ldl_phys(page_desc & 0xFFFFFFFC);
+                //fprintf(stderr,"indirect page desc\n"); 
+                *physical = (indirect &0xFFFFE000) | (address & 0x1FFF);
+
+                break;
+        }
+        //fprintf(stderr,"phys ptr = %x\n", *physical);
+    
+    }else{
+        page_desc = ldl_phys(MMU_PGI_4K(address)*4 + MMU_4K_MASK(ptr_pointer));
+        abort();  
+        *physical = (page_desc &0xFFFFF000) | (address & 0xFFF);
+        //fprintf(stderr,"phys ptr = %x\n", *physical);
+    }
+    *physical |= wp & 4;
+    //if(*phys_ptr == 0) *phys_ptr = 0x40b24e8;
+    //if(*phys_ptr == 0) return -1;
+    
+   ret = 0;
+
+
+
+    //*physical = address;
     *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
     return ret;
 }
@@ -715,7 +832,7 @@ target_phys_addr_t cpu_get_phys_page_debug(CPUState *env, target_ulong addr)
 
     if (get_physical_address(env, &phys_addr, &prot,
                              addr, ACCESS_INT) != 0) {
-        return -1;
+        return 0;
     }
     return phys_addr;
 }
@@ -1092,7 +1209,7 @@ HELPER_SAL(int16_t, 16)
 HELPER_SAL(int32_t, 32)
 
 #define HELPER_SAR(type, bits) \
-uint32_t HELPER(glue(glue(sar, bits), _cc))(CPUState *env, uint32_t val, uint32_t shift)					\
+uint32_t HELPER(glue(glue(sar, bits), _cc))(CPUState *env, uint32_t val, uint32_t shift)                    \
 { \
     type result; \
     uint32_t cf; \
@@ -1330,38 +1447,38 @@ static inline floatx80 FP1_to_floatx80(CPUState *env)
 
 static inline long double floatx80_to_ldouble(floatx80 val)
 {
-	if (floatx80_is_infinity(val)) {
-		if (floatx80_is_neg(val)) {
-			return -__builtin_infl();
-		}
-		return __builtin_infl();
-	}
-	if (floatx80_is_any_nan(val)) {
-		char low[20];
-		sprintf(low, "0x%016"PRIx64, val.low);
+    if (floatx80_is_infinity(val)) {
+        if (floatx80_is_neg(val)) {
+            return -__builtin_infl();
+        }
+        return __builtin_infl();
+    }
+    if (floatx80_is_any_nan(val)) {
+        char low[20];
+        sprintf(low, "0x%016"PRIx64, val.low);
 
-		return nanl(low);
-	}
+        return nanl(low);
+    }
 
-	return *(long double *)&val;
+    return *(long double *)&val;
 }
 
 static inline floatx80 ldouble_to_floatx80(long double val)
 {
-	floatx80 res;
+    floatx80 res;
 
-	if (isinf(val)) {
-		res.high = floatx80_default_nan.high;
-		res.low = 0;
-	}
-	if (isinf(val) < 0) {
-		res.high |= 0x8000;
-	}
-	if (isnan(val)) {
-		res.high = floatx80_default_nan.high;
-		res.low = *(uint64_t*)((char *)&val + 4);
-	}
-	return *(floatx80*)&val;
+    if (isinf(val)) {
+        res.high = floatx80_default_nan.high;
+        res.low = 0;
+    }
+    if (isinf(val) < 0) {
+        res.high |= 0x8000;
+    }
+    if (isnan(val)) {
+        res.high = floatx80_default_nan.high;
+        res.low = *(uint64_t*)((char *)&val + 4);
+    }
+    return *(floatx80*)&val;
 }
 
 void HELPER(const_FP0)(CPUState *env, uint32_t offset)
@@ -1473,7 +1590,7 @@ void HELPER(reds32_FP0)(CPUState *env)
 
     val = FP0_to_floatx80(env);
     DBG_FPUH("reds32_FP0 %Lg (%08x %016"PRIx64")",
-	      floatx80_to_ldouble(val), env->fp0h, env->fp0l);
+          floatx80_to_ldouble(val), env->fp0h, env->fp0l);
     res = floatx80_to_int32(val, &env->fp_status);
     DBG_FPU(" = %d\n", res);
 
@@ -1961,7 +2078,7 @@ uint32_t HELPER(compare_FP0)(CPUState *env)
     DBG_FPUH("compare_FP0 %Lg", floatx80_to_ldouble(FP0_to_floatx80(env)));
     res = float64_compare_quiet(floatx80_to_float64(FP0_to_floatx80(env),
                                                     &env->fp_status),
-				float64_zero, &env->fp_status);
+                float64_zero, &env->fp_status);
     DBG_FPU(" = %d\n", res);
     return res;
 }
