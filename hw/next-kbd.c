@@ -28,7 +28,7 @@
 
 #include "hw.h"
 #include "console.h"
-#include "next-kbd.h"
+#include "next-cube.h"
 
 /* debug NeXT keyboard */
 //#define DEBUG_KBD

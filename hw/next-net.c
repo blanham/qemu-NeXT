@@ -24,7 +24,7 @@
 #include "sysemu.h"//only needed for vm_stop
 #include "hw.h"
 #include "net.h"
-#include "next-net.h"
+#include "next-cube.h"
 #include "sysbus.h"
 /* debug NeXT ethernet */
 #define DEBUG_NET
