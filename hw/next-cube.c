@@ -11,9 +11,8 @@
 
 
 #include "hw.h"
-#include "next-fb.h"
-#include "next-kbd.h"
-#include "next-net.h"
+//#include "next-proto.h"
+#include "next-cube.h"
 
 #include "monitor.h"
 #include "sysemu.h"
@@ -48,7 +47,6 @@ uint8_t rtc_ram2[32]={
 0x00,0x00,0x00,0x00,0x00,0x00,0x84,0x7e,
 };
 
-next_state_t next_state;
 
 static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr);
 static uint32_t mmio_readw(void*opaque, target_phys_addr_t addr);
@@ -407,7 +405,7 @@ static void next_cube_init(ram_addr_t ram_size,
         qemu_ram_alloc(NULL, "next-cube.ram", RAM_SIZE) | IO_MEM_RAM);
   
 	/* Framebuffer */
-    nextfb_init(&next_state);
+    nextfb_init(&nextfb_state);
  
     /* MMIO */
 	cpu_register_physical_memory((uint32_t)0x2000000,0xD0000,

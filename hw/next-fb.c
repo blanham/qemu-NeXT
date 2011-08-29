@@ -27,7 +27,10 @@
 #include "framebuffer.h"
 #define BITS 8
 #include "pixel_ops.h"
-#include "next-fb.h"
+#include "next-cube.h"
+
+nextfb_state_t nextfb_state;
+
 /*
 typedef struct NextVGAState {
     VGACommonState vga;
@@ -60,7 +63,7 @@ void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s, int width, int
 
 static void nextfb_update(void * opaque)
 {
-	next_state_t *s = (next_state_t *)opaque;
+	nextfb_state_t *s = (nextfb_state_t *)opaque;
 	DisplaySurface *info = s->ds->surface;
 
 	
@@ -88,7 +91,7 @@ static void nextfb_invalidate(void *opaque)
 {
 }
 
-void nextfb_init(next_state_t *s)
+void nextfb_init(nextfb_state_t *s)
 {
     s->ds = graphic_console_init(nextfb_update,nextfb_invalidate, NULL, NULL, s);
 	qemu_console_resize(s->ds,1120,832);	
