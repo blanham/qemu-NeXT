@@ -93,7 +93,10 @@ static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr)
             return (scr2 >> 0) & 0xFF;
 //case 0xc0008:
       		//return 0xff;//hack to hide memory error
-     	//case 0x18000:
+     	
+		case 0x14020:
+			return 0xff;
+		//case 0x18000:
      	//case 0x18001:
       		//return 0;
         //case 0x1a000:
@@ -315,7 +318,7 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
 
 static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
 {
-  //  CPUState *s = (CPUState *)opaque;
+    CPUState *s = (CPUState *)opaque;
     
     switch(addr)
     {
@@ -331,9 +334,8 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
          //   return 0x0;
         
         case 0x14108:
-       //     fprintf(stderr,"FD read @ %x %x\n",addr,s->pc);
+            DPRINTF("FD read @ %x %x\n",addr,s->pc);
             return 0xff;
-        
         case 0x14021:
             DPRINTF("SCSI STATUS READ %X\n",next_state.scsi_csr_2);
             return 0x40; 
@@ -369,7 +371,7 @@ static uint32_t scr_readl(void*opaque, target_phys_addr_t addr)
 }
 static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 {
-    //CPUState *s = (CPUState *)opaque;
+    CPUState *s = (CPUState *)opaque;
     switch(addr)
     {
      	//case 0x10000: break;//Screen brightness
@@ -412,7 +414,7 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			{
 				//DPRINTF("SCSICSR Reset\n");
             	//i think this should set DMADIR. CPUDMA and INTMASK to 0 
-				//qemu_irq_pulse(next_state.scsi_reset);
+				qemu_irq_pulse(next_state.scsi_reset);
 				//abort();		
 			}
 			if(value & SCSICSR_DMADIR)
@@ -427,7 +429,7 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			{
 				//DPRINTF("SCSICSR INTMASK\n");
 			}
-			//DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
+			DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
 			//next_state.scsi_csr_1 = value;
 			next_state.scsi_csr_1 = value;
            	return;
@@ -589,7 +591,7 @@ void nextscsi_read(void *opaque, uint8_t *buf, int len)
 
 void nextscsi_write(void *opaque, uint8_t *buf, int size)
 {
-    //fprintf(stderr,"SCSI WRITE: %i\n",size);
+    DPRINTF("SCSI WRITE: %i\n",size);
     
     /* Most DMA is supposedly 16 byte aligned */    
     if((size % 16) != 0)
@@ -627,10 +629,10 @@ void nextscsi_write(void *opaque, uint8_t *buf, int size)
     of which the purpose is unknown as of yet*/
     //stl_phys(s->rx_dma.base-32,0xFFFFFFFF);
     
-    //if(!(next_state.dma[NEXTDMA_SCSI].csr & DMA_SUPDATE)){  
-    //    next_state.dma[NEXTDMA_SCSI].next  = next_state.dma[NEXTDMA_SCSI].start;
-   //     next_state.dma[NEXTDMA_SCSI].limit = next_state.dma[NEXTDMA_SCSI].stop;
-   // }
+    if(!(next_state.dma[NEXTDMA_SCSI].csr & DMA_SUPDATE)){  
+        next_state.dma[NEXTDMA_SCSI].next  = next_state.dma[NEXTDMA_SCSI].start;
+        next_state.dma[NEXTDMA_SCSI].limit = next_state.dma[NEXTDMA_SCSI].stop;
+    }
 
     //next_state.scsi_csr_2 = 0x05;//time(NULL) & 0xff;
     
@@ -714,7 +716,6 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
                 if(value & DMA_SETSUPDATE)
                     {
                         next_state.dma[NEXTDMA_ENRX].csr |= DMA_SUPDATE;   
-                        DPRINTF("DMA SUPDATE\n");
                     }
                 if(value & DMA_CLRCOMPLETE)
                     next_state.dma[NEXTDMA_ENRX].csr&= ~DMA_COMPLETE;
@@ -722,8 +723,6 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
                 if(value & DMA_RESET)
 				{
                     next_state.dma[NEXTDMA_ENRX].csr &= ~(DMA_COMPLETE | DMA_SUPDATE | DMA_ENABLE | DMA_DEV2M);                
-                
-                    DPRINTF("SCSI DMA RESET\n");
     			}
               //  DPRINTF("RXCSR \tWrite: %x\n",value);
                 break;
@@ -731,7 +730,7 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
             next_state.dma[NEXTDMA_ENRX].next_initbuf = value;
             //DPRINTF("DMA INITBUF WRITE\n");
             break; 
-		  case NEXTDMA_ENRX(NEXTDMA_NEXT):
+		case NEXTDMA_ENRX(NEXTDMA_NEXT):
             //DPRINTF("DMA NEXT WRITE\n");
             next_state.dma[NEXTDMA_ENRX].next = value;
             break;
@@ -739,7 +738,7 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
             //DPRINTF("DMA NEXT WRITE\n");
             next_state.dma[NEXTDMA_ENRX].limit = value;
             break; 
-case NEXTDMA_SCSI(NEXTDMA_CSR):
+        case NEXTDMA_SCSI(NEXTDMA_CSR):
                 if(value & DMA_DEV2M)
                     next_state.dma[NEXTDMA_SCSI].csr |= DMA_DEV2M;
                 
@@ -810,7 +809,7 @@ static uint32_t dma_readl(void*opaque, target_phys_addr_t addr)
     switch(addr)
     {
         case NEXTDMA_SCSI(NEXTDMA_CSR):
-            //DPRINTF("DMA CSR READ\n");
+            DPRINTF("SCSI DMA CSR READ\n");
             return next_state.dma[NEXTDMA_SCSI].csr;
 		case NEXTDMA_ENRX(NEXTDMA_CSR):
             return next_state.dma[NEXTDMA_ENRX].csr;
