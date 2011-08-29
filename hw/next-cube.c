@@ -480,9 +480,13 @@ static void next_cube_init(ram_addr_t ram_size,
         rtc_ram = qemu_malloc(32);
         //#ifdef LOAD_RTC
         FILE *fp = fopen("rtc.ram","rb");
-        if(fread(rtc_ram,1,32,fp) != 32)
-            abort();
-        fclose(fp);
+        if(fp == NULL)
+			memcpy(rtc_ram,rtc_ram2,32);
+		else{
+			if(fread(rtc_ram,1,32,fp) != 32)
+				memcpy(rtc_ram,rtc_ram2,32);
+        	fclose(fp);
+		}
         //#endif
 		//the following line uses the built-in nvram value instead
        //memcpy(rtc_ram,rtc_ram2,32);
@@ -514,10 +518,10 @@ static void next_cube_init(ram_addr_t ram_size,
    	nextkbd_init((void *)env);
 
     /* Serial */
-  	//CharDriverState *console = serial_hds[0];//text_console_init(NULL);
-   	//qemu_irq *serial = qemu_allocate_irqs(serial_irq, env, 2);
-  	//escc_init(0x2118000, serial[0], serial[1],
-    //    NULL,console,   (9600*384),1);
+  	CharDriverState *console = serial_hds[0];//text_console_init(NULL);
+   	qemu_irq *serial = qemu_allocate_irqs(serial_irq, env, 2);
+  	escc_init(0x2118000, serial[0], serial[1],
+        NULL,console,   (9600*384),1);
 
     
     /* Load ROM here */  
@@ -543,30 +547,30 @@ static void next_cube_init(ram_addr_t ram_size,
     nextnet_init((void *)env);
     
     /* SCSI */
-   	////void *espdma;
-    //next_state.scsi_irq = qemu_allocate_irqs(nextscsi_irq, env, 1);
-    //qemu_irq *scsi = next_state.scsi_irq; 
- 	////qemu_irq esp_reset, dma_enable;
-   	//esp_init(0x2114000, 0,
-  	//           nextscsi_read, nextscsi_write,
-   	//           (void *)env, scsi[0], &next_state.scsi_reset,
-   	//           &next_state.scsi_dma);
+   	//void *espdma;
+    next_state.scsi_irq = qemu_allocate_irqs(nextscsi_irq, env, 1);
+    qemu_irq *scsi = next_state.scsi_irq; 
+ 	//qemu_irq esp_reset, dma_enable;
+   	esp_init(0x2114000, 0,
+  	           nextscsi_read, nextscsi_write,
+   	           (void *)env, scsi[0], &next_state.scsi_reset,
+   	           &next_state.scsi_dma);
     
 	//qdev_connect_gpio_out(espdma, 0, esp_reset);
     //qdev_connect_gpio_out(espdma, 1, dma_enable);
 
     /* FLOPPY */
-  	//DriveInfo *fd[MAX_FD];
+  	DriveInfo *fd[MAX_FD];
  	/* FD terminal count, asserted when dma transfer is complete */
-	//qemu_irq fdc_tc;
-	//next_state.fd_irq = &fdc_tc;
-  	//qemu_irq *fdc = qemu_allocate_irqs(nextfdc_irq, env, 3);
-  	//memset(fd, 0, sizeof(fd));
- 	//fd[0] = drive_get(IF_FLOPPY, 0, 0);
-  	//sun4m_fdctrl_init(*fdc, 0x2114100, fd,
-    //                 &fdc_tc);
-  	////fdctrl_init_sysbus(*fdc, 1,
-  	////                   0x2114100, fd);
+	qemu_irq fdc_tc;
+	next_state.fd_irq = &fdc_tc;
+  	qemu_irq *fdc = qemu_allocate_irqs(nextfdc_irq, env, 3);
+  	memset(fd, 0, sizeof(fd));
+ 	fd[0] = drive_get(IF_FLOPPY, 0, 0);
+  	sun4m_fdctrl_init(*fdc, 0x2114100, fd,
+                     &fdc_tc);
+  	//fdctrl_init_sysbus(*fdc, 1,
+  	//                   0x2114100, fd);
 
 
   	//sysbus_connect_irq(s, 1, fdc_tc);
