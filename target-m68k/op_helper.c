@@ -172,11 +172,14 @@ static void do_interrupt_all(int is_hw)
     /* ??? This could cause MMU faults.  */
 
     if (m68k_feature(env, M68K_FEATURE_M68000)) {
+        /* stack pointer is word aligned */
         sp &= ~1;
+        
         stw_kernel(sp, env->sr);
         sp += 2;
         stl_kernel(sp, retaddr);
         sp += 4;
+        
         if (m68k_feature(env, M68K_FEATURE_QUAD_MULDIV)) {
             /* 680x0, except 68000
              * FIXME: 68060 ?
