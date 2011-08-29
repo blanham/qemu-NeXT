@@ -22,14 +22,14 @@
  * THE SOFTWARE.
  */
 
-/* This is admittedly hackish, but works well enough for basic input
+/* This is admittedly hackish, but works well enough for basic input.
    Mouse support will be added once we can boot something that needs
 	the mouse. */ 
 
 #include "hw.h"
 #include "console.h"
 #include "next-cube.h"
-
+#include "sysemu.h"
 /* debug NeXT keyboard */
 //#define DEBUG_KBD
 
@@ -39,7 +39,7 @@
 #else
 #define DPRINTF(fmt, ...)
 #endif
-/* follwoing defintions from next68k netbsd */
+/* following defintions from next68k netbsd */
 #define CSR_INT 0x00800000
 #define CSR_DATA 0x00400000
 
@@ -66,7 +66,7 @@ typedef struct {
 typedef struct KBDState {
     KBDQueue queue;
     uint8_t blank;
-    int shift;//make this an unsigned short, and set it to the modifier value
+    uint16_t shift;//make this an unsigned short, and set it to set the modifier value
 
 } KBDState;
 KBDState *kbd_env;
@@ -107,7 +107,7 @@ void nextkbd_init(void *opaque)
 
     qemu_add_kbd_event_handler(nextkbd_event, s);
 }
-
+/* lots of magic numbers here */
 static uint32_t kbd_read_byte(void *opaque, target_phys_addr_t addr)
 {
     addr = addr & 0xe003;
@@ -121,9 +121,11 @@ static uint32_t kbd_read_byte(void *opaque, target_phys_addr_t addr)
 		return 0x80|0x40|0x20|0x10;
 		
         case 0xe002:
-		return 0x40|0x10|0x2|0x1;
-
-        default:
+		//return 0x40|0x10|0x2|0x1;
+		//returning 0x40 caused mach to hang
+		return 0x10|0x2|0x1;
+        
+		default:
         DPRINTF("RB ADDR %x\n",addr);
         return 0;
     }
@@ -134,6 +136,7 @@ static uint32_t kbd_read_word(void *opaque, target_phys_addr_t addr)
     DPRINTF("RW ADDR %x\n",addr);
     return 0;
 }
+/* even more magic numbers */
 static uint32_t kbd_read_long(void *opaque, target_phys_addr_t addr)
 {
     int key = 0;
@@ -158,15 +161,15 @@ static uint32_t kbd_read_long(void *opaque, target_phys_addr_t addr)
             
           
             if(s->shift)
-            key |= KD_LSHIFT;
-            if(key & 0x80)
-            return 0;
+            	key |= s->shift;
+            
+			if(key & 0x80)
+            	return 0;
             else
-            return 0x10000000 | KD_VALID | key;
+            	return 0x10000000 | KD_VALID | key;
         }
         else
             return 0;
-    //    return 0x10009026;		
         
         default:
         DPRINTF("RL ADDR %x\n",addr);
@@ -176,7 +179,7 @@ static uint32_t kbd_read_long(void *opaque, target_phys_addr_t addr)
 
 static void kbd_write_byte(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
-    //DPRINTF("WB ADDR %x\n",addr);
+    DPRINTF("WB ADDR %x\n",addr);
 }
 static void kbd_write_word(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
@@ -184,7 +187,8 @@ static void kbd_write_word(void *opaque, target_phys_addr_t addr, uint32_t val)
 }
 static void kbd_write_long(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
-   // DPRINTF("WL ADDR %x\n",addr);
+	DPRINTF("WL ADDR %x\n",addr);
+	//if(addr == 0xe000)vm_stop(VMSTOP_DEBUG);
 }
 
 
@@ -193,7 +197,7 @@ static void nextkbd_event(void *opaque, int ch)
     /*will want to set vars for caps/num lock*/
     /*if (ch & 0x80) -> key release */
    /* there's also e0 escaped scancodes that might need to be handled */ 
-     DPRINTF("EVENT %X\n",ch);
+	DPRINTF("EVENT %X\n",ch);
  
     queue_code(opaque, ch);
    
@@ -215,29 +219,49 @@ static void queue_code(void *opaque, int code)
 
     KBDState *s = (KBDState *)opaque;
     KBDQueue *q = &s->queue;
-    int key = code & 0x7F;
+	int key = code & 0x7F;
     int release = code & 0x80;
-      if(code == 0x2A)
-            {
-                s->shift = 1;
-                return;
-            }
-            else if(code == (0x2A | 0x80))
-            {
-                s->shift = 0;
-                return;
-            }
+   	static int ext = 0; 
+	if(code == 0xE0)
+		ext =1;
 
-
+	if(code == 0x2A || code == 0x1D || code == 0x36){
+		
+		if(code == 0x2A){
+			s->shift = KD_LSHIFT;
+		}else if(code == 0x36){
+			s->shift = KD_RSHIFT;
+			ext = 0;
+		}else if(code == 0x1D && !ext)
+		{
+			s->shift = KD_LCOMM;
+		}else if(code == 0x1D && ext){
+			ext = 0;
+			s->shift = KD_RCOMM;
+		}       
+		
+		return;
+    
+	}else if(code == (0x2A | 0x80) || code == (0x1D | 0x80)|| code == (0x36 | 0x80)){
+       	s->shift = 0;
+        return;
+  	}
 
 
     if (q->count >= KBD_QUEUE_SIZE)
         return;
     
     q->data[q->wptr] = next_keycodes[key] | release;
-    if (++q->wptr == KBD_QUEUE_SIZE)
+    
+	if (++q->wptr == KBD_QUEUE_SIZE)
         q->wptr = 0;
-    q->count++;
-    //s->update_irq(s->update_arg, 1);
-    s->blank += 1;
+    
+	q->count++;
+    
+	/* might need to actually trigger the NeXT irq,
+		but as the keyboard works at the moment,
+		I'll worry about it later */
+	//s->update_irq(s->update_arg, 1);
+    
+	s->blank += 1;
 }
