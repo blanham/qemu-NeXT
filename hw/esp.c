@@ -440,7 +440,8 @@ static void handle_ti(ESPState *s)
     uint32_t dmalen, minlen;
 
     dmalen = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
-    if (dmalen==0) {
+   	if(dmalen == 7240) dmalen = 7680; 
+	if (dmalen==0) {
       dmalen=0x10000;
     }
     s->dma_counter = dmalen;
