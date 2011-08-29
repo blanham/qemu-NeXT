@@ -150,6 +150,9 @@ static void do_interrupt_all(int is_hw)
             env->exception_index = EXCP_HLT;
             cpu_loop_exit(env);
             return;
+        case EXCP_ACCESS:
+            MPRINTF("PAGE FAULT\n");
+            break;
         }
         if (env->exception_index >= EXCP_TRAP0
             && env->exception_index <= EXCP_TRAP15) {
