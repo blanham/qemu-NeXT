@@ -644,8 +644,8 @@ int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
 #define MMU_PG_OFF_8K(x) (0x00001FFF & x)
 #define MMU_PG_OFF_4K(x) (0x00000FFF & x)
 #define MMU_PNT_MASK(x)  (0xFFFFFE00 & x)
-#define MMU_8K_MASK(x)  (0xFFFFFF00 & x)
-#define MMU_4K_MASK(x)  (0xFFFFFF10 & x)
+#define MMU_8K_MASK(x)  (0xFFFFFF80 & x)
+#define MMU_4K_MASK(x)  (0xFFFFFF00 & x)
 /*
 ldl RI*4 + (PNT_MASK(URP)) -> root level
 ldl PI*4 + (PNT_MASK(root level)) -> pointer level
@@ -669,7 +669,7 @@ static inline int get_phys_addr(CPUState *env, uint32_t address,
     uint32_t ptr_pointer;
     uint32_t page_desc;
     uint32_t indirect;
-
+	int wp = 0;
     /* Handle Transparent Translation first */
     if(address & ((MMU_LOG_BASE & env->itt0)| (MMU_LOG_MASK(env->itt0)) ))
     {
@@ -685,27 +685,40 @@ static inline int get_phys_addr(CPUState *env, uint32_t address,
        // root_pointer = env->urp;
     //else
         root_pointer = env->srp;
-
+	int i = (address >> 23) & 0x1FC;
+	
     fprintf(stderr,"MMU fault @ %x ADDR%x  RP %x access_type %i\n",env->pc,address,root_pointer,access_type);
-    
-    rt_pointer = ldl_phys(MMU_RI(address)*4 | MMU_PNT_MASK(root_pointer));
+    rt_pointer = ldl_phys((root_pointer& 0xfffffe00) | i);
+	if((rt_pointer & 2) == 0){
+		fprintf("MMU: invalid ptr for %x\n", address);
+	}
+	wp |= rt_pointer;
+	if((rt_pointer & 8) == 0)
+		stl_phys((root_pointer & 0xfffffe00) | i, rt_pointer | 8);
+    //rt_pointer = ldl_phys(MMU_RI(address)*4 | MMU_PNT_MASK(root_pointer));
     fprintf(stderr,"RT PTR = %x\n", rt_pointer);
-    
-    ptr_pointer = ldl_phys(MMU_PI(address)*4 | MMU_PNT_MASK(rt_pointer));
+    i = (address >> 16) & 0x1fc;
+    ptr_pointer = ldl_phys(MMU_PNT_MASK(rt_pointer) | i);
     fprintf(stderr,"PTR PTR = %x\n",ptr_pointer );
     
-    if(env->mmu.tc & MMU_PAGE_SIZE){
-        
-        page_desc = ldl_phys(MMU_PGI_8K(address)*4 | MMU_8K_MASK(ptr_pointer));
+
+	wp |= ptr_pointer; 
+    	if((ptr_pointer & 8) == 0)
+		stl_phys((ptr_pointer & 0xfffffe00) | i, ptr_pointer | 8);
+	if(env->mmu.tc & MMU_PAGE_SIZE){
+        i = (address >> 11) & 0x7c;
+        page_desc = ldl_phys(i | MMU_8K_MASK(ptr_pointer));
         //*phys_ptr = (page_desc &0xFFFFE000) | (address & 0x1FFF);
         fprintf(stderr,"page_desc %x\n",page_desc);
         
         switch(page_desc&3)
         {
             case 0:
-                fprintf(stderr,"PAGE FAULT\n");
+                fprintf(stderr,"PAGE FAULT @ %x\n",address);
                 env->exception_index = EXCP_ACCESS;
-                env->mmu.ar = address;
+               	env->mmu.ar = address;
+				*phys_ptr = page_desc;
+				fflush(stderr);
                 return 1;
             
             case 1: case 3:
@@ -728,11 +741,12 @@ static inline int get_phys_addr(CPUState *env, uint32_t address,
     
     }else{
         page_desc = ldl_phys(MMU_PGI_4K(address)*4 + MMU_4K_MASK(ptr_pointer));
-            
+        abort();  
         *phys_ptr = (page_desc &0xFFFFF000) | (address & 0xFFF);
         fprintf(stderr,"phys ptr = %x\n", *phys_ptr);
     }
-    //if(*phys_ptr == 0) *phys_ptr = 0x40b24e8;
+    *phys_ptr |= wp & 4;
+	//if(*phys_ptr == 0) *phys_ptr = 0x40b24e8;
     //if(*phys_ptr == 0) return -1;
     return 0;
 }
@@ -1754,7 +1768,7 @@ void HELPER(exp10_FP0)(CPUState *env)
     val = floatx80_to_ldouble(res);
 
     DBG_FPUH("exp2_FP0 %Lg", val);
-    val = exp10l(val);
+    //val = exp10l(val);
     DBG_FPU(" = %Lg", val);
     res = ldouble_to_floatx80(val);
     floatx80_to_FP0(env, res);
@@ -1941,7 +1955,7 @@ void HELPER(sincos_FP0_FP1)(CPUState *env)
     val = floatx80_to_ldouble(res);
 
     DBG_FPUH("sincos_FP0 %Lg", val);
-    sincosl(val, &valsin, &valcos);
+    //sincosl(val, &valsin, &valcos);
     DBG_FPU(" = %Lg, %Lg", valsin, valcos);
     res = ldouble_to_floatx80(valsin);
     floatx80_to_FP0(env, res);
