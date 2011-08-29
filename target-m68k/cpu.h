@@ -19,6 +19,15 @@
  */
 #ifndef CPU_M68K_H
 #define CPU_M68K_H
+/* debug M68k */
+#define DEBUG_M68K
+
+#ifdef DEBUG_M68K
+#define MPRINTF(fmt, ...)                                       \
+    do { printf("M68K: " fmt , ## __VA_ARGS__); } while (0);
+#else
+#define MPRINTF(fmt, ...)
+#endif
 
 #define TARGET_LONG_BITS 32
 

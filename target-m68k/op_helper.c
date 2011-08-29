@@ -83,18 +83,43 @@ void tlb_fill (target_ulong addr, int is_write, int mmu_idx, void *retaddr)
     env = saved_env;
 }
 
-static void do_rte(void)
+/* this should agree with the Motorola 68040 User Manual now */
+static void do_rte(int is_hw)
 {
     uint32_t sp;
     uint32_t fmt;
 
+    MPRINTF("Return to exception @ %x\n", env->pc);
+    
     sp = env->aregs[7];
-    fmt = ldl_kernel(sp);
-    env->pc = ldl_kernel(sp + 4);
-    sp |= (fmt >> 28) & 3;
-    env->sr = fmt & 0xffff;
-    m68k_switch_sp(env);
-    env->aregs[7] = sp + 8;
+
+    if (m68k_feature(env, M68K_FEATURE_M68000)) {
+        fmt = lduw_kernel(sp+6);
+        
+        uint8_t type = fmt >> 24;
+        
+        switch(type)
+        {
+            case 0: case 7:
+                env->sr = lduw_kernel(sp);
+                sp += 2;
+                env->pc = ldl_kernel(sp);
+                sp += 4;
+                env->aregs[7] = sp + 2;
+                break;
+            default:
+                fprintf(stderr,"unhandled exception frame format 0x%X in do_rte\n", type);
+                abort();
+        }
+    
+    } else {
+        fmt = ldl_kernel(sp);
+        env->pc = ldl_kernel(sp + 4);
+        sp |= (fmt >> 28) & 3;
+        env->sr = fmt & 0xffff;
+        m68k_switch_sp(env);
+        env->aregs[7] = sp + 8;
+    }
 }
 
 static void do_interrupt_all(int is_hw)
@@ -111,7 +136,7 @@ static void do_interrupt_all(int is_hw)
         switch (env->exception_index) {
         case EXCP_RTE:
             /* Return from an exception.  */
-            do_rte();
+            do_rte(is_hw);
             return;
         case EXCP_HALT_INSN:
             if (semihosting_enabled
