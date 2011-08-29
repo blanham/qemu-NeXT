@@ -89,8 +89,6 @@ static void do_rte(int is_hw)
     uint32_t sp;
     uint32_t fmt;
 
-    MPRINTF("Return to exception @ %x\n", env->pc);
-    
     sp = env->aregs[7];
 
     if (m68k_feature(env, M68K_FEATURE_M68000)) {
@@ -175,15 +173,14 @@ static void do_interrupt_all(int is_hw)
 
     if (m68k_feature(env, M68K_FEATURE_M68000)) {
         sp &= ~1;
-        sp -= 2;
         stw_kernel(sp, env->sr);
-        sp -= 4;
+        sp += 2;
         stl_kernel(sp, retaddr);
+        sp +=4;
         if (m68k_feature(env, M68K_FEATURE_QUAD_MULDIV)) {
             /* 680x0, except 68000
              * FIXME: 68060 ?
              */
-            sp -= 2;
             stw_kernel(sp, vector & 0x0fff);
         }
     } else {
@@ -199,7 +196,6 @@ static void do_interrupt_all(int is_hw)
         stl_kernel(sp, fmt);
     }
 
-    env->aregs[7] = sp;
     /* Jump to vector.  */
     env->pc = ldl_kernel(env->vbr + vector);
 }
