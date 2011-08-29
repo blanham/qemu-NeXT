@@ -29,7 +29,6 @@
 #include "pixel_ops.h"
 #include "next-cube.h"
 
-nextfb_state_t nextfb_state;
 
 /*
 typedef struct NextVGAState {
