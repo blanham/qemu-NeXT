@@ -11,7 +11,6 @@
 
 
 #include "hw.h"
-//#include "next-proto.h"
 #include "next-cube.h"
 
 #include "monitor.h"
@@ -22,6 +21,10 @@
 #include "elf.h"
 #include "esp.h" //SCSI ESP should work out of the box
 #include "escc.h" //ZILOG 8530 Serial Emulation
+
+#include "next-proto.h"
+
+
 #define ENTRY 0x0100001e
 
 /* Board init.  */
@@ -48,24 +51,7 @@ uint8_t rtc_ram2[32]={
 };
 
 
-static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr);
-static uint32_t mmio_readw(void*opaque, target_phys_addr_t addr);
-static uint32_t mmio_readl(void*opaque, target_phys_addr_t addr);
 
-static void mmio_writeb(void*opaque, target_phys_addr_t addr, uint32_t val);
-static void mmio_writew(void*opaque, target_phys_addr_t addr, uint32_t val);
-static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val);
-static CPUReadMemoryFunc *mmio_read[3] = {
-	mmio_readb,
-	mmio_readw,
-	mmio_readl
-};
-
-static CPUWriteMemoryFunc *mmio_write[3] = {
-	mmio_writeb,
-	mmio_writew,
-	mmio_writel
-};
 static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr)
 {
 	switch(addr)
@@ -271,25 +257,6 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
 }
 
 
-static uint32_t scr_readb(void*opaque, target_phys_addr_t addr);
-static uint32_t scr_readw(void*opaque, target_phys_addr_t addr);
-static uint32_t scr_readl(void*opaque, target_phys_addr_t addr);
-static CPUReadMemoryFunc *scr_read[3] = {
-	scr_readb,
-	scr_readw,
-	scr_readl
-
-};
-
-static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value);
-static void scr_writew(void*opaque, target_phys_addr_t addr, uint32_t value);
-static void scr_writel(void*opaque, target_phys_addr_t addr, uint32_t value);
-static CPUWriteMemoryFunc * const scr_write[3] = {
-	scr_writeb,
-	scr_writew,
-	scr_writel
-};
-
 static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
 {
  //   CPUState *s = (CPUState *)opaque;
@@ -362,7 +329,6 @@ static void scr_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
 /* need to make more defines, put them into a header */
 #define RAM_SIZE 0x4000000
 
-void serial_irq(void *opaque, int n, int level);
 static void next_cube_init(ram_addr_t ram_size,
                      const char *boot_device,
                      const char *kernel_filename, const char *kernel_cmdline,

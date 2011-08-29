@@ -1,3 +1,5 @@
+/* I seperated all of the major prototypes from next-cube.c into this file to
+   make it easier to read, I'll probably add these back in when this is upstreamed*/
 static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr);
 static uint32_t mmio_readw(void*opaque, target_phys_addr_t addr);
 static uint32_t mmio_readl(void*opaque, target_phys_addr_t addr);
@@ -34,13 +36,13 @@ static CPUWriteMemoryFunc * const scr_write[3] = {
     scr_writew,
     scr_writel
 };
-void nextscsi_read(void *opaque, uint8_t *buf, int len);
-void nextscsi_write(void *opaque, uint8_t *buf, int len);
-void nextscsi_irq(void *opaque, int n, int level);
+//void nextscsi_read(void *opaque, uint8_t *buf, int len);
+//void nextscsi_write(void *opaque, uint8_t *buf, int len);
+//void nextscsi_irq(void *opaque, int n, int level);
 
-void nextfdc_irq(void *opaque, int n, int level);
+//void nextfdc_irq(void *opaque, int n, int level);
 void serial_irq(void *opaque, int n, int level);
-
+/*
 static uint32_t dma_readl(void*opaque, target_phys_addr_t addr);
 
 static CPUReadMemoryFunc *dma_read[3] = {
@@ -54,7 +56,7 @@ static CPUWriteMemoryFunc * const dma_write[3] = {
 	NULL,
 	NULL,
 	dma_writel
-};
+};*/
 
 
 void next_dma_write(void *opaque, const uint8_t *buf, int len, int type);
