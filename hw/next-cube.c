@@ -28,7 +28,7 @@
 
 #define ENTRY 0x0100001e
 #define RAM_SIZE 0x4000000
-#define ROM_FILE "rom66.bin"
+#define ROM_FILE "./rom66.bin"
 
 /* would like to dynamically allocate these later */
 next_state_t next_state;
@@ -724,7 +724,19 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
     			}
               //  DPRINTF("RXCSR \tWrite: %x\n",value);
                 break;
-		case NEXTDMA_SCSI(NEXTDMA_CSR):
+		case NEXTDMA_ENRX(NEXTDMA_NEXT_INIT):
+            next_state.dma[NEXTDMA_ENRX].next_initbuf = value;
+            //DPRINTF("DMA INITBUF WRITE\n");
+            break; 
+		  case NEXTDMA_ENRX(NEXTDMA_NEXT):
+            //DPRINTF("DMA NEXT WRITE\n");
+            next_state.dma[NEXTDMA_ENRX].next = value;
+            break;
+	  	case NEXTDMA_ENRX(NEXTDMA_LIMIT):
+            //DPRINTF("DMA NEXT WRITE\n");
+            next_state.dma[NEXTDMA_ENRX].limit = value;
+            break; 
+case NEXTDMA_SCSI(NEXTDMA_CSR):
                 if(value & DMA_DEV2M)
                     next_state.dma[NEXTDMA_SCSI].csr |= DMA_DEV2M;
                 
@@ -799,7 +811,17 @@ static uint32_t dma_readl(void*opaque, target_phys_addr_t addr)
             return next_state.dma[NEXTDMA_SCSI].csr;
 		case NEXTDMA_ENRX(NEXTDMA_CSR):
             return next_state.dma[NEXTDMA_ENRX].csr;
-        case NEXTDMA_SCSI(NEXTDMA_NEXT):
+        case NEXTDMA_ENRX(NEXTDMA_NEXT_INIT):
+			return next_state.dma[NEXTDMA_ENRX].next_initbuf;
+		case NEXTDMA_ENRX(NEXTDMA_NEXT):
+            //DPRINTF("DMA NEXT READ\n");
+            return next_state.dma[NEXTDMA_ENRX].next;
+		case NEXTDMA_ENRX(NEXTDMA_LIMIT):
+            //DPRINTF("DMA NEXT READ\n");
+			vm_stop(VMSTOP_DEBUG);
+            return next_state.dma[NEXTDMA_ENRX].limit;
+
+		case NEXTDMA_SCSI(NEXTDMA_NEXT):
             //DPRINTF("DMA NEXT READ\n");
             return next_state.dma[NEXTDMA_SCSI].next;
 
