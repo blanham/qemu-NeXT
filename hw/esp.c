@@ -27,7 +27,7 @@
 #include "esp.h"
 
 /* debug ESP card */
-//#define DEBUG_ESP
+#define DEBUG_ESP
 
 /*
  * On Sparc32, this is the ESP (NCR53C90) part of chip STP2000 (Master I/O),
@@ -218,7 +218,9 @@ static uint32_t get_cmd(ESPState *s, uint8_t *buf)
     s->ti_size = 0;
     s->ti_rptr = 0;
     s->ti_wptr = 0;
-
+    /* zero FIFO count */
+    s->rregs[ESP_RFLAGS] &= 0xe0;
+    
     if (s->current_req) {
         /* Started a new command before the old one finished.  Cancel it.  */
         scsi_req_cancel(s->current_req);
@@ -534,6 +536,8 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
         if (s->ti_size == 0) {
             s->ti_rptr = 0;
             s->ti_wptr = 0;
+            /* zero out FIFO count */
+            s->rregs[ESP_RFLAGS] &= 0xe0;
         }
         break;
     case ESP_RINTR:
@@ -573,6 +577,8 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
         } else {
             s->ti_size++;
             s->ti_buf[s->ti_wptr++] = val & 0xff;
+            /* set FIFO count in RFLAGS */
+            s->rregs[ESP_RFLAGS] = (s->rregs[ESP_RFLAGS]&0xe0) | (s->ti_wptr);
         }
         break;
     case ESP_CMD:
@@ -592,6 +598,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
         case CMD_FLUSH:
             DPRINTF("Flush FIFO (%2.2x)\n", val);
             //s->ti_size = 0;
+            
             s->rregs[ESP_RINTR] = INTR_FC;
             s->rregs[ESP_RSEQ] = 0;
             s->rregs[ESP_RFLAGS] = 0;
