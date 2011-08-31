@@ -543,9 +543,9 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
        
         /* these 4 registers may be the hardware timer, not sure though */ 
         case 0x1a000:
-            //return 0xff& (clock() >> 24);
+            return 0xff& (clock() >> 24);
         case 0x1a001: 
-            //return 0xff & (clock() >> 16);
+            return 0xff & (clock() >> 16);
         case 0x1a002: 
             return 0xff & (clock() >> 8);
         case 0x1a003: 
@@ -742,7 +742,7 @@ static void next_cube_init(ram_addr_t ram_size,
   	CharDriverState *console = serial_hds[0];//text_console_init(NULL);
    	qemu_irq *serial = qemu_allocate_irqs(serial_irq, env, 2);
   	escc_init(0x2118000, serial[0], serial[1],
-        NULL,console,   (9600*384),1);
+        NULL,console,   (9600*384),0);
 
     
     /* Load ROM here */  
@@ -807,60 +807,66 @@ void nextscsi_read(void *opaque, uint8_t *buf, int len)
     fprintf(stderr,"SCSI READ: %x\n",len);
 	abort();
 }
-
-void nextscsi_write(void *opaque, uint8_t *buf, int size)
+void nextdma_write(void *opaque, uint8_t *buf, int size, int type);
+void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 {
-    DPRINTF("SCSI WRITE: %i\n",size);
-    
-    /* Most DMA is supposedly 16 byte aligned */    
-    if((size % 16) != 0)
-    {
-        size -= size % 16;
-        size += 16;
-    }
-    //fprintf(stderr,"SCSI LEN %i\n", next_state.dma[NEXTDMA_SCSI].limit -next_state.dma[NEXTDMA_SCSI].next);
-    //fprintf(stderr,"SCSI LEN %i\n", next_state.dma[NEXTDMA_SCSI].limit -next_state.dma[NEXTDMA_SCSI].next_initbuf);
-    
-	//fprintf(stderr,"SCSI %x\n",next_state.dma[NEXTDMA_SCSI].next_initbuf);
-	//fprintf(stderr,"SCSI %x\n",next_state.dma[NEXTDMA_SCSI].next);
-	/* write the packet into memory */
-    
     uint32_t base_addr;
+    int irq = 0;
+    uint8_t align = 16;
+	if(type == NEXTDMA_ENRX || type == NEXTDMA_ENTX)
+		align = 32;
+    /* Most DMA is supposedly 16 byte aligned */    
+    if((size % align) != 0)
+    {
+        size -= size % align;
+        size += align;
+    }
+    
     /* prom sets the dma start using initbuf
         while the bootloader uses next so
         we check to see if initbuf is 0 */
-    if(next_state.dma[NEXTDMA_SCSI].next_initbuf == 0)
-       	base_addr = next_state.dma[NEXTDMA_SCSI].next;
+    if(next_state.dma[type].next_initbuf == 0)
+       	base_addr = next_state.dma[type].next;
     else
-       	base_addr = next_state.dma[NEXTDMA_SCSI].next_initbuf;
+       	base_addr = next_state.dma[type].next_initbuf;
     
-	//fprintf(stderr,"SCSI base_addr %x\n",next_state.dma[NEXTDMA_SCSI].next);
     cpu_physical_memory_write(base_addr,buf,size);
     
-    next_state.dma[NEXTDMA_SCSI].next_initbuf = 0;
+    next_state.dma[type].next_initbuf = 0;
     
     /* saved limit is checked to calculate packet size
         by both the rom and netbsd */ 
-    next_state.dma[NEXTDMA_SCSI].saved_limit = (next_state.dma[NEXTDMA_SCSI].next + size);
-    next_state.dma[NEXTDMA_SCSI].saved_next  = (next_state.dma[NEXTDMA_SCSI].next);
+    next_state.dma[type].saved_limit = (next_state.dma[type].next + size);
+    next_state.dma[type].saved_next  = (next_state.dma[type].next);
     
     /*32 bytes under savedbase seems to be some kind of register
     of which the purpose is unknown as of yet*/
     //stl_phys(s->rx_dma.base-32,0xFFFFFFFF);
     
-    if(!(next_state.dma[NEXTDMA_SCSI].csr & DMA_SUPDATE)){  
-        next_state.dma[NEXTDMA_SCSI].next  = next_state.dma[NEXTDMA_SCSI].start;
-        next_state.dma[NEXTDMA_SCSI].limit = next_state.dma[NEXTDMA_SCSI].stop;
+    if(!(next_state.dma[type].csr & DMA_SUPDATE)){  
+        next_state.dma[type].next  = next_state.dma[type].start;
+        next_state.dma[type].limit = next_state.dma[type].stop;
     }
 
-    //next_state.scsi_csr_2 = 0x05;//time(NULL) & 0xff;
     
     //Set dma registers and raise an irq
-    next_state.dma[NEXTDMA_SCSI].csr |= DMA_COMPLETE; //DON'T CHANGE THIS!!!!
-    next_irq(opaque, NEXT_SCSI_DMA_I);
-    //qemu_irq_pulse(next_state.scsi_irq[1]);
-    
+    next_state.dma[type].csr |= DMA_COMPLETE; //DON'T CHANGE THIS!!!!
+	
+	switch(type)
+	{
+		case NEXTDMA_SCSI:
+			irq = NEXT_SCSI_DMA_I;
+			break; 
+	}
+	
+	next_irq(opaque, irq);
 
+
+}
+void nextscsi_write(void *opaque, uint8_t *buf, int size)
+{
+    DPRINTF("SCSI WRITE: %i\n",size);
+	nextdma_write(opaque, buf, size, NEXTDMA_SCSI);
 }
 void nextfdc_irq(void *opaque, int n, int level)
 {
@@ -889,10 +895,9 @@ void serial_irq(void *opaque, int n, int level)
     DPRINTF("SCC IRQ NUM %i\n",n);
     CPUM68KState *s = opaque;
     //next_irq(opaque, NEXT_SCC_I);
- if(level)
+ 	if(level)
 	next_irq(opaque, NEXT_SCC_I);
     else
-    
     cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
 }
 #define NEXTDMA_SCSI(x)      0x10 + x
