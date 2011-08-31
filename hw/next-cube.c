@@ -4,7 +4,6 @@
  *
  * Based on dummy_m68k.c Copyright (c) 2007 CodeSourcery.
  *
- * Scr2 code from Previous, used under the GPL
  *
  * This code is licensed under the GPL
  */
@@ -95,7 +94,7 @@ static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr)
       		//return 0xff;//hack to hide memory error
      	
 		case 0x14020:
-			return 0xff;
+			return 0x7f;
 		//case 0x18000:
      	//case 0x18001:
       		//return 0;
@@ -161,28 +160,10 @@ static uint32_t mmio_readl(void*opaque, target_phys_addr_t addr)
         return 0x0;
     }
 }
-static void mmio_writeb(void*opaque, target_phys_addr_t addr, uint32_t val)
+/* this could use a lot of refactoring */
+static void nextscr2_write(void *opaque, uint32_t val, int size)
 {
-     //  if(addr > 0xC0000)
-     //   return;
-
-    switch(addr)
-    {
-     //   case 0x18001:
-     //   break;
-        default:
-        fprintf(stderr,"MMIO Write B @ %x with %x\n",addr,val);
-    }
-
-}
-static void mmio_writew(void*opaque, target_phys_addr_t addr, uint32_t val)
-{
-    fprintf(stderr,"MMIO Write W\n" );
-}
-
-static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
-{
-    static int led = 0;
+   static int led = 0;
     static int phase = 0;
     static uint8_t old_scr2;
     static uint8_t rtc_command = 0;
@@ -190,26 +171,15 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
     static uint8_t rtc_status = 0x90;
     static uint8_t rtc_return = 0;
     uint8_t scr2_2; 
-    
-  //  if(addr > 0xC0000)
-     //   return;
+ 
 
-    switch(addr)
-    {
-        case 0x7000:
-        	DPRINTF("INT Status old: %x new: %x\n",int_status,val);
-        	int_status = val;
-        	break;
-        case 0x7800:
-        	DPRINTF("INT Status old: %x new: %x\n",int_mask,val);
-        	int_mask  = val;
-        	break;
-        case 0xc000:
-        	DPRINTF("SCR1 Write: %x @ %X\n",val,((CPUM68KState *)opaque)->pc);
-        	break;
-        case 0xd000:
-        //old_scr2 = val;
-        	scr2_2 = (val >> 8) & 0xFF;
+
+if(size == 4)
+        scr2_2 = (val >> 8) & 0xFF;
+    else
+        scr2_2 = val&0xFF;
+
+
             if(val &0x1)
         	{		   
             	printf("fault!\n");
@@ -264,7 +234,36 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
                 if ((rtc_command>=0x20) && (rtc_command<=0x2F)) {
                     scr2_2=scr2_2&(~SCR2_RTDATA);
                     // for now 0x00
-                    if (0x00&(0x80>>(phase-8)))
+                     time_t time_h = time(NULL);
+                    struct tm *info = localtime(&time_h);
+  
+                    int ret = 0;
+                    #define SCR2_TOBCD(x) (((x / 10) << 4) + ( x % 10)) 
+
+                switch(rtc_command)
+                {
+                    case 0x20:
+                        ret = SCR2_TOBCD(info->tm_sec);
+                        break;
+                    case 0x21:
+                        ret = SCR2_TOBCD(info->tm_min);
+                        break;
+                    case 0x22:
+                        ret = SCR2_TOBCD(info->tm_hour);
+                        break;
+                    case 0x24:
+                        ret = SCR2_TOBCD(info->tm_mday);
+                        break;
+                    case 0x25:
+                        ret = SCR2_TOBCD((info->tm_mon+1));
+                        break;
+                    case 0x26:
+                        ret = SCR2_TOBCD((info->tm_year - 100));
+                        break;
+                        
+                }
+
+                    if (ret&(0x80>>(phase-8)))
                         scr2_2|=SCR2_RTDATA;
                     rtc_return=(rtc_return<<1)|((scr2_2&SCR2_RTDATA)?1:0);
                 }
@@ -306,7 +305,199 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
         scr2 |= scr2_2<< 8; 
         old_scr2 = scr2_2;
 
+
+
+
+
+
+/*  #define RTC_ADDRESS 0
+    #define RTC_DATA    1
+    #define SCR2_RTCLK 0x2
+    #define SCR2_RTDATA 0x4
+
+    static uint8_t rtc_status = 0x90;
+    static uint8_t old_scr2;
+    static int state = RTC_ADDRESS; 
+    static int bits = 0;
+    uint16_t ret;
+    
+    static uint8_t command = 0;
+    static uint8_t data = 0;
+    
+    uint8_t scr2_2;
+     
+    if(size == 4)
+        scr2_2 = (val >> 8) & 0xFF;
+    else
+        scr2_2 = val&0xFF;
+
+    //DPRINTF("scr2 write %x 2_2: %x bits %x\n",val,scr2_2,bits);	
+    time_t time_h = time(NULL);
+    struct tm *info = localtime(&time_h);
+  
+
+    #define SCR2_TOBCD(x) (((x / 10) << 4) + ( x % 10)) 
+
+    switch(command)
+    {
+        case 0x0 ... 0x1F:
+            ret = rtc_ram[command];
+            break;
+        case 0x20:
+            ret = SCR2_TOBCD(info->tm_sec);
+            break;
+        case 0x21:
+            ret = SCR2_TOBCD(info->tm_min);
+            break;
+        case 0x22:
+            ret = SCR2_TOBCD(info->tm_hour);
+            break;
+        case 0x23:
+            ret = 0x00;
+            break;
+        case 0x24:
+            ret = SCR2_TOBCD(info->tm_mday);
+            break;
+        case 0x25:
+            ret = SCR2_TOBCD((info->tm_mon+1));
+            break;
+         case 0x26:
+            ret = SCR2_TOBCD((info->tm_year - 100));
+            break;
+        case 0x30:
+            ret = rtc_status;
+            break;
+        case 0x31:
+            ret = 0;
+            break;
+        default:
+            ret = 0x100;
+
+    }
+
+
+
+    
+    switch(state)
+    {
+        case RTC_ADDRESS:
+            if(((scr2_2 & 2) == 0) && (old_scr2 & 2))
+            {
+                command = (command << 1) | ((scr2_2 & SCR2_RTDATA) >> 2);
+
+                bits++;
+                if(bits == 8)
+                {
+                    //DPRINTF("RTC command %x\n",command);
+                    bits = 0;
+                    state = RTC_DATA;
+                }
+            }            
+            break;
+        case RTC_DATA:
+            if(((scr2_2 & 2) == 0) && (old_scr2 & 2))
+            {
+               
+                if(ret & 0x100)
+                {
+                    data = (data << 1) | ((scr2_2 & SCR2_RTDATA) >> 2);
+                }
+                else  
+                    scr2_2 = scr2_2 & (~SCR2_RTDATA);
+    
+                if (ret & (0x80 >> (bits)))
+                {
+                    scr2_2 |= SCR2_RTDATA;
+                }
+                
+                bits++;
+                
+                if(bits == 8)
+                {
+                    if(ret & 0x100)
+                    {
+                        if(command >= 0x80)
+                        {
+                            rtc_ram[command - 0x80] = data & 0xff;
+                                //#ifdef READ_RTC
+                            FILE *fp = fopen("rtc.ram", "wb+");
+                            if(fwrite(rtc_ram, 1, 32, fp) != 32)
+                                abort();
+                            fclose(fp);
+                            //#endif
+
+                        } 
+                        if (command == 0xB1) {
+                            // clear FTU
+                            if (data & 0x04) {
+                                rtc_status = rtc_status & (~0x18);
+                                int_status = int_status & (~0x04);
+                            }
+                        }   
+                        
+                    }
+                    bits = 0;
+                    state = RTC_ADDRESS;
+                    command = 0;
+                    data = 0;
+                }
+        }
         break;
+
+    }
+
+    scr2 = (0xFFFF00FF & scr2) | (scr2_2 << 8);
+    old_scr2 = scr2_2;*/
+}
+
+static void mmio_writeb(void*opaque, target_phys_addr_t addr, uint32_t val)
+{
+     //  if(addr > 0xC0000)
+     //   return;
+
+    switch(addr)
+    {
+     //   case 0x18001:
+     //   break;
+        case 0xd003:
+            nextscr2_write(opaque, val, 1);
+            break;
+        default:
+        fprintf(stderr,"MMIO Write B @ %x with %x\n",addr,val);
+    }
+
+}
+static void mmio_writew(void*opaque, target_phys_addr_t addr, uint32_t val)
+{
+    fprintf(stderr,"MMIO Write W\n" );
+}
+
+
+
+static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
+{
+   
+    
+    CPUState *s = (CPUState *)opaque;
+  //  if(addr > 0xC0000)
+     //   return;
+
+    switch(addr)
+    {
+        case 0x7000:
+        	DPRINTF("INT Status old: %x new: %x @ %x\n",int_status,val,s->pc);
+        	int_status = val;
+        	break;
+        case 0x7800:
+        	DPRINTF("INT Mask old: %x new: %x @ %x\n",int_mask,val,s->pc);
+        	int_mask  = val;
+        	break;
+        case 0xc000:
+        	DPRINTF("SCR1 Write: %x @ %X\n",val,((CPUM68KState *)opaque)->pc);
+        	break;
+        case 0xd000:
+            nextscr2_write(opaque, val, 4);
+            break;
         
 		default:
             fprintf(stderr,"MMIO Write l @ %x with %x\n",addr,val);
@@ -335,9 +526,15 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
         
         case 0x14108:
             DPRINTF("FD read @ %x %x\n",addr,s->pc);
-            return 0xff;
+            return 0x7f;
+        case 0x14020:
+            DPRINTF("SCSI 4020  STATUS READ %X\n",next_state.scsi_csr_1);
+            return next_state.scsi_csr_1;//next_state.scsi_csr_1; 
+
+
+
         case 0x14021:
-            DPRINTF("SCSI STATUS READ %X\n",next_state.scsi_csr_2);
+            DPRINTF("SCSI 4021 STATUS READ %X\n",next_state.scsi_csr_2);
             return 0x40; 
         
       //  case 0x18001: 
@@ -346,8 +543,11 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
        
         /* these 4 registers may be the hardware timer, not sure though */ 
         case 0x1a000:
+            //return 0xff& (clock() >> 24);
         case 0x1a001: 
+            //return 0xff & (clock() >> 16);
         case 0x1a002: 
+            return 0xff & (clock() >> 8);
         case 0x1a003: 
             //A hell of a hack, but all we need is to have this change
             //consistently, so this works for now
@@ -402,21 +602,29 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			if(value & SCSICSR_FIFOFL)
 			{
 				//DPRINTF("SCSICSR FIFO Flush\n");
-				//esp_flush_fifo(esp_g);
+				//esp_puflush_fifo(esp_g);
+				//qemu_irq_pulse(next_state.scsi_dma);
 			}
+            
 			if(value & SCSICSR_ENABLE)
             {
 				//DPRINTF("SCSICSR Enable\n");
 				//qemu_irq_raise(next_state.scsi_dma);
 				//next_state.scsi_csr_1 = 0xc0;
+                next_state.scsi_csr_1 |= 0x1;
 			}
-			if(value & SCSICSR_RESET)
+            else
+                next_state.scsi_csr_1 &= ~SCSICSR_ENABLE;
+			
+            if(value & SCSICSR_RESET)
 			{
 				//DPRINTF("SCSICSR Reset\n");
             	//i think this should set DMADIR. CPUDMA and INTMASK to 0 
-				qemu_irq_pulse(next_state.scsi_reset);
 				//abort();		
-			}
+			
+				qemu_irq_raise(next_state.scsi_reset);
+			    next_state.scsi_csr_1 &= (uint8_t)~(SCSICSR_INTMASK |0x80|0x1);
+            }
 			if(value & SCSICSR_DMADIR)
 			{	
 				//DPRINTF("SCSICSR DMAdir\n");
@@ -424,14 +632,25 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			if(value & SCSICSR_CPUDMA)
 			{
 				//DPRINTF("SCSICSR CPUDMA\n");
+				//qemu_irq_raise(next_state.scsi_dma);
+
 			}
 			if(value & SCSICSR_INTMASK)
 			{
 				//DPRINTF("SCSICSR INTMASK\n");
-			}
+                //int_mask &= ~0x1000;
+			    next_state.scsi_csr_1 |= value;
+			}else
+                next_state.scsi_csr_1 &= ~SCSICSR_INTMASK;
+            if(value & 0x80)
+            {
+
+                //int_mask |= 0x1000;
+                //next_state.scsi_csr_1 |= 0x80;
+
+            }
 			DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
 			//next_state.scsi_csr_1 = value;
-			next_state.scsi_csr_1 = value;
            	return;
         //case 0x14021://SCSI Status Register
      	//case 0x18000:
@@ -569,10 +788,10 @@ static void next_cube_init(ram_addr_t ram_size,
   	qemu_irq *fdc = qemu_allocate_irqs(nextfdc_irq, env, 3);
   	memset(fd, 0, sizeof(fd));
  	fd[0] = drive_get(IF_FLOPPY, 0, 0);
-  	sun4m_fdctrl_init(*fdc, 0x2114100, fd,
-                     &fdc_tc);
-  	//fdctrl_init_sysbus(*fdc, 1,
-  	//                   0x2114100, fd);
+  	//sun4m_fdctrl_init(*fdc, 0x2114100, fd,
+    //                 &fdc_tc);
+  	fdctrl_init_sysbus(*fdc, 1,
+  	                   0x2114100, fd);
 
 
   	//sysbus_connect_irq(s, 1, fdc_tc);
@@ -584,8 +803,8 @@ static void next_cube_init(ram_addr_t ram_size,
 
 void nextscsi_read(void *opaque, uint8_t *buf, int len)
 {
-    next_irq(opaque, NEXT_SCSI_I);
-    //fprintf(stderr,"SCSI READ: %x\n",len);
+    //next_irq(opaque, NEXT_SCSI_I);
+    fprintf(stderr,"SCSI READ: %x\n",len);
 	abort();
 }
 
@@ -646,20 +865,35 @@ void nextscsi_write(void *opaque, uint8_t *buf, int size)
 void nextfdc_irq(void *opaque, int n, int level)
 {
     DPRINTF("FLOPPY IRQ LVL %i %i\n",n,level);
+    CPUM68KState *s = opaque;
     //if(level)
-    next_irq(opaque, NEXT_FD_I);
+    //next_irq(opaque, NEXT_FD_I);
+ if(level)	
+next_irq(opaque, NEXT_FD_I);
+    else
+    
+    cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
 }
 
 void nextscsi_irq(void *opaque, int n, int level)
 {
     //DPRINTF("SCSI IRQ NUM %i %i\n",n,level);
-    if(level)
-	next_irq(opaque, NEXT_SCSI_I);
+    CPUM68KState *s = opaque;
+    if(level)// && !(int_mask & 0x1000))
+	    next_irq(opaque, NEXT_SCSI_I);
+    else
+        cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
 }
 void serial_irq(void *opaque, int n, int level)
 {
     DPRINTF("SCC IRQ NUM %i\n",n);
-    next_irq(opaque, NEXT_SCC_I);
+    CPUM68KState *s = opaque;
+    //next_irq(opaque, NEXT_SCC_I);
+ if(level)
+	next_irq(opaque, NEXT_SCC_I);
+    else
+    
+    cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
 }
 #define NEXTDMA_SCSI(x)      0x10 + x
 #define NEXTDMA_FD(x)        0x10 + x
@@ -910,8 +1144,10 @@ void next_irq(void *opaque, int number)
             break;
 
     }
-    
-    int_status |= 1 << shift;
+    if(int_mask & (1 << shift))
+        return;
+    else 
+        int_status |= 1 << shift;
     
     /* second switch triggers the correct interrupt */
     switch(number)
