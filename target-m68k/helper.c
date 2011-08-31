@@ -819,22 +819,22 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
     *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
     return ret;
 }
-
+/* disabled currently so gdb will play nice */
 target_phys_addr_t cpu_get_phys_page_debug(CPUState *env, target_ulong addr)
 {
-    target_phys_addr_t phys_addr;
-    int prot;
+   // target_phys_addr_t phys_addr;
+    //int prot;
 
-    if ((env->mmu.tcr & (1 << 15)) == 0) {
+    //if ((env->mmu.tcr & (1 << 15)) == 0) {
         /* MMU disabled */
-        return addr;
-    }
+   //     return addr;
+   // }
 
-    if (get_physical_address(env, &phys_addr, &prot,
-                             addr, ACCESS_INT) != 0) {
-        return 0;
-    }
-    return phys_addr;
+   // if (get_physical_address(env, &phys_addr, &prot,
+    //                         addr, ACCESS_INT) != 0) {
+    //    return 0;
+    //}
+    return addr;
 }
 
 int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
