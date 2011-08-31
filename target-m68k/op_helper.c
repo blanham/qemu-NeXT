@@ -82,90 +82,71 @@ void tlb_fill (target_ulong addr, int is_write, int mmu_idx, void *retaddr)
     }
     env = saved_env;
 }
-static void m68k_handle_bus_error(int is_hw)
-{
-    uint32_t vector;
-    uint32_t sp;
-//    uint16_t sr;
-
-    //uint32_t fmt;
-    
-    uint32_t retaddr;
-
-    retaddr = env->pc;
-    vector = env->exception_index << 2;
-
-    sp = env->aregs[7];
-
-    env->sr |= SR_S;
-    if (is_hw) {
-        env->sr = (env->sr & ~SR_I) | (env->pending_level << SR_I_SHIFT);
-        env->sr &= ~SR_M;
-    }
-    m68k_switch_sp(env);
-
-    /* only valid for 68040 at the moment */
-    if (m68k_feature(env, M68K_FEATURE_M68000)) {
-        sp &= ~1;
-        
-        stw_kernel(sp, env->sr);
-        sp +=2;
-        stl_kernel(sp, retaddr); 
-        sp += 4;
-        stw_kernel(sp, vector | 0x7000);
-        sp +=2;
-        /* EA? */
-        sp +=4;
-        /* special status word? */
-        sp +=2;
-        /* write back status*/
-        sp +=6;
-        stl_kernel(sp, env->mmu.ar);
-    } 
-     
-    //env->aregs[7] = sp;
-    /* Jump to vector.  */
-    env->pc = ldl_kernel(env->vbr + vector);
-
-
-}
-
-/* this should agree with the Motorola 68040 User Manual now */
+       
 static void do_rte(int is_hw)
 {
     uint32_t sp;
-    uint32_t fmt;
+    uint16_t fmt;
 
-   // cpu_reset_interrupt(env, CPU_INTERRUPT_HARD); 
     sp = env->aregs[7];
     MPRINTF("RTE @ %x\n",env->pc);
-    if (m68k_feature(env, M68K_FEATURE_M68000)) {
-        fmt = lduw_kernel(sp+6);
-        
-        uint8_t type = fmt >> 24;
-        
-        switch(type)
-        {
-            case 0: case 7:
-                env->sr = lduw_kernel(sp);
-                sp += 2;
-                env->pc = ldl_kernel(sp);
-                sp += 4;
-                env->aregs[7] = sp + 2;
-                break;
-            default:
-                fprintf(stderr,"unhandled exception frame format 0x%X in do_rte\n", type);
-                abort();
-        }
     
+    if (m68k_feature(env, M68K_FEATURE_M68000)) {
+        env->sr = lduw_kernel(sp);
+        sp += 2;
+        env->pc = ldl_kernel(sp);
+        sp += 4;
+        fmt = lduw_kernel(sp);
+        sp += 2;
+        switch (fmt >> 12) {
+        case 0:
+        case 1:
+            sp += 2;
+            break;
+        case 2:
+        case 3:
+            sp += 6;
+            break;
+        case 4:
+            sp += 10;
+            break;
+        case 7:
+            sp += 52;
+            break;
+        }
     } else {
         fmt = ldl_kernel(sp);
         env->pc = ldl_kernel(sp + 4);
         sp |= (fmt >> 28) & 3;
         env->sr = fmt & 0xffff;
         m68k_switch_sp(env);
-        env->aregs[7] = sp + 8;
+        sp += 8;
     }
+    env->aregs[7] = sp;
+}
+
+static inline void do_stack_frame(uint32_t *sp, uint16_t format,
+                                  uint32_t addr, uint32_t retaddr)
+{
+    switch (format) {
+    case 4:
+        *sp -= 4;
+        stl_kernel(*sp, env->pc);
+        *sp -= 4;
+        stl_kernel(*sp, addr);
+        break;
+    case 3:
+    case 2:
+        *sp -= 4;
+        stl_kernel(*sp, addr);
+        break;
+    }
+    *sp -= 2;
+    stw_kernel(*sp, (format << 12) + (env->exception_index << 2));
+    *sp -= 4;
+    stl_kernel(*sp, retaddr);
+    *sp -= 2;
+    stw_kernel(*sp, env->sr);
 }
 
 static void do_interrupt_all(int is_hw)
@@ -198,10 +179,6 @@ static void do_interrupt_all(int is_hw)
             env->exception_index = EXCP_HLT;
             cpu_loop_exit(env);
             return;
-        case EXCP_ACCESS:
-            MPRINTF("PAGE FAULT\n");
-            m68k_handle_bus_error(is_hw);
-            break;
         }
         if (env->exception_index >= EXCP_TRAP0
             && env->exception_index <= EXCP_TRAP15) {
@@ -224,24 +201,56 @@ static void do_interrupt_all(int is_hw)
     /* ??? This could cause MMU faults.  */
 
     if (m68k_feature(env, M68K_FEATURE_M68000)) {
-        /* stack pointer is word aligned */
         sp &= ~1;
-        if (m68k_feature(env, M68K_FEATURE_QUAD_MULDIV)) {
-            /* 680x0, except 68000
-             * FIXME: 68060 ?
-             */
-            sp -=2;
-            stw_kernel(sp, vector&0xfff);
+        if (env->exception_index == 2) {
+            /* FIXME */
+            sp -= 4;
+            stl_kernel(sp, 0); /* PD3 */
+            sp -= 4;
+            stl_kernel(sp, 0); /* PD2 */
+            sp -= 4;
+            stl_kernel(sp, 0); /* PD1 */
+            sp -= 4;
+            stl_kernel(sp, 0); /* WB1D/PD0 */
+            sp -= 4;
+            stl_kernel(sp, 0); /* WB1A */
+            sp -= 4;
+            stl_kernel(sp, 0); /* WB2D */
+            sp -= 4;
+            stl_kernel(sp, 0); /* WB2A */
+            sp -= 4;
+            stl_kernel(sp, 0); /* WB3D */
+            sp -= 4;
+            stl_kernel(sp, env->mmu.ar); /* WB3A */
+            sp -= 4;
+            stl_kernel(sp, env->mmu.ar); /* FA */
+            sp -= 2;
+            stw_kernel(sp, 0); /* WB1S */
+            sp -= 2;
+            stw_kernel(sp, 0); /* WB2S */
+            sp -= 2;
+            stw_kernel(sp, 0); /* WB3S */
+            sp -= 2;
+            stw_kernel(sp, 0); /* SPECIAL STATUS WORD */
+            sp -= 4;
+            stl_kernel(sp, env->mmu.ar); /* EA */
+            do_stack_frame(&sp, 7, 0, retaddr);
+        } else if (env->exception_index == 3) {
+            do_stack_frame(&sp, 2, 0, retaddr);
+        } else if (env->exception_index == 5 ||
+                   env->exception_index == 6 ||
+                   env->exception_index == 7 ||
+                   env->exception_index == 9) {
+            /* FIXME: addr is not only env->pc */
+            do_stack_frame(&sp, 2, env->pc, retaddr);
+        } else if (is_hw && env->exception_index >= 24 &&
+                   env->exception_index < 32) {
+            do_stack_frame(&sp, 0, 0, retaddr);
+            do_stack_frame(&sp, 1, 0, retaddr);
+        } else {
+            do_stack_frame(&sp, 0, 0, retaddr);
         }
-
-               
-        sp -= 4;
-        stl_kernel(sp, retaddr); 
-        sp -=2;
-        stw_kernel(sp, env->sr);
-
-
-         } else {
+    } else {
         fmt |= 0x40000000;
         fmt |= (sp & 3) << 28;
         fmt |= vector << 16;

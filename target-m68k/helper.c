@@ -677,13 +677,6 @@ static int check_TTR(uint32_t ttr, target_phys_addr_t *physical, int *prot,
 /* TC Constants */
 #define MMU_PAGE_SIZE   0x4000 //if set page size = 8K not set 4K
 #define MMU_ENABLE      0x8000
-/* TTR Constants */
-#define MMU_LOG_BASE     0xFF000000
-#define MMU_LOG_MASK(x)  ((0x00FF0000 & x) <<8)
-#define MMU_TTR_ENABLE   0x00008000
-#define MMU_SUPER_ACCESS 0x00001000
-#define MMU_IGN_FC2      0x00002000
-#define MMU_READ_ONLY    0x00000004
 /* MMU Status Register Constants*/
 //TODO
 #define MMU_RI(x) ((0xFE000000 & x)>>25)
@@ -706,6 +699,7 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
     /* Transparent Translation (physical = logical) */
 
     if (access_type & ACCESS_CODE) {
+
         if (check_TTR(env->mmu.ittr0, physical, prot, address, access_type)) {
             return 0;
         }
@@ -819,22 +813,22 @@ static int get_physical_address(CPUState *env, target_phys_addr_t *physical,
     *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
     return ret;
 }
-/* disabled currently so gdb will play nice */
+
 target_phys_addr_t cpu_get_phys_page_debug(CPUState *env, target_ulong addr)
 {
-   // target_phys_addr_t phys_addr;
-    //int prot;
+    target_phys_addr_t phys_addr;
+    int prot;
 
-    //if ((env->mmu.tcr & (1 << 15)) == 0) {
+    if ((env->mmu.tcr & (1 << 15)) == 0) {
         /* MMU disabled */
-   //     return addr;
-   // }
+        return addr;
+    }
 
-   // if (get_physical_address(env, &phys_addr, &prot,
-    //                         addr, ACCESS_INT) != 0) {
-    //    return 0;
-    //}
-    return addr;
+    if (get_physical_address(env, &phys_addr, &prot,
+                             addr, ACCESS_INT) != 0) {
+        return -1;
+    }
+    return phys_addr;
 }
 
 int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
@@ -1854,7 +1848,7 @@ void HELPER(exp10_FP0)(CPUState *env)
     val = floatx80_to_ldouble(res);
 
     DBG_FPUH("exp2_FP0 %Lg", val);
-    val = exp10l(val);
+    //val = exp10l(val);
     DBG_FPU(" = %Lg", val);
     res = ldouble_to_floatx80(val);
     floatx80_to_FP0(env, res);
@@ -2041,7 +2035,7 @@ void HELPER(sincos_FP0_FP1)(CPUState *env)
     val = floatx80_to_ldouble(res);
 
     DBG_FPUH("sincos_FP0 %Lg", val);
-    sincosl(val, &valsin, &valcos);
+    //sincosl(val, &valsin, &valcos);
     DBG_FPU(" = %Lg, %Lg", valsin, valcos);
     res = ldouble_to_floatx80(valsin);
     floatx80_to_FP0(env, res);
