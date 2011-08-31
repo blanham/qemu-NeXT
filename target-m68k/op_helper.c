@@ -82,6 +82,53 @@ void tlb_fill (target_ulong addr, int is_write, int mmu_idx, void *retaddr)
     }
     env = saved_env;
 }
+static void m68k_handle_bus_error(int is_hw)
+{
+    uint32_t vector;
+    uint32_t sp;
+//    uint16_t sr;
+
+    //uint32_t fmt;
+    
+    uint32_t retaddr;
+
+    retaddr = env->pc;
+    vector = env->exception_index << 2;
+
+    sp = env->aregs[7];
+
+    env->sr |= SR_S;
+    if (is_hw) {
+        env->sr = (env->sr & ~SR_I) | (env->pending_level << SR_I_SHIFT);
+        env->sr &= ~SR_M;
+    }
+    m68k_switch_sp(env);
+
+    /* only valid for 68040 at the moment */
+    if (m68k_feature(env, M68K_FEATURE_M68000)) {
+        sp &= ~1;
+        
+        stw_kernel(sp, env->sr);
+        sp +=2;
+        stl_kernel(sp, retaddr); 
+        sp += 4;
+        stw_kernel(sp, vector | 0x7000);
+        sp +=2;
+        /* EA? */
+        sp +=4;
+        /* special status word? */
+        sp +=2;
+        /* write back status*/
+        sp +=6;
+        stl_kernel(sp, env->mmu.ar);
+    } 
+     
+    //env->aregs[7] = sp;
+    /* Jump to vector.  */
+    env->pc = ldl_kernel(env->vbr + vector);
+
+
+}
 
 /* this should agree with the Motorola 68040 User Manual now */
 static void do_rte(int is_hw)
@@ -89,8 +136,9 @@ static void do_rte(int is_hw)
     uint32_t sp;
     uint32_t fmt;
 
+   // cpu_reset_interrupt(env, CPU_INTERRUPT_HARD); 
     sp = env->aregs[7];
-
+    MPRINTF("RTE @ %x\n",env->pc);
     if (m68k_feature(env, M68K_FEATURE_M68000)) {
         fmt = lduw_kernel(sp+6);
         
@@ -129,7 +177,7 @@ static void do_interrupt_all(int is_hw)
 
     fmt = 0;
     retaddr = env->pc;
-
+    
     if (!is_hw) {
         switch (env->exception_index) {
         case EXCP_RTE:
@@ -152,6 +200,7 @@ static void do_interrupt_all(int is_hw)
             return;
         case EXCP_ACCESS:
             MPRINTF("PAGE FAULT\n");
+            m68k_handle_bus_error(is_hw);
             break;
         }
         if (env->exception_index >= EXCP_TRAP0
@@ -177,19 +226,22 @@ static void do_interrupt_all(int is_hw)
     if (m68k_feature(env, M68K_FEATURE_M68000)) {
         /* stack pointer is word aligned */
         sp &= ~1;
-        
-        stw_kernel(sp, env->sr);
-        sp += 2;
-        stl_kernel(sp, retaddr);
-        sp += 4;
-        
         if (m68k_feature(env, M68K_FEATURE_QUAD_MULDIV)) {
             /* 680x0, except 68000
              * FIXME: 68060 ?
              */
-            stw_kernel(sp, vector & 0x0fff);
+            sp -=2;
+            stw_kernel(sp, vector&0xfff);
         }
-    } else {
+
+               
+        sp -= 4;
+        stl_kernel(sp, retaddr); 
+        sp -=2;
+        stw_kernel(sp, env->sr);
+
+
+         } else {
         fmt |= 0x40000000;
         fmt |= (sp & 3) << 28;
         fmt |= vector << 16;
@@ -201,9 +253,11 @@ static void do_interrupt_all(int is_hw)
         sp -= 4;
         stl_kernel(sp, fmt);
     }
-
+    
+    env->aregs[7] = sp;
     /* Jump to vector.  */
     env->pc = ldl_kernel(env->vbr + vector);
+    MPRINTF("INTERRUPT %x @ %x\n",env->exception_index,env->pc);
 }
 
 void do_interrupt(CPUState *env1)
