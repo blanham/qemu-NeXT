@@ -61,7 +61,7 @@ enum next_irqs {
     NEXT_SCC_DMA_I,
     NEXT_SND_I
 };
-void next_irq(void *opaque, int number);
+void next_irq(void *opaque, int number, int level);
 
 typedef struct {
     uint32_t int_mask;
