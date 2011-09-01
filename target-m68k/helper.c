@@ -1848,7 +1848,7 @@ void HELPER(exp10_FP0)(CPUState *env)
     val = floatx80_to_ldouble(res);
 
     DBG_FPUH("exp2_FP0 %Lg", val);
-    //val = exp10l(val);
+    val = expl(val * M_LN10);
     DBG_FPU(" = %Lg", val);
     res = ldouble_to_floatx80(val);
     floatx80_to_FP0(env, res);
@@ -2035,7 +2035,8 @@ void HELPER(sincos_FP0_FP1)(CPUState *env)
     val = floatx80_to_ldouble(res);
 
     DBG_FPUH("sincos_FP0 %Lg", val);
-    //sincosl(val, &valsin, &valcos);
+	valsin = sinl(val);
+	valcos = cosl(val);
     DBG_FPU(" = %Lg, %Lg", valsin, valcos);
     res = ldouble_to_floatx80(valsin);
     floatx80_to_FP0(env, res);
