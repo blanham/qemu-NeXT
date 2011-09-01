@@ -679,7 +679,9 @@ static void next_cube_init(ram_addr_t ram_size,
 {
 	/* Initialize the cpu core */ 
     CPUState *env = cpu_init("m68040");
-    if (env == NULL) {
+    //NextState *next_env = qemu_malloc(sizeof(NextState));
+	//next_env->env = env;
+	if (env == NULL) {
         fprintf(stderr, "Unable to find m68k CPU definition\n");
         exit(1);
     }
@@ -742,7 +744,7 @@ static void next_cube_init(ram_addr_t ram_size,
   	CharDriverState *console = serial_hds[0];//text_console_init(NULL);
    	qemu_irq *serial = qemu_allocate_irqs(serial_irq, env, 2);
   	escc_init(0x2118000, serial[0], serial[1],
-        NULL,console,   (9600*384),0);
+        NULL,console,   (9600*384),1);
 
     
     /* Load ROM here */  
@@ -801,12 +803,6 @@ static void next_cube_init(ram_addr_t ram_size,
 
 }
 
-void nextscsi_read(void *opaque, uint8_t *buf, int len)
-{
-    //next_irq(opaque, NEXT_SCSI_I);
-    fprintf(stderr,"SCSI READ: %x\n",len);
-	abort();
-}
 void nextdma_write(void *opaque, uint8_t *buf, int size, int type);
 void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 {
@@ -859,46 +855,38 @@ void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 			break; 
 	}
 	
-	next_irq(opaque, irq);
+	next_irq(opaque, irq, 1);
 
 
 }
+
+void nextscsi_read(void *opaque, uint8_t *buf, int len)
+{
+    fprintf(stderr,"SCSI READ: %x\n",len);
+	abort();
+}
+
 void nextscsi_write(void *opaque, uint8_t *buf, int size)
 {
     DPRINTF("SCSI WRITE: %i\n",size);
 	nextdma_write(opaque, buf, size, NEXTDMA_SCSI);
 }
+
 void nextfdc_irq(void *opaque, int n, int level)
 {
     DPRINTF("FLOPPY IRQ LVL %i %i\n",n,level);
-    CPUM68KState *s = opaque;
-    //if(level)
-    //next_irq(opaque, NEXT_FD_I);
- if(level)	
-next_irq(opaque, NEXT_FD_I);
-    else
-    
-    cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
+	next_irq(opaque, NEXT_FD_I, level);
 }
 
 void nextscsi_irq(void *opaque, int n, int level)
 {
-    //DPRINTF("SCSI IRQ NUM %i %i\n",n,level);
-    CPUM68KState *s = opaque;
-    if(level)// && !(int_mask & 0x1000))
-	    next_irq(opaque, NEXT_SCSI_I);
-    else
-        cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
+    DPRINTF("SCSI IRQ NUM %i %i\n",n,level);
+	next_irq(opaque, NEXT_SCSI_I, level);
 }
 void serial_irq(void *opaque, int n, int level)
 {
     DPRINTF("SCC IRQ NUM %i\n",n);
-    CPUM68KState *s = opaque;
-    //next_irq(opaque, NEXT_SCC_I);
- 	if(level)
-	next_irq(opaque, NEXT_SCC_I);
-    else
-    cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
+	next_irq(opaque, NEXT_SCC_I, level);
 }
 #define NEXTDMA_SCSI(x)      0x10 + x
 #define NEXTDMA_FD(x)        0x10 + x
@@ -1094,7 +1082,7 @@ void next_dma_check(void)
 }
 /* TODO: set the shift numbers in the enum, so the first switch
     will not be needed */
-void next_irq(void *opaque, int number)
+void next_irq(void *opaque, int number, int level)
 {
     CPUM68KState *s = opaque;
     int shift = 0;
@@ -1149,40 +1137,45 @@ void next_irq(void *opaque, int number)
             break;
 
     }
-    if(int_mask & (1 << shift))
+    
+	if(int_mask & (1 << shift))
         return;
-    else 
-        int_status |= 1 << shift;
     
     /* second switch triggers the correct interrupt */
-    switch(number)
-    {
-        /* level 3 - floppy, kbd/mouse, power, 
-        ether rx/tx, scsi, clock */
-        case NEXT_FD_I:
-        case NEXT_KBD_I:
-        case NEXT_PWR_I:
-        case NEXT_ENRX_I:
-        case NEXT_ENTX_I:
-        case NEXT_SCSI_I:
-        case NEXT_CLK_I:
-            m68k_set_irq_level(s,3,27);
-            break; 
-        
-        /* level 5 - scc (serial) */
-        case NEXT_SCC_I:
-            m68k_set_irq_level(s,5,29);
-            break;
+    if(level){
+        int_status |= 1 << shift;
+		switch(number)
+		{
+			/* level 3 - floppy, kbd/mouse, power, 
+			ether rx/tx, scsi, clock */
+			case NEXT_FD_I:
+			case NEXT_KBD_I:
+			case NEXT_PWR_I:
+			case NEXT_ENRX_I:
+			case NEXT_ENTX_I:
+			case NEXT_SCSI_I:
+			case NEXT_CLK_I:
+				m68k_set_irq_level(s,3,27);
+				break; 
+			
+			/* level 5 - scc (serial) */
+			case NEXT_SCC_I:
+				m68k_set_irq_level(s,5,29);
+				break;
 
-        /* level 6 - audio etherrx/tx dma */
-        case NEXT_ENTX_DMA_I:
-        case NEXT_ENRX_DMA_I:
-        case NEXT_SND_I:
-        case NEXT_SCC_DMA_I:
-            m68k_set_irq_level(s,6,30);
-            break;
-
-    }
+			/* level 6 - audio etherrx/tx dma */
+			case NEXT_ENTX_DMA_I:
+			case NEXT_ENRX_DMA_I:
+			case NEXT_SND_I:
+			case NEXT_SCC_DMA_I:
+				m68k_set_irq_level(s,6,30);
+				break;
+		}
+	
+	}else{
+        int_status &= ~(1 << shift);
+		cpu_reset_interrupt(s, CPU_INTERRUPT_HARD); 
+	}
 }
 
 
