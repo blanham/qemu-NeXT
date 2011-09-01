@@ -25,9 +25,9 @@
 
 #include "next-proto.h"
 
-#define ENTRY 0x0100001e
-#define RAM_SIZE 0x4000000
-#define ROM_FILE "./rom66.bin"
+#define ENTRY 		0x0100001e
+#define RAM_SIZE 	0x4000000
+#define ROM_FILE 	"./rom66.bin"
 
 /* would like to dynamically allocate these later */
 next_state_t next_state;
@@ -40,7 +40,7 @@ nextfb_state_t nextfb_state;
 #define DPRINTF(fmt, ...)                                       \
     do { printf("NeXT: " fmt , ## __VA_ARGS__); } while (0);
 #else
-#define DPRINTF(fmt, ...)
+#define DPRINTF(fmt, ...) ;
 #endif
 
 
@@ -69,9 +69,7 @@ uint8_t rtc_ram2[32]={
 
 
 static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr)
-{  // if(addr > 0xC0000)
-    //    return 0xff;
-
+{  
     switch(addr)
     {
         case 0xc000:
@@ -79,36 +77,23 @@ static uint32_t mmio_readb(void*opaque, target_phys_addr_t addr)
         case 0xc001:
             return (scr1 >> 16) & 0xFF;
         case 0xc002:
-            return (scr1 >> 8) & 0xFF;
+            return (scr1 >> 8) 	& 0xFF;
         case 0xc003:
-            return (scr1 >> 0) & 0xFF;
-       	case 0xd000:
+            return (scr1 >> 0) 	& 0xFF;
+       	
+		case 0xd000:
             return (scr2 >> 24) & 0xFF;
         case 0xd001:
             return (scr2 >> 16) & 0xFF;
         case 0xd002:
-            return (scr2 >> 8) & 0xFF;
+            return (scr2 >> 8) 	& 0xFF;
         case 0xd003:
-            return (scr2 >> 0) & 0xFF;
-//case 0xc0008:
-      		//return 0xff;//hack to hide memory error
+            return (scr2 >> 0) 	& 0xFF;
      	
 		case 0x14020:
+            fprintf(stderr,"Read 0x4020\n");
 			return 0x7f;
-		//case 0x18000:
-     	//case 0x18001:
-      		//return 0;
-        //case 0x1a000:
-    		//return 0;
-        //case 0x1a001: 
-     		//return 0;
-        //case 0x1a002: 
-       		//return 0;
-        //case 0x1a003: 
-     		//fprintf(stderr,"event #%x @ %x\n",addr &0x3,s->pc);
-       		//event_test++;
-      		//if(event_test == 200) event_test = 0;
-        	//return time(NULL) & 0xFF; 
+		
 		default:
             fprintf(stderr,"MMIO Read B @ %x\n",addr);
         	return 0x0;
@@ -119,16 +104,13 @@ static uint32_t mmio_readw(void*opaque, target_phys_addr_t addr)
     switch(addr)
     {
         default:
-        fprintf(stderr,"MMIO Read W @ %x\n",addr);
-        return 0x0;
+        	DPRINTF("MMIO Read W @ %x\n",addr);
+        	return 0x0;
     }
 }
 
 static uint32_t mmio_readl(void*opaque, target_phys_addr_t addr)
 {
-  	//if(addr > 0xC0000)
-     	//return 0;
-
     switch(addr)
     {
         case 0x7000:
@@ -145,19 +127,10 @@ static uint32_t mmio_readl(void*opaque, target_phys_addr_t addr)
          
         case 0xd000:
         	return scr2;
-     	//case 0x20000:
-      		//return 0x100000i0 
-     	//case 0xc0000:
-      		//return 0x01;    
-        
-      	//case 0xc0030:
-      		//return 0x90000010;
-      	//  case 0xc0034:
-      		//return 0x1000000;
-        
+             
         default:
-        fprintf(stderr,"MMIO Read L @ %x\n",addr);
-        return 0x0;
+        	DPRINTF("MMIO Read L @ %x\n",addr);
+        	return 0x0;
     }
 }
 /* this could use a lot of refactoring */
@@ -307,9 +280,6 @@ if(size == 4)
 
 
 
-
-
-
 /*  #define RTC_ADDRESS 0
     #define RTC_DATA    1
     #define SCR2_RTCLK 0x2
@@ -452,37 +422,30 @@ if(size == 4)
 
 static void mmio_writeb(void*opaque, target_phys_addr_t addr, uint32_t val)
 {
-     //  if(addr > 0xC0000)
-     //   return;
-
     switch(addr)
     {
-     //   case 0x18001:
-     //   break;
         case 0xd003:
             nextscr2_write(opaque, val, 1);
             break;
         default:
-        fprintf(stderr,"MMIO Write B @ %x with %x\n",addr,val);
+        DPRINTF("MMIO Write B @ %x with %x\n",addr,val);
     }
 
 }
 static void mmio_writew(void*opaque, target_phys_addr_t addr, uint32_t val)
 {
-    fprintf(stderr,"MMIO Write W\n" );
+    DPRINTF("MMIO Write W\n" );
 }
 
 
 
 static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
 {
-   
-    
+    #ifdef DEBUG_NEXT
     CPUState *s = (CPUState *)opaque;
-  //  if(addr > 0xC0000)
-     //   return;
-
-    switch(addr)
+	#endif
+    
+	switch(addr)
     {
         case 0x7000:
         	DPRINTF("INT Status old: %x new: %x @ %x\n",int_status,val,s->pc);
@@ -500,7 +463,8 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
             break;
         
 		default:
-            fprintf(stderr,"MMIO Write l @ %x with %x\n",addr,val);
+            DPRINTF("MMIO Write l @ %x with %x\n",addr,val);
+			;
 
     }
 }
@@ -509,38 +473,23 @@ static void mmio_writel(void*opaque, target_phys_addr_t addr, uint32_t val)
 
 static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
 {
+	#ifdef DEBUG_NEXT
     CPUState *s = (CPUState *)opaque;
+	#endif
     
     switch(addr)
     {
-        
-      //  case 0x12000://OD
-      //  case 0x12001:
-      //  case 0x12004:
-      //  case 0x12005:
-      //  case 0x12007:
-        //    return 0x0;
-        
-       // case 0x14104://FDD
-         //   return 0x0;
-        
         case 0x14108:
             DPRINTF("FD read @ %x %x\n",addr,s->pc);
             return 0x7f;
         case 0x14020:
             DPRINTF("SCSI 4020  STATUS READ %X\n",next_state.scsi_csr_1);
-            return next_state.scsi_csr_1;//next_state.scsi_csr_1; 
-
-
+            return next_state.scsi_csr_1; 
 
         case 0x14021:
             DPRINTF("SCSI 4021 STATUS READ %X\n",next_state.scsi_csr_2);
             return 0x40; 
         
-      //  case 0x18001: 
-            //fprintf(stderr, "SCC @ %X\n",((CPUM68KState *)opaque)->pc);
-       //     return 0;
-       
         /* these 4 registers may be the hardware timer, not sure though */ 
         case 0x1a000:
             return 0xff& (clock() >> 24);
@@ -555,18 +504,18 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
             return 0xFF & clock(); 
         
         default:
-            fprintf(stderr,"BMAP Read B @ %x\n",addr);
+            DPRINTF("BMAP Read B @ %x\n",addr);
             return 0;
     }
 }
 static uint32_t scr_readw(void*opaque, target_phys_addr_t addr)
 {
-    fprintf(stderr,"S Read W @ %x\n",addr);
+    DPRINTF("BMAP Read W @ %x\n",addr);
     return 0;
 }
 static uint32_t scr_readl(void*opaque, target_phys_addr_t addr)
 {
-    fprintf(stderr,"SRead L @ %x\n",addr);
+    DPRINTF("BMAP Read L @ %x\n",addr);
     return 0;
 }
 static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
@@ -574,25 +523,8 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
     CPUState *s = (CPUState *)opaque;
     switch(addr)
     {
-     	//case 0x10000: break;//Screen brightness
-        
-     	//case 0x12000://OD
-     	//case 0x12001:
-     	//case 0x12004:
-     	//case 0x12005:
-      	//case 0x12007:
-       		//return;
-        
-
-        //case 0x14108:
-			//if(value == 0x40)
-				//qemu_irq_pulse(next_state.fd_irq[0]);
-			//return;
 		
 		case 0x14020://SCSI Control Register
-          //DPRINTF("SCSI CSR WRITE %X\n",value);
-            //if((value == 0x22))
-            //qemu_irq_pulse(next_state.scsi_irq[1]);
             #define SCSICSR_ENABLE 	0x01
 			#define SCSICSR_RESET	0x02//reset scsi dma
 			#define SCSICSR_FIFOFL	0x04
@@ -601,14 +533,14 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			#define SCSICSR_INTMASK	0x20//if set, interrupt enabled
 			if(value & SCSICSR_FIFOFL)
 			{
-				//DPRINTF("SCSICSR FIFO Flush\n");
+				DPRINTF("SCSICSR FIFO Flush\n");
 				//esp_puflush_fifo(esp_g);
 				//qemu_irq_pulse(next_state.scsi_dma);
 			}
             
 			if(value & SCSICSR_ENABLE)
             {
-				//DPRINTF("SCSICSR Enable\n");
+				DPRINTF("SCSICSR Enable\n");
 				//qemu_irq_raise(next_state.scsi_dma);
 				//next_state.scsi_csr_1 = 0xc0;
                 next_state.scsi_csr_1 |= 0x1;
@@ -618,26 +550,26 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			
             if(value & SCSICSR_RESET)
 			{
-				//DPRINTF("SCSICSR Reset\n");
+				DPRINTF("SCSICSR Reset\n");
             	//i think this should set DMADIR. CPUDMA and INTMASK to 0 
 				//abort();		
 			
-				qemu_irq_raise(next_state.scsi_reset);
+				//qemu_irq_raise(next_state.scsi_reset);
 			    next_state.scsi_csr_1 &= (uint8_t)~(SCSICSR_INTMASK |0x80|0x1);
             }
 			if(value & SCSICSR_DMADIR)
 			{	
-				//DPRINTF("SCSICSR DMAdir\n");
+				DPRINTF("SCSICSR DMAdir\n");
 			}
 			if(value & SCSICSR_CPUDMA)
 			{
-				//DPRINTF("SCSICSR CPUDMA\n");
+				DPRINTF("SCSICSR CPUDMA\n");
 				//qemu_irq_raise(next_state.scsi_dma);
 
 			}
 			if(value & SCSICSR_INTMASK)
 			{
-				//DPRINTF("SCSICSR INTMASK\n");
+				DPRINTF("SCSICSR INTMASK\n");
                 //int_mask &= ~0x1000;
 			    next_state.scsi_csr_1 |= value;
 			}else
@@ -650,25 +582,19 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 
             }
 			DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
-			//next_state.scsi_csr_1 = value;
            	return;
-        //case 0x14021://SCSI Status Register
-     	//case 0x18000:
-      	//case 0x18001:
-      	//case 0x18004:
-       		//break;
-       case 0x1a000:return; 
-        default:
-            fprintf(stderr,"BMAP Write B @ %x with %x\n",addr,value);
+       	default:
+            DPRINTF("BMAP Write B @ %x with %x\n",addr,value);
+			
     }
 }
 static void scr_writew(void*opaque, target_phys_addr_t addr, uint32_t value)
 {
-    fprintf(stderr,"SWrite w @ %x with %x\n",addr,value);
+   	DPRINTF("BMAP Write W @ %x with %x\n",addr,value);
 }
 static void scr_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
 {
-    fprintf(stderr,"SWrite l @ %x with %x\n",addr,value);
+   	DPRINTF("BMAP Write L @ %x with %x\n",addr,value);
 }
 
 
@@ -727,15 +653,9 @@ static void next_cube_init(ram_addr_t ram_size,
     cpu_register_physical_memory((uint32_t)0x2000000,0xD0000,
         cpu_register_io_memory(mmio_read, mmio_write, (void *)env,DEVICE_NATIVE_ENDIAN));    
     
-    
     /* BMAP */ //acts as a catch-all for now
     cpu_register_physical_memory((uint32_t)0x2100000,0x3A7FF,
         cpu_register_io_memory(scr_read, scr_write, (void *)env,DEVICE_NATIVE_ENDIAN));
-  	//cpu_register_physical_memory(0x20c0000, 0x20000,
-    //   qemu_ram_alloc(NULL, "next-bmap.ram", 0x20000) | IO_MEM_RAM);
-  	//tlb_set_page((CPUState *)env, 0x2100000,
-          //        0x2000000, 0,
-             //     0, 0x10000);
 
     /* KBD */
    	nextkbd_init((void *)env);
@@ -743,9 +663,7 @@ static void next_cube_init(ram_addr_t ram_size,
     /* Serial */
   	CharDriverState *console = serial_hds[0];//text_console_init(NULL);
    	qemu_irq *serial = qemu_allocate_irqs(serial_irq, env, 2);
-  	escc_init(0x2118000, serial[0], serial[1],
-        NULL,console,   (9600*384),1);
-
+  	escc_init(0x2118000, serial[0], serial[1], NULL, console, (9600*384), 1);
     
     /* Load ROM here */  
     if (bios_name == NULL) {
@@ -758,13 +676,11 @@ static void next_cube_init(ram_addr_t ram_size,
         fprintf(stderr,"Failed to load rom file!\n");
         exit(1);
     }
-   	/* still not sure if the rom should also be mapped at 0x0*/ 
+   	
+	/* still not sure if the rom should also be mapped at 0x0*/ 
     rom_add_file_fixed(bios_filename,0x1000000,0);
-   	//rom_add_file_fixed(ROM_FILE,0x000000,1);
    	cpu_register_physical_memory((uint32_t)0x1000000, 0x20000,
     	qemu_ram_alloc(NULL, bios_filename, 0x20000) | IO_MEM_ROM);
-    // cpu_register_physical_memory((uint32_t)0x000000, 0x20000,
-    //  	qemu_ram_alloc(NULL, "nex.rom", 0x20000) | IO_MEM_ROM);
 
     /* Ethernet */
     nextnet_init((void *)env);
@@ -790,13 +706,11 @@ static void next_cube_init(ram_addr_t ram_size,
   	qemu_irq *fdc = qemu_allocate_irqs(nextfdc_irq, env, 3);
   	memset(fd, 0, sizeof(fd));
  	fd[0] = drive_get(IF_FLOPPY, 0, 0);
-  	//sun4m_fdctrl_init(*fdc, 0x2114100, fd,
-    //                 &fdc_tc);
-  	fdctrl_init_sysbus(*fdc, 1,
-  	                   0x2114100, fd);
+  	sun4m_fdctrl_init(*fdc, 0x2114100, fd,
+                     &fdc_tc);
+  	//fdctrl_init_sysbus(*fdc, 1,
+  	//                   0x2114100, fd);
 
-
-  	//sysbus_connect_irq(s, 1, fdc_tc);
     /* DMA */ 
     cpu_register_physical_memory((uint32_t)0x2000000,0x5000,
         cpu_register_io_memory(dma_read, dma_write, (void *)env,DEVICE_NATIVE_ENDIAN));   
@@ -844,7 +758,6 @@ void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
         next_state.dma[type].limit = next_state.dma[type].stop;
     }
 
-    
     //Set dma registers and raise an irq
     next_state.dma[type].csr |= DMA_COMPLETE; //DON'T CHANGE THIS!!!!
 	
@@ -856,7 +769,6 @@ void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 	}
 	
 	next_irq(opaque, irq, 1);
-
 
 }
 
@@ -914,7 +826,7 @@ static void dma_writel(void*opaque, target_phys_addr_t addr, uint32_t value)
     /*
         case SCSI"all registers:
         channel = NEXTDMA_SCSI;
-        reg = "something to normalize"
+        addr = addr - NEXTDMA_SCSI(0);
 
 
 
