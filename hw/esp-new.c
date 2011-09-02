@@ -341,7 +341,7 @@ static CPUWriteMemoryFunc * const esp_mem_write[3] = {
 };
 
 static const VMStateDescription vmstate_esp = {
-        .name ="esp",
+        .name ="esp-new",
         .version_id = 3,
         .minimum_version_id = 3,
         .minimum_version_id_old = 3,
@@ -371,7 +371,7 @@ void esp_new_init(target_phys_addr_t espaddr, int it_shift,
         SysBusDevice *s;
         ESP2State *esp;
 
-        dev = qdev_create(NULL, "esp");
+        dev = qdev_create(NULL, "esp-new");
         esp = DO_UPCAST(ESP2State, busdev.qdev, dev);
         esp->dma_memory_read = dma_memory_read;
         esp->dma_memory_write = dma_memory_write;
