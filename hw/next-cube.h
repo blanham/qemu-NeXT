@@ -15,6 +15,8 @@ typedef struct next_dma {
 
     uint32_t next_initbuf;
     uint32_t size;
+
+    /* need to add a callback function pointer */
 } next_dma;
 
 

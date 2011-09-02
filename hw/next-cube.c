@@ -1,11 +1,15 @@
 /*
- * Next Cube System Driver
- * Copyright (c) 2011 Bryce Lanham
+ * 	Next Cube System Driver
+ * 	Copyright (c) 2011 Bryce Lanham
  *
- * Based on dummy_m68k.c Copyright (c) 2007 CodeSourcery.
+ * 	Based on dummy_m68k.c Copyright (c) 2007 CodeSourcery.
+ *	TODO:
+ *	FIX CODING STYLE!
+ *  Change opaques to pass a dynamically allocated machine state
+ *  which include the cpu env
+ *	Add more comments!
  *
- *
- * This code is licensed under the GPL
+ * 	This code is licensed under the GPL
  */
 
 
@@ -148,7 +152,7 @@ static void nextscr2_write(void *opaque, uint32_t val, int size)
  
 
 
-if(size == 4)
+	if(size == 4)
         scr2_2 = (val >> 8) & 0xFF;
     else
         scr2_2 = val&0xFF;
@@ -491,9 +495,11 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
             DPRINTF("SCSI 4021 STATUS READ %X\n",next_state.scsi_csr_2);
             return 0x40; 
         
-        /* these 4 registers may be the hardware timer, not sure though */ 
+        /* these 4 registers are the hardware timer, not sure which register
+		 * is the latch instead of data, but no problems so far
+         */ 
         case 0x1a000:
-            return 0xff& (clock() >> 24);
+            return 0xff	& (clock() >> 24);
         case 0x1a001: 
             return 0xff & (clock() >> 16);
         case 0x1a002: 
@@ -625,6 +631,7 @@ static void next_cube_init(ram_addr_t ram_size,
     env->sr  = 0x2700;
     
     /* Set internal registers to initial values */
+	/*     0x0000XX00 << vital bits */
     scr1 = 0x00011102;
     scr2 = 0x00ff0c80;
     
@@ -999,7 +1006,7 @@ void next_dma_check(void)
 
 
 }
-/* TODO: set the shift numbers in the enum, so the first switch
+/* TODO: set the shift numbers as values in the enum, so the first switch
     will not be needed */
 void next_irq(void *opaque, int number, int level)
 {
