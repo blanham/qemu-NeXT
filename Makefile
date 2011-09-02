@@ -106,7 +106,8 @@ audio/audio.o audio/fmodaudio.o: QEMU_CFLAGS += $(FMOD_CFLAGS)
 
 QEMU_CFLAGS+=$(CURL_CFLAGS)
 
-QEMU_CFLAGS+=$(GLIB_CFLAGS)
+QEMU_CFLAGS+=$(GLIB_CFLAGS) -lgthread-2.0
+
 
 ui/cocoa.o: ui/cocoa.m
 
