@@ -19,6 +19,7 @@
 #include "loader.h"
 #include "elf.h"
 #include "esp.h" //SCSI ESP should work out of the box
+#include "esp-new.h"//about that....
 #include "sysbus.h"
 #include "escc.h" //ZILOG 8530 Serial Emulation
 #include "fdc.h"
@@ -34,7 +35,7 @@ next_state_t next_state;
 nextfb_state_t nextfb_state;
 
 /* debug NeXT */
-#define DEBUG_NEXT
+//#define DEBUG_NEXT
 
 #ifdef DEBUG_NEXT
 #define DPRINTF(fmt, ...)                                       \
@@ -484,7 +485,7 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
             return 0x7f;
         case 0x14020:
             DPRINTF("SCSI 4020  STATUS READ %X\n",next_state.scsi_csr_1);
-            return next_state.scsi_csr_1; 
+            return 0x3F;//next_state.scsi_csr_1; 
 
         case 0x14021:
             DPRINTF("SCSI 4021 STATUS READ %X\n",next_state.scsi_csr_2);
@@ -554,7 +555,7 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
             	//i think this should set DMADIR. CPUDMA and INTMASK to 0 
 				//abort();		
 			
-				//qemu_irq_raise(next_state.scsi_reset);
+				qemu_irq_raise(next_state.scsi_reset);
 			    next_state.scsi_csr_1 &= (uint8_t)~(SCSICSR_INTMASK |0x80|0x1);
             }
 			if(value & SCSICSR_DMADIR)
@@ -583,6 +584,9 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
             }
 			DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
            	return;
+		//Hardware timer latch - not implemented yet
+		case 0x1a000:
+			return;
        	default:
             DPRINTF("BMAP Write B @ %x with %x\n",addr,value);
 			
@@ -690,7 +694,7 @@ static void next_cube_init(ram_addr_t ram_size,
     next_state.scsi_irq = qemu_allocate_irqs(nextscsi_irq, env, 1);
     qemu_irq *scsi = next_state.scsi_irq; 
  	//qemu_irq esp_reset, dma_enable;
-   	esp_init(0x2114000, 0,
+   	esp_new_init(0x2114000, 0,
   	           nextscsi_read, nextscsi_write,
    	           (void *)env, scsi[0], &next_state.scsi_reset,
    	           &next_state.scsi_dma);
@@ -775,7 +779,7 @@ void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 void nextscsi_read(void *opaque, uint8_t *buf, int len)
 {
     fprintf(stderr,"SCSI READ: %x\n",len);
-	abort();
+	//abort();
 }
 
 void nextscsi_write(void *opaque, uint8_t *buf, int size)
