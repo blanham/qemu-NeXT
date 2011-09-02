@@ -521,7 +521,10 @@ static uint32_t scr_readl(void*opaque, target_phys_addr_t addr)
 }
 static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 {
+	#ifdef DEBUG_NEXT
     CPUState *s = (CPUState *)opaque;
+	#endif
+
     switch(addr)
     {
 		
