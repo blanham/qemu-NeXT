@@ -442,7 +442,7 @@ static void handle_ti(ESPState *s)
     uint32_t dmalen, minlen;
 
     dmalen = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
-   	if(dmalen == 7240) dmalen = 7680; 
+	
 	if (dmalen==0) {
       dmalen=0x10000;
     }
@@ -453,7 +453,7 @@ static void handle_ti(ESPState *s)
     else if (s->ti_size < 0)
         minlen = (dmalen < -s->ti_size) ? dmalen : -s->ti_size;
     else
-        minlen = (dmalen < s->ti_size) ? dmalen : s->ti_size;
+        minlen = (dmalen > s->ti_size) ? dmalen : s->ti_size;
     DPRINTF("Transfer Information len %d\n", minlen);
     if (s->dma) {
         s->dma_left = minlen;
