@@ -18,9 +18,9 @@
 #define ESP_REGS 16
 #define TI_BUFSZ 16
 
-typedef struct ESPState ESPState;
+typedef struct ESP2State ESP2State;
 
-struct ESPState {
+struct ESP2State {
         SysBusDevice busdev;
         uint32_t it_shift;
         qemu_irq irq;
@@ -55,7 +55,7 @@ struct ESPState {
         ESP2DMAMemoryReadWriteFunc dma_memory_write;
         void *dma_opaque;
         int dma_enabled;
-        void (*dma_cb)(ESPState *s);
+        void (*dma_cb)(ESP2State *s);
 };
 /* R/W Registers */
 #define ESP_TCLO   0x0
@@ -126,7 +126,7 @@ struct ESPState {
 #define CFG1_RESREPT 0x40
 
 #define TCHI_FAS100A 0x4
-static void esp_raise_irq(ESPState *s)
+static void esp_raise_irq(ESP2State *s)
 {
     if (!(s->rregs[ESP_RSTAT] & STAT_INT)) {
         s->rregs[ESP_RSTAT] |= STAT_INT;
@@ -136,7 +136,7 @@ static void esp_raise_irq(ESPState *s)
     }
 }
 
-static void esp_lower_irq(ESPState *s)
+static void esp_lower_irq(ESP2State *s)
 {
     if (s->rregs[ESP_RSTAT] & STAT_INT) {
         s->rregs[ESP_RSTAT] &= ~STAT_INT;
@@ -167,7 +167,7 @@ static void esp_hard_reset(DeviceState *d)
 
 static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
 {
-    ESPState *s = (ESPState *)opaque;
+    ESP2State *s = (ESP2State *)opaque;
     uint32_t saddr;
     uint32_t old_val;
     saddr = addr >> s->it_shift;
@@ -239,7 +239,7 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
 }
 static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
 {
-    ESPState *s = (ESPState *)opaque;
+    ESP2State *s = (ESP2State *)opaque;
     uint32_t saddr;
 
     saddr = addr >> s->it_shift;
@@ -346,18 +346,18 @@ static const VMStateDescription vmstate_esp = {
         .minimum_version_id = 3,
         .minimum_version_id_old = 3,
         .fields      = (VMStateField []) {
-                VMSTATE_BUFFER(rregs, ESPState),
-                VMSTATE_BUFFER(wregs, ESPState),
-                VMSTATE_INT32(ti_size, ESPState),
-                VMSTATE_UINT32(ti_rptr, ESPState),
-                VMSTATE_UINT32(ti_wptr, ESPState),
-                VMSTATE_BUFFER(ti_buf, ESPState),
-                VMSTATE_UINT32(status, ESPState),
-                VMSTATE_UINT32(dma, ESPState),
-                VMSTATE_BUFFER(cmdbuf, ESPState),
-                VMSTATE_UINT32(cmdlen, ESPState),
-                VMSTATE_UINT32(do_cmd, ESPState),
-                VMSTATE_UINT32(dma_left, ESPState),
+                VMSTATE_BUFFER(rregs, ESP2State),
+                VMSTATE_BUFFER(wregs, ESP2State),
+                VMSTATE_INT32(ti_size, ESP2State),
+                VMSTATE_UINT32(ti_rptr, ESP2State),
+                VMSTATE_UINT32(ti_wptr, ESP2State),
+                VMSTATE_BUFFER(ti_buf, ESP2State),
+                VMSTATE_UINT32(status, ESP2State),
+                VMSTATE_UINT32(dma, ESP2State),
+                VMSTATE_BUFFER(cmdbuf, ESP2State),
+                VMSTATE_UINT32(cmdlen, ESP2State),
+                VMSTATE_UINT32(do_cmd, ESP2State),
+                VMSTATE_UINT32(dma_left, ESP2State),
                 VMSTATE_END_OF_LIST()
         }
 };
@@ -369,10 +369,10 @@ void esp_new_init(target_phys_addr_t espaddr, int it_shift,
 {
         DeviceState *dev;
         SysBusDevice *s;
-        ESPState *esp;
+        ESP2State *esp;
 
         dev = qdev_create(NULL, "esp");
-        esp = DO_UPCAST(ESPState, busdev.qdev, dev);
+        esp = DO_UPCAST(ESP2State, busdev.qdev, dev);
         esp->dma_memory_read = dma_memory_read;
         esp->dma_memory_write = dma_memory_write;
         esp->dma_opaque = dma_opaque;
@@ -411,7 +411,7 @@ static const struct SCSIBusOps esp_scsi_ops = {
 
 static int esp_init1(SysBusDevice *dev)
 {
-        ESPState *s = FROM_SYSBUS(ESPState, dev);
+        ESP2State *s = FROM_SYSBUS(ESP2State, dev);
         int esp_io_memory;
 
         sysbus_init_irq(dev, &s->irq);
@@ -429,8 +429,8 @@ static int esp_init1(SysBusDevice *dev)
 
 static SysBusDeviceInfo esp_info = {
         .init = esp_init1,
-        .qdev.name  = "esp",
-        .qdev.size  = sizeof(ESPState),
+        .qdev.name  = "esp-new",
+        .qdev.size  = sizeof(ESP2State),
         .qdev.vmsd  = &vmstate_esp,
         .qdev.reset = esp_hard_reset,
         .qdev.props = (Property[]) {
