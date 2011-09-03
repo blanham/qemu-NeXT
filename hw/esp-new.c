@@ -31,7 +31,8 @@ struct ESP2State {
         uint8_t fifo_buf[TI_BUFSZ];
         uint8_t fifo_rptr, fifo_wptr, fifo_size;
         uint16_t transfer_count;
-        /* will reuse some of these */
+        uint32_t data_len;
+         /* will reuse some of these */
         int32_t ti_size;
         uint32_t ti_rptr, ti_wptr;
         uint8_t ti_buf[TI_BUFSZ];
@@ -196,10 +197,10 @@ static void esp_hard_reset(DeviceState *d)
     /* reset transfer count */
     s->transfer_count = 0;
      
-    //s->do_cmd = 0;
-    //s->dma_cb = NULL;
+    s->do_cmd = 0;
+    s->dma_cb = NULL;
     
-    /* DERP? */
+    /* Double check to see if this is correct? */
     s->rregs[ESP_CFG1] = 7;
 }
 
@@ -209,8 +210,37 @@ static void esp_soft_reset(DeviceState *d)
 
     qemu_irq_lower(s->irq);
     //esp_hard_reset(d);//<- WTF?
+    
+    /* set all registers to 0 */
+    //memset(s->rregs, 0, ESP_REGS);
+    //memset(s->wregs, 0, ESP_REGS);
+    
+    /* FAS100A identity, need to look at other docs to see
+     * if this is necessary for other chips */
+    s->rregs[ESP_TCHI] = TCHI_FAS100A;
+    
+    /* clear fifo */
+    s->fifo_size = s->fifo_wptr = s->fifo_rptr = 0;
+    
+    /* non-dma mode */
+    s->dma = 0;
+   
+    /* reset transfer count */
+    //s->transfer_count = 0;
+     
+    //s->do_cmd = 0;
+    //s->dma_cb = NULL;
+    
+    /* Double check to see if this is correct? */
+    s->rregs[ESP_CFG1] = 7;
+
+    
+
+
     /* set the Reset interrupt bit */
     s->rregs[ESP_RINTR] = INTR_RST;
+
+    //esp_raise_irq(s);
 }
 
 static void parent_esp_reset(void *opaque, int irq, int level)
@@ -230,73 +260,162 @@ static void esp_gpio_demux(void *opaque, int irq, int level)
             break;
     }
 }
+static void esp_dma_done(ESP2State *s)
+{
+    s->rregs[ESP_RSTAT] |= STAT_TC;
+    s->rregs[ESP_RINTR] = INTR_BS;
+    s->rregs[ESP_RSEQ] = 0;
+    s->rregs[ESP_RFLAGS] = 0;
+    s->rregs[ESP_TCLO] = 0;
+    s->rregs[ESP_TCMID] = 0;
+    esp_raise_irq(s);
+}
+
+static void esp_do_dma(ESP2State *s)
+{
+    uint32_t len;
+    int to_device;
+
+    to_device = (s->data_len < 0);
+
+    len = s->dma_left;
+    /* fix this when I fix esp_transfer_data*/
+    if (s->do_cmd) {
+        abort();
+        DPRINTF("command len %d + %d\n", s->cmdlen, len);
+        s->dma_memory_read(s->dma_opaque, &s->cmdbuf[s->cmdlen], len);
+        s->fifo_size = 0;
+        s->cmdlen = 0;
+        s->do_cmd = 0;
+        //do_cmd(s, s->cmdbuf);
+        return;
+    }
+    /* handle async transfers to/from scsi bus */
+    if (s->async_len == 0) {
+        /* Defer until data is available.  */
+        return;
+    }
+   
+    /* check if this is backwards */ 
+    if (len > s->async_len) {
+        len = s->async_len;
+    }
+    
+    if (to_device) {
+        s->dma_memory_read(s->dma_opaque, s->async_buf, len);
+    } else {
+        s->dma_memory_write(s->dma_opaque, s->async_buf, len);
+    }
+    
+    s->dma_left -= len;
+    s->async_buf += len;
+    s->async_len -= len;
+    
+    if (to_device)
+        s->data_len += len;
+    else
+        s->data_len -= len;
+
+    if (s->async_len == 0) {
+        scsi_req_continue(s->current_req);
+        /* If there is still data to be read from the device then
+           complete the DMA operation immediately.  Otherwise defer
+           until the scsi layer has completed.  */
+        if (to_device || s->dma_left != 0 || s->fifo_size == 0) {
+            return;
+        }
+    }
+
+    /* Partially filled a scsi buffer. Complete immediately.  */
+    esp_dma_done(s);
+}
+
+
+/* TODO: This doesn't handle stacked commands */
 static uint32_t get_cmd(ESP2State *s, uint8_t *buf)
 {
-    uint32_t dmalen = 0;
-    int target = 0;
-
- /*   target = s->wregs[ESP_WBUSID] & BUSID_DID;
+    uint32_t xfer_len = 0;
+    
+    int target = s->wregs[ESP_WBUSID] & BUSID_DID;
+    
     if (s->dma) {
-        dmalen = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
-        s->dma_memory_read(s->dma_opaque, buf, dmalen);
+        /* check for zero should happen here, not in do_busid_cmd()? */
+        xfer_len = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
+        s->dma_memory_read(s->dma_opaque, buf, xfer_len);
     } else {
-        dmalen = s->ti_size;
-        memcpy(buf, s->ti_buf, dmalen);
+        xfer_len = s->fifo_size;
+        memcpy(buf, s->fifo_buf, s->fifo_size);
+        
+        /* what does this do? */
         buf[0] = buf[2] >> 5;
-    }
-    DPRINTF("get_cmd: len %d target %d\n", dmalen, target);
 
-    s->ti_size = 0;
-    s->ti_rptr = 0;
-    s->ti_wptr = 0;*/
+        /* now i think the fifo should be cleared */
+        s->fifo_size = s->fifo_rptr = s->fifo_wptr = 0;
+        /* zero FIFO count */
+        s->rregs[ESP_RFLAGS] &= 0xe0;
+    }
+    DPRINTF("get_cmd: len %d target %d\n", xfer_len, target);
+
+    /* Derp, why do we clear the fifo, when it might be a dma transfer? */
+    //s->ti_size = 0;
+    //s->ti_rptr = 0;
+    //s->ti_wptr = 0;
     /* zero FIFO count */
     //s->rregs[ESP_RFLAGS] &= 0xe0;
     
     if (s->current_req) {
         /* Started a new command before the old one finished.  Cancel it.  */
-        //scsi_req_cancel(s->current_req);
-        //s->async_len = 0;
+        scsi_req_cancel(s->current_req);
+        /* where else is this used? */
+        s->async_len = 0;
     }
 
     if (target >= ESP_MAX_DEVS || !s->bus.devs[target]) {
         // No such drive
+        /* I think these are right */
         s->rregs[ESP_RSTAT] = 0;
         s->rregs[ESP_RINTR] = INTR_DC;
         s->rregs[ESP_RSEQ] = SEQ_0;
         esp_raise_irq(s);
         return 0;
     }
-    //s->current_dev = s->bus.devs[target];
-    return dmalen;
+    s->current_dev = s->bus.devs[target];
+    return xfer_len;
 }
 static void do_busid_cmd(ESP2State *s, uint8_t *buf, uint8_t busid)
 {
-    //int32_t datalen;
-    //int lun;
+    int lun;
 
     DPRINTF("do_busid_cmd: busid 0x%x\n", busid);
-    //lun = busid & 7;
-    //s->current_req = scsi_req_new(s->current_dev, 0, lun, NULL);
-    //datalen = scsi_req_enqueue(s->current_req, buf);
-    //s->ti_size = datalen;
-    //if (datalen != 0) {
-   //     s->rregs[ESP_RSTAT] = STAT_TC;
-    //    s->dma_left = 0;
-    //    s->dma_counter = 0;
-    //    if (datalen > 0) {
-    //        s->rregs[ESP_RSTAT] |= STAT_DI;
-    //    } else {
-    //        s->rregs[ESP_RSTAT] |= STAT_DO;
-    //    }
-   //     scsi_req_continue(s->current_req);
-   // }
-   // s->rregs[ESP_RINTR] = INTR_BS | INTR_FC;
-   // s->rregs[ESP_RSEQ] = SEQ_CD;
-   // esp_raise_irq(s);
+    lun = busid & 7;
+    s->current_req = scsi_req_new(s->current_dev, 0, lun, NULL);
+    s->data_len = scsi_req_enqueue(s->current_req, buf);
+    
+    if (s->data_len != 0) {
+        /* not sure about this */
+        s->rregs[ESP_RSTAT] = STAT_TC;
+
+        /* where are these used? */
+        s->dma_left = 0;
+        s->dma_counter = 0;
+
+        if (s->data_len > 0) {
+            s->rregs[ESP_RSTAT] |= STAT_DI;
+        } else {
+            s->rregs[ESP_RSTAT] |= STAT_DO;
+        }
+        
+        scsi_req_continue(s->current_req);
+    }
+    s->rregs[ESP_RINTR] = INTR_BS | INTR_FC;
+    s->rregs[ESP_RSEQ] = SEQ_CD;
+   
+    esp_raise_irq(s);
 }
 
 static void do_cmd(ESP2State *s, uint8_t *buf)
 {
+    /* is this really necessary? can't we just get the value and use it? */ 
     uint8_t busid = buf[0];
 
     do_busid_cmd(s, &buf[1], busid);
@@ -312,6 +431,12 @@ static void handle_satn(ESP2State *s)
         return;
     }
     len = get_cmd(s, buf);
+    if(!(len == 0 || len == 7 || len == 11 || len == 13)){
+        fprintf(stderr,"invalid command length %i in handle_satn\n",
+            len);
+        abort();
+    }
+
     if (len)
         do_cmd(s, buf);
 }
@@ -326,6 +451,12 @@ static void handle_s_without_atn(ESP2State *s)
         return;
     }
     len = get_cmd(s, buf);
+    if(!(len == 0 || len == 7 || len == 11 || len == 13)){
+        fprintf(stderr,"invalid command length %i in handle_s_without_atn\n",
+            len);
+        abort();
+    }
+
     if (len) {
         do_busid_cmd(s, buf, 0);
     }
@@ -339,6 +470,7 @@ static void handle_satn_stop(ESP2State *s)
     }
     s->cmdlen = get_cmd(s, s->cmdbuf);
     if (s->cmdlen) {
+        /* check these to be sure they are right */
         DPRINTF("Set ATN & Stop: cmdlen %d\n", s->cmdlen);
         s->do_cmd = 1;
         s->rregs[ESP_RSTAT] = STAT_TC | STAT_CD;
@@ -346,6 +478,60 @@ static void handle_satn_stop(ESP2State *s)
         s->rregs[ESP_RSEQ] = SEQ_CD;
         esp_raise_irq(s);
     }
+}
+static void handle_ti(ESP2State *s)
+{
+    uint32_t dma_len, min_len;
+
+    dma_len = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
+	
+	if (dma_len == 0) {
+      dma_len = 0x10000;
+    }
+    s->dma_counter = dma_len;
+
+    min_len = dma_len;
+
+    if (s->do_cmd)
+        min_len = (dma_len < 32) ? dma_len : 32;
+    /* everything after this point i am unsure about */
+    else if (s->data_len < 0)
+        min_len = (dma_len < -s->data_len) ? dma_len : -s->data_len;
+    else
+        min_len = (dma_len > s->data_len) ? dma_len : s->data_len;
+    DPRINTF("Transfer Information len %d\n", min_len);
+    if (s->dma) {
+        s->dma_left = min_len;
+        s->rregs[ESP_RSTAT] &= ~STAT_TC;
+        esp_do_dma(s);
+    } else if (s->do_cmd) {
+        DPRINTF("command len %d\n", s->cmdlen);
+        s->data_len = 0;
+        s->cmdlen = 0;
+        s->do_cmd = 0;
+        do_cmd(s, s->cmdbuf);
+        return;
+    }
+}
+static void write_response(ESP2State *s)
+{
+    DPRINTF("Transfer status (status=%d)\n", s->status);
+    s->fifo_buf[0] = s->status;
+    s->fifo_buf[1] = 0;
+    if (s->dma) {
+        s->dma_memory_write(s->dma_opaque, s->fifo_buf, 2);
+        s->rregs[ESP_RSTAT] = STAT_TC | STAT_ST;
+        s->rregs[ESP_RINTR] = INTR_BS | INTR_FC;
+        s->rregs[ESP_RSEQ] = SEQ_CD;
+    } else {
+        s->fifo_size = 2;
+        /* are these pointers right? */
+        s->fifo_rptr = 0;
+        s->fifo_wptr = 0;
+        s->rregs[ESP_RFLAGS] = (s->rregs[ESP_RFLAGS] & 0xe0) | 2;
+        
+    }
+    esp_raise_irq(s);
 }
 
 static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
@@ -369,7 +555,11 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
                 s->fifo_size--;
                 if ((s->rregs[ESP_RSTAT] & STAT_PIO_MASK) == 0) {
                     /* Data out.  */
+                    /* TODO: add PIO support */
                     ESP_ERROR("PIO data read not implemented\n");
+                    /* added abort to make it easier to check if a
+                       guest tried to use this */
+                    abort();
                     s->rregs[ESP_FIFO] = 0;
                 } else {
                     s->rregs[ESP_FIFO] = s->fifo_buf[s->fifo_rptr++];
@@ -392,6 +582,7 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
                 break;
         case ESP_RINTR:
             if(s->irq_status == 1){
+            /* should doublecheck if these are right */
                 old_val = s->rregs[ESP_RINTR];
                 s->rregs[ESP_RINTR] = 0;
                 s->rregs[ESP_RSTAT] &= ~STAT_TC;
@@ -436,6 +627,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                  * length (65536 bytes)
                  */
                 s->rregs[ESP_RSTAT] &= ~STAT_TC;
+                s->rregs[saddr] = val & 0xFF;
                 break;
         case ESP_FIFO:
             if (s->fifo_size == TI_BUFSZ - 1) {
@@ -446,7 +638,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                 /* write value to fifo buffer */
                 s->fifo_buf[s->fifo_wptr++] = val & 0xff;
                 /* set FIFO count in RFLAGS */
-                s->rregs[ESP_RFLAGS] = (s->rregs[ESP_RFLAGS]&0xe0) | (s->ti_wptr);
+                s->rregs[ESP_RFLAGS] = (s->rregs[ESP_RFLAGS]&0xe0) | (s->fifo_wptr);
             }
             break;
         case ESP_CMD:
@@ -497,6 +689,28 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                         esp_raise_irq(s);
                     }
                     break;
+                case CMD_TI:
+                    DPRINTF("Transfer Information (%x)\n",val);
+                    handle_ti(s);
+                    break;
+                case CMD_ICCS:
+                    DPRINTF("Initiator Command Complete Sequence (%2.2x)\n", 
+                        val);
+                    write_response(s);
+                    /* these are supposed to be conditional */
+                    s->rregs[ESP_RINTR] = INTR_FC;
+                    s->rregs[ESP_RSTAT] |= STAT_MI;
+                    break;
+                case CMD_MSGACC:
+                    DPRINTF("Message Accepted (%2.2x)\n", val);
+                    s->rregs[ESP_RINTR] = INTR_DC;
+                    /* are these right ? */
+                    s->rregs[ESP_RSEQ] = 0;
+                    s->rregs[ESP_RFLAGS] = 0;
+                    esp_raise_irq(s);
+                    break;
+
+                /* error catching needs to be added to catch uninitialized registers */
                 case CMD_SEL:
                     DPRINTF("Select without ATN (%x)\n",val);
                     handle_s_without_atn(s);
@@ -613,18 +827,58 @@ void esp_new_init(target_phys_addr_t espaddr, int it_shift,
 /* SCSI call backs */
 static void esp_transfer_data(SCSIRequest *req, uint32_t len)
 {
-    DPRINTF("Transfer data %x\n",len);
-}
+    ESP2State *s = DO_UPCAST(ESP2State, busdev.qdev, req->bus->qbus.parent);
 
+    DPRINTF("transfer %d/%d\n", s->dma_left, s->data_len);
+    s->async_len = len;
+    s->async_buf = scsi_req_get_buf(req);
+    if (s->dma_left) {
+        esp_do_dma(s);
+    } else if (s->dma_counter != 0 && s->data_len <= 0) {
+        /* If this was the last part of a DMA transfer then the
+           completion interrupt is deferred to here.  */
+        esp_dma_done(s);
+    }
+
+}
 static void esp_command_complete(SCSIRequest *req, uint32_t status)
 {
-    DPRINTF("Command complete %x\n",status);
-}
+    ESP2State *s = DO_UPCAST(ESP2State, busdev.qdev, req->bus->qbus.parent);
 
+    DPRINTF("SCSI Command complete\n");
+    if (s->data_len != 0) {
+        DPRINTF("SCSI command completed unexpectedly\n");
+    }
+    s->data_len = 0;
+    s->dma_left = 0;
+    s->async_len = 0;
+    if (status) {
+        DPRINTF("Command failed\n");
+    }
+    s->status = status;
+    /* is this right? */
+    s->rregs[ESP_RSTAT] = STAT_ST;
+    esp_dma_done(s);
+    if (s->current_req) {
+        scsi_req_unref(s->current_req);
+        s->current_req = NULL;
+        s->current_dev = NULL;
+    }
+}
 static void esp_request_cancelled(SCSIRequest *req)
 {
+    ESP2State *s = DO_UPCAST(ESP2State, busdev.qdev, req->bus->qbus.parent);
+
     DPRINTF("Request cancelled\n");
+    
+    if (req == s->current_req) {
+        scsi_req_unref(s->current_req);
+        s->current_req = NULL;
+        s->current_dev = NULL;
+    }
 }
+
+
 
 static const struct SCSIBusOps esp_scsi_ops = {
     .transfer_data = esp_transfer_data,
