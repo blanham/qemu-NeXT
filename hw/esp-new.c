@@ -29,9 +29,10 @@ struct ESP2State {
         /* new vars */
         int irq_status;
         uint8_t fifo_buf[TI_BUFSZ];
+        uint8_t fifo_pbuf[TI_BUFSZ];
         uint8_t fifo_rptr, fifo_wptr, fifo_size;
         uint16_t transfer_count;
-        uint32_t data_len;
+        int32_t data_len;
          /* will reuse some of these */
         int32_t ti_size;
         uint32_t ti_rptr, ti_wptr;
@@ -60,6 +61,10 @@ struct ESP2State {
         void *dma_opaque;
         int dma_enabled;
         void (*dma_cb)(ESP2State *s);
+
+        
+        void (*deferred_cmd)(ESP2State *s);
+        int cmd_count;
 };
 /* R/W Registers */
 #define ESP_TCLO   0x0
@@ -87,8 +92,8 @@ struct ESP2State {
 #define ESP_WCCF   0x9
 #define ESP_WTEST  0xa
 
-#define CMD_DMA 0x80
-#define CMD_CMD 0x7f
+#define CMD_DMA      0x80
+#define CMD_CMD      0x7f
 
 #define CMD_NOP      0x00
 #define CMD_FLUSH    0x01
@@ -104,33 +109,52 @@ struct ESP2State {
 #define CMD_SELATNS  0x43
 #define CMD_ENSEL    0x44
 
-#define STAT_DO 0x00
-#define STAT_DI 0x01
-#define STAT_CD 0x02
-#define STAT_ST 0x03
-#define STAT_MO 0x06
-#define STAT_MI 0x07
+#define STAT_DO      0x00
+#define STAT_DI      0x01
+#define STAT_CD      0x02
+#define STAT_ST      0x03
+#define STAT_MO      0x06
+#define STAT_MI      0x07
 #define STAT_PIO_MASK 0x06
 
-#define STAT_TC 0x10
-#define STAT_PE 0x20
-#define STAT_GE 0x40
-#define STAT_INT 0x80
+#define STAT_TC      0x10
+#define STAT_PE      0x20
+#define STAT_GE      0x40
+#define STAT_INT     0x80
 
-#define BUSID_DID 0x07
+#define BUSID_DID    0x07
 
-#define INTR_FC 0x08
-#define INTR_BS 0x10
-#define INTR_DC 0x20
-#define INTR_RST 0x80
+#define INTR_FC      0x08
+#define INTR_BS      0x10
+#define INTR_DC      0x20
+#define INTR_RST     0x80
 
-#define SEQ_0 0x0
-#define SEQ_CD 0x4
+#define SEQ_0        0x00
+#define SEQ_CD       0x04
 
 #define CFG1_RESREPT 0x40
 
-#define TCHI_FAS100A 0x4
+#define CFG2_ENFEA   0x40
 
+#define TCHI_FAS100A 0x04
+
+/* chip versions, may have to add version select to esp_init() */
+#define ESP100      0x1
+#define NCR53C90    0x1
+#define ESP100A     0x2
+#define NCR53C90A   0x2
+/*
+int esp_parity(uint8_t x)
+{
+    x ^= x >> 1;
+    x ^= x >> 2;
+    x ^= x >> 4;
+    x ^= x >> 8;
+    x ^= x >> 16;
+    
+    return x & 1;
+}
+*/
 /* wrapper functions that set the interrupt register */
 static void esp_raise_irq(ESP2State *s)
 {
@@ -181,6 +205,7 @@ static void esp_hard_reset(DeviceState *d)
     ESP2State *s = container_of(d, ESP2State, busdev.qdev);
     
     /* set all registers to 0 */
+    /* this is wrong */
     memset(s->rregs, 0, ESP_REGS);
     memset(s->wregs, 0, ESP_REGS);
     
@@ -201,9 +226,9 @@ static void esp_hard_reset(DeviceState *d)
     s->dma_cb = NULL;
     
     /* Double check to see if this is correct? */
-    s->rregs[ESP_CFG1] = 7;
+    s->rregs[ESP_CFG1] &= 7;
 }
-
+/* needs a way to differentiate between chip and hardware soft resets */
 static void esp_soft_reset(DeviceState *d)
 {
     ESP2State *s = container_of(d, ESP2State, busdev.qdev);
@@ -220,25 +245,25 @@ static void esp_soft_reset(DeviceState *d)
     s->rregs[ESP_TCHI] = TCHI_FAS100A;
     
     /* clear fifo */
-    s->fifo_size = s->fifo_wptr = s->fifo_rptr = 0;
+    //s->fifo_size = s->fifo_wptr = s->fifo_rptr = 0;
     
     /* non-dma mode */
     s->dma = 0;
    
     /* reset transfer count */
     //s->transfer_count = 0;
+    s->data_len = 0;
      
-    //s->do_cmd = 0;
-    //s->dma_cb = NULL;
+    s->do_cmd = 0;
+    s->dma_cb = NULL;
     
     /* Double check to see if this is correct? */
-    s->rregs[ESP_CFG1] = 7;
+    s->rregs[ESP_CFG1] &= 7;
 
-    
-
-
-    /* set the Reset interrupt bit */
-    s->rregs[ESP_RINTR] = INTR_RST;
+    /* set the RINT RSTAT and RSEQ */
+    s->rregs[ESP_RSTAT] = 0;
+    s->rregs[ESP_RINTR] = 0;
+    s->rregs[ESP_RSEQ] = 0;
 
     //esp_raise_irq(s);
 }
@@ -347,8 +372,9 @@ static uint32_t get_cmd(ESP2State *s, uint8_t *buf)
         memcpy(buf, s->fifo_buf, s->fifo_size);
         
         /* what does this do? */
-        buf[0] = buf[2] >> 5;
-
+        //buf[0] = buf[2] >> 5;
+        //buf[0] = 0;
+        
         /* now i think the fifo should be cleared */
         s->fifo_size = s->fifo_rptr = s->fifo_wptr = 0;
         /* zero FIFO count */
@@ -392,6 +418,7 @@ static void do_busid_cmd(ESP2State *s, uint8_t *buf, uint8_t busid)
     s->data_len = scsi_req_enqueue(s->current_req, buf);
     
     if (s->data_len != 0) {
+        DPRINTF("excuting command\n");
         /* not sure about this */
         s->rregs[ESP_RSTAT] = STAT_TC;
 
@@ -400,8 +427,10 @@ static void do_busid_cmd(ESP2State *s, uint8_t *buf, uint8_t busid)
         s->dma_counter = 0;
 
         if (s->data_len > 0) {
+            DPRINTF("DATA IN\n");
             s->rregs[ESP_RSTAT] |= STAT_DI;
         } else {
+            DPRINTF("DATA IN\n");
             s->rregs[ESP_RSTAT] |= STAT_DO;
         }
         
@@ -484,13 +513,26 @@ static void handle_ti(ESP2State *s)
     uint32_t dma_len, min_len;
 
     dma_len = s->rregs[ESP_TCLO] | (s->rregs[ESP_TCMID] << 8);
-	
-	if (dma_len == 0) {
-      dma_len = 0x10000;
-    }
-    s->dma_counter = dma_len;
+    
+    if(s->rregs[ESP_CFG2] & CFG2_ENFEA){
+        /* disabled for now, until we properly handle device
+         * type inquiry */
+        //dma_len |= s->rregs[ESP_TCHI];
+    }	
 
-    min_len = dma_len;
+	if (dma_len == 0) {
+        /* 53c90/ESP100 have a default DMA size of 64k
+         * 53c6X has a default size of 16MB
+         */
+        if(s->rregs[ESP_CFG2] & CFG2_ENFEA)
+        {
+            dma_len = 0x1000000;
+        }else{
+            dma_len = 0x10000;
+        }
+    }
+    
+    s->dma_counter = dma_len;
 
     if (s->do_cmd)
         min_len = (dma_len < 32) ? dma_len : 32;
@@ -499,7 +541,9 @@ static void handle_ti(ESP2State *s)
         min_len = (dma_len < -s->data_len) ? dma_len : -s->data_len;
     else
         min_len = (dma_len > s->data_len) ? dma_len : s->data_len;
+    
     DPRINTF("Transfer Information len %d\n", min_len);
+    
     if (s->dma) {
         s->dma_left = min_len;
         s->rregs[ESP_RSTAT] &= ~STAT_TC;
@@ -532,6 +576,25 @@ static void write_response(ESP2State *s)
         
     }
     esp_raise_irq(s);
+}
+
+static void fifo_flush(ESP2State *s)
+{
+    /* should read pointer also be set to zero? */
+    s->fifo_wptr = 0;
+    s->fifo_rptr = 0;
+    s->fifo_size = 0;
+    s->fifo_buf[0] = 0; 
+    /* dunno if this is right either */
+    /* nope from what i can tell from the 53c90a datasheet
+    * clearing fifo only clears position, first byte of buffer and flags */ 
+    //s->rregs[ESP_RINTR] = INTR_FC;
+    
+    /* not sure if this command follows the datasheet */
+    //s->rregs[ESP_RSEQ] = 0;
+   
+    /* clear fifo count in fifo flags register */
+    s->rregs[ESP_RFLAGS] &= 0xe0;
 }
 
 static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
@@ -587,6 +650,7 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
                 s->rregs[ESP_RINTR] = 0;
                 s->rregs[ESP_RSTAT] &= ~STAT_TC;
                 s->rregs[ESP_RSEQ] = SEQ_CD;
+                        
                 esp_lower_irq(s);
                 s->irq_status = 0;
                 return old_val;
@@ -604,9 +668,12 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
         case ESP_RRES2:
                 DPRINTF("Read RRES2\n");
                 break;
-
+        case ESP_CFG2:
+            break;
+        case ESP_TCHI:
+            return TCHI_FAS100A;
         default:
-                DPRINTF("readb @ %x\n",addr);
+                DPRINTF("readb @ %x\n",(uint32_t)addr);
     }
 
     return s->rregs[saddr];
@@ -626,7 +693,9 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                  * transfer count bit, as 0 represents maximum transfer
                  * length (65536 bytes)
                  */
-                s->rregs[ESP_RSTAT] &= ~STAT_TC;
+                //should probably be set when stuff is copied to xfer_cnt
+                s->rregs[ESP_RSTAT] &= ~STAT_TC; 
+                
                 s->rregs[saddr] = val & 0xFF;
                 break;
         case ESP_FIFO:
@@ -635,65 +704,65 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
             } else {
                 /* fifo has another byte in it */
                 s->fifo_size++;
+                
                 /* write value to fifo buffer */
-                s->fifo_buf[s->fifo_wptr++] = val & 0xff;
+                //s->fifo_pbuf[s->fifo_wptr] = esp_parity(val & 0xFF);
+                
+                s->fifo_buf[s->fifo_wptr++] = val & 0xFF;
+                
                 /* set FIFO count in RFLAGS */
                 s->rregs[ESP_RFLAGS] = (s->rregs[ESP_RFLAGS]&0xe0) | (s->fifo_wptr);
             }
             break;
+        /* this is actually a two-deep FIFO, might need to handle that accordiingly */
         case ESP_CMD:
             /* next comand is a dma command if val & CMD_DMA */
             s->dma = (val & CMD_DMA ? 1 : 0); 
-            
+            s->cmd_count++; 
             switch(val & CMD_CMD)
-            {   
+            {  
+                /* Miscellaneous Group */ 
                 case CMD_NOP:
+                    /* some commands should be deferred and run here */
                     DPRINTF("NOP (%x)\n",val);
+                    /* transfer counter should be filled here */
+                    if(val & CMD_DMA){
+                        /* transfer counter = TCMID + TCLO /TCLHI */ 
+                        /* s->xfer_cnt = s->rregs[ESP_TCLO] | (s-rregs[ESP_TCMID] << 8);
+                         * if(s->rregs[ESP_CFG2] & CFG2_ENFEA){
+                         *      s->xfer_cnt |= s->rregs[ESP_TCHI] << 16;
+                         *  }
+                         */
+                    }
                     break; 
                 case CMD_FLUSH:
                     DPRINTF("Fifo Flush (%x)\n",val);
-                    /* should read pointer also be set to zero? */
-                    s->fifo_wptr = 0;
-                    s->fifo_size = 0;
-    
-                    /* dunno if this is right either */ 
-                    s->rregs[ESP_RINTR] = INTR_FC;
-                    
-                    /* not sure if this command follows the datasheet */
-                    //s->rregs[ESP_RSEQ] = 0;
-                    
-                    /* clear fifo count in fifo flags register */
-                    s->rregs[ESP_RFLAGS] &= 0xe0;
+                    fifo_flush(s);
                     break;
                 case CMD_RESET:
                     DPRINTF("Reset (%x)\n",val);
                     /* might want to rewrite this function, I'm not completely
                      * certain of the relationship between external reset interrupt
                      * an this reset */
-                    esp_soft_reset(&s->busdev.qdev);
+                    /* doesn't interrupt, therefore calling esp_soft_reset is incorrect */
+                    //esp_soft_reset(&s->busdev.qdev);
+                    abort(); 
                     break;
                 case CMD_BUSRESET:
                     DPRINTF("Bus Reset (%x)\n",val);
-                    
-                    /* clear transfer count zero */
-                    s->rregs[ESP_RSTAT] &= ~(STAT_TC);
-
-                    /* also needs: reset dma, reset seq step
-                    *clear sequence bits Enable,resel, Target, Initiator
-                    *set FIFO to empty
-                    */
-
                     /* this could be a seperate function */
-                    s->rregs[ESP_RINTR] = INTR_RST;
-                    if (!(s->wregs[ESP_CFG1] & CFG1_RESREPT)) {
+                    if (!(s->rregs[ESP_CFG1] & CFG1_RESREPT)) {
+                        DPRINTF("Bus Reset raising IRQ\n");
+                        s->rregs[ESP_RINTR] = INTR_RST;
                         esp_raise_irq(s);
                     }
                     break;
-                case CMD_TI:
+                /* Initiator State Group */
+                case CMD_TI:/* INT */
                     DPRINTF("Transfer Information (%x)\n",val);
                     handle_ti(s);
                     break;
-                case CMD_ICCS:
+                case CMD_ICCS:/* INT */
                     DPRINTF("Initiator Command Complete Sequence (%2.2x)\n", 
                         val);
                     write_response(s);
@@ -701,7 +770,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                     s->rregs[ESP_RINTR] = INTR_FC;
                     s->rregs[ESP_RSTAT] |= STAT_MI;
                     break;
-                case CMD_MSGACC:
+                case CMD_MSGACC:/* INT */
                     DPRINTF("Message Accepted (%2.2x)\n", val);
                     s->rregs[ESP_RINTR] = INTR_DC;
                     /* are these right ? */
@@ -709,8 +778,14 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                     s->rregs[ESP_RFLAGS] = 0;
                     esp_raise_irq(s);
                     break;
+                //case CMD_PAD: /* INT */
+                //case CMD_SATN: /*No INT */
+                
+                /* Target State Group 0x20 - 0x2b (and 0x4) not implemented */
 
+                /* Disconnected State Group */
                 /* error catching needs to be added to catch uninitialized registers */
+                /* CMD_SEL - CMD_SEL3 need to check if disconnected or not */
                 case CMD_SEL:
                     DPRINTF("Select without ATN (%x)\n",val);
                     handle_s_without_atn(s);
@@ -728,6 +803,8 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                     abort();
                     break;
             }
+            /* CMD can be read back */
+            s->rregs[ESP_CMD] = val;
             break;
         case ESP_WBUSID:
                 break;
@@ -735,7 +812,11 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                 DPRINTF("Write SEL %x\n",val);
                 break;
         case ESP_WSYNTP:
+            break;
         case ESP_WSYNO:
+            DPRINTF("Write SYNO Offset %x\n",val);
+            
+            s->rregs[saddr] = val;
             /* I imagine that these registers are unneeded, given the level
              * of scsi emulation in qemu (we don't emulate REQ/ACK cycles) 
              */    
@@ -749,6 +830,11 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
         case ESP_WTEST:
             ESP_ERROR("ESP TEST command unimplemented (%2.2x)\n", val);
             return;
+        /* 53C90A/ESP(FAS)100A and up register */
+        /* NeXT uses this to detect version of chip */
+        case ESP_CFG2:
+            s->rregs[saddr] = val;
+            break;
 
         default:
             ESP_ERROR("invalid write of 0x%02x at [0x%x]\n", val, saddr);
@@ -841,6 +927,7 @@ static void esp_transfer_data(SCSIRequest *req, uint32_t len)
     }
 
 }
+/* this needs to call deferred commands */
 static void esp_command_complete(SCSIRequest *req, uint32_t status)
 {
     ESP2State *s = DO_UPCAST(ESP2State, busdev.qdev, req->bus->qbus.parent);
@@ -875,6 +962,14 @@ static void esp_request_cancelled(SCSIRequest *req)
         scsi_req_unref(s->current_req);
         s->current_req = NULL;
         s->current_dev = NULL;
+        
+        s->rregs[ESP_RINTR] |= INTR_DC;
+        esp_raise_irq(s);
+    }else{
+
+        s->rregs[ESP_RINTR] |= INTR_DC;
+        esp_raise_irq(s);
+
     }
 }
 
