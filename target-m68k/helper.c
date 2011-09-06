@@ -826,9 +826,9 @@ target_phys_addr_t cpu_get_phys_page_debug(CPUState *env, target_ulong addr)
 
     if (get_physical_address(env, &phys_addr, &prot,
                              addr, ACCESS_INT) != 0) {
-        return -1;
+        //return -1;
     }
-    return phys_addr;
+    return addr;
 }
 
 int cpu_m68k_handle_mmu_fault (CPUState *env, target_ulong address, int rw,
