@@ -39,7 +39,7 @@ next_state_t next_state;
 nextfb_state_t nextfb_state;
 
 /* debug NeXT */
-//#define DEBUG_NEXT
+#define DEBUG_NEXT
 
 #ifdef DEBUG_NEXT
 #define DPRINTF(fmt, ...)                                       \
@@ -481,7 +481,7 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
 	#ifdef DEBUG_NEXT
     CPUState *s = (CPUState *)opaque;
 	#endif
-    
+   	//static uint32_t eventc = 0; 
     switch(addr)
     {
         case 0x14108:
@@ -489,7 +489,7 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
             return 0x7f;
         case 0x14020:
             DPRINTF("SCSI 4020  STATUS READ %X\n",next_state.scsi_csr_1);
-            return 0x3F;//next_state.scsi_csr_1; 
+            return next_state.scsi_csr_1; 
 
         case 0x14021:
             DPRINTF("SCSI 4021 STATUS READ %X\n",next_state.scsi_csr_2);
@@ -499,16 +499,16 @@ static uint32_t scr_readb(void*opaque, target_phys_addr_t addr)
 		 * is the latch instead of data, but no problems so far
          */ 
         case 0x1a000:
-            return 0xff	& (clock() >> 24);
+            return 0xff	& (clock() >> 16);
         case 0x1a001: 
-            return 0xff & (clock() >> 16);
-        case 0x1a002: 
             return 0xff & (clock() >> 8);
+        case 0x1a002: 
+            return 0xff & (clock() >> 0);
         case 0x1a003: 
             //A hell of a hack, but all we need is to have this change
             //consistently, so this works for now
 			//8/22/2011: mess uses almost the same thing apparetnly
-            return 0xFF & clock(); 
+            return 0xff;//0xFF & clock(); 
         
         default:
             DPRINTF("BMAP Read B @ %x\n",addr);
@@ -544,6 +544,7 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			if(value & SCSICSR_FIFOFL)
 			{
 				DPRINTF("SCSICSR FIFO Flush\n");
+				/* will have to add another irq to the esp if this is needed */
 				//esp_puflush_fifo(esp_g);
 				//qemu_irq_pulse(next_state.scsi_dma);
 			}
@@ -551,12 +552,12 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			if(value & SCSICSR_ENABLE)
             {
 				DPRINTF("SCSICSR Enable\n");
-				//qemu_irq_raise(next_state.scsi_dma);
+				qemu_irq_raise(next_state.scsi_dma);
 				//next_state.scsi_csr_1 = 0xc0;
-                next_state.scsi_csr_1 |= 0x1;
+                //next_state.scsi_csr_1 |= 0x1;
 			}
-            else
-                next_state.scsi_csr_1 &= ~SCSICSR_ENABLE;
+           // else
+                //next_state.scsi_csr_1 &= ~SCSICSR_ENABLE;
 			
             if(value & SCSICSR_RESET)
 			{
@@ -564,8 +565,9 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
             	//i think this should set DMADIR. CPUDMA and INTMASK to 0 
 				//abort();		
 			
-				qemu_irq_raise(next_state.scsi_reset);
+				//qemu_irq_raise(next_state.scsi_reset);
 			    next_state.scsi_csr_1 &= (uint8_t)~(SCSICSR_INTMASK |0x80|0x1);
+	
             }
 			if(value & SCSICSR_DMADIR)
 			{	
@@ -581,9 +583,9 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 			{
 				DPRINTF("SCSICSR INTMASK\n");
                 //int_mask &= ~0x1000;
-			    next_state.scsi_csr_1 |= value;
-			}else
-                next_state.scsi_csr_1 &= ~SCSICSR_INTMASK;
+			    //next_state.scsi_csr_1 |= value;
+			}//else
+                //next_state.scsi_csr_1 &= ~SCSICSR_INTMASK;
             if(value & 0x80)
             {
 
@@ -592,6 +594,7 @@ static void scr_writeb(void*opaque, target_phys_addr_t addr, uint32_t value)
 
             }
 			DPRINTF("SCSICSR Write: %x @ %x\n",value,s->pc);
+			    next_state.scsi_csr_1 = value;
            	return;
 		//Hardware timer latch - not implemented yet
 		case 0x1a000:
@@ -807,6 +810,9 @@ void nextfdc_irq(void *opaque, int n, int level)
 void nextscsi_irq(void *opaque, int n, int level)
 {
     DPRINTF("SCSI IRQ NUM %i %i\n",n,level);
+	//if(next_state.scsi_csr_1 & 0x20){
+	//	int_mask &= ~(0x1000);
+	//} 
 	next_irq(opaque, NEXT_SCSI_I, level);
 }
 void serial_irq(void *opaque, int n, int level)
@@ -1064,10 +1070,12 @@ void next_irq(void *opaque, int number, int level)
 
     }
     
-	if(int_mask & (1 << shift))
-        return;
+	if(int_mask & (1 << shift)){
+     	DPRINTF("%x interrupt masked\n",1 << shift);
+		return;
+    }
     
-    /* second switch triggers the correct interrupt */
+	/* second switch triggers the correct interrupt */
     if(level){
         int_status |= 1 << shift;
 		switch(number)
@@ -1092,6 +1100,7 @@ void next_irq(void *opaque, int number, int level)
 			/* level 6 - audio etherrx/tx dma */
 			case NEXT_ENTX_DMA_I:
 			case NEXT_ENRX_DMA_I:
+        	case NEXT_SCSI_DMA_I:
 			case NEXT_SND_I:
 			case NEXT_SCC_DMA_I:
 				m68k_set_irq_level(s,6,30);
