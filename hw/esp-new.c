@@ -30,23 +30,20 @@ struct ESP2State {
         int irq_status;
         uint8_t fifo_buf[TI_BUFSZ];
         uint8_t fifo_pbuf[TI_BUFSZ];
-        uint8_t fifo_rptr, fifo_wptr, fifo_size;
+        uint8_t fifo_rptr, fifo_wptr; 
+
+        int8_t fifo_size;
         uint16_t transfer_count;
         int32_t data_len;
-         /* will reuse some of these */
-        int32_t ti_size;
-        uint32_t ti_rptr, ti_wptr;
-        uint8_t ti_buf[TI_BUFSZ];
-        /*   */
+        
+        uint32_t cmdlen;
+        uint32_t do_cmd;
+
         uint32_t status;
         uint32_t dma;
         SCSIBus bus;
         SCSIDevice *current_dev;
         SCSIRequest *current_req;
-        /*  */
-        uint8_t cmdbuf[TI_BUFSZ];
-        uint32_t cmdlen;
-        uint32_t do_cmd;
 
         /* The amount of data left in the current DMA transfer.  */
         uint32_t dma_left;
@@ -308,7 +305,7 @@ static void esp_do_dma(ESP2State *s)
     if (s->do_cmd) {
         abort();
         DPRINTF("command len %d + %d\n", s->cmdlen, len);
-        s->dma_memory_read(s->dma_opaque, &s->cmdbuf[s->cmdlen], len);
+        s->dma_memory_read(s->dma_opaque, &s->fifo_buf[s->cmdlen], len);
         s->fifo_size = 0;
         s->cmdlen = 0;
         s->do_cmd = 0;
@@ -418,7 +415,7 @@ static void do_busid_cmd(ESP2State *s, uint8_t *buf, uint8_t busid)
     s->data_len = scsi_req_enqueue(s->current_req, buf);
     
     if (s->data_len != 0) {
-        DPRINTF("excuting command\n");
+        DPRINTF("executing command\n");
         /* not sure about this */
         s->rregs[ESP_RSTAT] = STAT_TC;
 
@@ -430,7 +427,7 @@ static void do_busid_cmd(ESP2State *s, uint8_t *buf, uint8_t busid)
             DPRINTF("DATA IN\n");
             s->rregs[ESP_RSTAT] |= STAT_DI;
         } else {
-            DPRINTF("DATA IN\n");
+            DPRINTF("DATA OUT\n");
             s->rregs[ESP_RSTAT] |= STAT_DO;
         }
         
@@ -497,7 +494,7 @@ static void handle_satn_stop(ESP2State *s)
         s->dma_cb = handle_satn_stop;
         return;
     }
-    s->cmdlen = get_cmd(s, s->cmdbuf);
+    s->cmdlen = get_cmd(s, s->fifo_buf);
     if (s->cmdlen) {
         /* check these to be sure they are right */
         DPRINTF("Set ATN & Stop: cmdlen %d\n", s->cmdlen);
@@ -553,7 +550,7 @@ static void handle_ti(ESP2State *s)
         s->data_len = 0;
         s->cmdlen = 0;
         s->do_cmd = 0;
-        do_cmd(s, s->cmdbuf);
+        do_cmd(s, s->fifo_buf);
         return;
     }
 }
@@ -576,6 +573,38 @@ static void write_response(ESP2State *s)
         
     }
     esp_raise_irq(s);
+}
+static void esp_chip_reset(ESP2State *s)
+{
+    /* set all registers to 0 */
+    memset(s->rregs, 0, ESP_REGS);
+    memset(s->wregs, 0, ESP_REGS);
+    
+    /* FAS100A identity, need to look at other docs to see
+     * if this is necessary for other chips */
+    s->rregs[ESP_TCHI] = TCHI_FAS100A;
+    
+    /* clear fifo */
+    s->fifo_size = s->fifo_wptr = s->fifo_rptr = 0;
+    s->fifo_buf[0] = s->fifo_pbuf[0] = 0;
+     
+    /* non-dma mode */
+    s->dma = 0;
+   
+    /* reset transfer count */
+    //s->transfer_count = 0;
+    s->data_len = 0;
+     
+    s->do_cmd = 0;
+    s->dma_cb = NULL;
+    
+    /* We are always busid 7 */
+    s->rregs[ESP_CFG1] &= 7;
+
+    /* set the RINT RSTAT and RSEQ */
+    s->rregs[ESP_RSTAT] = 0;
+    s->rregs[ESP_RINTR] = 0;
+    s->rregs[ESP_RSEQ] = 0;
 }
 
 static void fifo_flush(ESP2State *s)
@@ -652,8 +681,12 @@ static uint32_t esp_mem_readb(void *opaque, target_phys_addr_t addr)
                 s->rregs[ESP_RSEQ] = SEQ_CD;
                         
                 esp_lower_irq(s);
-                s->irq_status = 0;
+                //s->irq_status = 0;//DERP
                 return old_val;
+            } else {
+
+
+
             }
             break;
         case ESP_RSEQ:
@@ -725,7 +758,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                 case CMD_NOP:
                     /* some commands should be deferred and run here */
                     DPRINTF("NOP (%x)\n",val);
-                    /* transfer counter should be filled here */
+                    /* transfer counter is filled on a DMA NOP */
                     if(val & CMD_DMA){
                         /* transfer counter = TCMID + TCLO /TCLHI */ 
                         /* s->xfer_cnt = s->rregs[ESP_TCLO] | (s-rregs[ESP_TCMID] << 8);
@@ -745,12 +778,21 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                      * certain of the relationship between external reset interrupt
                      * an this reset */
                     /* doesn't interrupt, therefore calling esp_soft_reset is incorrect */
-                    //esp_soft_reset(&s->busdev.qdev);
-                    abort(); 
+                    esp_chip_reset(s);
                     break;
                 case CMD_BUSRESET:
                     DPRINTF("Bus Reset (%x)\n",val);
                     /* this could be a seperate function */
+                    /* Need to reset all devices on the bus */
+                    DeviceState *dev;
+                    int id;
+                    for (id = 0; id < s->bus.ndev; id++) {
+                        if (s->bus.devs[id]) {
+                            dev = &s->bus.devs[id]->qdev;
+                            dev->info->reset(dev);
+                        }
+                    }
+
                     if (!(s->rregs[ESP_CFG1] & CFG1_RESREPT)) {
                         DPRINTF("Bus Reset raising IRQ\n");
                         s->rregs[ESP_RINTR] = INTR_RST;
@@ -833,7 +875,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
         /* 53C90A/ESP(FAS)100A and up register */
         /* NeXT uses this to detect version of chip */
         case ESP_CFG2:
-            s->rregs[saddr] = val;
+            s->rregs[saddr] = 0;//val;
             break;
 
         default:
@@ -865,15 +907,12 @@ static const VMStateDescription vmstate_esp = {
     .fields      = (VMStateField []) {
         VMSTATE_BUFFER(rregs, ESP2State),
         VMSTATE_BUFFER(wregs, ESP2State),
-        VMSTATE_INT32(ti_size, ESP2State),
-        VMSTATE_UINT32(ti_rptr, ESP2State),
-        VMSTATE_UINT32(ti_wptr, ESP2State),
-        VMSTATE_BUFFER(ti_buf, ESP2State),
+        VMSTATE_INT8(fifo_size, ESP2State),
+        VMSTATE_UINT8(fifo_rptr, ESP2State),
+        VMSTATE_UINT8(fifo_wptr, ESP2State),
+        VMSTATE_BUFFER(fifo_buf, ESP2State),
         VMSTATE_UINT32(status, ESP2State),
         VMSTATE_UINT32(dma, ESP2State),
-        VMSTATE_BUFFER(cmdbuf, ESP2State),
-        VMSTATE_UINT32(cmdlen, ESP2State),
-        VMSTATE_UINT32(do_cmd, ESP2State),
         VMSTATE_UINT32(dma_left, ESP2State),
         VMSTATE_END_OF_LIST()
     }
