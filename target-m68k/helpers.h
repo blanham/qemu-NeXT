@@ -2,7 +2,7 @@
 
 DEF_HELPER_1(bitrev, i32, i32)
 DEF_HELPER_1(ff1, i32, i32)
-DEF_HELPER_2(bfffo, i32, i32, i32)
+DEF_HELPER_3(bfffo, i32, i32, i32,i32)
 DEF_HELPER_2(rol32, i32, i32, i32)
 DEF_HELPER_2(ror32, i32, i32, i32)
 DEF_HELPER_2(sats, i32, i32, i32)

@@ -3258,8 +3258,8 @@ DISAS_INSN(bitfield_reg)
         break;
     case 5: /* bfffo */
         gen_helper_rol32(reg2, tmp, offset);
-        gen_helper_bfffo(tmp, tmp, width);
-        tcg_gen_add_i32(reg2, tmp, offset);
+        gen_helper_bfffo(reg2, tmp, width,offset);
+        //tcg_gen_sub_i32(reg2, tmp, offset);
         break;
     case 6: /* bfset */
         tcg_gen_or_i32(reg, reg, mask);
@@ -3465,7 +3465,7 @@ DISAS_INSN(bitfield_mem)
         gen_helper_bitfield_store(src, offset, width, bitfield);
         break;
     case 5: /* bfffo */
-        gen_helper_bfffo(val, val, width);
+        gen_helper_bfffo(val, val, width,offset);
         tcg_gen_add_i32(reg, val, offset);
         break;
     case 6: /* bfset */
@@ -3491,42 +3491,6 @@ DISAS_INSN(ff1)
     reg = DREG(insn, 0);
     gen_logic_cc(s, reg, OS_LONG);
     gen_helper_ff1(reg, reg);
-}
-
-DISAS_INSN(chk)
-{
-    TCGv src;
-    TCGv reg;
-    int opsize;
-    int l1, l2;
-
-    switch ((insn >> 7) & 4) {
-    case 2:
-        opsize = OS_LONG;
-        break;
-    case 3:
-        opsize = OS_WORD;
-        break;
-    default:
-        gen_exception(s, s->pc - 2, EXCP_ILLEGAL);
-        return;
-    }
-    SRC_EA(src, opsize, -1, NULL);
-    reg = DREG(insn, 9);
-
-    l1 = gen_new_label();
-    l2 = gen_new_label();
-    tcg_gen_brcondi_i32(TCG_COND_GE, reg, 0, l1);
-    s->cc_op = CC_OP_FLAGS;
-    tcg_gen_ori_i32(QREG_CC_DEST, QREG_CC_DEST, CCF_N);
-    gen_exception(s, s->pc - 2, EXCP_CHK);
-    tcg_gen_br(l2);
-    gen_set_label(l1);
-    tcg_gen_brcond_i32(TCG_COND_LE, reg, src, l2);
-    s->cc_op = CC_OP_FLAGS;
-    tcg_gen_andi_i32(QREG_CC_DEST, QREG_CC_DEST, ~CCF_N);
-    gen_exception(s, s->pc - 2, EXCP_CHK);
-    gen_set_label(l2);
 }
 
 DISAS_INSN(strldsr)
@@ -4593,10 +4557,10 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(move,      2000, f000, M68000);
     INSN(move,      3000, f000, CF_ISA_A);
     INSN(move,      3000, f000, M68000);
-    INSN(chk,       4000, f040, M68000);
     INSN(strldsr,   40e7, ffff, CF_ISA_APLUSC);
     INSN(negx,      4080, fff8, CF_ISA_A);
     INSN(negx,      4000, ff00, M68000);
+    INSN(undef,     40c0, ffc0, M68000);
     INSN(move_from_sr, 40c0, fff8, CF_ISA_A);
     INSN(move_from_sr, 40c0, ffc0, M68000);
     INSN(lea,       41c0, f1c0, CF_ISA_A);

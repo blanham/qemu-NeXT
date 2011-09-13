@@ -496,8 +496,11 @@ void HELPER(movec_to)(CPUM68KState * env, uint32_t reg, uint32_t val)
         m68k_switch_sp(env);
         return;
     case M68K_CR_CAAR:
+        break;
     case M68K_CR_MSP:
-    case M68K_CR_ISP:
+    env->sp[M68K_SSP] = val;
+        return;
+case M68K_CR_ISP:
         break;
     /* MC68040/MC68LC040 */
     case M68K_CR_TC:
@@ -545,7 +548,9 @@ uint32_t HELPER(movec_from)(CPUM68KState * env, uint32_t reg)
     case M68K_CR_CACR:
         return env->cacr;
     case M68K_CR_CAAR:
+        break;
     case M68K_CR_MSP:
+        return env->sp[M68K_SSP];
     case M68K_CR_ISP:
         break;
     /* MC68040/MC68LC040 */
@@ -906,17 +911,26 @@ uint32_t HELPER(ff1)(uint32_t x)
     return n;
 }
 
-uint32_t HELPER(bfffo)(uint32_t arg, uint32_t width)
+uint32_t HELPER(bfffo)(uint32_t arg, uint32_t width, uint32_t offset)
 {
-    int n;
+    int n= 0;
     uint32_t mask;
-    mask = 0x80000000;
-    for (n = 0; n < width; n++) {
-       if (arg & mask)
-           break;
-       mask >>= 1;
+    fprintf(stderr,"bfffo arg: %x width %i offset %i\n",arg,width,offset);
+    mask = 1 << width;
+    while(mask)
+    {   if((arg & mask) == 1) break;
+        
+        n++;
+        mask >>= 1;
     }
-    return n;
+    if(n == 32)
+    {
+        return offset+width;
+    }else
+    {
+    fprintf(stderr,"bfffo returning %x\n",n);
+    return 32-n;
+}
 }
 
 uint32_t HELPER(rol32)(uint32_t val, uint32_t shift)
