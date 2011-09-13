@@ -229,7 +229,7 @@ static void esp_hard_reset(DeviceState *d)
 static void esp_soft_reset(DeviceState *d)
 {
     ESP2State *s = container_of(d, ESP2State, busdev.qdev);
-
+    DPRINTF("Soft Reset\n");
     qemu_irq_lower(s->irq);
     //esp_hard_reset(d);//<- WTF?
     
@@ -258,11 +258,11 @@ static void esp_soft_reset(DeviceState *d)
     s->rregs[ESP_CFG1] &= 7;
 
     /* set the RINT RSTAT and RSEQ */
-    s->rregs[ESP_RSTAT] = 0;
-    s->rregs[ESP_RINTR] = 0;
-    s->rregs[ESP_RSEQ] = 0;
+   // s->rregs[ESP_RSTAT] = 0;
+    s->rregs[ESP_RINTR] = INTR_RST;
+   // s->rregs[ESP_RSEQ] = 0;
 
-    //esp_raise_irq(s);
+    esp_raise_irq(s);
 }
 
 static void parent_esp_reset(void *opaque, int irq, int level)
@@ -840,6 +840,11 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
                     DPRINTF("Select with ATN and Stop (%x)\n",val);
                     handle_satn_stop(s);
                     break;
+                case CMD_ENSEL:
+                    DPRINTF("Enable selection (%2.2x)\n", val);
+                    s->rregs[ESP_RINTR] = 0;
+                    break;
+
                 default:
                     ESP_ERROR("Unhandled ESP command (%2.2x)\n", val);
                     abort();
@@ -875,7 +880,7 @@ static void esp_mem_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
         /* 53C90A/ESP(FAS)100A and up register */
         /* NeXT uses this to detect version of chip */
         case ESP_CFG2:
-            s->rregs[saddr] = 0;//val;
+            s->rregs[saddr] = val;
             break;
 
         default:
