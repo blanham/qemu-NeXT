@@ -1402,9 +1402,12 @@ NeXTcube
 M: Thomas Huth <th.huth+qemu@posteo.eu>
 S: Odd Fixes
 F: hw/m68k/next-*.c
+F: hw/m68k/trace-events
+F: hw/m68k/trace.h
 F: hw/display/next-fb.c
 F: include/hw/m68k/next-cube.h
 F: tests/functional/m68k/test_nextcube.py
+F: tests/qtest/next-cube-scsi-trace-test.c
 
 q800
 M: Laurent Vivier <laurent@vivier.eu>

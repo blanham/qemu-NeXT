@@ -800,10 +800,7 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         DPRINTF("SCSICSR2 Write: %"PRIx64 "\n", val);
         trace_next_scsi_csr_write(
             NEXT_SCSI_CSR_BASE + addr, old, val,
-            !!(val & SCSICSR_ENABLE),
-            !!(val & SCSICSR_RESET), !!(val & SCSICSR_FIFOFL),
-            !!(val & SCSICSR_DMADIR), !!(val & SCSICSR_CPUDMA),
-            !!(val & SCSICSR_INTMASK));
+            0, 0, 0, 0, 0, 0);
         s->scsi_csr_2 = val;
         break;
 

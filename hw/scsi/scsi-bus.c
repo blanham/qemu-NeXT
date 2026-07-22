@@ -1621,8 +1621,6 @@ void scsi_req_complete_failed(SCSIRequest *req, int host_status)
 
 void scsi_req_complete(SCSIRequest *req, int status)
 {
-    SCSISense sense = SENSE_CODE(NO_SENSE);
-
     assert(req->status == -1 && req->host_status == -1);
     req->status = status;
     req->host_status = SCSI_HOST_OK;
@@ -1641,15 +1639,18 @@ void scsi_req_complete(SCSIRequest *req, int status)
         req->dev->sense_is_ua = false;
     }
 
-    if (req->sense_len) {
-        sense = scsi_parse_sense_buf(req->sense, req->sense_len);
-    }
-
     scsi_req_ref(req);
     scsi_req_dequeue(req);
-    trace_scsi_req_complete(req->dev->id, req->lun, req->tag, req->status,
-                            req->residual, req->sense_len, sense.key,
-                            sense.asc, sense.ascq);
+    if (trace_event_get_state_backends(TRACE_SCSI_REQ_COMPLETE)) {
+        SCSISense sense = SENSE_CODE(NO_SENSE);
+
+        if (req->sense_len) {
+            sense = scsi_parse_sense_buf(req->sense, req->sense_len);
+        }
+        trace_scsi_req_complete(req->dev->id, req->lun, req->tag, req->status,
+                                req->residual, req->sense_len, sense.key,
+                                sense.asc, sense.ascq);
+    }
     req->bus->info->complete(req, req->residual);
 
     /* Cancelled requests might end up being completed instead of cancelled */

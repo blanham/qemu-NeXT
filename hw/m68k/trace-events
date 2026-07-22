@@ -1,4 +1,6 @@
 # See docs/devel/tracing.rst for syntax documentation.
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
 
 # next-cube.c
 next_scsi_csr_read(uint64_t addr, uint64_t value, uint64_t repeats) "addr=0x%" PRIx64 " value=0x%" PRIx64 " repeats=%" PRIu64
