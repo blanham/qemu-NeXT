@@ -99,24 +99,30 @@ static void test_next_cube_scsi_trace(void)
                                "next_scsi_dma_reg_write"));
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_dma_reg_read"));
+    g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
+                               "next_scsi_dma_transfer"));
+    g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
+                               "next_scsi_irq"));
+    g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
+                               "scsi_req_complete"));
 
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
-        "next_scsi_csr_write addr=0x0 old=0x0 value=0x39"));
+        "next_scsi_csr_write addr=0x2114020 old=0x0 value=0x39"));
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
-        "next_scsi_csr_read addr=0x0 value=0x39 repeats=1"));
+        "next_scsi_csr_read addr=0x2114020 value=0x39 repeats=1"));
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
-        "next_scsi_dma_reg_write addr=0x4010 value=0x4002000 "
+        "next_scsi_dma_reg_write addr=0x2004010 value=0x4002000 "
         "csr=0x0 next=0x4002000"));
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
-        "next_scsi_dma_reg_read addr=0x4010 value=0x4002000 "
+        "next_scsi_dma_reg_read addr=0x2004010 value=0x4002000 "
         "csr=0x0 next=0x4002000"));
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
-        "next_scsi_dma_reg_read addr=0x10 value=0x0 csr=0x0"));
+        "next_scsi_dma_reg_read addr=0x2000010 value=0x0 csr=0x0"));
 
     g_assert_cmpint(g_unlink(rom_path), ==, 0);
     g_assert_cmpint(g_unlink(disabled_log_path), ==, 0);

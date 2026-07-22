@@ -47,6 +47,11 @@
 #define RAM_SIZE    0x4000000
 #define ROM_FILE    "Rev_2.5_v66.bin"
 
+#define NEXT_DMA_BASE        0x02000000
+#define NEXT_SCSI_BASE       0x02114000
+#define NEXT_SCSI_CSR_OFFSET 0x20
+#define NEXT_SCSI_CSR_BASE   (NEXT_SCSI_BASE + NEXT_SCSI_CSR_OFFSET)
+
 
 #define TYPE_NEXT_RTC "next-rtc"
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTRTC, NEXT_RTC)
@@ -318,7 +323,9 @@ static bool next_trace_read_sample(NeXTTraceReadSampler *sampler,
 {
     if (sampler->repeats && sampler->addr == addr &&
         sampler->value == value) {
-        sampler->repeats++;
+        if (sampler->repeats != UINT64_MAX) {
+            sampler->repeats++;
+        }
     } else {
         sampler->addr = addr;
         sampler->value = value;
@@ -426,9 +433,9 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
     if (scsi_reg) {
         next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
 
-        trace_next_scsi_dma_reg_write(addr, val, dma->csr, dma->next,
-                                      dma->next_initbuf, dma->limit,
-                                      dma->start, dma->stop);
+        trace_next_scsi_dma_reg_write(NEXT_DMA_BASE + addr, val, dma->csr,
+                                      dma->next, dma->next_initbuf,
+                                      dma->limit, dma->start, dma->stop);
     }
 }
 
@@ -497,14 +504,18 @@ static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
      */
 
     if (scsi_reg &&
-        trace_event_get_state_backends(TRACE_NEXT_SCSI_DMA_REG_READ) &&
-        next_trace_read_sample(&next_state->trace_scsi_dma_read, addr, val)) {
-        next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
+        trace_event_get_state_backends(TRACE_NEXT_SCSI_DMA_REG_READ)) {
+        hwaddr trace_addr = NEXT_DMA_BASE + addr;
 
-        trace_next_scsi_dma_reg_read(addr, val, dma->csr, dma->next,
-                                     dma->next_initbuf, dma->limit,
-                                     dma->start, dma->stop,
-                                     next_state->trace_scsi_dma_read.repeats);
+        if (next_trace_read_sample(&next_state->trace_scsi_dma_read,
+                                   trace_addr, val)) {
+            next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
+
+            trace_next_scsi_dma_reg_read(
+                trace_addr, val, dma->csr, dma->next, dma->next_initbuf,
+                dma->limit, dma->start, dma->stop,
+                next_state->trace_scsi_dma_read.repeats);
+        }
     }
 
     return val;
@@ -776,7 +787,8 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         }
         DPRINTF("SCSICSR1 Write: %"PRIx64 "\n", val);
         trace_next_scsi_csr_write(
-            addr, old, val, !!(val & SCSICSR_ENABLE),
+            NEXT_SCSI_CSR_BASE + addr, old, val,
+            !!(val & SCSICSR_ENABLE),
             !!(val & SCSICSR_RESET), !!(val & SCSICSR_FIFOFL),
             !!(val & SCSICSR_DMADIR), !!(val & SCSICSR_CPUDMA),
             !!(val & SCSICSR_INTMASK));
@@ -787,7 +799,8 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         old = s->scsi_csr_2;
         DPRINTF("SCSICSR2 Write: %"PRIx64 "\n", val);
         trace_next_scsi_csr_write(
-            addr, old, val, !!(val & SCSICSR_ENABLE),
+            NEXT_SCSI_CSR_BASE + addr, old, val,
+            !!(val & SCSICSR_ENABLE),
             !!(val & SCSICSR_RESET), !!(val & SCSICSR_FIFOFL),
             !!(val & SCSICSR_DMADIR), !!(val & SCSICSR_CPUDMA),
             !!(val & SCSICSR_INTMASK));
@@ -819,9 +832,13 @@ static uint64_t next_scsi_csr_read(void *opaque, hwaddr addr, unsigned size)
         g_assert_not_reached();
     }
 
-    if (trace_event_get_state_backends(TRACE_NEXT_SCSI_CSR_READ) &&
-        next_trace_read_sample(&s->trace_csr_read, addr, val)) {
-        trace_next_scsi_csr_read(addr, val, s->trace_csr_read.repeats);
+    if (trace_event_get_state_backends(TRACE_NEXT_SCSI_CSR_READ)) {
+        hwaddr trace_addr = NEXT_SCSI_CSR_BASE + addr;
+
+        if (next_trace_read_sample(&s->trace_csr_read, trace_addr, val)) {
+            trace_next_scsi_csr_read(trace_addr, val,
+                                     s->trace_csr_read.repeats);
+        }
     }
 
     return val;
@@ -875,7 +892,8 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
                                 sysbus_mmio_get_region(sbd, 0));
 
     /* SCSI CSRs */
-    memory_region_add_subregion(&s->scsi_mem, 0x20, &s->scsi_csr_mem);
+    memory_region_add_subregion(&s->scsi_mem, NEXT_SCSI_CSR_OFFSET,
+                                &s->scsi_csr_mem);
 
     scsi_bus_legacy_handle_cmdline(&s->sysbus_esp.esp.bus);
 }
@@ -1392,7 +1410,7 @@ static void next_cube_init(MachineState *machine)
     empty_slot_init("next.unknown.1", 0x02112000, 0x10);
 
     /* SCSI */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, 0x02114000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, NEXT_SCSI_BASE);
     /* Floppy */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, 0x02114108);
     /* ESCC */
@@ -1449,7 +1467,7 @@ static void next_cube_init(MachineState *machine)
     /* DMA */
     memory_region_init_io(&m->dmamem, NULL, &next_dma_ops, machine,
                           "next.dma", 0x5000);
-    memory_region_add_subregion(sysmem, 0x02000000, &m->dmamem);
+    memory_region_add_subregion(sysmem, NEXT_DMA_BASE, &m->dmamem);
 }
 
 static void next_machine_class_init(ObjectClass *oc, const void *data)
