@@ -14,6 +14,7 @@ scsi_req_parsed(int target, int lun, int tag, int cmd, int mode, int xfer) "targ
 scsi_req_parsed_lba(int target, int lun, int tag, int cmd, uint64_t lba) "target %d lun %d tag %d command %d lba %"PRIu64
 scsi_req_parse_bad(int target, int lun, int tag, int cmd) "target %d lun %d tag %d command %d"
 scsi_req_build_sense(int target, int lun, int tag, int key, int asc, int ascq) "target %d lun %d tag %d key 0x%02x asc 0x%02x ascq 0x%02x"
+scsi_req_complete(int target, int lun, uint32_t tag, int status, uint64_t residual, uint32_t sense_len, uint8_t key, uint8_t asc, uint8_t ascq) "target=%d lun=%d tag=0x%x status=0x%x residual=%" PRIu64 " sense_len=%u key=0x%02x asc=0x%02x ascq=0x%02x"
 scsi_device_set_ua(int target, int lun, int key, int asc, int ascq) "target %d lun %d key 0x%02x asc 0x%02x ascq 0x%02x"
 scsi_report_luns(int target, int lun, int tag) "target %d lun %d tag %d"
 scsi_inquiry(int target, int lun, int tag, int cdb1, int cdb2) "target %d lun %d tag %d page 0x%02x/0x%02x"

@@ -1,0 +1,9 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# next-cube.c
+next_scsi_csr_read(uint64_t addr, uint64_t value, uint64_t repeats) "addr=0x%" PRIx64 " value=0x%" PRIx64 " repeats=%" PRIu64
+next_scsi_csr_write(uint64_t addr, uint64_t old, uint64_t value, int enable, int reset, int fifofl, int dmadir, int cpudma, int intmask) "addr=0x%" PRIx64 " old=0x%" PRIx64 " value=0x%" PRIx64 " enable=%d reset=%d fifofl=%d dmadir=%d cpudma=%d intmask=%d"
+next_scsi_dma_reg_read(uint64_t addr, uint64_t value, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t start, uint32_t stop, uint64_t repeats) "addr=0x%" PRIx64 " value=0x%" PRIx64 " csr=0x%x next=0x%x next_init=0x%x limit=0x%x start=0x%x stop=0x%x repeats=%" PRIu64
+next_scsi_dma_reg_write(uint64_t addr, uint64_t value, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t start, uint32_t stop) "addr=0x%" PRIx64 " value=0x%" PRIx64 " csr=0x%x next=0x%x next_init=0x%x limit=0x%x start=0x%x stop=0x%x"
+next_scsi_dma_transfer(const char *stage, int requested, int aligned, uint32_t base, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t saved_next, uint32_t saved_limit) "stage=%s direction=device-to-memory requested=%d aligned=%d base=0x%x csr=0x%x next=0x%x next_init=0x%x limit=0x%x saved_next=0x%x saved_limit=0x%x"
+next_scsi_irq(const char *source, int level, uint32_t status, uint32_t mask, uint32_t pc) "source=%s level=%d status=0x%x mask=0x%x pc=0x%x"
