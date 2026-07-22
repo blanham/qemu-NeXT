@@ -7,7 +7,16 @@
 #define NEXT_SCSI_CSR2 0x02114021
 #define NEXT_DMA_CSR   0x02000010
 #define NEXT_DMA_NEXT  0x02004010
+#define NEXT_ESP_FIFO  0x02114002
+#define NEXT_ESP_CMD   0x02114003
+#define NEXT_ESP_BUSID 0x02114004
+#define NEXT_ESP_INTR  0x02114005
 #define NEXT_ROM_SIZE  (128 * 1024)
+#define NEXT_DISK_SIZE (512 * 1024)
+
+#define ESP_CMD_SEL 0x41
+#define ESP_CMD_ICCS 0x11
+#define ESP_CMD_MSGACC 0x12
 
 #ifndef _WIN32
 #define DEV_NULL "/dev/null"
@@ -24,17 +33,23 @@ typedef struct AccessResults {
 
 typedef struct TestFiles {
     int rom_fd;
+    int disk_fd;
     int disabled_log_fd;
     int enabled_log_fd;
+    int completion_log_fd;
     char *rom_path;
+    char *disk_path;
     char *disabled_log_path;
     char *enabled_log_path;
+    char *completion_log_path;
 } TestFiles;
 
 static TestFiles test_files = {
     .rom_fd = -1,
+    .disk_fd = -1,
     .disabled_log_fd = -1,
     .enabled_log_fd = -1,
+    .completion_log_fd = -1,
 };
 
 static AccessResults run_accesses(const char *rom_path, const char *log_path,
@@ -96,6 +111,70 @@ static AccessResults run_accesses(const char *rom_path, const char *log_path,
     return results;
 }
 
+static uint8_t submit_cdb(QTestState *qts, const uint8_t cdb[6])
+{
+    uint8_t status;
+    int i;
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, 0);
+    for (i = 0; i < 6; i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, cdb[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SEL);
+
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_ICCS);
+    status = qtest_readb(qts, NEXT_ESP_FIFO);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_FIFO), ==, 0);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_MSGACC);
+    qtest_readb(qts, NEXT_ESP_INTR);
+
+    return status;
+}
+
+static void run_completion_commands(const char *rom_path,
+                                    const char *disk_path,
+                                    const char *log_path)
+{
+#ifdef CONFIG_TRACE_SIMPLE
+    const char *simple_trace_file = ",file=" DEV_NULL;
+#else
+    const char *simple_trace_file = "";
+#endif
+    static const uint8_t test_unit_ready[6] = { 0 };
+    static const uint8_t invalid_opcode[6] = { 0x1f };
+    g_autofree char *quoted_rom_path = g_shell_quote(rom_path);
+    g_autofree char *quoted_disk_path = g_shell_quote(disk_path);
+    g_autofree char *quoted_log_path = g_shell_quote(log_path);
+    g_autofree char *trace_arg =
+        g_strdup_printf("scsi_req_complete%s", simple_trace_file);
+    g_autofree char *quoted_trace_arg = g_shell_quote(trace_arg);
+#ifdef CONFIG_TRACE_SIMPLE
+    g_autofree char *default_trace_path = NULL;
+#endif
+    QTestState *qts;
+
+    qts = qtest_initf("-machine next-cube -bios %s "
+                      "-drive file=%s,if=scsi,format=raw "
+                      "-trace %s -D %s",
+                      quoted_rom_path, quoted_disk_path, quoted_trace_arg,
+                      quoted_log_path);
+#ifdef CONFIG_TRACE_SIMPLE
+    default_trace_path = g_strdup_printf(CONFIG_TRACE_FILE "-" FMT_pid,
+                                         qtest_pid(qts));
+#endif
+
+    /* Consume power-on unit attention before the two asserted completions. */
+    g_assert_cmphex(submit_cdb(qts, test_unit_ready), ==, 0x02);
+    g_assert_cmphex(submit_cdb(qts, invalid_opcode), ==, 0x02);
+    g_assert_cmphex(submit_cdb(qts, test_unit_ready), ==, 0x00);
+
+    qtest_quit(qts);
+
+#ifdef CONFIG_TRACE_SIMPLE
+    g_assert_false(g_file_test(default_trace_path, G_FILE_TEST_EXISTS));
+#endif
+}
+
 static void cleanup_temp_file(int *fd, char **path)
 {
     if (*fd >= 0) {
@@ -114,8 +193,11 @@ static void cleanup_test_files(void *opaque)
 
     qtest_remove_abrt_handler(files);
     cleanup_temp_file(&files->rom_fd, &files->rom_path);
+    cleanup_temp_file(&files->disk_fd, &files->disk_path);
     cleanup_temp_file(&files->disabled_log_fd, &files->disabled_log_path);
     cleanup_temp_file(&files->enabled_log_fd, &files->enabled_log_path);
+    cleanup_temp_file(&files->completion_log_fd,
+                      &files->completion_log_path);
 }
 
 static void test_next_cube_scsi_trace(void)
@@ -123,8 +205,10 @@ static void test_next_cube_scsi_trace(void)
     TestFiles *files = &test_files;
     g_autofree char *disabled_log = NULL;
     g_autofree char *enabled_log = NULL;
+    g_autofree char *completion_log = NULL;
     gsize disabled_log_len;
     gsize enabled_log_len;
+    gsize completion_log_len;
     AccessResults disabled;
     AccessResults enabled;
     qtest_add_abrt_handler(cleanup_test_files, files);
@@ -136,6 +220,13 @@ static void test_next_cube_scsi_trace(void)
     g_assert_cmpint(ftruncate(files->rom_fd, NEXT_ROM_SIZE), ==, 0);
     close(files->rom_fd);
     files->rom_fd = -1;
+
+    files->disk_fd = g_file_open_tmp("next-cube-scsi-disk-XXXXXX",
+                                     &files->disk_path, NULL);
+    g_assert_cmpint(files->disk_fd, >=, 0);
+    g_assert_cmpint(ftruncate(files->disk_fd, NEXT_DISK_SIZE), ==, 0);
+    close(files->disk_fd);
+    files->disk_fd = -1;
 
     files->disabled_log_fd =
         g_file_open_tmp("next-cube-scsi-trace-disabled-XXXXXX",
@@ -151,8 +242,17 @@ static void test_next_cube_scsi_trace(void)
     close(files->enabled_log_fd);
     files->enabled_log_fd = -1;
 
+    files->completion_log_fd =
+        g_file_open_tmp("next-cube-scsi-trace-completion-XXXXXX",
+                        &files->completion_log_path, NULL);
+    g_assert_cmpint(files->completion_log_fd, >=, 0);
+    close(files->completion_log_fd);
+    files->completion_log_fd = -1;
+
     disabled = run_accesses(files->rom_path, files->disabled_log_path, false);
     enabled = run_accesses(files->rom_path, files->enabled_log_path, true);
+    run_completion_commands(files->rom_path, files->disk_path,
+                            files->completion_log_path);
 
     g_assert_cmphex(enabled.csr1, ==, disabled.csr1);
     g_assert_cmphex(enabled.csr2, ==, disabled.csr2);
@@ -163,6 +263,9 @@ static void test_next_cube_scsi_trace(void)
                                       &disabled_log_len, NULL));
     g_assert_true(g_file_get_contents(files->enabled_log_path, &enabled_log,
                                       &enabled_log_len, NULL));
+    g_assert_true(g_file_get_contents(files->completion_log_path,
+                                      &completion_log,
+                                      &completion_log_len, NULL));
 
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_csr_write"));
@@ -200,6 +303,15 @@ static void test_next_cube_scsi_trace(void)
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
         "next_scsi_dma_reg_read addr=0x2000010 value=0x0 csr=0x0"));
+
+    g_assert_nonnull(g_strstr_len(
+        completion_log, completion_log_len,
+        "scsi_req_complete target=0 lun=0 tag=0x0 status=0x2 residual=0 "
+        "sense_len=18 key=0x05 asc=0x20 ascq=0x00"));
+    g_assert_nonnull(g_strstr_len(
+        completion_log, completion_log_len,
+        "scsi_req_complete target=0 lun=0 tag=0x0 status=0x0 residual=0 "
+        "sense_len=0 key=0x00 asc=0x00 ascq=0x00"));
 
     cleanup_test_files(files);
 }
