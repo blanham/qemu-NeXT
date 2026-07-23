@@ -3,6 +3,8 @@
 # next-mb8795.c
 next_mb8795_tx_kick(void) "scheduled ENTX transfer"
 next_mb8795_tx_complete(int result, size_t length, uint8_t status) "result=%d length=%zu status=0x%02x"
+next_mb8795_rx_filtered(size_t length, uint8_t mode) "length=%zu mode=0x%02x"
+next_mb8795_rx_complete(int result, size_t length, uint8_t status) "result=%d length=%zu status=0x%02x"
 
 # allwinner-sun8i-emac.c
 allwinner_sun8i_emac_mii_write_reg(uint32_t reg, uint32_t value) "MII write: reg=0x%" PRIx32 " value=0x%" PRIx32

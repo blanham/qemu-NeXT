@@ -74,6 +74,9 @@
 #define NEXT_DMA_ENTX_END_BIAS    15
 #define NEXT_DMA_ENTX_MIN_FRAME   60
 #define NEXT_DMA_ENTX_MAX_FRAME   1514
+#define NEXT_DMA_ENRX_BOP         0x40000000
+#define NEXT_DMA_ENRX_EOP         0x80000000
+#define NEXT_DMA_ENRX_MAX_FRAME   1518
 
 typedef enum NextDMASavedCapability {
     NEXT_DMA_SAVED_NONE,
@@ -167,6 +170,7 @@ struct NextDMAState {
     const NextDMAEthernetNotify *enet_notify;
     void *enet_opaque;
     bool rx_ready;
+    bool rx_keep_enabled;
     NextDMATraceReadSampler trace_scsi_dma_read;
 };
 
@@ -196,6 +200,75 @@ static void next_dma_update_irq(NextDMAState *s, NextDMAChannel channel)
         qemu_set_irq(s->irq[channel],
                      !!(s->channel[channel].csr &
                         NEXT_DMA_CSR_COMPLETE));
+    }
+}
+
+typedef struct NextDMAEnetRxRange {
+    uint32_t first_start;
+    uint32_t first_limit;
+    uint32_t second_start;
+    uint32_t second_limit;
+    size_t first_capacity;
+    size_t second_capacity;
+    bool chained;
+    bool consume_next_initbuf;
+} NextDMAEnetRxRange;
+
+static bool next_dma_enrx_address_valid(uint32_t value)
+{
+    return !(value & ~NEXT_DMA_ENET_ADDR_MASK);
+}
+
+static bool next_dma_enrx_decode(const NextDMAChannelState *c,
+                                 NextDMAEnetRxRange *range)
+{
+    memset(range, 0, sizeof(*range));
+    range->first_start = c->next_initbuf_valid
+                       ? c->next_initbuf : c->next;
+    range->first_limit = c->limit;
+    range->consume_next_initbuf = c->next_initbuf_valid;
+
+    if (!next_dma_enrx_address_valid(range->first_start) ||
+        !next_dma_enrx_address_valid(range->first_limit) ||
+        range->first_limit < range->first_start) {
+        return false;
+    }
+    range->first_capacity = range->first_limit - range->first_start;
+
+    if (c->csr & NEXT_DMA_CSR_SUPDATE) {
+        range->second_start = c->start;
+        range->second_limit = c->stop;
+        range->chained = true;
+        if (!next_dma_enrx_address_valid(range->second_start) ||
+            !next_dma_enrx_address_valid(range->second_limit) ||
+            range->second_limit < range->second_start) {
+            return false;
+        }
+        range->second_capacity =
+            range->second_limit - range->second_start;
+    }
+
+    return range->first_capacity || range->second_capacity;
+}
+
+static bool next_dma_enrx_ready_state(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_ENRX];
+
+    return (c->csr & NEXT_DMA_CSR_ENABLE) &&
+           !(c->csr & NEXT_DMA_CSR_COMPLETE);
+}
+
+static void next_dma_recompute_rx_ready(NextDMAState *s)
+{
+    bool ready = next_dma_enrx_ready_state(s);
+
+    if (ready == s->rx_ready) {
+        return;
+    }
+    s->rx_ready = ready;
+    if (s->enet_notify && s->enet_notify->rx_ready_changed) {
+        s->enet_notify->rx_ready_changed(s->enet_opaque, ready);
     }
 }
 
@@ -434,6 +507,9 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_update_irq(s, channel);
+    if (channel == NEXT_DMA_ENRX) {
+        next_dma_recompute_rx_ready(s);
+    }
 
     if (channel == NEXT_DMA_ENTX &&
         (value & NEXT_DMA_CMD_SETENABLE) &&
@@ -474,6 +550,10 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
 
     if (resolved.channel == NEXT_DMA_SCSI) {
         next_dma_trace_scsi_register_write(s, addr, value);
+    }
+    if (resolved.channel == NEXT_DMA_ENRX &&
+        resolved.reg != NEXT_DMA_REGISTER_CSR) {
+        next_dma_recompute_rx_ready(s);
     }
     trace_next_dma_reg_write(NEXT_DMA_MMIO_BASE + addr,
                              next_dma_channels[resolved.channel].name,
@@ -822,12 +902,117 @@ void next_dma_enet_tx_complete(NextDMAState *s, NextDMAResult result)
     next_dma_update_irq(s, NEXT_DMA_ENTX);
 }
 
+bool next_dma_enet_rx_ready(NextDMAState *s)
+{
+    return s->rx_ready;
+}
+
+NextDMAResult next_dma_enet_rx_write(NextDMAState *s,
+                                     const uint8_t *frame_fcs,
+                                     size_t length)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_ENRX];
+    NextDMAEnetRxRange range;
+    size_t first_length;
+    size_t second_length;
+    uint32_t first_end;
+    uint32_t final_end;
+
+    s->rx_keep_enabled = false;
+    if (!(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE) ||
+        !frame_fcs || !length || length > NEXT_DMA_ENRX_MAX_FRAME ||
+        !next_dma_enrx_decode(c, &range)) {
+        return NEXT_DMA_RANGE_ERROR;
+    }
+
+    first_length = MIN(length, range.first_capacity);
+    second_length = length - first_length;
+    if (second_length > range.second_capacity) {
+        return NEXT_DMA_NO_SPACE;
+    }
+    first_end = range.first_start + first_length;
+    final_end = second_length
+              ? range.second_start + second_length : first_end;
+
+    /*
+     * Validate both guest ranges before the first write.  This preserves
+     * the all-or-nothing receive contract for malformed DMA programming.
+     */
+    if ((first_length &&
+         !address_space_access_valid(s->as, range.first_start,
+                                     first_length, true,
+                                     MEMTXATTRS_UNSPECIFIED)) ||
+        (second_length &&
+         !address_space_access_valid(s->as, range.second_start,
+                                     second_length, true,
+                                     MEMTXATTRS_UNSPECIFIED))) {
+        return NEXT_DMA_RANGE_ERROR;
+    }
+    if ((first_length &&
+         address_space_write(s->as, range.first_start,
+                             MEMTXATTRS_UNSPECIFIED, frame_fcs,
+                             first_length) != MEMTX_OK) ||
+        (second_length &&
+         address_space_write(s->as, range.second_start,
+                             MEMTXATTRS_UNSPECIFIED,
+                             frame_fcs + first_length,
+                             second_length) != MEMTX_OK)) {
+        return NEXT_DMA_RANGE_ERROR;
+    }
+
+    c->saved_next = range.first_start | NEXT_DMA_ENRX_BOP;
+    if (second_length) {
+        c->saved_limit = range.first_limit;
+        c->next = final_end | NEXT_DMA_ENRX_EOP;
+        c->limit = range.second_limit;
+        c->csr &= ~NEXT_DMA_CSR_SUPDATE;
+    } else {
+        c->saved_limit = first_end | NEXT_DMA_ENRX_EOP;
+        if (range.chained) {
+            c->next = range.second_start;
+            c->limit = range.second_limit;
+            c->csr &= ~NEXT_DMA_CSR_SUPDATE;
+            s->rx_keep_enabled = true;
+        } else {
+            c->next = first_end | NEXT_DMA_ENRX_EOP;
+        }
+    }
+    if (range.consume_next_initbuf) {
+        c->next_initbuf_valid = false;
+    }
+
+    return NEXT_DMA_OK;
+}
+
+void next_dma_enet_rx_complete(NextDMAState *s, NextDMAResult result)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_ENRX];
+
+    if (result == NEXT_DMA_OK) {
+        c->csr |= NEXT_DMA_CSR_COMPLETE;
+        c->csr &= ~NEXT_DMA_CSR_SUPDATE;
+        if (!s->rx_keep_enabled) {
+            c->csr &= ~NEXT_DMA_CSR_ENABLE;
+        }
+    } else {
+        c->csr |= NEXT_DMA_CSR_BUSEXC | NEXT_DMA_CSR_COMPLETE;
+        c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+    }
+    s->rx_keep_enabled = false;
+    next_dma_update_irq(s, NEXT_DMA_ENRX);
+    next_dma_recompute_rx_ready(s);
+}
+
 void next_dma_set_ethernet_notify(NextDMAState *s,
                                   const NextDMAEthernetNotify *notify,
                                   void *opaque)
 {
     s->enet_notify = notify;
     s->enet_opaque = opaque;
+    if (notify) {
+        next_dma_recompute_rx_ready(s);
+    }
 }
 
 static void next_dma_reset_hold(Object *obj, ResetType type)
@@ -837,11 +1022,12 @@ static void next_dma_reset_hold(Object *obj, ResetType type)
 
     memset(s->channel, 0, sizeof(s->channel));
     memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
-    s->rx_ready = false;
+    s->rx_keep_enabled = false;
 
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
         qemu_irq_lower(s->irq[channel]);
     }
+    next_dma_recompute_rx_ready(s);
 }
 
 static int next_dma_post_load(void *opaque, int version_id)
@@ -864,15 +1050,10 @@ static int next_dma_post_load(void *opaque, int version_id)
         next_dma_update_irq(s, channel);
     }
 
-    /*
-     * Ethernet transfer support lands with the MB8795.  Until then there
-     * is no receive-ready DMA state, so the only valid cached value is
-     * false.  Host callbacks and their opaque are deliberately not VMState.
-     */
+    /* Host callbacks and their opaque are deliberately not VMState. */
     s->rx_ready = false;
-    if (s->enet_notify && s->enet_notify->rx_ready_changed) {
-        s->enet_notify->rx_ready_changed(s->enet_opaque, s->rx_ready);
-    }
+    s->rx_keep_enabled = false;
+    next_dma_recompute_rx_ready(s);
 
     return 0;
 }

@@ -41,6 +41,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "trace.h"
+#include <zlib.h>
 
 #define NEXT_MB8795_MMIO_SIZE 0x10
 
@@ -56,8 +57,17 @@
 
 #define NEXT_MB8795_TXSTAT_READY 0x80
 #define NEXT_MB8795_TXSTAT_UNDERFLOW 0x08
+#define NEXT_MB8795_RXSTAT_OK 0x80
+#define NEXT_MB8795_RXSTAT_OVERFLOW 0x01
 #define NEXT_MB8795_RESET_MODE   0x80
 #define NEXT_MB8795_MAX_FRAME    1514
+#define NEXT_MB8795_FCS_SIZE     4
+
+#define NEXT_MB8795_RXMODE_TEST        0x80
+#define NEXT_MB8795_RXMODE_ADDRSIZE    0x10
+#define NEXT_MB8795_RXMODE_SHORTENABLE 0x08
+#define NEXT_MB8795_RXMODE_RESETENABLE 0x04
+#define NEXT_MB8795_RXMODE_MASK        0x03
 
 struct NextMB8795State {
     SysBusDevice parent_obj;
@@ -113,6 +123,9 @@ static void next_mb8795_leave_reset(NextMB8795State *s)
     s->reset = false;
     s->tx_status |= NEXT_MB8795_TXSTAT_READY;
     next_mb8795_update_tx_irq(s);
+    if (s->nic && next_dma_enet_rx_ready(s->dma)) {
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
+    }
 }
 
 static uint64_t next_mb8795_read(void *opaque, hwaddr addr,
@@ -217,13 +230,101 @@ static const MemoryRegionOps next_mb8795_ops = {
 
 static bool next_mb8795_can_receive(NetClientState *nc)
 {
-    return false;
+    NextMB8795State *s = qemu_get_nic_opaque(nc);
+
+    return !s->reset && next_dma_enet_rx_ready(s->dma);
+}
+
+static bool next_mb8795_station_match(NextMB8795State *s,
+                                      const uint8_t *destination)
+{
+    size_t length = s->rx_mode & NEXT_MB8795_RXMODE_ADDRSIZE ? 5 : 6;
+
+    return !memcmp(destination, s->station, length);
+}
+
+static bool next_mb8795_accept(NextMB8795State *s,
+                               const uint8_t *buf, size_t size)
+{
+    static const uint8_t broadcast[6] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    uint8_t mode;
+    bool multicast;
+
+    if (size < sizeof(s->station) ||
+        (s->rx_mode &
+         ~(NEXT_MB8795_RXMODE_ADDRSIZE |
+           NEXT_MB8795_RXMODE_SHORTENABLE |
+           NEXT_MB8795_RXMODE_RESETENABLE |
+           NEXT_MB8795_RXMODE_TEST |
+           NEXT_MB8795_RXMODE_MASK)) ||
+        (s->rx_mode &
+         (NEXT_MB8795_RXMODE_TEST | NEXT_MB8795_RXMODE_RESETENABLE))) {
+        return false;
+    }
+
+    mode = s->rx_mode & NEXT_MB8795_RXMODE_MASK;
+    multicast = buf[0] & 1;
+    switch (mode) {
+    case 0:
+        return false;
+    case 1:
+        return next_mb8795_station_match(s, buf) ||
+               !memcmp(buf, broadcast, sizeof(broadcast)) ||
+               (multicast &&
+                !memcmp(buf, s->station, 3));
+    case 2:
+        return next_mb8795_station_match(s, buf) ||
+               !memcmp(buf, broadcast, sizeof(broadcast)) ||
+               multicast;
+    case 3:
+        return true;
+    default:
+        g_assert_not_reached();
+    }
 }
 
 static ssize_t next_mb8795_receive(NetClientState *nc,
                                    const uint8_t *buf, size_t size)
 {
-    return 0;
+    NextMB8795State *s = qemu_get_nic_opaque(nc);
+    uint8_t frame_fcs[NEXT_MB8795_MAX_FRAME + NEXT_MB8795_FCS_SIZE];
+    NextDMAResult result;
+    uint32_t fcs;
+
+    if (!next_mb8795_accept(s, buf, size)) {
+        trace_next_mb8795_rx_filtered(size, s->rx_mode);
+        return size;
+    }
+
+    if (size > NEXT_MB8795_MAX_FRAME ||
+        size > SIZE_MAX - NEXT_MB8795_FCS_SIZE) {
+        result = NEXT_DMA_NO_SPACE;
+    } else {
+        memcpy(frame_fcs, buf, size);
+        /*
+         * Standard Ethernet CRC32, emitted least-significant byte first.
+         * Independent check: "123456789" yields 26 39 f4 cb on the wire.
+         */
+        fcs = crc32(0, buf, size);
+        frame_fcs[size] = fcs;
+        frame_fcs[size + 1] = fcs >> 8;
+        frame_fcs[size + 2] = fcs >> 16;
+        frame_fcs[size + 3] = fcs >> 24;
+        result = next_dma_enet_rx_write(s->dma, frame_fcs,
+                                        size + NEXT_MB8795_FCS_SIZE);
+    }
+
+    next_dma_enet_rx_complete(s->dma, result);
+    if (result == NEXT_DMA_OK) {
+        s->rx_status |= NEXT_MB8795_RXSTAT_OK;
+    } else {
+        s->rx_status |= NEXT_MB8795_RXSTAT_OVERFLOW;
+    }
+    next_mb8795_update_rx_irq(s);
+    trace_next_mb8795_rx_complete(result, size, s->rx_status);
+    return size;
 }
 
 static NetClientInfo next_mb8795_net_info = {

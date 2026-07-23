@@ -45,11 +45,21 @@
 #define NEXT_ENTX_START       (NEXT_ENTX_CSR + 0x4008)
 #define NEXT_ENTX_STOP        (NEXT_ENTX_CSR + 0x400c)
 #define NEXT_ENTX_NEXT_INIT   (NEXT_ENTX_CSR + 0x4200)
+#define NEXT_ENRX_CSR         (NEXT_DMA_BASE + 0x0150)
+#define NEXT_ENRX_SAVED_NEXT  (NEXT_ENRX_CSR + 0x3ff0)
+#define NEXT_ENRX_SAVED_LIMIT (NEXT_ENRX_CSR + 0x3ff4)
+#define NEXT_ENRX_NEXT        (NEXT_ENRX_CSR + 0x4000)
+#define NEXT_ENRX_LIMIT       (NEXT_ENRX_CSR + 0x4004)
+#define NEXT_ENRX_START       (NEXT_ENRX_CSR + 0x4008)
+#define NEXT_ENRX_STOP        (NEXT_ENRX_CSR + 0x400c)
+#define NEXT_ENRX_NEXT_INIT   (NEXT_ENRX_CSR + 0x4200)
 #define NEXT_INTR_STATUS 0x02007000
 #define NEXT_ROM_SIZE    (128 * 1024)
 #define NEXT_TX_BUFFER   0x04010000
+#define NEXT_RX_BUFFER   0x04012000
 #define NEXT_ENRX_IRQ    (1U << 9)
 #define NEXT_ENTX_IRQ    (1U << 10)
+#define NEXT_ENRX_DMA_IRQ (1U << 27)
 #define NEXT_ENTX_DMA_IRQ (1U << 28)
 
 #define DMA_SETENABLE      0x00010000
@@ -64,6 +74,8 @@
 #define ENTX_EOP           0x80000000
 #define ENTX_ADDR_MASK     0x0fffffff
 #define ENTX_END_BIAS      15
+#define ENRX_BOP            0x40000000
+#define ENRX_EOP            0x80000000
 
 enum {
     EN_TXSTAT = 0x00,
@@ -81,6 +93,22 @@ enum {
 #define EN_RXSTAT_OK        0x80
 #define EN_RXSTAT_OVERFLOW  0x01
 #define EN_RESET_MODE       0x80
+
+#ifndef _WIN32
+static const uint8_t rx_frame[60] = {
+    0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    0x52, 0x54, 0x00, 0x65, 0x43, 0x21,
+    0x08, 0x00,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+};
+
+static const uint8_t rx_fcs[4] = { 0xd5, 0xbd, 0x90, 0xc3 };
+#endif
 
 typedef struct TestROM {
     int fd;
@@ -104,6 +132,16 @@ typedef struct TxPointers {
     uint32_t stop;
     uint32_t next_init;
 } TxPointers;
+
+typedef struct RxPointers {
+    uint32_t saved_next;
+    uint32_t saved_limit;
+    uint32_t next;
+    uint32_t limit;
+    uint32_t start;
+    uint32_t stop;
+    uint32_t next_init;
+} RxPointers;
 #endif
 
 static void cleanup_test_rom(void *opaque)
@@ -210,6 +248,78 @@ static void socket_read_frame(int fd, uint8_t *frame, size_t length)
     socket_read_exact(fd, &wire_length, sizeof(wire_length));
     g_assert_cmpuint(ntohl(wire_length), ==, length);
     socket_read_exact(fd, frame, length);
+}
+
+static void socket_write_frame(int fd, const uint8_t *frame, size_t length)
+{
+    uint32_t wire_length = htonl(length);
+    const uint8_t *parts[] = {
+        (const uint8_t *)&wire_length,
+        frame,
+    };
+    const size_t lengths[] = { sizeof(wire_length), length };
+    size_t part;
+
+    for (part = 0; part < ARRAY_SIZE(parts); part++) {
+        size_t offset = 0;
+
+        while (offset < lengths[part]) {
+            ssize_t ret;
+
+            do {
+                ret = send(fd, parts[part] + offset,
+                           lengths[part] - offset, 0);
+            } while (ret < 0 && errno == EINTR);
+            g_assert_cmpint(ret, >, 0);
+            offset += ret;
+        }
+    }
+}
+
+static void rx_program(QTestState *qts, uint32_t first_start,
+                       uint32_t first_limit, uint32_t second_start,
+                       uint32_t second_limit, bool chain)
+{
+    qtest_writel(qts, NEXT_ENRX_CSR, DMA_RESET);
+    qtest_writel(qts, NEXT_ENRX_NEXT, first_start);
+    qtest_writel(qts, NEXT_ENRX_LIMIT, first_limit);
+    qtest_writel(qts, NEXT_ENRX_START, second_start);
+    qtest_writel(qts, NEXT_ENRX_STOP, second_limit);
+    qtest_writel(qts, NEXT_ENRX_CSR,
+                 DMA_SETENABLE | (chain ? DMA_SETSUPDATE : 0));
+}
+
+static void rx_prepare_controller(QTestState *qts, uint8_t mode)
+{
+    qtest_writeb(qts, NEXT_MB8795_BASE + EN_RESET, 0);
+    qtest_writeb(qts, NEXT_MB8795_BASE + EN_RXMODE, mode);
+}
+
+static RxPointers rx_read_pointers(QTestState *qts)
+{
+    RxPointers pointers = {
+        .saved_next = qtest_readl(qts, NEXT_ENRX_SAVED_NEXT),
+        .saved_limit = qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT),
+        .next = qtest_readl(qts, NEXT_ENRX_NEXT),
+        .limit = qtest_readl(qts, NEXT_ENRX_LIMIT),
+        .start = qtest_readl(qts, NEXT_ENRX_START),
+        .stop = qtest_readl(qts, NEXT_ENRX_STOP),
+        .next_init = qtest_readl(qts, NEXT_ENRX_NEXT_INIT),
+    };
+
+    return pointers;
+}
+
+static void rx_assert_pointers_equal(const RxPointers *actual,
+                                     const RxPointers *expected)
+{
+    g_assert_cmphex(actual->saved_next, ==, expected->saved_next);
+    g_assert_cmphex(actual->saved_limit, ==, expected->saved_limit);
+    g_assert_cmphex(actual->next, ==, expected->next);
+    g_assert_cmphex(actual->limit, ==, expected->limit);
+    g_assert_cmphex(actual->start, ==, expected->start);
+    g_assert_cmphex(actual->stop, ==, expected->stop);
+    g_assert_cmphex(actual->next_init, ==, expected->next_init);
 }
 
 static void tx_write_saved_sentinels(QTestState *qts)
@@ -832,6 +942,356 @@ static void test_tx_ack_isolation(void)
 
     tx_harness_stop(&harness);
 }
+
+static void test_rx_fcs_single_buffer(void)
+{
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t received[sizeof(rx_frame) + sizeof(rx_fcs)];
+
+    memset(received, 0xa5, sizeof(received));
+    qtest_memwrite(qts, NEXT_RX_BUFFER, received, sizeof(received));
+    rx_prepare_controller(qts, 3);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0,
+               false);
+
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, received, sizeof(received));
+
+    g_assert_cmpmem(received, sizeof(rx_frame),
+                    rx_frame, sizeof(rx_frame));
+    g_assert_cmpmem(received + sizeof(rx_frame), sizeof(rx_fcs),
+                    rx_fcs, sizeof(rx_fcs));
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
+                    NEXT_RX_BUFFER | ENRX_BOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT), ==,
+                    (NEXT_RX_BUFFER + sizeof(received)) | ENRX_EOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT), ==,
+                    (NEXT_RX_BUFFER + sizeof(received)) | ENRX_EOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE |
+                     DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_ENRX_DMA_IRQ, ==, NEXT_ENRX_DMA_IRQ);
+
+    tx_harness_stop(&harness);
+}
+
+static void rx_filter_case(uint8_t mode, const uint8_t destination[6],
+                           const uint8_t station[6], bool accepted)
+{
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t frame[sizeof(rx_frame)];
+    uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
+    uint8_t after[sizeof(before)];
+    RxPointers expected;
+    RxPointers actual;
+    size_t i;
+
+    memcpy(frame, rx_frame, sizeof(frame));
+    memcpy(frame, destination, 6);
+    memset(before, 0xa5, sizeof(before));
+    qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+    for (i = 0; i < 6; i++) {
+        en_writeb(qts, EN_ADDR + i, station[i]);
+    }
+    rx_prepare_controller(qts, mode);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0,
+               false);
+    expected = rx_read_pointers(qts);
+
+    socket_write_frame(harness.backend_fd, frame, sizeof(frame));
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+
+    if (accepted) {
+        g_assert_cmpmem(after, sizeof(frame), frame, sizeof(frame));
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) & DMA_COMPLETE,
+                        ==, DMA_COMPLETE);
+    } else {
+        g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+        actual = rx_read_pointers(qts);
+        rx_assert_pointers_equal(&actual, &expected);
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                        (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                        ==, DMA_ENABLE);
+    }
+
+    tx_harness_stop(&harness);
+}
+
+static void test_rx_filter_modes(void)
+{
+    static const uint8_t station[6] = {
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    };
+    static const uint8_t station_unicast[6] = {
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    };
+    static const uint8_t broadcast[6] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    };
+    static const uint8_t multicast[6] = {
+        0x01, 0x00, 0x5e, 0x11, 0x22, 0x33,
+    };
+    static const uint8_t other_unicast[6] = {
+        0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc,
+    };
+    static const uint8_t limited_station[6] = {
+        0x53, 0x54, 0x00, 0x12, 0x34, 0x56,
+    };
+    static const uint8_t limited_multicast[6] = {
+        0x53, 0x54, 0x00, 0xaa, 0xbb, 0xcc,
+    };
+
+    rx_filter_case(0, station_unicast, station, false);
+    rx_filter_case(1, station_unicast, station, true);
+    rx_filter_case(1, broadcast, station, true);
+    rx_filter_case(1, limited_multicast, limited_station, true);
+    rx_filter_case(1, multicast, station, false);
+    rx_filter_case(2, multicast, station, true);
+    rx_filter_case(2, other_unicast, station, false);
+    rx_filter_case(3, other_unicast, station, true);
+    rx_filter_case(0x83, station_unicast, station, false);
+    rx_filter_case(0x07, station_unicast, station, false);
+}
+
+static void test_rx_addrsize(void)
+{
+    static const uint8_t station[6] = {
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    };
+    static const uint8_t differing_last[6] = {
+        0x52, 0x54, 0x00, 0x12, 0x34, 0xa5,
+    };
+
+    rx_filter_case(1, differing_last, station, false);
+    rx_filter_case(0x11, differing_last, station, true);
+}
+
+static void test_rx_crosses_chain(void)
+{
+    enum { FIRST_LENGTH = 20 };
+    const uint32_t second = NEXT_RX_BUFFER + 0x200;
+    const size_t wire_length = sizeof(rx_frame) + sizeof(rx_fcs);
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t first[FIRST_LENGTH];
+    uint8_t second_data[sizeof(rx_frame) + sizeof(rx_fcs) - FIRST_LENGTH];
+    uint8_t expected[sizeof(rx_frame) + sizeof(rx_fcs)];
+
+    memcpy(expected, rx_frame, sizeof(rx_frame));
+    memcpy(expected + sizeof(rx_frame), rx_fcs, sizeof(rx_fcs));
+    rx_prepare_controller(qts, 3);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + FIRST_LENGTH,
+               second, second + 0x100, true);
+
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, first, sizeof(first));
+    qtest_memread(qts, second, second_data, sizeof(second_data));
+
+    g_assert_cmpmem(first, sizeof(first), expected, sizeof(first));
+    g_assert_cmpmem(second_data, sizeof(second_data),
+                    expected + sizeof(first), sizeof(second_data));
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
+                    NEXT_RX_BUFFER | ENRX_BOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT), ==,
+                    NEXT_RX_BUFFER + FIRST_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT), ==,
+                    (second + wire_length - FIRST_LENGTH) | ENRX_EOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_LIMIT), ==,
+                    second + 0x100);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE |
+                     DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+
+    tx_harness_stop(&harness);
+}
+
+static void test_rx_first_buffer_supdate(void)
+{
+    const uint32_t second = NEXT_RX_BUFFER + 0x200;
+    const size_t wire_length = sizeof(rx_frame) + sizeof(rx_fcs);
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t received[sizeof(rx_frame) + sizeof(rx_fcs)];
+
+    rx_prepare_controller(qts, 3);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x100,
+               second, second + 0x100, true);
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, received, sizeof(received));
+
+    g_assert_cmpmem(received, sizeof(rx_frame),
+                    rx_frame, sizeof(rx_frame));
+    g_assert_cmpmem(received + sizeof(rx_frame), sizeof(rx_fcs),
+                    rx_fcs, sizeof(rx_fcs));
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
+                    NEXT_RX_BUFFER | ENRX_BOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT), ==,
+                    (NEXT_RX_BUFFER + wire_length) | ENRX_EOP);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT), ==, second);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_LIMIT), ==,
+                    second + 0x100);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE |
+                     DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE | DMA_COMPLETE);
+
+    tx_harness_stop(&harness);
+}
+
+typedef enum RxOverflowKind {
+    RX_OVERFLOW_INSUFFICIENT,
+    RX_OVERFLOW_REVERSED,
+    RX_OVERFLOW_WRAPPED,
+    RX_OVERFLOW_UNMAPPED,
+} RxOverflowKind;
+
+static void rx_program_overflow(QTestState *qts, RxOverflowKind kind)
+{
+    switch (kind) {
+    case RX_OVERFLOW_INSUFFICIENT:
+        rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 32, 0, 0,
+                   false);
+        break;
+    case RX_OVERFLOW_REVERSED:
+        rx_program(qts, NEXT_RX_BUFFER + 0x100, NEXT_RX_BUFFER, 0, 0,
+                   false);
+        break;
+    case RX_OVERFLOW_WRAPPED:
+        rx_program(qts, 0x14012000, 0x14012100, 0, 0, false);
+        break;
+    case RX_OVERFLOW_UNMAPPED:
+        rx_program(qts, 0x03000000, 0x03000100, 0, 0, false);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void test_rx_overflow(void)
+{
+    uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
+    uint8_t after[sizeof(before)];
+    RxOverflowKind kind;
+
+    memset(before, 0xa5, sizeof(before));
+    for (kind = RX_OVERFLOW_INSUFFICIENT;
+         kind <= RX_OVERFLOW_UNMAPPED; kind++) {
+        TxHarness harness = tx_harness_start();
+        QTestState *qts = harness.qts;
+        RxPointers expected;
+        RxPointers actual;
+
+        qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+        rx_prepare_controller(qts, 3);
+        rx_program_overflow(qts, kind);
+        expected = rx_read_pointers(qts);
+
+        socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+        qtest_clock_step(qts, 1);
+
+        qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+        actual = rx_read_pointers(qts);
+        rx_assert_pointers_equal(&actual, &expected);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                        (DMA_ENABLE | DMA_SUPDATE |
+                         DMA_COMPLETE | DMA_BUSEXC),
+                        ==, DMA_COMPLETE | DMA_BUSEXC);
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==,
+                        EN_RXSTAT_OVERFLOW);
+        g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                        ((1U << 26) | NEXT_ENRX_DMA_IRQ |
+                         NEXT_ENTX_DMA_IRQ),
+                        ==, NEXT_ENRX_DMA_IRQ);
+
+        tx_harness_stop(&harness);
+    }
+}
+
+static void test_rx_backpressure_flush(void)
+{
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
+    uint8_t after[sizeof(before)];
+
+    memset(before, 0xa5, sizeof(before));
+    qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+    qtest_writel(qts, NEXT_ENRX_NEXT, NEXT_RX_BUFFER);
+    qtest_writel(qts, NEXT_ENRX_LIMIT, NEXT_RX_BUFFER + 0x1000);
+    rx_prepare_controller(qts, 3);
+
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+    g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
+
+    qtest_writel(qts, NEXT_ENRX_CSR, DMA_SETENABLE);
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+    g_assert_cmpmem(after, sizeof(rx_frame),
+                    rx_frame, sizeof(rx_frame));
+    g_assert_cmpmem(after + sizeof(rx_frame), sizeof(rx_fcs),
+                    rx_fcs, sizeof(rx_fcs));
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) & DMA_COMPLETE,
+                    ==, DMA_COMPLETE);
+
+    tx_harness_stop(&harness);
+}
+
+static void test_rx_ack_isolation(void)
+{
+    const uint32_t second = NEXT_RX_BUFFER + 0x200;
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+
+    rx_prepare_controller(qts, 3);
+    en_writeb(qts, EN_RXMASK, EN_RXSTAT_OK);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0,
+               false);
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(controller_irqs(qts), ==, NEXT_ENRX_IRQ);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_ENRX_DMA_IRQ, ==, NEXT_ENRX_DMA_IRQ);
+
+    en_writeb(qts, EN_RXSTAT, EN_RXSTAT_OK);
+    g_assert_cmphex(controller_irqs(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) & DMA_COMPLETE,
+                    ==, DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_ENRX_DMA_IRQ, ==, NEXT_ENRX_DMA_IRQ);
+    qtest_writel(qts, NEXT_ENRX_CSR, DMA_CLRCOMPLETE);
+
+    rx_program(qts, second, second + 0x1000, 0, 0, false);
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(controller_irqs(qts), ==, NEXT_ENRX_IRQ);
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+    qtest_writel(qts, NEXT_ENRX_CSR, DMA_CLRCOMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_ENRX_DMA_IRQ, ==, 0);
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+    g_assert_cmphex(controller_irqs(qts), ==, NEXT_ENRX_IRQ);
+
+    en_writeb(qts, EN_RXSTAT, EN_RXSTAT_OK);
+    g_assert_cmphex(controller_irqs(qts), ==, 0);
+    tx_harness_stop(&harness);
+}
 #else
 static void test_tx_transport_unavailable(void)
 {
@@ -1005,6 +1465,22 @@ int main(int argc, char **argv)
                    test_tx_async);
     qtest_add_func("/next-cube/mb8795/tx-ack-isolation",
                    test_tx_ack_isolation);
+    qtest_add_func("/next-cube/mb8795/rx-filter-modes",
+                   test_rx_filter_modes);
+    qtest_add_func("/next-cube/mb8795/rx-addrsize",
+                   test_rx_addrsize);
+    qtest_add_func("/next-cube/mb8795/rx-fcs-single-buffer",
+                   test_rx_fcs_single_buffer);
+    qtest_add_func("/next-cube/mb8795/rx-crosses-chain",
+                   test_rx_crosses_chain);
+    qtest_add_func("/next-cube/mb8795/rx-first-buffer-supdate",
+                   test_rx_first_buffer_supdate);
+    qtest_add_func("/next-cube/mb8795/rx-overflow",
+                   test_rx_overflow);
+    qtest_add_func("/next-cube/mb8795/rx-backpressure-flush",
+                   test_rx_backpressure_flush);
+    qtest_add_func("/next-cube/mb8795/rx-ack-isolation",
+                   test_rx_ack_isolation);
 #else
     qtest_add_func("/next-cube/mb8795/tx-single-buffer",
                    test_tx_transport_unavailable);
@@ -1015,6 +1491,22 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/mb8795/tx-async",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/tx-ack-isolation",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-filter-modes",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-addrsize",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-fcs-single-buffer",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-crosses-chain",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-first-buffer-supdate",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-overflow",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-backpressure-flush",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/rx-ack-isolation",
                    test_tx_transport_unavailable);
 #endif
     qtest_add_func("/next-cube/mb8795/migration-register-state",
