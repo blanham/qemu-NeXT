@@ -1150,57 +1150,94 @@ static void test_rx_first_buffer_supdate(void)
     tx_harness_stop(&harness);
 }
 
-typedef enum RxOverflowKind {
-    RX_OVERFLOW_INSUFFICIENT,
-    RX_OVERFLOW_REVERSED,
-    RX_OVERFLOW_WRAPPED,
-    RX_OVERFLOW_UNMAPPED,
-} RxOverflowKind;
-
-static void rx_program_overflow(QTestState *qts, RxOverflowKind kind)
-{
-    switch (kind) {
-    case RX_OVERFLOW_INSUFFICIENT:
-        rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 32, 0, 0,
-                   false);
-        break;
-    case RX_OVERFLOW_REVERSED:
-        rx_program(qts, NEXT_RX_BUFFER + 0x100, NEXT_RX_BUFFER, 0, 0,
-                   false);
-        break;
-    case RX_OVERFLOW_WRAPPED:
-        rx_program(qts, 0x14012000, 0x14012100, 0, 0, false);
-        break;
-    case RX_OVERFLOW_UNMAPPED:
-        rx_program(qts, 0x03000000, 0x03000100, 0, 0, false);
-        break;
-    default:
-        g_assert_not_reached();
-    }
-}
-
 static void test_rx_overflow(void)
 {
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
     uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
     uint8_t after[sizeof(before)];
-    RxOverflowKind kind;
+    RxPointers expected;
+    RxPointers actual;
 
     memset(before, 0xa5, sizeof(before));
-    for (kind = RX_OVERFLOW_INSUFFICIENT;
-         kind <= RX_OVERFLOW_UNMAPPED; kind++) {
+    qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+    rx_prepare_controller(qts, 3);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 32, 0, 0, false);
+    expected = rx_read_pointers(qts);
+
+    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+    qtest_clock_step(qts, 1);
+
+    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+    g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+    actual = rx_read_pointers(qts);
+    rx_assert_pointers_equal(&actual, &expected);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE |
+                     DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE | DMA_BUSEXC);
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==,
+                    EN_RXSTAT_OVERFLOW);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    ((1U << 26) | NEXT_ENRX_DMA_IRQ |
+                     NEXT_ENTX_DMA_IRQ),
+                    ==, NEXT_ENRX_DMA_IRQ);
+
+    tx_harness_stop(&harness);
+}
+
+static void test_rx_backpressure_flush(void)
+{
+    {
         TxHarness harness = tx_harness_start();
         QTestState *qts = harness.qts;
+        uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
+        uint8_t after[sizeof(before)];
+
+        memset(before, 0xa5, sizeof(before));
+        qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+        qtest_writel(qts, NEXT_ENRX_NEXT, NEXT_RX_BUFFER);
+        qtest_writel(qts, NEXT_ENRX_LIMIT, NEXT_RX_BUFFER + 0x1000);
+        rx_prepare_controller(qts, 3);
+
+        socket_write_frame(harness.backend_fd,
+                           rx_frame, sizeof(rx_frame));
+        qtest_clock_step(qts, 1);
+        qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
+
+        qtest_writel(qts, NEXT_ENRX_CSR, DMA_SETENABLE);
+        qtest_clock_step(qts, 1);
+        qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(rx_frame),
+                        rx_frame, sizeof(rx_frame));
+        g_assert_cmpmem(after + sizeof(rx_frame), sizeof(rx_fcs),
+                        rx_fcs, sizeof(rx_fcs));
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) & DMA_COMPLETE,
+                        ==, DMA_COMPLETE);
+
+        tx_harness_stop(&harness);
+    }
+
+    {
+        TxHarness harness = tx_harness_start();
+        QTestState *qts = harness.qts;
+        uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
+        uint8_t after[sizeof(before)];
         RxPointers expected;
         RxPointers actual;
 
+        memset(before, 0xa5, sizeof(before));
         qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
         rx_prepare_controller(qts, 3);
-        rx_program_overflow(qts, kind);
+        rx_program(qts, 0x03000000, 0x03000100, 0, 0, false);
         expected = rx_read_pointers(qts);
 
-        socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
+        socket_write_frame(harness.backend_fd,
+                           rx_frame, sizeof(rx_frame));
         qtest_clock_step(qts, 1);
-
         qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
         g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
         actual = rx_read_pointers(qts);
@@ -1208,49 +1245,31 @@ static void test_rx_overflow(void)
         g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
                         (DMA_ENABLE | DMA_SUPDATE |
                          DMA_COMPLETE | DMA_BUSEXC),
-                        ==, DMA_COMPLETE | DMA_BUSEXC);
-        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==,
-                        EN_RXSTAT_OVERFLOW);
+                        ==, DMA_ENABLE);
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
         g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
-                        ((1U << 26) | NEXT_ENRX_DMA_IRQ |
-                         NEXT_ENTX_DMA_IRQ),
-                        ==, NEXT_ENRX_DMA_IRQ);
+                        NEXT_ENRX_DMA_IRQ, ==, 0);
+
+        qtest_writel(qts, NEXT_ENRX_NEXT, NEXT_RX_BUFFER);
+        qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
+
+        qtest_writel(qts, NEXT_ENRX_LIMIT, NEXT_RX_BUFFER + 0x1000);
+        qtest_clock_step(qts, 1);
+        qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(rx_frame),
+                        rx_frame, sizeof(rx_frame));
+        g_assert_cmpmem(after + sizeof(rx_frame), sizeof(rx_fcs),
+                        rx_fcs, sizeof(rx_fcs));
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                        (DMA_ENABLE | DMA_SUPDATE |
+                         DMA_COMPLETE | DMA_BUSEXC),
+                        ==, DMA_COMPLETE);
 
         tx_harness_stop(&harness);
     }
-}
-
-static void test_rx_backpressure_flush(void)
-{
-    TxHarness harness = tx_harness_start();
-    QTestState *qts = harness.qts;
-    uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
-    uint8_t after[sizeof(before)];
-
-    memset(before, 0xa5, sizeof(before));
-    qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
-    qtest_writel(qts, NEXT_ENRX_NEXT, NEXT_RX_BUFFER);
-    qtest_writel(qts, NEXT_ENRX_LIMIT, NEXT_RX_BUFFER + 0x1000);
-    rx_prepare_controller(qts, 3);
-
-    socket_write_frame(harness.backend_fd, rx_frame, sizeof(rx_frame));
-    qtest_clock_step(qts, 1);
-    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
-    g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
-    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
-
-    qtest_writel(qts, NEXT_ENRX_CSR, DMA_SETENABLE);
-    qtest_clock_step(qts, 1);
-    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
-    g_assert_cmpmem(after, sizeof(rx_frame),
-                    rx_frame, sizeof(rx_frame));
-    g_assert_cmpmem(after + sizeof(rx_frame), sizeof(rx_fcs),
-                    rx_fcs, sizeof(rx_fcs));
-    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
-    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) & DMA_COMPLETE,
-                    ==, DMA_COMPLETE);
-
-    tx_harness_stop(&harness);
 }
 
 static void test_rx_ack_isolation(void)

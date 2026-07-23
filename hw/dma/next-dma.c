@@ -254,9 +254,22 @@ static bool next_dma_enrx_decode(const NextDMAChannelState *c,
 static bool next_dma_enrx_ready_state(NextDMAState *s)
 {
     NextDMAChannelState *c = &s->channel[NEXT_DMA_ENRX];
+    NextDMAEnetRxRange range;
 
-    return (c->csr & NEXT_DMA_CSR_ENABLE) &&
-           !(c->csr & NEXT_DMA_CSR_COMPLETE);
+    if (!(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE) ||
+        !next_dma_enrx_decode(c, &range)) {
+        return false;
+    }
+
+    return (!range.first_capacity ||
+            address_space_access_valid(s->as, range.first_start,
+                                       range.first_capacity, true,
+                                       MEMTXATTRS_UNSPECIFIED)) &&
+           (!range.second_capacity ||
+            address_space_access_valid(s->as, range.second_start,
+                                       range.second_capacity, true,
+                                       MEMTXATTRS_UNSPECIFIED));
 }
 
 static void next_dma_recompute_rx_ready(NextDMAState *s)
