@@ -401,6 +401,12 @@ static uint32_t next_dma_begin_scsi_transfer(NextDMAChannelState *c)
     return c->next;
 }
 
+static bool next_dma_scsi_beat_fits(const NextDMAChannelState *c)
+{
+    return c->limit <= c->next ||
+           c->limit - c->next >= NEXT_DMA_SCSI_BEAT;
+}
+
 void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
 {
     NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
@@ -423,15 +429,15 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
 
     while (remaining) {
-        size_t room = NEXT_DMA_SCSI_BEAT - c->scsi_stage_len;
-        size_t copied = MIN(remaining, room);
+        size_t room;
+        size_t copied;
         bool continue_segment;
 
-        if (c->scsi_stage_len + copied == NEXT_DMA_SCSI_BEAT &&
-            c->limit > c->next &&
-            c->limit - c->next < NEXT_DMA_SCSI_BEAT) {
+        if (!next_dma_scsi_beat_fits(c)) {
             break;
         }
+        room = NEXT_DMA_SCSI_BEAT - c->scsi_stage_len;
+        copied = MIN(remaining, room);
         memcpy(c->scsi_stage + c->scsi_stage_len, buf, copied);
         c->scsi_stage_len += copied;
         c->scsi_stage_flushes = NEXT_DMA_SCSI_FLUSH_EDGES;
@@ -526,8 +532,11 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
     if (!c->scsi_stage_len || !c->scsi_stage_flushes) {
         return;
     }
-    c->scsi_stage_flushes--;
-    if (c->scsi_stage_flushes) {
+    if (c->scsi_stage_flushes > 1) {
+        c->scsi_stage_flushes--;
+        return;
+    }
+    if (!next_dma_scsi_beat_fits(c)) {
         return;
     }
 
@@ -543,6 +552,7 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
     }
 
     c->scsi_stage_len = 0;
+    c->scsi_stage_flushes = 0;
     next_dma_advance(s, NEXT_DMA_SCSI, sizeof(beat));
     trace_next_scsi_dma_transfer(
         "flush", staged, sizeof(beat), base, c->csr, c->next,
