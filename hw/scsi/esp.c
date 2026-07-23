@@ -85,6 +85,7 @@ static void esp_selection_timeout(void *opaque)
     ESPState *s = opaque;
 
     s->rregs[ESP_RSTAT] = 0;
+    s->rregs[ESP_RSEQ] = SEQ_0;
     s->asc_mode = ESP_ASC_MODE_DIS;
     s->rregs[ESP_RINTR] = INTR_DC;
     esp_raise_irq(s);
@@ -297,6 +298,7 @@ static int esp_select(ESPState *s)
 {
     int target;
 
+    timer_del(s->selection_timeout);
     target = s->wregs[ESP_WBUSID] & BUSID_DID;
 
     s->ti_size = 0;
@@ -1133,6 +1135,7 @@ static void handle_ti(ESPState *s)
 
 void esp_hard_reset(ESPState *s)
 {
+    timer_del(s->selection_timeout);
     memset(s->rregs, 0, ESP_REGS);
     memset(s->wregs, 0, ESP_REGS);
     s->tchi_written = 0;
@@ -1156,6 +1159,7 @@ static void esp_soft_reset(ESPState *s)
 
 static void esp_bus_reset(ESPState *s)
 {
+    timer_del(s->selection_timeout);
     bus_cold_reset(BUS(&s->bus));
 }
 
@@ -1433,6 +1437,32 @@ int esp_pre_save(void *opaque)
     return 0;
 }
 
+static int esp_pre_load(void *opaque)
+{
+    ESPState *s = ESP(opaque);
+
+    timer_del(s->selection_timeout);
+    return 0;
+}
+
+static bool esp_selection_timeout_needed(void *opaque)
+{
+    ESPState *s = ESP(opaque);
+
+    return timer_pending(s->selection_timeout);
+}
+
+static const VMStateDescription vmstate_esp_selection_timeout = {
+    .name = "esp/selection-timeout",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = esp_selection_timeout_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER_PTR(selection_timeout, ESPState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int esp_post_load(void *opaque, int version_id)
 {
     ESPState *s = ESP(opaque);
@@ -1464,10 +1494,16 @@ static int esp_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static const VMStateDescription * const vmstate_esp_subsections[] = {
+    &vmstate_esp_selection_timeout,
+    NULL
+};
+
 const VMStateDescription vmstate_esp = {
     .name = "esp",
     .version_id = 8,
     .minimum_version_id = 3,
+    .pre_load = esp_pre_load,
     .post_load = esp_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_BUFFER(rregs, ESPState),
@@ -1501,6 +1537,7 @@ const VMStateDescription vmstate_esp = {
         VMSTATE_UINT8_TEST(asc_mode, ESPState, esp_is_version_8),
         VMSTATE_END_OF_LIST()
     },
+    .subsections = vmstate_esp_subsections,
 };
 
 static void sysbus_esp_mem_write(void *opaque, hwaddr addr,
