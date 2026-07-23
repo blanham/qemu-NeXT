@@ -4,8 +4,8 @@
 #include "libqtest.h"
 
 #define NEXT_DSP_BASE      0x02108000
+#define NEXT_DSP_SIZE      8
 #define NEXT_DSP_ICR       (NEXT_DSP_BASE + 0)
-#define NEXT_DSP_CVR       (NEXT_DSP_BASE + 1)
 #define NEXT_ESP_CMD       0x02114003
 #define NEXT_ESP_BUSID     0x02114004
 #define NEXT_ESP_STAT      0x02114004
@@ -195,15 +195,19 @@ static void test_dsp_mmio_mapping(void)
 {
     QTestState *qts = next_cube_scsi_start();
     g_autofree char *flatview = qtest_hmp(qts, "info mtree -f");
+    unsigned int offset;
 
+    g_assert_nonnull(strstr(flatview,
+        "0000000002106000-000000000210601f (prio 0, i/o): next.en"));
     g_assert_nonnull(strstr(flatview,
         "0000000002108000-0000000002108007 (prio 0, i/o): next.dsp"));
 
     qtest_writeb(qts, NEXT_DSP_ICR, 0x00);
     g_assert_cmphex(qtest_readb(qts, NEXT_DSP_ICR), ==, 0);
     qtest_writeb(qts, NEXT_DSP_ICR, 0xff);
-    g_assert_cmphex(qtest_readb(qts, NEXT_DSP_ICR), ==, 0);
-    g_assert_cmphex(qtest_readb(qts, NEXT_DSP_CVR), ==, 0);
+    for (offset = 0; offset < NEXT_DSP_SIZE; offset++) {
+        g_assert_cmphex(qtest_readb(qts, NEXT_DSP_BASE + offset), ==, 0);
+    }
 
     qtest_quit(qts);
 }
