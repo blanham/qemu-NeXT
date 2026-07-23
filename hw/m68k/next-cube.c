@@ -773,10 +773,63 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
     next_irq(opaque, irq, 0);
 }
 
+static void nextdma_read(void *opaque, uint8_t *buf, int size, int type)
+{
+    uint32_t base_addr;
+    int irq = 0;
+    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
+
+    /*
+     * The PROM uses initbuf while the boot loader and kernel use next.
+     * Consume exactly the amount requested by ESP: unlike a DMA write into
+     * guest memory, rounding here would overrun ESP's transfer buffer.
+     */
+    if (next_state->dma[type].next_initbuf == 0) {
+        base_addr = next_state->dma[type].next;
+    } else {
+        base_addr = next_state->dma[type].next_initbuf;
+    }
+
+    trace_next_scsi_dma_read(
+        "entry", size, size, base_addr,
+        next_state->dma[type].csr, next_state->dma[type].next,
+        next_state->dma[type].next_initbuf, next_state->dma[type].limit,
+        next_state->dma[type].saved_next, next_state->dma[type].saved_limit);
+
+    physical_memory_read(base_addr, buf, size);
+
+    next_state->dma[type].next_initbuf = 0;
+    next_state->dma[type].saved_limit =
+        next_state->dma[type].next + size;
+    next_state->dma[type].saved_next = next_state->dma[type].next;
+
+    if (!(next_state->dma[type].csr & DMA_SUPDATE)) {
+        next_state->dma[type].next = next_state->dma[type].start;
+        next_state->dma[type].limit = next_state->dma[type].stop;
+    }
+
+    next_state->dma[type].csr |= DMA_COMPLETE;
+
+    trace_next_scsi_dma_read(
+        "complete", size, size, base_addr,
+        next_state->dma[type].csr, next_state->dma[type].next,
+        next_state->dma[type].next_initbuf, next_state->dma[type].limit,
+        next_state->dma[type].saved_next, next_state->dma[type].saved_limit);
+
+    switch (type) {
+    case NEXTDMA_SCSI:
+        irq = NEXT_SCSI_DMA_I;
+        break;
+    }
+
+    next_irq(opaque, irq, 1);
+    next_irq(opaque, irq, 0);
+}
+
 static void nextscsi_read(void *opaque, uint8_t *buf, int len)
 {
     DPRINTF("SCSI READ: %x\n", len);
-    abort();
+    nextdma_read(opaque, buf, len, NEXTDMA_SCSI);
 }
 
 static void nextscsi_write(void *opaque, uint8_t *buf, int size)
