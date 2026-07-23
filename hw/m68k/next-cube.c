@@ -63,6 +63,14 @@
 #define NEXT_SCR2_TIMER_IPL7    0x00008000
 #define NEXT_EVENTC_MASK        0x000fffff
 
+#define NEXT_IRQ_IPL7_MASK      0xc0000000
+#define NEXT_IRQ_IPL6_MASK      0x3ffc0000
+#define NEXT_IRQ_IPL5_MASK      0x00038000
+#define NEXT_IRQ_IPL4_MASK      0x00004000
+#define NEXT_IRQ_IPL3_MASK      0x00003ffc
+#define NEXT_IRQ_IPL2_MASK      0x00000002
+#define NEXT_IRQ_IPL1_MASK      0x00000001
+
 
 #define TYPE_NEXT_RTC "next-rtc"
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTRTC, NEXT_RTC)
@@ -250,12 +258,38 @@ static int next_timer_irq_vector(const NeXTPC *s)
     return next_timer_irq_level(s) == 7 ? 31 : 30;
 }
 
+static void next_update_irq(NeXTPC *s)
+{
+    uint32_t pending = s->int_status & s->int_mask;
+    int level = 0;
+
+    if ((pending & NEXT_IRQ_IPL7_MASK) ||
+        ((pending & NEXT_TIMER_IRQ_STATUS) &&
+         (s->scr2 & NEXT_SCR2_TIMER_IPL7))) {
+        level = 7;
+    } else if (pending & NEXT_IRQ_IPL6_MASK) {
+        level = 6;
+    } else if (pending & NEXT_IRQ_IPL5_MASK) {
+        level = 5;
+    } else if (pending & NEXT_IRQ_IPL4_MASK) {
+        level = 4;
+    } else if (pending & NEXT_IRQ_IPL3_MASK) {
+        level = 3;
+    } else if (pending & NEXT_IRQ_IPL2_MASK) {
+        level = 2;
+    } else if (pending & NEXT_IRQ_IPL1_MASK) {
+        level = 1;
+    }
+
+    m68k_set_irq_level(s->cpu, level, level ? level + 24 : 0);
+}
+
 static void next_timer_reroute_irq(NeXTPC *s)
 {
     int level = next_timer_irq_level(s);
     int vector = next_timer_irq_vector(s);
 
-    m68k_set_irq_level(s->cpu, level, vector);
+    next_update_irq(s);
     trace_next_timer_irq(1, level, vector, s->int_status, s->scr2);
 }
 
@@ -304,11 +338,13 @@ static void next_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         DPRINTF("INT Status old: %x new: %x\n", s->int_status,
                 (unsigned int)val);
         s->int_status = val;
+        next_update_irq(s);
         break;
 
     case 0x2800:    /* 0x2007800 */
         DPRINTF("INT Mask old: %x new: %x\n", s->int_mask, (unsigned int)val);
         s->int_mask  = val;
+        next_update_irq(s);
         break;
 
     case 0x7000 ... 0x7003:    /* 0x200c000 */
@@ -383,10 +419,13 @@ static bool next_trace_read_sample(NeXTTraceReadSampler *sampler,
     return !(sampler->repeats & (sampler->repeats - 1));
 }
 
+static void next_irq(void *opaque, int number, int level);
+
 static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned int size)
 {
-    NeXTState *next_state = NEXT_MACHINE(opaque);
+    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
+    bool scsi_irq_ack = false;
     bool scsi_reg = false;
 
     switch (addr) {
@@ -439,11 +478,13 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
         }
         if (val & DMA_CLRCOMPLETE) {
             next_state->dma[NEXTDMA_SCSI].csr &= ~DMA_COMPLETE;
+            scsi_irq_ack = true;
         }
 
         if (val & DMA_RESET) {
             next_state->dma[NEXTDMA_SCSI].csr &= ~(DMA_COMPLETE | DMA_SUPDATE |
                                                   DMA_ENABLE | DMA_DEV2M);
+            scsi_irq_ack = true;
             /* DPRINTF("SCSI DMA RESET\n"); */
         }
         /* DPRINTF("RXCSR \tWrite: %x\n",value); */
@@ -485,11 +526,14 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
                                       dma->next, dma->next_initbuf,
                                       dma->limit, dma->start, dma->stop);
     }
+    if (scsi_irq_ack) {
+        next_irq(opaque, NEXT_SCSI_DMA_I, 0);
+    }
 }
 
 static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
 {
-    NeXTState *next_state = NEXT_MACHINE(opaque);
+    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
     uint64_t val;
     bool scsi_reg = false;
 
@@ -581,7 +625,6 @@ static const MemoryRegionOps next_dma_ops = {
 static void next_irq(void *opaque, int number, int level)
 {
     NeXTPC *s = NEXT_PC(opaque);
-    M68kCPU *cpu = s->cpu;
     int shift = 0;
 
     /* first switch sets interrupt status */
@@ -633,58 +676,16 @@ static void next_irq(void *opaque, int number, int level)
         break;
 
     }
-    /*
-     * this HAS to be wrong, the interrupt handlers in mach and together
-     * int_status and int_mask and return if there is a hit
-     */
-    if (s->int_mask & (1U << shift)) {
-        DPRINTF("%x interrupt masked @ %x\n", 1U << shift, cpu->env.pc);
-        /* return; */
-    }
-
-    /* second switch triggers the correct interrupt */
     if (level) {
         s->int_status |= 1U << shift;
-
-        switch (number) {
-        /* level 3 - floppy, kbd/mouse, power, ether rx/tx, scsi */
-        case NEXT_FD_I:
-        case NEXT_KBD_I:
-        case NEXT_PWR_I:
-        case NEXT_ENRX_I:
-        case NEXT_ENTX_I:
-        case NEXT_SCSI_I:
-            m68k_set_irq_level(cpu, 3, 27);
-            break;
-
-        /* level 6/7 - system timer, selected by SCR2 */
-        case NEXT_CLK_I:
-            m68k_set_irq_level(cpu, next_timer_irq_level(s),
-                               next_timer_irq_vector(s));
-            break;
-
-        /* level 5 - scc (serial) */
-        case NEXT_SCC_I:
-            m68k_set_irq_level(cpu, 5, 29);
-            break;
-
-        /* level 6 - audio etherrx/tx dma */
-        case NEXT_ENTX_DMA_I:
-        case NEXT_ENRX_DMA_I:
-        case NEXT_SCSI_DMA_I:
-        case NEXT_SND_I:
-        case NEXT_SCC_DMA_I:
-            m68k_set_irq_level(cpu, 6, 30);
-            break;
-        }
     } else {
         s->int_status &= ~(1U << shift);
-        cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD);
     }
+    next_update_irq(s);
 
     if (number == NEXT_SCSI_I || number == NEXT_SCSI_DMA_I) {
         trace_next_scsi_irq(number == NEXT_SCSI_I ? "esp" : "dma", level,
-                            s->int_status, s->int_mask, cpu->env.pc);
+                            s->int_status, s->int_mask, s->cpu->env.pc);
     }
 }
 
@@ -770,7 +771,6 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
     }
 
     next_irq(opaque, irq, 1);
-    next_irq(opaque, irq, 0);
 }
 
 static void nextdma_read(void *opaque, uint8_t *buf, int size, int type)
@@ -823,7 +823,6 @@ static void nextdma_read(void *opaque, uint8_t *buf, int size, int type)
     }
 
     next_irq(opaque, irq, 1);
-    next_irq(opaque, irq, 0);
 }
 
 static void nextscsi_read(void *opaque, uint8_t *buf, int len)
@@ -880,12 +879,6 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         }
         if (val & SCSICSR_CPUDMA) {
             DPRINTF("SCSICSR CPUDMA\n");
-            /* qemu_irq_raise(s->scsi_dma); */
-            pc->int_status |= 0x4000000;
-        } else {
-            /* fprintf(stderr,"SCSICSR CPUDMA disabled\n"); */
-            pc->int_status &= ~(0x4000000);
-            /* qemu_irq_lower(s->scsi_dma); */
         }
         if (val & SCSICSR_INTMASK) {
             DPRINTF("SCSICSR INTMASK\n");
@@ -1626,6 +1619,7 @@ static int next_pc_post_load(void *opaque, int version_id)
         s->eventc_latched = 0;
         s->timer_irq_pending = false;
         s->int_status &= ~NEXT_TIMER_IRQ_STATUS;
+        next_update_irq(s);
         return 0;
     }
 
@@ -1646,6 +1640,7 @@ static int next_pc_post_load(void *opaque, int version_id)
     } else {
         s->timer_irq_pending = false;
         s->int_status &= ~NEXT_TIMER_IRQ_STATUS;
+        next_update_irq(s);
     }
     return 0;
 }
@@ -1798,7 +1793,7 @@ static void next_cube_init(MachineState *machine)
     }
 
     /* DMA */
-    memory_region_init_io(&m->dmamem, NULL, &next_dma_ops, machine,
+    memory_region_init_io(&m->dmamem, NULL, &next_dma_ops, pcdev,
                           "next.dma", 0x5000);
     memory_region_add_subregion(sysmem, NEXT_DMA_BASE, &m->dmamem);
 }
