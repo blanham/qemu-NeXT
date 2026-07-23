@@ -69,6 +69,12 @@
 #define NEXT_DMA_SCSI_BEAT        16
 #define NEXT_DMA_SCSI_FLUSH_EDGES 4
 
+#define NEXT_DMA_ENET_ADDR_MASK   0x0fffffff
+#define NEXT_DMA_ENTX_EOP         0x80000000
+#define NEXT_DMA_ENTX_END_BIAS    15
+#define NEXT_DMA_ENTX_MIN_FRAME   60
+#define NEXT_DMA_ENTX_MAX_FRAME   1514
+
 typedef enum NextDMASavedCapability {
     NEXT_DMA_SAVED_NONE,
     NEXT_DMA_SAVED_TWO,
@@ -428,6 +434,13 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_update_irq(s, channel);
+
+    if (channel == NEXT_DMA_ENTX &&
+        (value & NEXT_DMA_CMD_SETENABLE) &&
+        (c->csr & NEXT_DMA_CSR_ENABLE) &&
+        s->enet_notify && s->enet_notify->tx_kick) {
+        s->enet_notify->tx_kick(s->enet_opaque);
+    }
 }
 
 static void next_dma_trace_scsi_register_write(NextDMAState *s, hwaddr addr,
@@ -675,6 +688,135 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
     trace_next_scsi_dma_transfer(
         "flush", staged, sizeof(beat), base, c->csr, c->next,
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
+}
+
+typedef struct NextDMAEnetTxRange {
+    uint32_t first_start;
+    uint32_t first_end;
+    uint32_t second_start;
+    uint32_t second_end;
+    uint32_t final_limit;
+    size_t first_length;
+    size_t second_length;
+    size_t total_length;
+    bool consume_next_initbuf;
+} NextDMAEnetTxRange;
+
+static bool next_dma_entx_eop_address_valid(uint32_t value)
+{
+    return (value & NEXT_DMA_ENTX_EOP) &&
+           !(value & ~(NEXT_DMA_ENTX_EOP | NEXT_DMA_ENET_ADDR_MASK));
+}
+
+static bool next_dma_entx_decode(NextDMAChannelState *c, size_t capacity,
+                                 NextDMAEnetTxRange *range)
+{
+    uint32_t final_encoded;
+
+    memset(range, 0, sizeof(*range));
+    if (c->limit & NEXT_DMA_ENTX_EOP) {
+        if (!next_dma_entx_eop_address_valid(c->limit)) {
+            return false;
+        }
+        final_encoded = c->limit & NEXT_DMA_ENET_ADDR_MASK;
+        if (final_encoded < NEXT_DMA_ENTX_END_BIAS) {
+            return false;
+        }
+
+        range->first_start = c->next_initbuf_valid
+                           ? c->next_initbuf
+                           : c->next & NEXT_DMA_ENET_ADDR_MASK;
+        if (range->first_start > NEXT_DMA_ENET_ADDR_MASK) {
+            return false;
+        }
+        range->first_end = final_encoded - NEXT_DMA_ENTX_END_BIAS;
+        if (range->first_end < range->first_start) {
+            return false;
+        }
+        range->first_length = range->first_end - range->first_start;
+        range->final_limit = c->limit;
+        range->consume_next_initbuf = c->next_initbuf_valid;
+    } else {
+        if (c->limit & ~NEXT_DMA_ENET_ADDR_MASK ||
+            !next_dma_entx_eop_address_valid(c->stop)) {
+            return false;
+        }
+        final_encoded = c->stop & NEXT_DMA_ENET_ADDR_MASK;
+        if (final_encoded < NEXT_DMA_ENTX_END_BIAS) {
+            return false;
+        }
+
+        range->first_start = c->next & NEXT_DMA_ENET_ADDR_MASK;
+        range->first_end = c->limit;
+        range->second_start = c->start & NEXT_DMA_ENET_ADDR_MASK;
+        range->second_end = final_encoded - NEXT_DMA_ENTX_END_BIAS;
+        if (range->first_end < range->first_start ||
+            range->second_end < range->second_start) {
+            return false;
+        }
+        range->first_length = range->first_end - range->first_start;
+        range->second_length = range->second_end - range->second_start;
+        range->final_limit = c->stop;
+    }
+
+    if (range->first_length > SIZE_MAX - range->second_length) {
+        return false;
+    }
+    range->total_length = range->first_length + range->second_length;
+    return range->total_length >= NEXT_DMA_ENTX_MIN_FRAME &&
+           range->total_length <= NEXT_DMA_ENTX_MAX_FRAME &&
+           range->total_length <= capacity;
+}
+
+NextDMAResult next_dma_enet_tx_read(NextDMAState *s, uint8_t *frame,
+                                    size_t capacity, size_t *length)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_ENTX];
+    NextDMAEnetTxRange range;
+
+    *length = 0;
+    if (!(c->csr & NEXT_DMA_CSR_ENABLE)) {
+        return NEXT_DMA_RANGE_ERROR;
+    }
+    if (!next_dma_entx_decode(c, capacity, &range)) {
+        return capacity < NEXT_DMA_ENTX_MIN_FRAME
+               ? NEXT_DMA_NO_SPACE : NEXT_DMA_RANGE_ERROR;
+    }
+
+    if (address_space_read(s->as, range.first_start,
+                           MEMTXATTRS_UNSPECIFIED, frame,
+                           range.first_length) != MEMTX_OK) {
+        return NEXT_DMA_RANGE_ERROR;
+    }
+    if (range.second_length &&
+        address_space_read(s->as, range.second_start,
+                           MEMTXATTRS_UNSPECIFIED,
+                           frame + range.first_length,
+                           range.second_length) != MEMTX_OK) {
+        return NEXT_DMA_RANGE_ERROR;
+    }
+
+    c->next = range.second_length ? range.second_end : range.first_end;
+    c->limit = range.final_limit;
+    if (range.consume_next_initbuf) {
+        c->next_initbuf_valid = false;
+    }
+    *length = range.total_length;
+    return NEXT_DMA_OK;
+}
+
+void next_dma_enet_tx_complete(NextDMAState *s, NextDMAResult result)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_ENTX];
+
+    if (result == NEXT_DMA_OK) {
+        next_dma_complete_segment(s, NEXT_DMA_ENTX);
+        return;
+    }
+
+    c->csr |= NEXT_DMA_CSR_BUSEXC | NEXT_DMA_CSR_COMPLETE;
+    c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+    next_dma_update_irq(s, NEXT_DMA_ENTX);
 }
 
 void next_dma_set_ethernet_notify(NextDMAState *s,

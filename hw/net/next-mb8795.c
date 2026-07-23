@@ -40,6 +40,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "trace.h"
 
 #define NEXT_MB8795_MMIO_SIZE 0x10
 
@@ -54,7 +55,9 @@
 #define NEXT_MB8795_ADDR_SIZE 6
 
 #define NEXT_MB8795_TXSTAT_READY 0x80
+#define NEXT_MB8795_TXSTAT_UNDERFLOW 0x08
 #define NEXT_MB8795_RESET_MODE   0x80
+#define NEXT_MB8795_MAX_FRAME    1514
 
 struct NextMB8795State {
     SysBusDevice parent_obj;
@@ -232,11 +235,21 @@ static NetClientInfo next_mb8795_net_info = {
 
 static void next_mb8795_tx_timer(void *opaque)
 {
-    /*
-     * Task 7 supplies the bounded ENTX transfer.  Keeping the callback
-     * harmless now makes reset and migration safe without inventing a data
-     * path.
-     */
+    NextMB8795State *s = NEXT_MB8795(opaque);
+    uint8_t frame[NEXT_MB8795_MAX_FRAME];
+    size_t length;
+    NextDMAResult result;
+
+    result = next_dma_enet_tx_read(s->dma, frame, sizeof(frame), &length);
+    if (result == NEXT_DMA_OK) {
+        qemu_send_packet(qemu_get_queue(s->nic), frame, length);
+        s->tx_status |= NEXT_MB8795_TXSTAT_READY;
+    } else {
+        s->tx_status |= NEXT_MB8795_TXSTAT_UNDERFLOW;
+    }
+    next_dma_enet_tx_complete(s->dma, result);
+    next_mb8795_update_tx_irq(s);
+    trace_next_mb8795_tx_complete(result, length, s->tx_status);
 }
 
 static void next_mb8795_tx_kick(void *opaque)
@@ -246,6 +259,7 @@ static void next_mb8795_tx_kick(void *opaque)
     if (!s->reset) {
         timer_mod(&s->tx_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+        trace_next_mb8795_tx_kick();
     }
 }
 
