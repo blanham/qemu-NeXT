@@ -917,7 +917,10 @@ static void test_migration_idle_all_channels(void)
      */
     {
         uint32_t init = 0x04100000 | 4 << 8 | 0x10;
+        uint32_t live = init + 0x1000;
         uint8_t received[TRANSFER_LENGTH];
+        uint8_t old_init[TRANSFER_LENGTH];
+        size_t i;
 
         qtest_memset(destination, init, 0xa5, sizeof(received));
         qtest_writel(destination, NEXT_DMA_BASE + channels[0].csr,
@@ -931,6 +934,42 @@ static void test_migration_idle_all_channels(void)
         qtest_memread(destination, init, received, sizeof(received));
         g_assert_cmpmem(&received[8], 4, "QEMU", 4);
         g_assert_false(qtest_get_irq(destination, 0));
+
+        /*
+         * The latch was one-shot.  Poison its old target and a distinct
+         * live buffer, then prove the next transfer follows live NEXT
+         * without changing the guest-visible NEXT_INIT register.
+         */
+        qtest_memset(destination, init, 0x5a, sizeof(old_init));
+        qtest_memset(destination, live, 0xa5, sizeof(received));
+        qtest_writel(destination,
+                     channel_address(&channels[0], 0x4000), live);
+        qtest_writel(destination,
+                     channel_address(&channels[0], 0x4004),
+                     live + TRANSFER_LENGTH);
+        g_assert_cmphex(qtest_readl(
+                            destination,
+                            channel_address(&channels[0], 0x4200)),
+                        ==, init);
+
+        issue_inquiry_dma(destination, TRANSFER_LENGTH);
+        finish_scsi_command(destination);
+
+        g_assert_cmphex(qtest_readl(
+                            destination,
+                            channel_address(&channels[0], 0x4000)),
+                        ==, live + TRANSFER_LENGTH);
+        g_assert_cmphex(qtest_readl(
+                            destination,
+                            channel_address(&channels[0], 0x4200)),
+                        ==, init);
+        qtest_memread(destination, live, received, sizeof(received));
+        g_assert_cmpmem(&received[8], 4, "QEMU", 4);
+        qtest_memread(destination, init, old_init, sizeof(old_init));
+        for (i = 0; i < sizeof(old_init); i++) {
+            g_assert_cmphex(old_init[i], ==, 0x5a);
+        }
+        g_assert_true(qtest_get_irq(destination, 0));
     }
 
     qtest_quit(source);
