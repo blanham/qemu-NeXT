@@ -427,6 +427,11 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         size_t copied = MIN(remaining, room);
         bool continue_segment;
 
+        if (c->scsi_stage_len + copied == NEXT_DMA_SCSI_BEAT &&
+            c->limit > c->next &&
+            c->limit - c->next < NEXT_DMA_SCSI_BEAT) {
+            break;
+        }
         memcpy(c->scsi_stage + c->scsi_stage_len, buf, copied);
         c->scsi_stage_len += copied;
         c->scsi_stage_flushes = NEXT_DMA_SCSI_FLUSH_EDGES;
@@ -434,10 +439,6 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         remaining -= copied;
 
         if (c->scsi_stage_len != NEXT_DMA_SCSI_BEAT) {
-            break;
-        }
-        if (c->limit > c->next &&
-            c->limit - c->next < NEXT_DMA_SCSI_BEAT) {
             break;
         }
         if (address_space_write(s->as, c->next, MEMTXATTRS_UNSPECIFIED,
