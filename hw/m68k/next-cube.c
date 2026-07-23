@@ -22,6 +22,7 @@
 #include "hw/m68k/next-cube.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
+#include "hw/dma/next-dma.h"
 #include "hw/scsi/esp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
@@ -124,6 +125,8 @@ typedef struct NeXTTraceReadSampler {
 struct NeXTSCSI {
     SysBusDevice parent_obj;
 
+    NextDMAState *dma;
+
     MemoryRegion scsi_mem;
 
     SysBusESPState sysbus_esp;
@@ -143,6 +146,7 @@ struct NeXTPC {
     SysBusDevice parent_obj;
 
     M68kCPU *cpu;
+    NextDMAState *dma;
 
     MemoryRegion floppy_mem;
     MemoryRegion system_timer_mem;
@@ -179,27 +183,6 @@ struct NeXTPC {
     qemu_irq rtc_cmd_reset_irq;
 };
 
-typedef struct next_dma {
-    uint32_t csr;
-
-    uint32_t saved_next;
-    uint32_t saved_limit;
-    uint32_t saved_start;
-    uint32_t saved_stop;
-
-    uint32_t next;
-    uint32_t limit;
-    uint32_t start;
-    uint32_t stop;
-
-    uint32_t next_initbuf;
-    uint32_t size;
-
-    uint8_t stage[16];
-    uint8_t stage_len;
-    uint8_t stage_flushes;
-} next_dma;
-
 #define TYPE_NEXT_MACHINE MACHINE_TYPE_NAME("next-cube")
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTState, NEXT_MACHINE)
 
@@ -208,13 +191,10 @@ struct NeXTState {
 
     MemoryRegion rom;
     MemoryRegion rom2;
-    MemoryRegion dmamem;
     MemoryRegion bmapm1;
     MemoryRegion bmapm2;
 
-    next_dma dma[10];
-
-    NeXTTraceReadSampler trace_scsi_dma_read;
+    NextDMAState *dma;
 };
 
 /* Thanks to NeXT forums for this */
@@ -424,23 +404,6 @@ static const MemoryRegionOps next_mmio_ops = {
 #define SCSICSR_CPUDMA  0x10  /* if set, dma enabled */
 #define SCSICSR_INTMASK 0x20  /* if set, interrupt enabled */
 
-#define NEXTDMA_SCSI(x)      (0x10 + x)
-#define NEXTDMA_FD(x)        (0x10 + x)
-#define NEXTDMA_ENTX(x)      (0x110 + x)
-#define NEXTDMA_ENRX(x)      (0x150 + x)
-#define NEXTDMA_CSR          0x0
-#define NEXTDMA_SAVED_NEXT   0x3ff0
-#define NEXTDMA_SAVED_LIMIT  0x3ff4
-#define NEXTDMA_SAVED_START  0x3ff8
-#define NEXTDMA_SAVED_STOP   0x3ffc
-#define NEXTDMA_NEXT         0x4000
-#define NEXTDMA_LIMIT        0x4004
-#define NEXTDMA_START        0x4008
-#define NEXTDMA_STOP         0x400c
-#define NEXTDMA_NEXT_INIT    0x4200
-#define NEXTDMA_SIZE         0x4204
-#define NEXTDMA_READ         0x04000000
-
 static bool next_trace_read_sample(NeXTTraceReadSampler *sampler,
                                    hwaddr addr, uint64_t value)
 {
@@ -459,252 +422,6 @@ static bool next_trace_read_sample(NeXTTraceReadSampler *sampler,
 }
 
 static void next_irq(void *opaque, int number, int level);
-
-static uint32_t *next_enet_dma_reg(NeXTState *s, hwaddr addr,
-                                   next_dma **dma_out, hwaddr *reg_out)
-{
-    static const struct {
-        hwaddr base;
-        int channel;
-    } channels[] = {
-        { NEXTDMA_ENTX(0), NEXTDMA_ENTX },
-        { NEXTDMA_ENRX(0), NEXTDMA_ENRX },
-    };
-    size_t i;
-
-    for (i = 0; i < ARRAY_SIZE(channels); i++) {
-        next_dma *dma;
-        hwaddr reg;
-
-        if (addr < channels[i].base) {
-            continue;
-        }
-        reg = addr - channels[i].base;
-        dma = &s->dma[channels[i].channel];
-        *dma_out = dma;
-        *reg_out = reg;
-
-        switch (reg) {
-        case NEXTDMA_CSR:
-            return &dma->csr;
-        case NEXTDMA_SAVED_NEXT:
-            return &dma->saved_next;
-        case NEXTDMA_SAVED_LIMIT:
-            return &dma->saved_limit;
-        case NEXTDMA_SAVED_START:
-            return &dma->saved_start;
-        case NEXTDMA_SAVED_STOP:
-            return &dma->saved_stop;
-        case NEXTDMA_NEXT:
-            return &dma->next;
-        case NEXTDMA_LIMIT:
-            return &dma->limit;
-        case NEXTDMA_START:
-            return &dma->start;
-        case NEXTDMA_STOP:
-            return &dma->stop;
-        case NEXTDMA_NEXT_INIT:
-            return &dma->next_initbuf;
-        default:
-            break;
-        }
-    }
-
-    return NULL;
-}
-
-static void next_enet_dma_csr_write(next_dma *dma, uint32_t val)
-{
-    if (val & DMA_RESET) {
-        dma->csr &= ~(DMA_COMPLETE | DMA_SUPDATE | DMA_ENABLE);
-    }
-    if (val & DMA_SETENABLE) {
-        dma->csr |= DMA_ENABLE;
-    }
-    if (val & DMA_SETSUPDATE) {
-        dma->csr |= DMA_SUPDATE;
-    }
-    if (val & DMA_CLRCOMPLETE) {
-        dma->csr &= ~DMA_COMPLETE;
-    }
-
-    dma->csr &= ~NEXTDMA_READ;
-    if (val & DMA_DEV2M) {
-        dma->csr |= NEXTDMA_READ;
-    }
-}
-
-static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
-                           unsigned int size)
-{
-    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
-    next_dma *enet_dma;
-    hwaddr enet_reg;
-    uint32_t *enet_reg_value;
-    bool scsi_irq_ack = false;
-    bool scsi_reg = false;
-
-    enet_reg_value = next_enet_dma_reg(next_state, addr, &enet_dma,
-                                       &enet_reg);
-    if (enet_reg_value) {
-        if (enet_reg == NEXTDMA_CSR) {
-            next_enet_dma_csr_write(enet_dma, val);
-        } else {
-            *enet_reg_value = val;
-        }
-        return;
-    }
-
-    switch (addr) {
-    case NEXTDMA_SCSI(NEXTDMA_CSR):
-        scsi_reg = true;
-        if (val & DMA_SETENABLE) {
-            /* DPRINTF("SCSI DMA ENABLE\n"); */
-            next_state->dma[NEXTDMA_SCSI].csr |= DMA_ENABLE;
-        }
-        if (val & DMA_SETSUPDATE) {
-            next_state->dma[NEXTDMA_SCSI].csr |= DMA_SUPDATE;
-        }
-        if (val & DMA_CLRCOMPLETE) {
-            next_state->dma[NEXTDMA_SCSI].csr &= ~DMA_COMPLETE;
-            scsi_irq_ack = true;
-        }
-
-        if (val & DMA_RESET) {
-            next_state->dma[NEXTDMA_SCSI].csr &= ~(DMA_COMPLETE | DMA_SUPDATE |
-                                                  DMA_ENABLE);
-            next_state->dma[NEXTDMA_SCSI].stage_len = 0;
-            next_state->dma[NEXTDMA_SCSI].stage_flushes = 0;
-            scsi_irq_ack = true;
-            /* DPRINTF("SCSI DMA RESET\n"); */
-        }
-        /* DPRINTF("RXCSR \tWrite: %x\n",value); */
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_NEXT):
-        next_state->dma[NEXTDMA_SCSI].next = val;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_LIMIT):
-        next_state->dma[NEXTDMA_SCSI].limit = val;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_START):
-        next_state->dma[NEXTDMA_SCSI].start = val;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_STOP):
-        next_state->dma[NEXTDMA_SCSI].stop = val;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_NEXT_INIT):
-        next_state->dma[NEXTDMA_SCSI].next_initbuf = val;
-        scsi_reg = true;
-        break;
-
-    default:
-        DPRINTF("DMA write @ %x w/ %x\n", (unsigned)addr, (unsigned)val);
-    }
-
-    if (scsi_reg) {
-        next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
-
-        trace_next_scsi_dma_reg_write(NEXT_DMA_BASE + addr, val, dma->csr,
-                                      dma->next, dma->next_initbuf,
-                                      dma->limit, dma->start, dma->stop);
-    }
-    if (scsi_irq_ack) {
-        next_irq(opaque, NEXT_SCSI_DMA_I, 0);
-    }
-}
-
-static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
-{
-    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
-    next_dma *enet_dma;
-    hwaddr enet_reg;
-    uint32_t *enet_reg_value;
-    uint64_t val;
-    bool scsi_reg = false;
-
-    enet_reg_value = next_enet_dma_reg(next_state, addr, &enet_dma,
-                                       &enet_reg);
-    if (enet_reg_value) {
-        return *enet_reg_value;
-    }
-
-    switch (addr) {
-    case NEXTDMA_SCSI(NEXTDMA_CSR):
-        DPRINTF("SCSI DMA CSR READ\n");
-        val = next_state->dma[NEXTDMA_SCSI].csr;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_NEXT):
-        val = next_state->dma[NEXTDMA_SCSI].next;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_NEXT_INIT):
-        val = next_state->dma[NEXTDMA_SCSI].next_initbuf;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_LIMIT):
-        val = next_state->dma[NEXTDMA_SCSI].limit;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_START):
-        val = next_state->dma[NEXTDMA_SCSI].start;
-        scsi_reg = true;
-        break;
-
-    case NEXTDMA_SCSI(NEXTDMA_STOP):
-        val = next_state->dma[NEXTDMA_SCSI].stop;
-        scsi_reg = true;
-        break;
-
-    default:
-        DPRINTF("DMA read @ %x\n", (unsigned int)addr);
-        val = 0;
-    }
-
-    /*
-     * once the csr's are done, subtract 0x3FEC from the addr, and that will
-     * normalize the upper registers
-     */
-
-    if (scsi_reg &&
-        trace_event_get_state_backends(TRACE_NEXT_SCSI_DMA_REG_READ)) {
-        hwaddr trace_addr = NEXT_DMA_BASE + addr;
-
-        if (next_trace_read_sample(&next_state->trace_scsi_dma_read,
-                                   trace_addr, val)) {
-            next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
-
-            trace_next_scsi_dma_reg_read(
-                trace_addr, val, dma->csr, dma->next, dma->next_initbuf,
-                dma->limit, dma->start, dma->stop,
-                next_state->trace_scsi_dma_read.repeats);
-        }
-    }
-
-    return val;
-}
-
-static const MemoryRegionOps next_dma_ops = {
-    .read = next_dma_read,
-    .write = next_dma_write,
-    .impl.min_access_size = 4,
-    .valid.min_access_size = 4,
-    .valid.max_access_size = 4,
-    .endianness = DEVICE_BIG_ENDIAN,
-};
 
 static void next_irq(void *opaque, int number, int level)
 {
@@ -787,227 +504,16 @@ static void next_timer_set_irq(NeXTPC *s, bool pending, bool force)
     trace_next_timer_irq(pending, level, vector, s->int_status, s->scr2);
 }
 
-static int nextdma_irq(int type)
-{
-    switch (type) {
-    case NEXTDMA_SCSI:
-        return NEXT_SCSI_DMA_I;
-    default:
-        return 0;
-    }
-}
-
-static bool nextdma_segment_complete(void *opaque, next_dma *dma, int type)
-{
-    bool updating = dma->csr & DMA_SUPDATE;
-
-    dma->csr |= DMA_COMPLETE;
-    if (updating) {
-        dma->csr &= ~DMA_SUPDATE;
-        dma->next = dma->start;
-        dma->limit = dma->stop;
-    } else {
-        dma->csr &= ~DMA_ENABLE;
-    }
-
-    next_irq(opaque, nextdma_irq(type), 1);
-    return updating;
-}
-
-static bool nextdma_advance(void *opaque, next_dma *dma, int type,
-                            uint32_t amount)
-{
-    dma->next += amount;
-    if (dma->limit && dma->next == dma->limit) {
-        return nextdma_segment_complete(opaque, dma, type);
-    }
-    return true;
-}
-
-static void nextdma_flush_stage(void *opaque, int type)
-{
-    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
-    next_dma *dma = &next_state->dma[type];
-    uint8_t beat[16] = { 0 };
-    int staged;
-
-    if (!dma->stage_len || !dma->stage_flushes) {
-        return;
-    }
-    if (--dma->stage_flushes) {
-        return;
-    }
-
-    staged = dma->stage_len;
-    memcpy(beat, dma->stage, staged);
-    physical_memory_write(dma->next, beat, sizeof(beat));
-    dma->stage_len = 0;
-    nextdma_advance(opaque, dma, type, sizeof(beat));
-
-    trace_next_scsi_dma_transfer(
-        "flush", staged, sizeof(beat), dma->next - sizeof(beat),
-        dma->csr, dma->next, dma->next_initbuf, dma->limit,
-        dma->saved_next, dma->saved_limit);
-}
-
-static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
-{
-    uint32_t base_addr;
-    uint32_t capacity;
-    int committed = 0;
-    int requested = size;
-    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
-    next_dma *dma = &next_state->dma[type];
-
-    if (!(dma->csr & DMA_ENABLE)) {
-        trace_next_scsi_dma_transfer(
-            "disabled", requested, committed, dma->next,
-            dma->csr, dma->next, dma->next_initbuf, dma->limit,
-            dma->saved_next, dma->saved_limit);
-        return;
-    }
-
-    /*
-     * prom sets the dma start using initbuf while the bootloader uses next
-     * so we check to see if initbuf is 0
-     */
-    if (dma->next_initbuf == 0) {
-        base_addr = dma->next;
-    } else {
-        base_addr = dma->next_initbuf;
-        dma->next = base_addr;
-        dma->next_initbuf = 0;
-    }
-
-    trace_next_scsi_dma_transfer(
-        "entry", requested, committed, base_addr,
-        dma->csr, dma->next, dma->next_initbuf, dma->limit,
-        dma->saved_next, dma->saved_limit);
-
-    while (size) {
-        int chunk;
-
-        if (dma->stage_len) {
-            chunk = MIN(size, sizeof(dma->stage) - dma->stage_len);
-            memcpy(dma->stage + dma->stage_len, buf, chunk);
-            dma->stage_len += chunk;
-            dma->stage_flushes = 4;
-            buf += chunk;
-            size -= chunk;
-            if (dma->stage_len != sizeof(dma->stage)) {
-                break;
-            }
-
-            physical_memory_write(dma->next, dma->stage,
-                                  sizeof(dma->stage));
-            dma->stage_len = 0;
-            dma->stage_flushes = 0;
-            committed += sizeof(dma->stage);
-            if (!nextdma_advance(opaque, dma, type, sizeof(dma->stage)) &&
-                size) {
-                break;
-            }
-            continue;
-        }
-
-        if (size < sizeof(dma->stage)) {
-            memcpy(dma->stage, buf, size);
-            dma->stage_len = size;
-            dma->stage_flushes = 4;
-            size = 0;
-            break;
-        }
-
-        capacity = dma->limit && dma->limit > dma->next ?
-                   dma->limit - dma->next : size;
-        chunk = MIN(size & ~(sizeof(dma->stage) - 1),
-                    capacity & ~(sizeof(dma->stage) - 1));
-        if (!chunk) {
-            break;
-        }
-        physical_memory_write(dma->next, buf, chunk);
-        buf += chunk;
-        size -= chunk;
-        committed += chunk;
-        if (!nextdma_advance(opaque, dma, type, chunk) && size) {
-            break;
-        }
-    }
-
-    trace_next_scsi_dma_transfer(
-        dma->stage_len ? "staged" : "complete", requested, committed,
-        base_addr,
-        dma->csr, dma->next, dma->next_initbuf, dma->limit,
-        dma->saved_next, dma->saved_limit);
-}
-
-static void nextdma_read(void *opaque, uint8_t *buf, int size, int type)
-{
-    uint32_t base_addr;
-    int requested = size;
-    int transferred = 0;
-    NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
-    next_dma *dma = &next_state->dma[type];
-
-    if (!(dma->csr & DMA_ENABLE)) {
-        trace_next_scsi_dma_read(
-            "disabled", requested, transferred, dma->next,
-            dma->csr, dma->next, dma->next_initbuf, dma->limit,
-            dma->saved_next, dma->saved_limit);
-        return;
-    }
-
-    /*
-     * The PROM uses initbuf while the boot loader and kernel use next.
-     * Consume exactly the amount requested by ESP: unlike a DMA write into
-     * guest memory, rounding here would overrun ESP's transfer buffer.
-     */
-    if (dma->next_initbuf == 0) {
-        base_addr = dma->next;
-    } else {
-        base_addr = dma->next_initbuf;
-        dma->next = base_addr;
-        dma->next_initbuf = 0;
-    }
-
-    trace_next_scsi_dma_read(
-        "entry", requested, transferred, base_addr,
-        dma->csr, dma->next, dma->next_initbuf, dma->limit,
-        dma->saved_next, dma->saved_limit);
-
-    while (size) {
-        uint32_t capacity = dma->limit && dma->limit > dma->next ?
-                            dma->limit - dma->next : size;
-        int chunk = MIN((uint32_t)size, capacity);
-
-        if (!chunk) {
-            break;
-        }
-        physical_memory_read(dma->next, buf, chunk);
-        buf += chunk;
-        size -= chunk;
-        transferred += chunk;
-        if (!nextdma_advance(opaque, dma, type, chunk) && size) {
-            break;
-        }
-    }
-
-    trace_next_scsi_dma_read(
-        "complete", requested, transferred, base_addr,
-        dma->csr, dma->next, dma->next_initbuf, dma->limit,
-        dma->saved_next, dma->saved_limit);
-}
-
 static void nextscsi_read(void *opaque, uint8_t *buf, int len)
 {
     DPRINTF("SCSI READ: %x\n", len);
-    nextdma_read(opaque, buf, len, NEXTDMA_SCSI);
+    next_dma_scsi_read(opaque, buf, len);
 }
 
 static void nextscsi_write(void *opaque, uint8_t *buf, int size)
 {
     DPRINTF("SCSI WRITE: %i\n", size);
-    nextdma_write(opaque, buf, size, NEXTDMA_SCSI);
+    next_dma_scsi_write(opaque, buf, size);
 }
 
 static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
@@ -1023,7 +529,7 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         if (val & SCSICSR_FIFOFL) {
             DPRINTF("SCSICSR FIFO Flush\n");
             if (!(old & SCSICSR_FIFOFL)) {
-                nextdma_flush_stage(pc, NEXTDMA_SCSI);
+                next_dma_scsi_fifo_flush(s->dma);
             }
         }
 
@@ -1156,16 +662,18 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
     SysBusESPState *sysbus_esp;
     SysBusDevice *sbd;
     ESPState *esp;
-    NeXTPC *pcdev;
 
-    pcdev = NEXT_PC(container_of(s, NeXTPC, next_scsi));
+    if (!s->dma) {
+        error_setg(errp, "'dma' link is not set");
+        return;
+    }
 
     /* ESP */
     sysbus_esp = SYSBUS_ESP(&s->sysbus_esp);
     esp = &sysbus_esp->esp;
     esp->dma_memory_read = nextscsi_read;
     esp->dma_memory_write = nextscsi_write;
-    esp->dma_opaque = pcdev;
+    esp->dma_opaque = s->dma;
     sysbus_esp->it_shift = 0;
     esp->dma_enabled = 1;
     clock_set_hz(esp->clock, NEXT_ESP_CLOCK_HZ);
@@ -1194,12 +702,17 @@ static const VMStateDescription next_scsi_vmstate = {
     },
 };
 
+static const Property next_scsi_properties[] = {
+    DEFINE_PROP_LINK("dma", NeXTSCSI, dma, TYPE_NEXT_DMA, NextDMAState *),
+};
+
 static void next_scsi_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->desc = "NeXT SCSI Controller";
     dc->realize = next_scsi_realize;
+    device_class_set_props(dc, next_scsi_properties);
     dc->vmsd = &next_scsi_vmstate;
 }
 
@@ -1751,6 +1264,15 @@ static void next_pc_realize(DeviceState *dev, Error **errp)
     SysBusDevice *sbd;
     DeviceState *d;
 
+    if (!s->dma) {
+        error_setg(errp, "'dma' link is not set");
+        return;
+    }
+    if (!object_property_set_link(OBJECT(&s->next_scsi), "dma",
+                                  OBJECT(s->dma), errp)) {
+        return;
+    }
+
     /* SCSI */
     sbd = SYS_BUS_DEVICE(&s->next_scsi);
     if (!sysbus_realize(sbd, errp)) {
@@ -1865,6 +1387,7 @@ static void next_pc_init(Object *obj)
  */
 static const Property next_pc_properties[] = {
     DEFINE_PROP_LINK("cpu", NeXTPC, cpu, TYPE_M68K_CPU, M68kCPU *),
+    DEFINE_PROP_LINK("dma", NeXTPC, dma, TYPE_NEXT_DMA, NextDMAState *),
 };
 
 static int next_pc_post_load(void *opaque, int version_id)
@@ -1956,6 +1479,7 @@ static void next_cube_init(MachineState *machine)
     CPUM68KState *env;
     MemoryRegion *sysmem = get_system_memory();
     const char *bios_name = machine->firmware ?: ROM_FILE;
+    DeviceState *dma_dev;
     DeviceState *pcdev;
 
     /* Initialize the cpu core */
@@ -1970,10 +1494,22 @@ static void next_cube_init(MachineState *machine)
     env->vbr = 0;
     env->sr  = 0x2700;
 
+    /* DMA */
+    dma_dev = qdev_new(TYPE_NEXT_DMA);
+    m->dma = NEXT_DMA(dma_dev);
+    object_property_add_child(OBJECT(machine), "next-dma", OBJECT(dma_dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dma_dev), &error_fatal);
+
     /* Peripheral Controller */
     pcdev = qdev_new(TYPE_NEXT_PC);
     object_property_set_link(OBJECT(pcdev), "cpu", OBJECT(cpu), &error_abort);
+    object_property_set_link(OBJECT(pcdev), "dma", OBJECT(m->dma),
+                             &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcdev), &error_fatal);
+
+    sysbus_mmio_map(SYS_BUS_DEVICE(m->dma), 0, NEXT_DMA_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(m->dma), NEXT_DMA_SCSI,
+                       qdev_get_gpio_in(pcdev, NEXT_SCSI_DMA_I));
 
     /* 64MB RAM starting at 0x04000000  */
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);
@@ -2053,11 +1589,6 @@ static void next_cube_init(MachineState *machine)
             exit(1);
         }
     }
-
-    /* DMA */
-    memory_region_init_io(&m->dmamem, NULL, &next_dma_ops, pcdev,
-                          "next.dma", 0x5000);
-    memory_region_add_subregion(sysmem, NEXT_DMA_BASE, &m->dmamem);
 }
 
 static void next_machine_class_init(ObjectClass *oc, const void *data)

@@ -1,5 +1,11 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# next-dma.c
+next_scsi_dma_reg_read(uint64_t addr, uint64_t value, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t start, uint32_t stop, uint64_t repeats) "addr=0x%" PRIx64 " value=0x%" PRIx64 " csr=0x%x next=0x%x next_init=0x%x limit=0x%x start=0x%x stop=0x%x repeats=%" PRIu64
+next_scsi_dma_reg_write(uint64_t addr, uint64_t value, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t start, uint32_t stop) "addr=0x%" PRIx64 " value=0x%" PRIx64 " csr=0x%x next=0x%x next_init=0x%x limit=0x%x start=0x%x stop=0x%x"
+next_scsi_dma_transfer(const char *stage, int requested, int aligned, uint32_t base, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t saved_next, uint32_t saved_limit) "stage=%s direction=device-to-memory requested=%d aligned=%d base=0x%x csr=0x%x next=0x%x next_init=0x%x limit=0x%x saved_next=0x%x saved_limit=0x%x"
+next_scsi_dma_read(const char *stage, int requested, int transferred, uint32_t base, uint32_t csr, uint32_t next, uint32_t next_init, uint32_t limit, uint32_t saved_next, uint32_t saved_limit) "stage=%s direction=memory-to-device requested=%d transferred=%d base=0x%x csr=0x%x next=0x%x next_init=0x%x limit=0x%x saved_next=0x%x saved_limit=0x%x"
+
 # rc4030.c
 jazzio_read(uint64_t addr, uint32_t ret) "read reg[0x%"PRIx64"] = 0x%x"
 jazzio_write(uint64_t addr, uint32_t val) "write reg[0x%"PRIx64"] = 0x%x"
