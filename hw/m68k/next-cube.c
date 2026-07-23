@@ -59,6 +59,7 @@
 #define NEXT_TIMER_UPDATE       0x40
 #define NEXT_TIMER_TICK_NS      INT64_C(1000)
 #define NEXT_TIMER_FULL_PERIOD  0x10000
+#define NEXT_TIMER_IRQ_STATUS   0x20000000
 #define NEXT_SCR2_TIMER_IPL7    0x00008000
 #define NEXT_EVENTC_MASK        0x000fffff
 
@@ -1563,7 +1564,6 @@ static const Property next_pc_properties[] = {
 static int next_pc_post_load(void *opaque, int version_id)
 {
     NeXTPC *s = opaque;
-    bool timer_irq_pending;
 
     if (version_id < 5) {
         timer_del(&s->system_timer);
@@ -1571,7 +1571,8 @@ static int next_pc_post_load(void *opaque, int version_id)
         s->timer_counter = 0;
         s->timer_csr = 0;
         s->eventc_latched = 0;
-        next_timer_set_irq(s, false, true);
+        s->timer_irq_pending = false;
+        s->int_status &= ~NEXT_TIMER_IRQ_STATUS;
         return 0;
     }
 
@@ -1581,15 +1582,18 @@ static int next_pc_post_load(void *opaque, int version_id)
 
     s->timer_csr &= NEXT_TIMER_ENABLE;
     s->eventc_latched &= NEXT_EVENTC_MASK;
-    if (!(s->timer_csr & NEXT_TIMER_ENABLE) || !s->timer_counter ||
-        s->timer_irq_pending) {
+    if (!(s->timer_csr & NEXT_TIMER_ENABLE) || !s->timer_counter) {
         timer_del(&s->system_timer);
     } else if (!timer_pending(&s->system_timer)) {
         next_system_timer_schedule(s);
     }
 
-    timer_irq_pending = s->timer_irq_pending;
-    next_timer_set_irq(s, timer_irq_pending, true);
+    if (s->timer_irq_pending) {
+        next_timer_set_irq(s, true, true);
+    } else {
+        s->timer_irq_pending = false;
+        s->int_status &= ~NEXT_TIMER_IRQ_STATUS;
+    }
     return 0;
 }
 
