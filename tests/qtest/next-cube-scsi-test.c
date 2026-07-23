@@ -89,6 +89,8 @@ static TestDisk test_disk = {
     .disk_fd = -1,
 };
 
+static void issue_inquiry_dma(QTestState *qts, uint8_t length);
+
 static void cleanup_test_rom(void *opaque)
 {
     TestROM *rom = opaque;
@@ -259,6 +261,43 @@ static void test_scsi_dma_control_does_not_raise_interrupt(void)
                     NEXT_SCSI_DMA_IRQ, ==, 0);
 
     qtest_quit(qts);
+}
+
+static void test_scsi_disabled_dma_does_not_complete(void)
+{
+    enum {
+        INQUIRY_LENGTH = 64,
+    };
+    uint8_t received[INQUIRY_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    int i;
+
+    /*
+     * A reset channel retains its programmed pointers, but the ESP must not
+     * be able to advance that stale window or post another DMA interrupt
+     * until software explicitly enables the channel again.
+     */
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, sizeof(received));
+    qtest_writel(qts, NEXT_INTR_MASK, NEXT_SCSI_DMA_IRQ | NEXT_SCSI_IRQ);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + INQUIRY_LENGTH);
+
+    issue_inquiry_dma(qts, INQUIRY_LENGTH);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, 0);
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, sizeof(received));
+    for (i = 0; i < sizeof(received); i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
 }
 
 static void test_scsi_write_dma(void)
@@ -790,6 +829,8 @@ int main(int argc, char **argv)
                    test_immediate_replacement_cancels_selection_timeout);
     qtest_add_func("/next-cube/scsi/dma-control-does-not-raise-interrupt",
                    test_scsi_dma_control_does_not_raise_interrupt);
+    qtest_add_func("/next-cube/scsi/disabled-dma-does-not-complete",
+                   test_scsi_disabled_dma_does_not_complete);
     qtest_add_func("/next-cube/scsi/write-dma", test_scsi_write_dma);
     qtest_add_func("/next-cube/scsi/dma-clear-complete",
                    test_scsi_dma_clear_complete);

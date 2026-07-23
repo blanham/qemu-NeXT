@@ -808,6 +808,14 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
     NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
     next_dma *dma = &next_state->dma[type];
 
+    if (!(dma->csr & DMA_ENABLE)) {
+        trace_next_scsi_dma_transfer(
+            "disabled", requested, committed, dma->next,
+            dma->csr, dma->next, dma->next_initbuf, dma->limit,
+            dma->saved_next, dma->saved_limit);
+        return;
+    }
+
     /*
      * prom sets the dma start using initbuf while the bootloader uses next
      * so we check to see if initbuf is 0
@@ -889,6 +897,14 @@ static void nextdma_read(void *opaque, uint8_t *buf, int size, int type)
     int transferred = 0;
     NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
     next_dma *dma = &next_state->dma[type];
+
+    if (!(dma->csr & DMA_ENABLE)) {
+        trace_next_scsi_dma_read(
+            "disabled", requested, transferred, dma->next,
+            dma->csr, dma->next, dma->next_initbuf, dma->limit,
+            dma->saved_next, dma->saved_limit);
+        return;
+    }
 
     /*
      * The PROM uses initbuf while the boot loader and kernel use next.
