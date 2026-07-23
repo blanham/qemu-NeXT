@@ -53,6 +53,7 @@
 #define NEXT_ENTX_DMA_IRQ (1U << 28)
 
 #define DMA_SETENABLE      0x00010000
+#define DMA_SETSUPDATE     0x00020000
 #define DMA_CLRCOMPLETE    0x00080000
 #define DMA_RESET          0x00100000
 #define DMA_ENABLE         0x01000000
@@ -612,14 +613,16 @@ static void test_tx_two_segment(void)
     saved = tx_read_pointers(qts);
     tx_prepare_controller(qts);
 
-    qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
+    qtest_writel(qts, NEXT_ENTX_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE);
     qtest_clock_step(qts, 1);
     socket_read_frame(harness.backend_fd, received, sizeof(received));
 
     g_assert_cmpmem(received, sizeof(received),
                     expected, sizeof(expected));
     g_assert_cmphex(qtest_readl(qts, NEXT_ENTX_CSR) &
-                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    (DMA_ENABLE | DMA_SUPDATE |
+                     DMA_COMPLETE | DMA_BUSEXC),
                     ==, DMA_COMPLETE);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENTX_NEXT), ==,
                     second + SECOND_LENGTH);

@@ -810,7 +810,9 @@ void next_dma_enet_tx_complete(NextDMAState *s, NextDMAResult result)
     NextDMAChannelState *c = &s->channel[NEXT_DMA_ENTX];
 
     if (result == NEXT_DMA_OK) {
-        next_dma_complete_segment(s, NEXT_DMA_ENTX);
+        c->csr |= NEXT_DMA_CSR_COMPLETE;
+        c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+        next_dma_update_irq(s, NEXT_DMA_ENTX);
         return;
     }
 
