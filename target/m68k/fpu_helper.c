@@ -116,10 +116,12 @@ void HELPER(extp96)(CPUM68KState *env, FPReg *res,
         return;
     }
 
-    exponent = extract32(word0, 24, 4) * 100 +
+    exponent = extract32(word0, 12, 4) * 1000 +
+               extract32(word0, 24, 4) * 100 +
                extract32(word0, 20, 4) * 10 +
                extract32(word0, 16, 4);
     if ((word0 & 0xf) > 9 ||
+        extract32(word0, 12, 4) > 9 ||
         extract32(word0, 24, 4) > 9 ||
         extract32(word0, 20, 4) > 9 ||
         extract32(word0, 16, 4) > 9) {
@@ -174,6 +176,152 @@ void HELPER(extp96)(CPUM68KState *env, FPReg *res,
 
     res->d = float128_to_floatx80(value, &env->fp_status);
     res->d.high = deposit32(res->d.high, 15, 1, sign);
+}
+
+static const uint64_t decimal_powers[] = {
+    UINT64_C(1), UINT64_C(10), UINT64_C(100), UINT64_C(1000),
+    UINT64_C(10000), UINT64_C(100000), UINT64_C(1000000),
+    UINT64_C(10000000), UINT64_C(100000000), UINT64_C(1000000000),
+    UINT64_C(10000000000), UINT64_C(100000000000),
+    UINT64_C(1000000000000), UINT64_C(10000000000000),
+    UINT64_C(100000000000000), UINT64_C(1000000000000000),
+    UINT64_C(10000000000000000), UINT64_C(100000000000000000),
+};
+
+static FloatRoundMode packed_rounding_mode(CPUM68KState *env, bool sign)
+{
+    FloatRoundMode mode = get_float_rounding_mode(&env->fp_status);
+
+    if (sign) {
+        if (mode == float_round_up) {
+            mode = float_round_down;
+        } else if (mode == float_round_down) {
+            mode = float_round_up;
+        }
+    }
+    return mode;
+}
+
+void HELPER(stp96)(CPUM68KState *env, FPReg *src, uint32_t addr,
+                   uint32_t kfactor)
+{
+    uintptr_t ra = GETPC();
+    float_status status = env->fp_status;
+    bool sign = extractFloatx80Sign(src->d);
+    float128 magnitude, value, one, ten, scaled;
+    uint64_t significand;
+    uint8_t digits[17];
+    uint32_t word0, word1 = 0, word2 = 0;
+    int exponent = 0;
+    int k = sextract32(kfactor, 0, 7);
+    int precision;
+    int scale;
+    int i;
+
+    if (floatx80_is_any_nan(src->d)) {
+        word0 = (uint32_t)src->d.high << 16;
+        word1 = src->d.low >> 32;
+        word2 = src->d.low;
+        if (floatx80_is_signaling_nan(src->d, &env->fp_status)) {
+            float_raise(float_flag_invalid | float_flag_invalid_snan,
+                        &env->fp_status);
+        }
+        goto store;
+    }
+    if (floatx80_is_infinity(src->d, &env->fp_status)) {
+        word0 = (sign ? 0x80000000 : 0) | 0x7fff0000;
+        goto store;
+    }
+    if (floatx80_is_zero(src->d)) {
+        word0 = sign ? 0x80000000 : 0;
+        goto store;
+    }
+
+    set_float_exception_flags(0, &status);
+    set_float_rounding_mode(float_round_nearest_even, &status);
+    magnitude = floatx80_to_float128(floatx80_abs(src->d), &status);
+    value = magnitude;
+    one = int64_to_float128(1, &status);
+    ten = int64_to_float128(10, &status);
+
+    while (float128_compare_quiet(value, ten, &status) >=
+           float_relation_equal) {
+        value = float128_div(value, ten, &status);
+        exponent++;
+    }
+    while (float128_compare_quiet(value, one, &status) ==
+           float_relation_less) {
+        value = float128_mul(value, ten, &status);
+        exponent--;
+    }
+
+    precision = k > 0 ? k : exponent - k + 1;
+    if (precision < 1) {
+        precision = 1;
+    } else if (precision > 17) {
+        if (k > 0) {
+            float_raise(float_flag_invalid, &env->fp_status);
+        }
+        precision = 17;
+    }
+    if (k <= 0 && exponent < k) {
+        exponent = k;
+    }
+
+    set_float_exception_flags(0, &status);
+    set_float_rounding_mode(float_round_nearest_even, &status);
+    scaled = magnitude;
+    scale = precision - exponent - 1;
+    while (scale > 0) {
+        scaled = float128_mul(scaled, ten, &status);
+        scale--;
+    }
+    while (scale < 0) {
+        scaled = float128_div(scaled, ten, &status);
+        scale++;
+    }
+    set_float_rounding_mode(packed_rounding_mode(env, sign), &status);
+    significand = float128_to_uint64(scaled, &status);
+    if (get_float_exception_flags(&status) & float_flag_inexact) {
+        float_raise(float_flag_inexact, &env->fp_status);
+    }
+    if (significand == decimal_powers[precision]) {
+        significand /= 10;
+        exponent++;
+    }
+    if (significand == 0) {
+        exponent = 1;
+    }
+    significand *= decimal_powers[17 - precision];
+
+    for (i = 16; i >= 0; i--) {
+        digits[i] = significand % 10;
+        significand /= 10;
+    }
+    for (i = 1; i <= 8; i++) {
+        word1 = (word1 << 4) | digits[i];
+    }
+    for (i = 9; i <= 16; i++) {
+        word2 = (word2 << 4) | digits[i];
+    }
+
+    word0 = (sign ? 0x80000000 : 0) | digits[0];
+    if (exponent < 0) {
+        word0 |= 0x40000000;
+        exponent = -exponent;
+    }
+    if (exponent >= 1000) {
+        float_raise(float_flag_invalid, &env->fp_status);
+    }
+    word0 |= ((exponent / 1000) % 10) << 12;
+    word0 |= ((exponent / 100) % 10) << 24;
+    word0 |= ((exponent / 10) % 10) << 20;
+    word0 |= (exponent % 10) << 16;
+
+store:
+    cpu_stl_be_data_ra(env, addr, word0, ra);
+    cpu_stl_be_data_ra(env, addr + 4, word1, ra);
+    cpu_stl_be_data_ra(env, addr + 8, word2, ra);
 }
 
 float64 HELPER(redf64)(CPUM68KState *env, FPReg *val)

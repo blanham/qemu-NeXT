@@ -13,6 +13,8 @@ trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 "${cross}ld" -T "$srcdir/kernel.ld" -o "$tmpdir/packed-fmove.elf" \
     "$tmpdir/packed-fmove.o"
 
-timeout 10s "$qemu" \
-    -M virt -cpu m68040 -display none -serial none -monitor none \
-    -kernel "$tmpdir/packed-fmove.elf"
+for cpu in m68020 m68040; do
+    timeout 10s "$qemu" \
+        -M virt -cpu "$cpu" -display none -serial none -monitor none \
+        -kernel "$tmpdir/packed-fmove.elf"
+done
