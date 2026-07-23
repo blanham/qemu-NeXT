@@ -112,6 +112,7 @@ typedef struct CPUArchState {
     uint32_t fpiar;
     uint8_t fp_state[M68K_FP_STATE_MAX];
     uint8_t fp_state_size;
+    bool fp_state_null;
     uint8_t fp_pending_vector;
     uint32_t fp_pending_pc;
     float_status fp_status;

@@ -66,6 +66,32 @@ compare:
         andi.l  #0x40000000,%d0
         cmpi.l  #0x40000000,%d0
         bne.w   fail
+        fmove.x %fp7,null_fp7
+        cmpi.l  #0x7fff0000,null_fp7
+        bne.w   fail
+        move.l  null_fp7+4,%d0
+        andi.l  #0x40000000,%d0
+        cmpi.l  #0x40000000,%d0
+        bne.w   fail
+
+        /*
+         * A NULL restore also discards a deferred exception before the next
+         * nonconditional instruction can deliver it.
+         */
+        moveq   #0,%d0
+        fmove.l %d0,%fpsr
+        move.l  #0x00000400,%d0
+        fmove.l %d0,%fpcr
+        fmove.d zero,%fp0
+        fmove.d one,%fp1
+        fdiv.x  %fp0,%fp1
+        lea     null_frame,%a0
+        frestore (%a0)
+        fmove.l null_frame,%fp0
+        lea     pending_saved_frame+4,%a1
+        fsave  -(%a1)
+        cmpi.l  #0x41000000,(%a1)
+        bne.w   fail
 
         /*
          * NeXT Mach probes the FPU with this exact sequence.  The FMOVE is
@@ -80,6 +106,48 @@ compare:
         cmpa.l  #idle_saved_frame,%a1
         bne.w   fail
         cmpi.l  #0x41000000,(%a1)
+        bne.w   fail
+
+        /*
+         * These instruction families return through specialized translator
+         * paths, but are still nonconditional operations and must move a
+         * restored NULL state to IDLE.
+         */
+        lea     null_frame,%a0
+        frestore (%a0)
+        fmovecr #0,%fp7
+        lea     fmovecr_saved_frame+4,%a1
+        fsave  -(%a1)
+        cmpi.l  #0x41000000,(%a1)
+        bne.w   fail
+        fmove.l %fpiar,%d0
+        bne.w   fail
+        fmove.l %fpsr,%d0
+        bne.w   fail
+
+        lea     null_frame,%a0
+        frestore (%a0)
+        moveq   #0,%d0
+        fmove.l %d0,%fpcr
+        lea     fcr_saved_frame+4,%a1
+        fsave  -(%a1)
+        cmpi.l  #0x41000000,(%a1)
+        bne.w   fail
+        fmove.l %fpiar,%d0
+        bne.w   fail
+        fmove.l %fpsr,%d0
+        bne.w   fail
+
+        lea     null_frame,%a0
+        frestore (%a0)
+        fmovem.x %fp7,fmovem_saved
+        lea     fmovem_saved_frame+4,%a1
+        fsave  -(%a1)
+        cmpi.l  #0x41000000,(%a1)
+        bne.w   fail
+        fmove.l %fpiar,%d0
+        bne.w   fail
+        fmove.l %fpsr,%d0
         bne.w   fail
 
         movea.l #0xff009004,%a0
@@ -109,5 +177,19 @@ idle_saved_frame:
         .long   0
 null_fp0:
         .long   0, 0, 0
+null_fp7:
+        .long   0, 0, 0
 one:
         .long   0x3ff00000, 0
+zero:
+        .long   0, 0
+pending_saved_frame:
+        .long   0
+fmovecr_saved_frame:
+        .long   0
+fcr_saved_frame:
+        .long   0
+fmovem_saved_frame:
+        .long   0
+fmovem_saved:
+        .long   0, 0, 0

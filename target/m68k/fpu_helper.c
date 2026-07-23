@@ -204,14 +204,17 @@ static bool valid_fp_state_frame(uint8_t version, unsigned size)
 uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
 {
     uintptr_t ra = GETPC();
-    unsigned size = env->fp_state_size ? env->fp_state_size : 4;
+    unsigned size = env->fp_state_null ? 4 :
+                    env->fp_state_size ? env->fp_state_size : 4;
     unsigned i;
 
     if (mode == 4) {
         addr -= size;
     }
 
-    if (env->fp_state_size) {
+    if (env->fp_state_null) {
+        cpu_stl_be_data_ra(env, addr, 0, ra);
+    } else if (env->fp_state_size) {
         for (i = 0; i < size; i++) {
             cpu_stb_data_ra(env, addr + i, env->fp_state[i], ra);
         }
@@ -220,8 +223,10 @@ uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
     }
 
     /* FSAVE leaves the floating-point unit in the idle state. */
+    env->fp_state_null = false;
     env->fp_state_size = 0;
     env->fp_pending_vector = 0;
+    env->fp_pending_pc = 0;
 
     return mode == 3 ? addr + size : addr;
 }
@@ -252,15 +257,18 @@ uint32_t HELPER(frestore)(CPUM68KState *env, uint32_t addr)
         env->fp_pending_vector = 0;
         env->fp_pending_pc = 0;
         set_float_exception_flags(0, &env->fp_status);
-        memset(env->fp_state, 0, 4);
-        env->fp_state_size = 4;
+        memset(env->fp_state, 0, sizeof(env->fp_state));
+        env->fp_state_size = 0;
+        env->fp_state_null = true;
     } else if (size == 4) {
         env->fp_state_size = 0;
+        env->fp_state_null = false;
     } else {
         for (i = 0; i < size; i++) {
             env->fp_state[i] = cpu_ldub_data_ra(env, addr + i, ra);
         }
         env->fp_state_size = size;
+        env->fp_state_null = false;
     }
 
     return size;
@@ -416,6 +424,7 @@ static void make_busy_fp_state(CPUM68KState *env, uint32_t pc)
     stl_be_p(&env->fp_state[36], cpu_m68k_get_fpsr(env));
     stl_be_p(&env->fp_state[40], pc);
     env->fp_state_size = 100;
+    env->fp_state_null = false;
 }
 
 static void deliver_pending_fp_exception(CPUM68KState *env, uintptr_t ra)
@@ -439,11 +448,14 @@ void HELPER(fpu_check_pending)(CPUM68KState *env, uint32_t pc)
     deliver_pending_fp_exception(env, GETPC());
 }
 
+void HELPER(fpu_null_to_idle)(CPUM68KState *env)
+{
+    env->fp_state_null = false;
+}
+
 void HELPER(fpu_begin)(CPUM68KState *env, uint32_t pc)
 {
-    if (env->fp_state_size == 4) {
-        env->fp_state_size = 0;
-    }
+    HELPER(fpu_null_to_idle)(env);
     env->fpiar = pc;
     env->fpsr &= ~FPSR_EXC_MASK;
     set_float_exception_flags(0, &env->fp_status);

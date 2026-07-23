@@ -4794,6 +4794,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
             gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
             return;
         }
+        gen_helper_fpu_null_to_idle(tcg_env);
         if (is_write) {
             gen_load_fcr(s, DREG(insn, 0), mask);
         } else {
@@ -4805,6 +4806,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
             gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
             return;
         }
+        gen_helper_fpu_null_to_idle(tcg_env);
         if (is_write) {
             gen_load_fcr(s, AREG(insn, 0), mask);
         } else {
@@ -4819,6 +4821,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
                 gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
                 return;
             }
+            gen_helper_fpu_null_to_idle(tcg_env);
             tmp = tcg_constant_i32(read_im32(env, s));
             gen_store_fcr(s, tmp, mask);
             return;
@@ -4833,6 +4836,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
         gen_addr_fault(s);
         return;
     }
+    gen_helper_fpu_null_to_idle(tcg_env);
 
     addr = tcg_temp_new();
     tcg_gen_mov_i32(addr, tmp);
@@ -4894,6 +4898,7 @@ static void gen_op_fmovem(CPUM68KState *env, DisasContext *s,
         gen_addr_fault(s);
         return;
     }
+    gen_helper_fpu_null_to_idle(tcg_env);
 
     tmp = tcg_temp_new();
     if (mode & 0x1) {
@@ -4956,6 +4961,7 @@ DISAS_INSN(fpu)
             /* fmovecr */
             TCGv rom_offset = tcg_constant_i32(opmode);
             cpu_dest = gen_fp_ptr(REG(ext, 7));
+            gen_helper_fpu_null_to_idle(tcg_env);
             gen_helper_fconst(tcg_env, cpu_dest, rom_offset);
             return;
         }

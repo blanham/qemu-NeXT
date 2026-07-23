@@ -481,6 +481,15 @@ static int fpu_pre_save(void *opaque)
     return 0;
 }
 
+static int fpu_pre_load(void *opaque)
+{
+    M68kCPU *s = opaque;
+
+    /* Older streams have no NULL-state subsection. */
+    s->env.fp_state_null = false;
+    return 0;
+}
+
 static int fpu_post_load(void *opaque, int version)
 {
     M68kCPU *s = opaque;
@@ -489,11 +498,44 @@ static int fpu_post_load(void *opaque, int version)
     return 0;
 }
 
+static bool fpu_null_state_needed(void *opaque)
+{
+    M68kCPU *s = opaque;
+
+    return s->env.fp_state_null;
+}
+
+static int fpu_null_state_post_load(void *opaque, int version)
+{
+    M68kCPU *s = opaque;
+
+    s->env.fp_state_size = 0;
+    s->env.fp_state_null = true;
+    return 0;
+}
+
+/*
+ * Keep the parent section at version 4 so normal states remain compatible
+ * with older destinations.  NULL is not representable there, so encode that
+ * rare state with a presence-only subsection.
+ */
+static const VMStateDescription vmstate_fpu_null_state = {
+    .name = "cpu/fpu/null_state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = fpu_null_state_needed,
+    .post_load = fpu_null_state_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmmstate_fpu = {
     .name = "cpu/fpu",
     .version_id = 4,
     .minimum_version_id = 1,
     .needed = fpu_needed,
+    .pre_load = fpu_pre_load,
     .pre_save = fpu_pre_save,
     .post_load = fpu_post_load,
     .fields = (const VMStateField[]) {
@@ -507,6 +549,10 @@ const VMStateDescription vmmstate_fpu = {
         VMSTATE_STRUCT_ARRAY(env.fregs, M68kCPU, 8, 0, vmstate_freg, FPReg),
         VMSTATE_STRUCT(env.fp_result, M68kCPU, 0, vmstate_freg, FPReg),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_fpu_null_state,
+        NULL
     }
 };
 
