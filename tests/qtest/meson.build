@@ -166,6 +166,7 @@ qtests_m68k = ['boot-serial-test'] + \
    ['next-cube-scsi-test',
     'next-dma-test',
     'next-mb8795-test',
+    'next-memctl-test',
     'next-cube-dma-test',
     'next-cube-timer-test',
     'next-cube-rtc-test'] : []) + \
