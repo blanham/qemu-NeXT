@@ -4935,10 +4935,6 @@ static void gen_op_fmovem(CPUM68KState *env, DisasContext *s,
     }
 }
 
-/*
- * ??? FP exceptions are not implemented.  Most exceptions are deferred until
- * immediately before the next FP instruction is executed.
- */
 DISAS_INSN(fpu)
 {
     uint16_t ext;
@@ -4948,6 +4944,8 @@ DISAS_INSN(fpu)
 
     ext = read_im16(env, s);
     opmode = ext & 0x7f;
+    gen_helper_fpu_check_pending(tcg_env,
+                                 tcg_constant_i32(s->base.pc_next));
     switch ((ext >> 13) & 7) {
     case 0:
         break;
@@ -4963,12 +4961,16 @@ DISAS_INSN(fpu)
         }
         break;
     case 3: /* fmove out */
+        gen_helper_fpu_begin(tcg_env,
+                             tcg_constant_i32(s->base.pc_next));
         cpu_src = gen_fp_ptr(REG(ext, 7));
         opsize = ext_opsize(ext, 10);
         if (gen_ea_fp(env, s, insn, opsize, cpu_src,
                       EA_STORE, IS_USER(s)) == -1) {
             gen_addr_fault(s);
         }
+        gen_helper_fpu_finish(tcg_env,
+                              tcg_constant_i32(s->base.pc_next));
         return;
     case 4: /* fmove to control register.  */
     case 5: /* fmove from control register.  */
@@ -4982,6 +4984,7 @@ DISAS_INSN(fpu)
         gen_op_fmovem(env, s, insn, ext);
         return;
     }
+    gen_helper_fpu_begin(tcg_env, tcg_constant_i32(s->base.pc_next));
     if (ext & (1 << 14)) {
         /* Source effective address.  */
         opsize = ext_opsize(ext, 10);
@@ -5160,14 +5163,16 @@ DISAS_INSN(fpu)
         break;
     case 0x38: /* fcmp */
         gen_helper_fcmp(tcg_env, cpu_src, cpu_dest);
-        return;
+        goto finish;
     case 0x3a: /* ftst */
         gen_helper_ftst(tcg_env, cpu_src);
-        return;
+        goto finish;
     default:
         goto undef;
     }
     gen_helper_ftst(tcg_env, cpu_dest);
+finish:
+    gen_helper_fpu_finish(tcg_env, tcg_constant_i32(s->base.pc_next));
     return;
 undef:
     /* FIXME: Is this right for offset addressing modes?  */

@@ -218,6 +218,7 @@ uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
 
     /* FSAVE leaves the floating-point unit in the idle state. */
     env->fp_state_size = 0;
+    env->fp_pending_vector = 0;
 
     return mode == 3 ? addr + size : addr;
 }
@@ -399,9 +400,124 @@ static void make_busy_fp_state(CPUM68KState *env, uint32_t pc)
     env->fp_state_size = 100;
 }
 
+static void deliver_pending_fp_exception(CPUM68KState *env, uintptr_t ra)
+{
+    CPUState *cs;
+    unsigned vector = env->fp_pending_vector;
+
+    if (!vector) {
+        return;
+    }
+
+    env->fp_pending_vector = 0;
+    cs = env_cpu(env);
+    cs->exception_index = vector;
+    cpu_loop_exit_restore(cs, ra);
+}
+
+void HELPER(fpu_check_pending)(CPUM68KState *env, uint32_t pc)
+{
+    (void)pc;
+    deliver_pending_fp_exception(env, GETPC());
+}
+
+void HELPER(fpu_begin)(CPUM68KState *env, uint32_t pc)
+{
+    env->fpiar = pc;
+    env->fpsr &= ~FPSR_EXC_MASK;
+    set_float_exception_flags(0, &env->fp_status);
+}
+
+static uint32_t fp_exc_from_softfloat(int flags)
+{
+    uint32_t exc = 0;
+
+    if (flags & float_flag_invalid_snan) {
+        exc |= FPSR_EXC_SNAN;
+    } else if (flags & float_flag_invalid) {
+        exc |= FPSR_EXC_OPERR;
+    }
+    if (flags & float_flag_overflow) {
+        exc |= FPSR_EXC_OVFL;
+    }
+    if (flags & float_flag_underflow) {
+        exc |= FPSR_EXC_UNFL;
+    }
+    if (flags & float_flag_divbyzero) {
+        exc |= FPSR_EXC_DZ;
+    }
+    if (flags & float_flag_inexact) {
+        exc |= FPSR_EXC_INEX2;
+    }
+    return exc;
+}
+
+static uint32_t fp_aexc_from_exc(uint32_t exc)
+{
+    uint32_t aexc = 0;
+
+    if (exc & (FPSR_EXC_SNAN | FPSR_EXC_OPERR)) {
+        aexc |= FPSR_AEXC_IOP;
+    }
+    if (exc & FPSR_EXC_OVFL) {
+        aexc |= FPSR_AEXC_OVFL;
+    }
+    if ((exc & (FPSR_EXC_UNFL | FPSR_EXC_INEX2)) ==
+        (FPSR_EXC_UNFL | FPSR_EXC_INEX2)) {
+        aexc |= FPSR_AEXC_UNFL;
+    }
+    if (exc & FPSR_EXC_DZ) {
+        aexc |= FPSR_AEXC_DZ;
+    }
+    if (exc & (FPSR_EXC_INEX1 | FPSR_EXC_INEX2)) {
+        aexc |= FPSR_AEXC_INEX;
+    }
+    return aexc;
+}
+
+static unsigned enabled_fp_exception(uint32_t enabled)
+{
+    if (enabled & FPSR_EXC_SNAN) {
+        return EXCP_FP_SNAN;
+    }
+    if (enabled & FPSR_EXC_OPERR) {
+        return EXCP_FP_OPERR;
+    }
+    if (enabled & FPSR_EXC_OVFL) {
+        return EXCP_FP_OVFL;
+    }
+    if (enabled & FPSR_EXC_UNFL) {
+        return EXCP_FP_UNFL;
+    }
+    if (enabled & FPSR_EXC_DZ) {
+        return EXCP_FP_DZ;
+    }
+    if (enabled & (FPSR_EXC_INEX1 | FPSR_EXC_INEX2)) {
+        return EXCP_FP_INEX;
+    }
+    return 0;
+}
+
+void HELPER(fpu_finish)(CPUM68KState *env, uint32_t pc)
+{
+    int flags = get_float_exception_flags(&env->fp_status);
+    uint32_t exc = fp_exc_from_softfloat(flags);
+    unsigned vector;
+
+    env->fpsr |= exc | fp_aexc_from_exc(exc);
+    vector = enabled_fp_exception(exc & env->fpcr);
+    if (vector) {
+        env->fp_pending_vector = vector;
+        env->fp_pending_pc = pc;
+        make_busy_fp_state(env, pc);
+    }
+}
+
 void HELPER(fcc_check)(CPUM68KState *env, uint32_t cond, uint32_t pc)
 {
     CPUState *cs;
+
+    deliver_pending_fp_exception(env, GETPC());
 
     if (!(cond & 0x10) || !(env->fpsr & FPSR_CC_A)) {
         return;
