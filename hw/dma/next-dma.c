@@ -758,6 +758,7 @@ static const VMStateDescription vmstate_next_dma_channel = {
 
 static const VMStateDescription vmstate_next_dma = {
     .name = "next-dma",
+    .priority = MIG_PRI_LOW,
     .version_id = 1,
     .minimum_version_id = 1,
     .post_load = next_dma_post_load,

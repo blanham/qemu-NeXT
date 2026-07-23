@@ -93,6 +93,13 @@ static const TestChannel channels[] = {
     { "m2r",      0x1d0, 19, 0, false },
 };
 
+/* enum next_irqs input indices, kept in stable NextDMAChannel order. */
+static const int dma_board_inputs[] = {
+    10, 12, 13, 14, 15, 11, 16, 8, 9, -1, 17, 18,
+};
+
+G_STATIC_ASSERT(ARRAY_SIZE(dma_board_inputs) == ARRAY_SIZE(channels));
+
 static const uint32_t current_offsets[] = {
     0x4000, 0x4004, 0x4008, 0x400c, 0x4200,
 };
@@ -225,9 +232,10 @@ static void pulse_scsi_fifo_flush(QTestState *qts)
                  SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA | SCSI_CSR_DMADIR);
 }
 
-static void unrealize_next_kbd(QTestState *qts)
+static char *find_unattached_device(QTestState *qts, const char *type)
 {
     g_autoptr(QDict) response = NULL;
+    g_autofree char *child_type = g_strdup_printf("child<%s>", type);
     g_autofree char *path = NULL;
     QList *children;
     QListEntry *entry;
@@ -241,7 +249,7 @@ static void unrealize_next_kbd(QTestState *qts)
     QLIST_FOREACH_ENTRY(children, entry) {
         QDict *child = qobject_to(QDict, qlist_entry_obj(entry));
 
-        if (!strcmp(qdict_get_str(child, "type"), "child<next-kbd>")) {
+        if (!strcmp(qdict_get_str(child, "type"), child_type)) {
             g_assert_null(path);
             path = g_strdup_printf("/machine/unattached/%s",
                                    qdict_get_str(child, "name"));
@@ -249,10 +257,24 @@ static void unrealize_next_kbd(QTestState *qts)
     }
     g_assert_nonnull(path);
 
+    return g_steal_pointer(&path);
+}
+
+static void unrealize_next_kbd(QTestState *qts)
+{
+    g_autofree char *path = find_unattached_device(qts, "next-kbd");
+
     qtest_qmp_assert_success(
         qts,
         "{ 'execute': 'qom-set', 'arguments': { "
         "'path': %s, 'property': 'realized', 'value': false } }", path);
+}
+
+static void intercept_next_pc_inputs(QTestState *qts)
+{
+    g_autofree char *path = find_unattached_device(qts, "next-pc");
+
+    qtest_irq_intercept_in(qts, path);
 }
 
 static void migrate_wait(QTestState *source, QTestState *destination,
@@ -833,8 +855,7 @@ static void test_migration_idle_all_channels(void)
     source = next_dma_start_with_args(true, NULL);
     unrealize_next_kbd(source);
     unrealize_next_kbd(destination);
-    qtest_irq_intercept_out_named(destination, "/machine/next-dma",
-                                  "sysbus-irq");
+    intercept_next_pc_inputs(destination);
 
     /* Create one real, idle COMPLETE state for IRQ reconstruction. */
     qtest_writel(source, NEXT_DMA_BASE + channels[0].csr,
@@ -874,6 +895,18 @@ static void test_migration_idle_all_channels(void)
     g_assert_cmphex(qtest_readl(source, NEXT_INTR_STATUS) &
                     NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
 
+    /*
+     * The board aggregator is derived state.  Leave the DMA output and
+     * COMPLETE asserted, but migrate a stale cleared board status to prove
+     * next-dma post-load reconstruction happens after next-pc loads it.
+     */
+    qtest_writel(source, NEXT_INTR_STATUS, 0);
+    g_assert_cmphex(qtest_readl(source,
+                               NEXT_DMA_BASE + channels[0].csr) &
+                    DMA_COMPLETE, ==, DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(source, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, 0);
+
     migrate_wait(source, destination, uri);
 
     for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
@@ -905,8 +938,11 @@ static void test_migration_idle_all_channels(void)
                                                 saved_offsets[reg])),
                             ==, expected);
         }
-        g_assert_cmpint(qtest_get_irq(destination, channel), ==,
-                        channel == 0);
+        if (dma_board_inputs[channel] >= 0) {
+            g_assert_cmpint(qtest_get_irq(destination,
+                                         dma_board_inputs[channel]), ==,
+                            channel == 0);
+        }
     }
     g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
                     NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
@@ -933,7 +969,7 @@ static void test_migration_idle_all_channels(void)
                         ==, init + TRANSFER_LENGTH);
         qtest_memread(destination, init, received, sizeof(received));
         g_assert_cmpmem(&received[8], 4, "QEMU", 4);
-        g_assert_false(qtest_get_irq(destination, 0));
+        g_assert_false(qtest_get_irq(destination, dma_board_inputs[0]));
 
         /*
          * The latch was one-shot.  Poison its old target and a distinct
@@ -969,7 +1005,7 @@ static void test_migration_idle_all_channels(void)
         for (i = 0; i < sizeof(old_init); i++) {
             g_assert_cmphex(old_init[i], ==, 0x5a);
         }
-        g_assert_true(qtest_get_irq(destination, 0));
+        g_assert_true(qtest_get_irq(destination, dma_board_inputs[0]));
     }
 
     qtest_quit(source);
