@@ -110,6 +110,7 @@ struct NeXTPC {
     MemoryRegion timer_mem;
     MemoryRegion dummyen_mem;
     MemoryRegion dsp_mem;
+    MemoryRegion printer_mem;
     MemoryRegion mmiomem;
     MemoryRegion scrmem;
 
@@ -1062,6 +1063,25 @@ static const MemoryRegionOps next_dsp_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+static void next_printer_write(void *opaque, hwaddr addr, uint64_t val,
+                               unsigned size)
+{
+    /* Do nothing */
+}
+
+static uint64_t next_printer_read(void *opaque, hwaddr addr, unsigned size)
+{
+    return 0;
+}
+
+static const MemoryRegionOps next_printer_ops = {
+    .read = next_printer_read,
+    .write = next_printer_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
 static bool next_rtc_cmd_is_write(uint8_t cmd)
 {
     return (cmd >= 0x80 && cmd <= 0x9f) ||
@@ -1316,6 +1336,10 @@ static void next_pc_init(Object *obj)
                           "next.dsp", 8);
     sysbus_init_mmio(sbd, &s->dsp_mem);
 
+    memory_region_init_io(&s->printer_mem, OBJECT(s), &next_printer_ops, s,
+                          "next.printer", 8);
+    sysbus_init_mmio(sbd, &s->printer_mem);
+
     object_initialize_child(obj, "next-scsi", &s->next_scsi, TYPE_NEXT_SCSI);
     sysbus_init_mmio(sbd,
                      sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->next_scsi), 0));
@@ -1428,23 +1452,26 @@ static void next_cube_init(MachineState *machine)
     /* DSP host interface */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, 0x02108000);
 
+    /* Printer interface */
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, 0x0200f000);
+
     /* unknown: Brightness control register? */
     empty_slot_init("next.unknown.0", 0x02110000, 0x10);
     /* unknown: Magneto-Optical drive controller? */
     empty_slot_init("next.unknown.1", 0x02112000, 0x10);
 
     /* SCSI */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, NEXT_SCSI_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, NEXT_SCSI_BASE);
     /* Floppy */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02114108);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02114108);
     /* ESCC */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02118000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x02118000);
 
     /* unknown: Serial clock configuration register? */
     empty_slot_init("next.unknown.2", 0x02118004, 0x10);
 
     /* Timer */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x0211a000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 7, 0x0211a000);
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",
