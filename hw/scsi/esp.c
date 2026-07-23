@@ -25,6 +25,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "hw/core/irq.h"
@@ -77,6 +78,41 @@ static void esp_lower_drq(ESPState *s)
         trace_esp_lower_drq();
         s->drq_state = false;
     }
+}
+
+static void esp_selection_timeout(void *opaque)
+{
+    ESPState *s = opaque;
+
+    s->rregs[ESP_RSTAT] = 0;
+    s->asc_mode = ESP_ASC_MODE_DIS;
+    s->rregs[ESP_RINTR] = INTR_DC;
+    esp_raise_irq(s);
+}
+
+static bool esp_schedule_selection_timeout(ESPState *s)
+{
+    uint8_t ccf = s->wregs[ESP_WCCF] & 7;
+    uint8_t selection_timeout = s->wregs[ESP_WSEL];
+    uint64_t ticks;
+    uint64_t delay_ns;
+    int64_t now_ns;
+    int64_t deadline_ns;
+
+    if (!selection_timeout || !clock_get(s->clock) || ccf == 1) {
+        return false;
+    }
+    if (ccf == 0) {
+        ccf = 8;
+    }
+
+    ticks = (uint64_t)selection_timeout * 8192 * ccf;
+    delay_ns = clock_ticks_to_ns(s->clock, ticks);
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    deadline_ns = delay_ns > INT64_MAX - now_ns ?
+                  INT64_MAX : now_ns + delay_ns;
+    timer_mod_ns(s->selection_timeout, deadline_ns);
+    return true;
 }
 
 static const char *esp_phase_names[8] = {
@@ -274,10 +310,9 @@ static int esp_select(ESPState *s)
     s->current_dev = scsi_device_find(&s->bus, 0, target, 0);
     if (!s->current_dev) {
         /* No such drive */
-        s->rregs[ESP_RSTAT] = 0;
-        s->asc_mode = ESP_ASC_MODE_DIS;
-        s->rregs[ESP_RINTR] = INTR_DC;
-        esp_raise_irq(s);
+        if (!esp_schedule_selection_timeout(s)) {
+            esp_selection_timeout(s);
+        }
         return -1;
     }
 
@@ -1652,6 +1687,7 @@ static void esp_finalize(Object *obj)
 {
     ESPState *s = ESP(obj);
 
+    timer_free(s->selection_timeout);
     fifo8_destroy(&s->fifo);
     fifo8_destroy(&s->cmdfifo);
 }
@@ -1660,6 +1696,9 @@ static void esp_init(Object *obj)
 {
     ESPState *s = ESP(obj);
 
+    s->clock = qdev_init_clock_in(DEVICE(obj), "clock", NULL, NULL, 0);
+    s->selection_timeout = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        esp_selection_timeout, s);
     fifo8_create(&s->fifo, ESP_FIFO_SZ);
     fifo8_create(&s->cmdfifo, ESP_CMDFIFO_SZ);
 }

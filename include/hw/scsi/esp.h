@@ -2,8 +2,10 @@
 #define QEMU_HW_ESP_H
 
 #include "hw/scsi/scsi.h"
+#include "hw/core/clock.h"
 #include "hw/core/sysbus.h"
 #include "qemu/fifo8.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 /* esp.c */
@@ -31,6 +33,8 @@ struct ESPState {
     qemu_irq irq;
     qemu_irq drq_irq;
     bool drq_state;
+    Clock *clock;
+    QEMUTimer *selection_timeout;
     uint8_t chip_id;
     bool tchi_written;
     int32_t ti_size;

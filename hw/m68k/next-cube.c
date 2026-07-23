@@ -23,6 +23,7 @@
 #include "hw/core/loader.h"
 #include "hw/scsi/esp.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/clock.h"
 #include "qom/object.h"
 #include "hw/char/escc.h" /* ZILOG 8530 Serial Emulation */
 #include "hw/block/fdc.h"
@@ -51,6 +52,7 @@
 #define NEXT_SCSI_BASE       0x02114000
 #define NEXT_SCSI_CSR_OFFSET 0x20
 #define NEXT_SCSI_CSR_BASE   (NEXT_SCSI_BASE + NEXT_SCSI_CSR_OFFSET)
+#define NEXT_ESP_CLOCK_HZ    20000000
 
 
 #define TYPE_NEXT_RTC "next-rtc"
@@ -881,6 +883,7 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
     esp->dma_opaque = pcdev;
     sysbus_esp->it_shift = 0;
     esp->dma_enabled = 1;
+    clock_set_hz(esp->clock, NEXT_ESP_CLOCK_HZ);
     sbd = SYS_BUS_DEVICE(sysbus_esp);
     if (!sysbus_realize(sbd, errp)) {
         return;

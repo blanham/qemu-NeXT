@@ -162,6 +162,8 @@ qtests_loongarch64 = qtests_filter + \
 
 qtests_m68k = ['boot-serial-test'] + \
   qtests_filter + \
+  (config_all_devices.has_key('CONFIG_NEXTCUBE') ?
+   ['next-cube-scsi-test'] : []) + \
   (config_all_devices.has_key('CONFIG_NEXTCUBE') and
    'log' in get_option('trace_backends') ?
    ['next-cube-scsi-trace-test'] : [])
