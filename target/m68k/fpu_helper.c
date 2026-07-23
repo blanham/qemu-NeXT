@@ -183,6 +183,9 @@ float64 HELPER(redf64)(CPUM68KState *env, FPReg *val)
 
 static bool valid_fp_state_frame(uint8_t version, unsigned size)
 {
+    if (version == 0) {
+        return true; /* null */
+    }
     if ((version & 0xf0) != 0x40) {
         return false;
     }
@@ -228,7 +231,8 @@ uint32_t HELPER(frestore)(CPUM68KState *env, uint32_t addr)
     uintptr_t ra = GETPC();
     CPUState *cs = env_cpu(env);
     uint8_t version = cpu_ldub_data_ra(env, addr, ra);
-    unsigned size = cpu_ldub_data_ra(env, addr + 1, ra) + 4;
+    unsigned size = version == 0 ? 4 :
+                    cpu_ldub_data_ra(env, addr + 1, ra) + 4;
     unsigned i;
 
     if (!valid_fp_state_frame(version, size)) {
@@ -236,7 +240,21 @@ uint32_t HELPER(frestore)(CPUM68KState *env, uint32_t addr)
         cpu_loop_exit_restore(cs, ra);
     }
 
-    if (size == 4) {
+    if (version == 0) {
+        floatx80 nan = floatx80_default_nan(&env->fp_status);
+
+        for (i = 0; i < ARRAY_SIZE(env->fregs); i++) {
+            env->fregs[i].d = nan;
+        }
+        cpu_m68k_set_fpcr(env, 0);
+        env->fpsr = 0;
+        env->fpiar = 0;
+        env->fp_pending_vector = 0;
+        env->fp_pending_pc = 0;
+        set_float_exception_flags(0, &env->fp_status);
+        memset(env->fp_state, 0, 4);
+        env->fp_state_size = 4;
+    } else if (size == 4) {
         env->fp_state_size = 0;
     } else {
         for (i = 0; i < size; i++) {
@@ -423,6 +441,9 @@ void HELPER(fpu_check_pending)(CPUM68KState *env, uint32_t pc)
 
 void HELPER(fpu_begin)(CPUM68KState *env, uint32_t pc)
 {
+    if (env->fp_state_size == 4) {
+        env->fp_state_size = 0;
+    }
     env->fpiar = pc;
     env->fpsr &= ~FPSR_EXC_MASK;
     set_float_exception_flags(0, &env->fp_status);
