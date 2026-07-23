@@ -491,7 +491,7 @@ static int fpu_post_load(void *opaque, int version)
 
 const VMStateDescription vmmstate_fpu = {
     .name = "cpu/fpu",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .needed = fpu_needed,
     .pre_save = fpu_pre_save,
@@ -499,6 +499,7 @@ const VMStateDescription vmmstate_fpu = {
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(env.fpcr, M68kCPU),
         VMSTATE_UINT32(env.fpsr, M68kCPU),
+        VMSTATE_UINT32_V(env.fpiar, M68kCPU, 2),
         VMSTATE_STRUCT_ARRAY(env.fregs, M68kCPU, 8, 0, vmstate_freg, FPReg),
         VMSTATE_STRUCT(env.fp_result, M68kCPU, 0, vmstate_freg, FPReg),
         VMSTATE_END_OF_LIST()

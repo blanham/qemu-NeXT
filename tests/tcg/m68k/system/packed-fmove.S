@@ -19,13 +19,12 @@ vector_loop:
         .word   0xf210, 0x4c00
         fmove.d %fp0,result
 
-        moveq   #3,%d0           /* VIRT_CTRL_CMD_PANIC */
         move.l  12(%a1),%d1
         cmp.l   result,%d1
-        bne.s   exit
+        bne.s   fail
         move.l  16(%a1),%d1
         cmp.l   result+4,%d1
-        bne.s   exit
+        bne.s   fail
         adda.l  #20,%a1
         dbra    %d2,vector_loop
 
@@ -35,17 +34,16 @@ vector_loop:
         move.l  result,%d1
         andi.l  #0x7ff00000,%d1
         cmpi.l  #0x7ff00000,%d1
-        bne.s   exit
+        bne.s   fail
         move.l  result,%d1
         andi.l  #0x000fffff,%d1
         or.l    result+4,%d1
-        beq.s   exit
+        beq.s   fail
 
-        moveq   #2,%d0           /* VIRT_CTRL_CMD_HALT */
-
-exit:
         movea.l #0xff009004,%a0  /* m68k virt power controller */
+        moveq   #2,%d0           /* VIRT_CTRL_CMD_HALT */
         move.l  %d0,(%a0)
+fail:
 1:
         bra.s   1b
 
