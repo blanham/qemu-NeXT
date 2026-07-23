@@ -831,7 +831,14 @@ static void next_system_timer_expire(void *opaque)
 {
     NeXTPC *s = opaque;
 
-    s->timer_counter = 0;
+    /*
+     * Expiry reloads the counter from the latch.  NeXT kernels load the
+     * immediate deadline, start the timer, then leave 0xffff in the latch
+     * as the fallback period until the interrupt handler programs it again.
+     */
+    s->timer_counter = s->timer_latch ?
+                       s->timer_latch : NEXT_TIMER_FULL_PERIOD;
+    next_system_timer_schedule(s);
     next_timer_set_irq(s, true, false);
 }
 

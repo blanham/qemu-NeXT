@@ -193,18 +193,25 @@ static void test_deadline_and_ack(void)
     uint16_t frozen;
 
     arm_timer(qts, 1000);
+    write_timer_latch(qts, 2000);
     qtest_clock_step(qts, 1000 * NEXT_TIMER_TICK_NS - 1);
     g_assert_cmphex(timer_status(qts), ==, 0);
     g_assert_cmphex(read_timer_count(qts), ==, 1);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(timer_status(qts), ==, NEXT_INTR_TIMER);
-    g_assert_cmphex(read_timer_count(qts), ==, 0);
+    g_assert_cmphex(read_timer_count(qts), ==, 2000);
     g_assert_cmphex(qtest_readb(qts, NEXT_TIMER_CSR), ==,
                     NEXT_TIMER_ENABLE);
     g_assert_cmphex(timer_status(qts), ==, 0);
-    qtest_clock_step(qts, 1000 * NEXT_TIMER_TICK_NS);
+    qtest_clock_step(qts, 2000 * NEXT_TIMER_TICK_NS - 1);
     g_assert_cmphex(timer_status(qts), ==, 0);
-    g_assert_cmphex(read_timer_count(qts), ==, 0);
+    g_assert_cmphex(read_timer_count(qts), ==, 1);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(timer_status(qts), ==, NEXT_INTR_TIMER);
+    g_assert_cmphex(read_timer_count(qts), ==, 2000);
+    g_assert_cmphex(qtest_readb(qts, NEXT_TIMER_CSR), ==,
+                    NEXT_TIMER_ENABLE);
+    g_assert_cmphex(timer_status(qts), ==, 0);
 
     arm_timer(qts, 1000);
     qtest_clock_step(qts, 500 * NEXT_TIMER_TICK_NS);
