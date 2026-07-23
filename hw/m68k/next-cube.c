@@ -34,6 +34,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
+#include "qemu/log.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
@@ -426,7 +427,7 @@ static void next_irq(void *opaque, int number, int level);
 static void next_irq(void *opaque, int number, int level)
 {
     NeXTPC *s = NEXT_PC(opaque);
-    int shift = 0;
+    int shift;
 
     /* first switch sets interrupt status */
     /* DPRINTF("IRQ %i\n",number); */
@@ -469,13 +470,35 @@ static void next_irq(void *opaque, int number, int level)
     case NEXT_SCSI_DMA_I:
         shift = 26;
         break;
-    case NEXT_SND_I:
+    case NEXT_OPTICAL_DMA_I:
+        shift = 25;
+        break;
+    case NEXT_PRINTER_DMA_I:
+        shift = 24;
+        break;
+    case NEXT_SOUND_OUT_DMA_I:
         shift = 23;
+        break;
+    case NEXT_SOUND_IN_DMA_I:
+        shift = 22;
         break;
     case NEXT_SCC_DMA_I:
         shift = 21;
         break;
-
+    case NEXT_DSP_DMA_I:
+        shift = 20;
+        break;
+    case NEXT_M2R_DMA_I:
+        shift = 19;
+        break;
+    case NEXT_R2M_DMA_I:
+        shift = 18;
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: unknown interrupt input %d\n",
+                      __func__, number);
+        return;
     }
     if (level) {
         s->int_status |= 1U << shift;
@@ -1302,7 +1325,6 @@ static void next_pc_realize(DeviceState *dev, Error **errp)
         return;
     }
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev, NEXT_SCC_I));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(dev, NEXT_SCC_DMA_I));
 
     /* RTC */
     d = DEVICE(&s->rtc);
@@ -1474,6 +1496,20 @@ static const TypeInfo next_pc_info = {
 
 static void next_cube_init(MachineState *machine)
 {
+    static const int dma_irq_inputs[NEXT_DMA_CHANNEL_COUNT] = {
+        [NEXT_DMA_SCSI] = NEXT_SCSI_DMA_I,
+        [NEXT_DMA_SOUND_OUT] = NEXT_SOUND_OUT_DMA_I,
+        [NEXT_DMA_OPTICAL] = NEXT_OPTICAL_DMA_I,
+        [NEXT_DMA_SOUND_IN] = NEXT_SOUND_IN_DMA_I,
+        [NEXT_DMA_PRINTER] = NEXT_PRINTER_DMA_I,
+        [NEXT_DMA_SCC] = NEXT_SCC_DMA_I,
+        [NEXT_DMA_DSP] = NEXT_DSP_DMA_I,
+        [NEXT_DMA_ENTX] = NEXT_ENTX_DMA_I,
+        [NEXT_DMA_ENRX] = NEXT_ENRX_DMA_I,
+        [NEXT_DMA_VIDEO] = -1,
+        [NEXT_DMA_R2M] = NEXT_R2M_DMA_I,
+        [NEXT_DMA_M2R] = NEXT_M2R_DMA_I,
+    };
     NeXTState *m = NEXT_MACHINE(machine);
     M68kCPU *cpu;
     CPUM68KState *env;
@@ -1481,6 +1517,7 @@ static void next_cube_init(MachineState *machine)
     const char *bios_name = machine->firmware ?: ROM_FILE;
     DeviceState *dma_dev;
     DeviceState *pcdev;
+    int channel;
 
     /* Initialize the cpu core */
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
@@ -1508,8 +1545,13 @@ static void next_cube_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcdev), &error_fatal);
 
     sysbus_mmio_map(SYS_BUS_DEVICE(m->dma), 0, NEXT_DMA_BASE);
-    sysbus_connect_irq(SYS_BUS_DEVICE(m->dma), NEXT_DMA_SCSI,
-                       qdev_get_gpio_in(pcdev, NEXT_SCSI_DMA_I));
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        if (dma_irq_inputs[channel] >= 0) {
+            sysbus_connect_irq(SYS_BUS_DEVICE(m->dma), channel,
+                               qdev_get_gpio_in(pcdev,
+                                                dma_irq_inputs[channel]));
+        }
+    }
 
     /* 64MB RAM starting at 0x04000000  */
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);

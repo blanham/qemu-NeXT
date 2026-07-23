@@ -34,6 +34,7 @@
 #include "hw/dma/next-dma.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "system/address-spaces.h"
 #include "trace.h"
@@ -183,10 +184,13 @@ static bool next_dma_trace_read_now(NextDMATraceReadSampler *sampler,
     return (sampler->repeats & (sampler->repeats - 1)) == 0;
 }
 
-static void next_dma_set_irq(NextDMAState *s, NextDMAChannel channel)
+static void next_dma_update_irq(NextDMAState *s, NextDMAChannel channel)
 {
-    qemu_set_irq(s->irq[channel],
-                 !!(s->channel[channel].csr & NEXT_DMA_CSR_COMPLETE));
+    if (next_dma_channels[channel].irq_bit >= 0) {
+        qemu_set_irq(s->irq[channel],
+                     !!(s->channel[channel].csr &
+                        NEXT_DMA_CSR_COMPLETE));
+    }
 }
 
 static bool next_dma_complete_segment(NextDMAState *s,
@@ -203,7 +207,7 @@ static bool next_dma_complete_segment(NextDMAState *s,
     } else {
         c->csr &= ~NEXT_DMA_CSR_ENABLE;
     }
-    next_dma_set_irq(s, channel);
+    next_dma_update_irq(s, channel);
 
     return promote;
 }
@@ -423,7 +427,7 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
     if (value & NEXT_DMA_CMD_READ) {
         c->csr |= NEXT_DMA_CSR_READ;
     }
-    next_dma_set_irq(s, channel);
+    next_dma_update_irq(s, channel);
 }
 
 static void next_dma_trace_scsi_register_write(NextDMAState *s, hwaddr addr,
@@ -681,6 +685,90 @@ void next_dma_set_ethernet_notify(NextDMAState *s,
     s->enet_opaque = opaque;
 }
 
+static void next_dma_reset_hold(Object *obj, ResetType type)
+{
+    NextDMAState *s = NEXT_DMA(obj);
+    int channel;
+
+    memset(s->channel, 0, sizeof(s->channel));
+    memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
+    s->rx_ready = false;
+
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        qemu_irq_lower(s->irq[channel]);
+    }
+}
+
+static int next_dma_post_load(void *opaque, int version_id)
+{
+    NextDMAState *s = opaque;
+    int channel;
+
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        NextDMAChannelState *c = &s->channel[channel];
+
+        if (c->scsi_stage_len > NEXT_DMA_SCSI_BEAT ||
+            c->scsi_stage_flushes > NEXT_DMA_SCSI_FLUSH_EDGES ||
+            (!!c->scsi_stage_len != !!c->scsi_stage_flushes)) {
+            return -EINVAL;
+        }
+    }
+
+    memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        next_dma_update_irq(s, channel);
+    }
+
+    /*
+     * Ethernet transfer support lands with the MB8795.  Until then there
+     * is no receive-ready DMA state, so the only valid cached value is
+     * false.  Host callbacks and their opaque are deliberately not VMState.
+     */
+    s->rx_ready = false;
+    if (s->enet_notify && s->enet_notify->rx_ready_changed) {
+        s->enet_notify->rx_ready_changed(s->enet_opaque, s->rx_ready);
+    }
+
+    return 0;
+}
+
+static const VMStateDescription vmstate_next_dma_channel = {
+    .name = "next-dma-channel",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(csr, NextDMAChannelState),
+        VMSTATE_UINT32(saved_next, NextDMAChannelState),
+        VMSTATE_UINT32(saved_limit, NextDMAChannelState),
+        VMSTATE_UINT32(saved_start, NextDMAChannelState),
+        VMSTATE_UINT32(saved_stop, NextDMAChannelState),
+        VMSTATE_UINT32(next, NextDMAChannelState),
+        VMSTATE_UINT32(limit, NextDMAChannelState),
+        VMSTATE_UINT32(start, NextDMAChannelState),
+        VMSTATE_UINT32(stop, NextDMAChannelState),
+        VMSTATE_UINT32(next_initbuf, NextDMAChannelState),
+        VMSTATE_BOOL(next_initbuf_valid, NextDMAChannelState),
+        VMSTATE_UINT8_ARRAY(scsi_stage, NextDMAChannelState,
+                            NEXT_DMA_SCSI_BEAT),
+        VMSTATE_UINT8(scsi_stage_len, NextDMAChannelState),
+        VMSTATE_UINT8(scsi_stage_flushes, NextDMAChannelState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_next_dma = {
+    .name = "next-dma",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = next_dma_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(channel, NextDMAState, NEXT_DMA_CHANNEL_COUNT, 1,
+                             vmstate_next_dma_channel,
+                             NextDMAChannelState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void next_dma_init(Object *obj)
 {
     NextDMAState *s = NEXT_DMA(obj);
@@ -697,11 +785,21 @@ static void next_dma_init(Object *obj)
     }
 }
 
+static void next_dma_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    dc->vmsd = &vmstate_next_dma;
+    rc->phases.hold = next_dma_reset_hold;
+}
+
 static const TypeInfo next_dma_info = {
     .name = TYPE_NEXT_DMA,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(NextDMAState),
     .instance_init = next_dma_init,
+    .class_init = next_dma_class_init,
 };
 
 static void next_dma_register_types(void)

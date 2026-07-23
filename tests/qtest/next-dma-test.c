@@ -35,8 +35,28 @@
 
 #define NEXT_DMA_BASE       0x02000000
 #define NEXT_INTR_STATUS    0x02007000
+#define NEXT_ESP_TCLO       0x02114000
+#define NEXT_ESP_TCMID      0x02114001
+#define NEXT_ESP_FIFO       0x02114002
+#define NEXT_ESP_CMD        0x02114003
+#define NEXT_ESP_BUSID      0x02114004
+#define NEXT_ESP_INTR       0x02114005
+#define NEXT_ESP_TCHI       0x0211400e
+#define NEXT_SCSI_CSR       0x02114020
 #define NEXT_ROM_SIZE       (128 * 1024)
+#define NEXT_DISK_SIZE      (512 * 1024)
 #define NEXT_TEST_RAM_BASE  0x04010000
+#define NEXT_SCSI_DMA_IRQ   (1U << 26)
+
+#define ESP_CMD_SEL         0x41
+#define ESP_CMD_TI_DMA      0x90
+#define ESP_CMD_ICCS        0x11
+#define ESP_CMD_MSGACC      0x12
+
+#define SCSI_CSR_CPUDMA     0x10
+#define SCSI_CSR_INTMASK    0x20
+#define SCSI_CSR_FIFOFL     0x04
+#define SCSI_CSR_DMADIR     0x08
 
 #define DMA_SETENABLE       0x00010000
 #define DMA_SETSUPDATE      0x00020000
@@ -82,6 +102,11 @@ typedef struct TestROM {
     char *path;
 } TestROM;
 
+typedef struct TestDisk {
+    int fd;
+    char *path;
+} TestDisk;
+
 static void cleanup_test_rom(void *opaque)
 {
     TestROM *rom = opaque;
@@ -97,10 +122,29 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_dma_start(void)
+static void cleanup_test_disk(void *opaque)
+{
+    TestDisk *disk = opaque;
+
+    qtest_remove_abrt_handler(disk);
+    if (disk->fd >= 0) {
+        close(disk->fd);
+    }
+    if (disk->path) {
+        g_unlink(disk->path);
+        g_free(disk->path);
+    }
+    g_free(disk);
+}
+
+static QTestState *next_dma_start_with_args(bool with_scsi_disk,
+                                            const char *extra_args)
 {
     TestROM *rom = g_new0(TestROM, 1);
+    TestDisk *disk = NULL;
     g_autofree char *quoted_rom_path = NULL;
+    g_autofree char *quoted_disk_path = NULL;
+    g_autofree char *disk_args = NULL;
 
     rom->fd = -1;
     qtest_add_abrt_handler(cleanup_test_rom, rom);
@@ -113,12 +157,112 @@ static QTestState *next_dma_start(void)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    return qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
+    if (with_scsi_disk) {
+        disk = g_new0(TestDisk, 1);
+        disk->fd = -1;
+        qtest_add_abrt_handler(cleanup_test_disk, disk);
+        g_test_queue_destroy(cleanup_test_disk, disk);
+
+        disk->fd = g_file_open_tmp("next-dma-disk-XXXXXX",
+                                   &disk->path, NULL);
+        g_assert_cmpint(disk->fd, >=, 0);
+        g_assert_cmpint(ftruncate(disk->fd, NEXT_DISK_SIZE), ==, 0);
+        close(disk->fd);
+        disk->fd = -1;
+        quoted_disk_path = g_shell_quote(disk->path);
+        disk_args = g_strdup_printf("-drive file=%s,if=scsi,format=raw",
+                                    quoted_disk_path);
+    }
+
+    return qtest_initf("-machine next-cube -bios %s %s %s",
+                       quoted_rom_path, disk_args ?: "", extra_args ?: "");
+}
+
+static QTestState *next_dma_start(void)
+{
+    return next_dma_start_with_args(false, NULL);
 }
 
 static uint64_t channel_address(const TestChannel *channel, uint32_t offset)
 {
     return NEXT_DMA_BASE + channel->csr + offset;
+}
+
+static void issue_inquiry_dma(QTestState *qts, uint8_t length)
+{
+    uint8_t inquiry[6] = { 0x12, 0, 0, 0, length, 0 };
+    size_t i;
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, 0);
+    for (i = 0; i < sizeof(inquiry); i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, inquiry[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SEL);
+    qtest_readb(qts, NEXT_ESP_INTR);
+
+    qtest_writeb(qts, NEXT_ESP_TCLO, length);
+    qtest_writeb(qts, NEXT_ESP_TCMID, 0);
+    qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+}
+
+static void finish_scsi_command(QTestState *qts)
+{
+    qtest_readb(qts, NEXT_ESP_INTR);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_ICCS);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_FIFO), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_FIFO), ==, 0);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_MSGACC);
+    qtest_readb(qts, NEXT_ESP_INTR);
+}
+
+static void pulse_scsi_fifo_flush(QTestState *qts)
+{
+    qtest_writeb(qts, NEXT_SCSI_CSR,
+                 SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA |
+                 SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+    qtest_writeb(qts, NEXT_SCSI_CSR,
+                 SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA | SCSI_CSR_DMADIR);
+}
+
+static void unrealize_next_kbd(QTestState *qts)
+{
+    g_autoptr(QDict) response = NULL;
+    g_autofree char *path = NULL;
+    QList *children;
+    QListEntry *entry;
+
+    response = qtest_qmp(
+        qts, "{ 'execute': 'qom-list', "
+        "'arguments': { 'path': '/machine/unattached' } }");
+    g_assert_nonnull(response);
+    g_assert_true(qdict_haskey(response, "return"));
+    children = qdict_get_qlist(response, "return");
+    QLIST_FOREACH_ENTRY(children, entry) {
+        QDict *child = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(child, "type"), "child<next-kbd>")) {
+            g_assert_null(path);
+            path = g_strdup_printf("/machine/unattached/%s",
+                                   qdict_get_str(child, "name"));
+        }
+    }
+    g_assert_nonnull(path);
+
+    qtest_qmp_assert_success(
+        qts,
+        "{ 'execute': 'qom-set', 'arguments': { "
+        "'path': %s, 'property': 'realized', 'value': false } }", path);
+}
+
+static void migrate_wait(QTestState *source, QTestState *destination,
+                         const char *uri)
+{
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
 }
 
 static bool is_current_quad_address(uint64_t address)
@@ -352,6 +496,541 @@ static void test_inert_channels(void)
     qtest_quit(qts);
 }
 
+static void test_zero_next_init_valid(void)
+{
+    enum {
+        TRANSFER_LENGTH = 16,
+    };
+    uint8_t received[TRANSFER_LENGTH];
+    QTestState *qts = next_dma_start_with_args(true, NULL);
+    uint64_t csr = NEXT_DMA_BASE + channels[0].csr;
+    uint64_t next = channel_address(&channels[0], 0x4000);
+    uint64_t limit = channel_address(&channels[0], 0x4004);
+    uint64_t next_init = channel_address(&channels[0], 0x4200);
+
+    qtest_memset(qts, NEXT_TEST_RAM_BASE, 0xa5, sizeof(received));
+    qtest_writel(qts, csr, DMA_RESET | DMA_READ_CMD);
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + TRANSFER_LENGTH);
+    qtest_writel(qts, next_init, 0);
+    g_assert_cmphex(qtest_readl(qts, next_init), ==, 0);
+    qtest_writel(qts, csr, DMA_SETENABLE | DMA_READ_CMD);
+
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==, 0);
+    qtest_memread(qts, NEXT_TEST_RAM_BASE, received, sizeof(received));
+    for (size_t i = 0; i < sizeof(received); i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+
+    /*
+     * A zero initial pointer is a value, not "no latch".  The first
+     * transfer consumed it, so this second transfer uses live NEXT.
+     */
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + TRANSFER_LENGTH);
+    qtest_writel(qts, csr, DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + TRANSFER_LENGTH);
+    qtest_memread(qts, NEXT_TEST_RAM_BASE, received, sizeof(received));
+    g_assert_cmpmem(&received[8], 4, "QEMU", 4);
+
+    qtest_quit(qts);
+}
+
+static uint32_t test_csr_command(size_t channel)
+{
+    unsigned pattern = channel % 7 + 1;
+    uint32_t command = 0;
+
+    if (pattern & 1) {
+        command |= DMA_SETENABLE;
+    }
+    if (pattern & 2) {
+        command |= DMA_SETSUPDATE;
+    }
+    if (pattern & 4) {
+        command |= DMA_READ_CMD;
+    }
+    return command;
+}
+
+static uint32_t test_csr_status(size_t channel)
+{
+    unsigned pattern = channel % 7 + 1;
+    uint32_t status = 0;
+
+    if (pattern & 1) {
+        status |= DMA_ENABLE;
+    }
+    if (pattern & 2) {
+        status |= DMA_SUPDATE;
+    }
+    if (pattern & 4) {
+        status |= DMA_READ;
+    }
+    return status;
+}
+
+static void assert_all_dma_irqs_low(QTestState *qts)
+{
+    size_t channel;
+
+    for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
+        g_assert_false(qtest_get_irq(qts, channel));
+    }
+}
+
+static void assert_all_channel_registers_zero(QTestState *qts)
+{
+    static const uint32_t saved_offsets[] = {
+        0x3ff0, 0x3ff4, 0x3ff8, 0x3ffc,
+    };
+    size_t channel;
+    size_t reg;
+
+    for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_BASE +
+                                    channels[channel].csr), ==, 0);
+        for (reg = 0; reg < ARRAY_SIZE(current_offsets); reg++) {
+            g_assert_cmphex(qtest_readl(
+                                qts, channel_address(&channels[channel],
+                                                     current_offsets[reg])),
+                            ==, 0);
+        }
+        for (reg = 0; reg < channels[channel].saved_words; reg++) {
+            g_assert_cmphex(qtest_readl(
+                                qts, channel_address(&channels[channel],
+                                                     saved_offsets[reg])),
+                            ==, 0);
+        }
+    }
+}
+
+static void test_device_reset_all_channels(void)
+{
+    static const uint32_t saved_offsets[] = {
+        0x3ff0, 0x3ff4, 0x3ff8, 0x3ffc,
+    };
+    enum {
+        INQUIRY_LENGTH = 66,
+        DMA_WINDOW_LENGTH = 96,
+        DMA_COMMITTED_LENGTH = 64,
+        RESET_BUFFER = NEXT_TEST_RAM_BASE + 0x4000,
+    };
+    uint8_t received[16];
+    QTestState *qts = next_dma_start_with_args(true, NULL);
+    size_t channel;
+    size_t reg;
+
+    qtest_irq_intercept_out_named(qts, "/machine/next-dma", "sysbus-irq");
+
+    /* Leave two real inquiry bytes in the controller's delayed stage. */
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_RESET | DMA_READ_CMD);
+    qtest_writel(qts, channel_address(&channels[0], 0x4000),
+                 NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, channel_address(&channels[0], 0x4004),
+                 NEXT_TEST_RAM_BASE + DMA_WINDOW_LENGTH);
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(qts, INQUIRY_LENGTH);
+    g_assert_cmphex(qtest_readl(
+                        qts, channel_address(&channels[0], 0x4000)),
+                    ==, NEXT_TEST_RAM_BASE + DMA_COMMITTED_LENGTH);
+
+    for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
+        qtest_writel(qts, NEXT_DMA_BASE + channels[channel].csr,
+                     test_csr_command(channel));
+        for (reg = 0; reg < ARRAY_SIZE(current_offsets); reg++) {
+            qtest_writel(qts,
+                         channel_address(&channels[channel],
+                                         current_offsets[reg]),
+                         0x11000000 | channel << 12 | reg << 4 | 1);
+        }
+        for (reg = 0; reg < channels[channel].saved_words; reg++) {
+            qtest_writel(qts,
+                         channel_address(&channels[channel],
+                                         saved_offsets[reg]),
+                         0x22000000 | channel << 12 | reg << 4 | 2);
+        }
+    }
+
+    qtest_system_reset(qts);
+    assert_all_channel_registers_zero(qts);
+    assert_all_dma_irqs_low(qts);
+
+    /*
+     * Four flush edges after reset must not resurrect the staged tail or
+     * write any of its bytes.
+     */
+    qtest_memset(qts, RESET_BUFFER, 0xa5, sizeof(received));
+    qtest_writel(qts, channel_address(&channels[0], 0x4000), RESET_BUFFER);
+    qtest_writel(qts, channel_address(&channels[0], 0x4004),
+                 RESET_BUFFER + sizeof(received));
+    for (reg = 0; reg < 4; reg++) {
+        pulse_scsi_fifo_flush(qts);
+    }
+    g_assert_cmphex(qtest_readl(
+                        qts, channel_address(&channels[0], 0x4000)),
+                    ==, RESET_BUFFER);
+    qtest_memread(qts, RESET_BUFFER, received, sizeof(received));
+    for (reg = 0; reg < sizeof(received); reg++) {
+        g_assert_cmphex(received[reg], ==, 0xa5);
+    }
+
+    /*
+     * QOM reset also clears the hidden NEXT_INIT-valid latch.  With no
+     * post-reset NEXT_INIT write, functional SCSI must use live NEXT.
+     */
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(qts, sizeof(received));
+    finish_scsi_command(qts);
+    g_assert_cmphex(qtest_readl(
+                        qts, channel_address(&channels[0], 0x4000)),
+                    ==, RESET_BUFFER + sizeof(received));
+    g_assert_true(qtest_get_irq(qts, 0));
+
+    qtest_system_reset(qts);
+    assert_all_channel_registers_zero(qts);
+    assert_all_dma_irqs_low(qts);
+
+    qtest_quit(qts);
+}
+
+static void test_functional_irq_invariant(void)
+{
+    enum {
+        TRANSFER_LENGTH = 16,
+    };
+    QTestState *qts = next_dma_start_with_args(true, NULL);
+    size_t functional[] = { 0, 7, 8 };
+    size_t i;
+
+    /*
+     * ENTX/ENRX transfer entry points are intentionally not implemented
+     * yet.  Lock the strongest observable invariant: every supported MMIO
+     * command leaves COMPLETE and its output low.
+     */
+    for (i = 0; i < ARRAY_SIZE(functional); i++) {
+        size_t channel = functional[i];
+        uint64_t csr = NEXT_DMA_BASE + channels[channel].csr;
+
+        qtest_writel(qts, csr, DMA_RESET | DMA_READ_CMD);
+        qtest_writel(qts, channel_address(&channels[channel], 0x4000),
+                     NEXT_TEST_RAM_BASE + channel * 0x100);
+        qtest_writel(qts, channel_address(&channels[channel], 0x4004),
+                     NEXT_TEST_RAM_BASE + channel * 0x100 + 0x40);
+        qtest_writel(qts, csr, DMA_SETENABLE | DMA_SETSUPDATE |
+                     DMA_INITBUF | DMA_READ_CMD);
+        g_assert_cmphex(qtest_readl(qts, csr) & DMA_COMPLETE, ==, 0);
+        g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                        (1U << channels[channel].irq_bit), ==, 0);
+    }
+
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_RESET | DMA_READ_CMD);
+    qtest_writel(qts, channel_address(&channels[0], 0x4000),
+                 NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, channel_address(&channels[0], 0x4004),
+                 NEXT_TEST_RAM_BASE + TRANSFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_BASE + channels[0].csr) &
+                    DMA_COMPLETE, ==, DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
+
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_CLRCOMPLETE | DMA_READ_CMD);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_BASE + channels[0].csr) &
+                    DMA_COMPLETE, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_cross_channel_ack_isolation(void)
+{
+    enum {
+        TRANSFER_LENGTH = 16,
+    };
+    QTestState *qts = next_dma_start_with_args(true, NULL);
+    size_t other[] = { 7, 8 };
+    size_t i;
+
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_RESET | DMA_READ_CMD);
+    qtest_writel(qts, channel_address(&channels[0], 0x4000),
+                 NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, channel_address(&channels[0], 0x4004),
+                 NEXT_TEST_RAM_BASE + TRANSFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
+
+    for (i = 0; i < ARRAY_SIZE(other); i++) {
+        size_t channel = other[i];
+
+        qtest_writel(qts, NEXT_DMA_BASE + channels[channel].csr,
+                     DMA_CLRCOMPLETE);
+        g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                        NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
+        qtest_writel(qts, NEXT_DMA_BASE + channels[channel].csr, DMA_RESET);
+        g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                        NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
+    }
+
+    qtest_writel(qts, NEXT_DMA_BASE + channels[0].csr, DMA_CLRCOMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_migration_idle_all_channels(void)
+{
+    static const uint32_t saved_offsets[] = {
+        0x3ff0, 0x3ff4, 0x3ff8, 0x3ffc,
+    };
+    enum {
+        TRANSFER_LENGTH = 16,
+        COMPLETE_BUFFER = NEXT_TEST_RAM_BASE + 0x8000,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    QTestState *source;
+    QTestState *destination;
+    size_t channel;
+    size_t reg;
+
+    tmpdir = g_dir_make_tmp("next-dma-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_dma_start_with_args(true, incoming_args);
+    source = next_dma_start_with_args(true, NULL);
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+    qtest_irq_intercept_out_named(destination, "/machine/next-dma",
+                                  "sysbus-irq");
+
+    /* Create one real, idle COMPLETE state for IRQ reconstruction. */
+    qtest_writel(source, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_RESET | DMA_READ_CMD);
+    qtest_writel(source, channel_address(&channels[0], 0x4000),
+                 COMPLETE_BUFFER);
+    qtest_writel(source, channel_address(&channels[0], 0x4004),
+                 COMPLETE_BUFFER + TRANSFER_LENGTH);
+    qtest_writel(source, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(source, TRANSFER_LENGTH);
+    finish_scsi_command(source);
+    g_assert_cmphex(qtest_readl(source,
+                               NEXT_DMA_BASE + channels[0].csr) &
+                    DMA_COMPLETE, ==, DMA_COMPLETE);
+
+    for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
+        qtest_writel(source, NEXT_DMA_BASE + channels[channel].csr,
+                     test_csr_command(channel));
+        for (reg = 0; reg < ARRAY_SIZE(current_offsets); reg++) {
+            uint32_t value = 0x04100000 | channel << 12 | reg << 8 | 0x10;
+
+            qtest_writel(source,
+                         channel_address(&channels[channel],
+                                         current_offsets[reg]),
+                         value);
+        }
+        for (reg = 0; reg < channels[channel].saved_words; reg++) {
+            uint32_t value = 0x05100000 | channel << 12 | reg << 8 | 0x20;
+
+            qtest_writel(source,
+                         channel_address(&channels[channel],
+                                         saved_offsets[reg]),
+                         value);
+        }
+    }
+    g_assert_cmphex(qtest_readl(source, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
+
+    migrate_wait(source, destination, uri);
+
+    for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
+        uint32_t expected_csr = test_csr_status(channel);
+
+        if (channel == 0) {
+            expected_csr |= DMA_COMPLETE;
+        }
+        g_assert_cmphex(qtest_readl(destination,
+                                   NEXT_DMA_BASE + channels[channel].csr),
+                        ==, expected_csr);
+        for (reg = 0; reg < ARRAY_SIZE(current_offsets); reg++) {
+            uint32_t expected =
+                0x04100000 | channel << 12 | reg << 8 | 0x10;
+
+            g_assert_cmphex(qtest_readl(
+                                destination,
+                                channel_address(&channels[channel],
+                                                current_offsets[reg])),
+                            ==, expected);
+        }
+        for (reg = 0; reg < channels[channel].saved_words; reg++) {
+            uint32_t expected =
+                0x05100000 | channel << 12 | reg << 8 | 0x20;
+
+            g_assert_cmphex(qtest_readl(
+                                destination,
+                                channel_address(&channels[channel],
+                                                saved_offsets[reg])),
+                            ==, expected);
+        }
+        g_assert_cmpint(qtest_get_irq(destination, channel), ==,
+                        channel == 0);
+    }
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, NEXT_SCSI_DMA_IRQ);
+
+    /*
+     * The migrated SCSI NEXT_INIT register is nonzero and its hidden valid
+     * latch must survive independently of the COMPLETE acknowledgement.
+     */
+    {
+        uint32_t init = 0x04100000 | 4 << 8 | 0x10;
+        uint8_t received[TRANSFER_LENGTH];
+
+        qtest_memset(destination, init, 0xa5, sizeof(received));
+        qtest_writel(destination, NEXT_DMA_BASE + channels[0].csr,
+                     DMA_CLRCOMPLETE | DMA_SETENABLE | DMA_READ_CMD);
+        issue_inquiry_dma(destination, TRANSFER_LENGTH);
+        finish_scsi_command(destination);
+        g_assert_cmphex(qtest_readl(
+                            destination,
+                            channel_address(&channels[0], 0x4000)),
+                        ==, init + TRANSFER_LENGTH);
+        qtest_memread(destination, init, received, sizeof(received));
+        g_assert_cmpmem(&received[8], 4, "QEMU", 4);
+        g_assert_false(qtest_get_irq(destination, 0));
+    }
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_migration_partial_scsi_stage(void)
+{
+    enum {
+        INQUIRY_LENGTH = 66,
+        DMA_WINDOW_LENGTH = 96,
+        DMA_COMMITTED_LENGTH = 64,
+        DMA_FLUSHED_LENGTH = 80,
+        DMA_BUFFER = NEXT_TEST_RAM_BASE + 0xc000,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    uint8_t received[DMA_WINDOW_LENGTH];
+    QTestState *source;
+    QTestState *destination;
+    size_t edge;
+    size_t i;
+
+    tmpdir = g_dir_make_tmp("next-dma-stage-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_dma_start_with_args(true, incoming_args);
+    source = next_dma_start_with_args(true, NULL);
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+    qtest_irq_intercept_out_named(destination, "/machine/next-dma",
+                                  "sysbus-irq");
+
+    qtest_memset(source, DMA_BUFFER, 0xa5, sizeof(received));
+    qtest_writel(source, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_RESET | DMA_READ_CMD);
+    qtest_writel(source, channel_address(&channels[0], 0x4000), DMA_BUFFER);
+    qtest_writel(source, channel_address(&channels[0], 0x4004),
+                 DMA_BUFFER + DMA_WINDOW_LENGTH);
+    qtest_writel(source, NEXT_DMA_BASE + channels[0].csr,
+                 DMA_SETENABLE | DMA_READ_CMD);
+    issue_inquiry_dma(source, INQUIRY_LENGTH);
+    g_assert_cmphex(qtest_readl(
+                        source, channel_address(&channels[0], 0x4000)),
+                    ==, DMA_BUFFER + DMA_COMMITTED_LENGTH);
+
+    migrate_wait(source, destination, uri);
+
+    g_assert_cmphex(qtest_readl(
+                        destination,
+                        channel_address(&channels[0], 0x4000)),
+                    ==, DMA_BUFFER + DMA_COMMITTED_LENGTH);
+    for (edge = 0; edge < 3; edge++) {
+        pulse_scsi_fifo_flush(destination);
+        g_assert_cmphex(qtest_readl(
+                            destination,
+                            channel_address(&channels[0], 0x4000)),
+                        ==, DMA_BUFFER + DMA_COMMITTED_LENGTH);
+    }
+    pulse_scsi_fifo_flush(destination);
+    g_assert_cmphex(qtest_readl(
+                        destination,
+                        channel_address(&channels[0], 0x4000)),
+                    ==, DMA_BUFFER + DMA_FLUSHED_LENGTH);
+    g_assert_cmphex(qtest_readl(destination,
+                               NEXT_DMA_BASE + channels[0].csr) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
+                    ==, DMA_ENABLE);
+    g_assert_false(qtest_get_irq(destination, 0));
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_SCSI_DMA_IRQ, ==, 0);
+
+    qtest_memread(destination, DMA_BUFFER, received, sizeof(received));
+    g_assert_cmpmem(&received[8], 4, "QEMU", 4);
+    g_assert_cmphex(received[64], ==, 0);
+    g_assert_cmphex(received[65], ==, 0);
+    for (i = 66; i < DMA_FLUSHED_LENGTH; i++) {
+        g_assert_cmphex(received[i], ==, 0);
+    }
+    for (i = DMA_FLUSHED_LENGTH; i < sizeof(received); i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -367,5 +1046,17 @@ int main(int argc, char **argv)
                    test_access_contract);
     qtest_add_func("/next-cube/dma/inert-never-completes",
                    test_inert_channels);
+    qtest_add_func("/next-cube/dma/zero-next-init-valid",
+                   test_zero_next_init_valid);
+    qtest_add_func("/next-cube/dma/device-reset-all-channels",
+                   test_device_reset_all_channels);
+    qtest_add_func("/next-cube/dma/functional-irq-invariant",
+                   test_functional_irq_invariant);
+    qtest_add_func("/next-cube/dma/cross-channel-ack-isolation",
+                   test_cross_channel_ack_isolation);
+    qtest_add_func("/next-cube/dma/migration-idle-all-channels",
+                   test_migration_idle_all_channels);
+    qtest_add_func("/next-cube/dma/migration-partial-scsi-stage",
+                   test_migration_partial_scsi_stage);
     return g_test_run();
 }
