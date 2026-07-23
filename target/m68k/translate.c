@@ -5368,15 +5368,28 @@ DISAS_INSN(ftrapcc)
 #if !defined(CONFIG_USER_ONLY)
 DISAS_INSN(frestore)
 {
-    TCGv addr;
+    int mode = extract32(insn, 3, 3);
+    TCGv addr, size;
 
     if (IS_USER(s)) {
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
     if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
-        SRC_EA(env, addr, OS_LONG, 0, NULL);
-        /* FIXME: check the state frame */
+        if (mode == 3) {
+            addr = get_areg(s, REG(insn, 0));
+        } else {
+            addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+        }
+        size = tcg_temp_new();
+        gen_helper_frestore(size, tcg_env, addr);
+        if (mode == 3) {
+            tcg_gen_add_i32(AREG(insn, 0), addr, size);
+        }
     } else {
         disas_undef(env, s, insn);
     }
@@ -5384,15 +5397,29 @@ DISAS_INSN(frestore)
 
 DISAS_INSN(fsave)
 {
+    int mode = extract32(insn, 3, 3);
+    TCGv addr, new_addr;
+
     if (IS_USER(s)) {
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
 
     if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
-        /* always write IDLE */
-        TCGv idle = tcg_constant_i32(0x41000000);
-        DEST_EA(env, insn, OS_LONG, idle, NULL);
+        if (mode == 3 || mode == 4) {
+            addr = get_areg(s, REG(insn, 0));
+        } else {
+            addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+        }
+        new_addr = tcg_temp_new();
+        gen_helper_fsave(new_addr, tcg_env, addr, tcg_constant_i32(mode));
+        if (mode == 3 || mode == 4) {
+            tcg_gen_mov_i32(AREG(insn, 0), new_addr);
+        }
     } else {
         disas_undef(env, s, insn);
     }

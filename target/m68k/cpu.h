@@ -35,6 +35,8 @@
 #define OS_PACKED   6
 #define OS_UNSIZED  7
 
+#define M68K_FP_STATE_MAX 100
+
 #define EXCP_ACCESS         2   /* Access (MMU) error.  */
 #define EXCP_ADDRESS        3   /* Address error.  */
 #define EXCP_ILLEGAL        4   /* Illegal instruction.  */
@@ -108,6 +110,8 @@ typedef struct CPUArchState {
     uint32_t fpcr;
     uint32_t fpsr;
     uint32_t fpiar;
+    uint8_t fp_state[M68K_FP_STATE_MAX];
+    uint8_t fp_state_size;
     float_status fp_status;
 
     uint64_t mactmp;

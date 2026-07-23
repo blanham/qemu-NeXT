@@ -22,6 +22,7 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-loop.h"
 #include "softfloat.h"
 
 /*
@@ -178,6 +179,72 @@ void HELPER(extp96)(CPUM68KState *env, FPReg *res,
 float64 HELPER(redf64)(CPUM68KState *env, FPReg *val)
 {
     return floatx80_to_float64(val->d, &env->fp_status);
+}
+
+static bool valid_fp_state_frame(uint8_t version, unsigned size)
+{
+    if ((version & 0xf0) != 0x40) {
+        return false;
+    }
+
+    switch (size) {
+    case 4:   /* idle */
+    case 44:  /* original-revision unimplemented instruction */
+    case 52:  /* revised unimplemented instruction */
+    case 100: /* busy */
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
+{
+    uintptr_t ra = GETPC();
+    unsigned size = env->fp_state_size ? env->fp_state_size : 4;
+    unsigned i;
+
+    if (mode == 4) {
+        addr -= size;
+    }
+
+    if (env->fp_state_size) {
+        for (i = 0; i < size; i++) {
+            cpu_stb_data_ra(env, addr + i, env->fp_state[i], ra);
+        }
+    } else {
+        cpu_stl_be_data_ra(env, addr, 0x41000000, ra);
+    }
+
+    /* FSAVE leaves the floating-point unit in the idle state. */
+    env->fp_state_size = 0;
+
+    return mode == 3 ? addr + size : addr;
+}
+
+uint32_t HELPER(frestore)(CPUM68KState *env, uint32_t addr)
+{
+    uintptr_t ra = GETPC();
+    CPUState *cs = env_cpu(env);
+    uint8_t version = cpu_ldub_data_ra(env, addr, ra);
+    unsigned size = cpu_ldub_data_ra(env, addr + 1, ra) + 4;
+    unsigned i;
+
+    if (!valid_fp_state_frame(version, size)) {
+        cs->exception_index = EXCP_FORMAT;
+        cpu_loop_exit_restore(cs, ra);
+    }
+
+    if (size == 4) {
+        env->fp_state_size = 0;
+    } else {
+        for (i = 0; i < size; i++) {
+            env->fp_state[i] = cpu_ldub_data_ra(env, addr + i, ra);
+        }
+        env->fp_state_size = size;
+    }
+
+    return size;
 }
 
 void HELPER(firound)(CPUM68KState *env, FPReg *res, FPReg *val)
