@@ -376,13 +376,46 @@ uint32_t cpu_m68k_get_fpsr(CPUM68KState *env)
 {
     int host_flags = get_float_exception_flags(&env->fp_status);
     int target_flags = cpu_m68k_exceptbits_from_host(host_flags);
-    int except = (env->fpsr & ~(0xf8)) | target_flags;
-    return except;
+
+    /*
+     * Some architectural accrued exceptions, notably BSUN, have no
+     * softfloat equivalent and live only in env->fpsr.
+     */
+    return env->fpsr | target_flags;
 }
 
 uint32_t HELPER(get_fpsr)(CPUM68KState *env)
 {
     return cpu_m68k_get_fpsr(env);
+}
+
+static void make_busy_fp_state(CPUM68KState *env, uint32_t pc)
+{
+    memset(env->fp_state, 0, sizeof(env->fp_state));
+    env->fp_state[0] = 0x40;
+    env->fp_state[1] = 0x60;
+    stl_be_p(&env->fp_state[36], cpu_m68k_get_fpsr(env));
+    stl_be_p(&env->fp_state[40], pc);
+    env->fp_state_size = 100;
+}
+
+void HELPER(fcc_check)(CPUM68KState *env, uint32_t cond, uint32_t pc)
+{
+    CPUState *cs;
+
+    if (!(cond & 0x10) || !(env->fpsr & FPSR_CC_A)) {
+        return;
+    }
+
+    env->fpsr |= FPSR_EXC_BSUN | FPSR_AEXC_IOP;
+    if (!(env->fpcr & FPSR_EXC_BSUN)) {
+        return;
+    }
+
+    make_busy_fp_state(env, pc);
+    cs = env_cpu(env);
+    cs->exception_index = EXCP_FP_BSUN;
+    cpu_loop_exit_restore(cs, GETPC());
 }
 
 void cpu_m68k_set_fpsr(CPUM68KState *env, uint32_t val)

@@ -446,6 +446,25 @@ typedef enum {
 #define FPSR_QT_MASK  0x00ff0000
 #define FPSR_QT_SHIFT 16
 
+/* Exception status byte */
+#define FPSR_EXC_BSUN  0x00008000
+#define FPSR_EXC_SNAN  0x00004000
+#define FPSR_EXC_OPERR 0x00002000
+#define FPSR_EXC_OVFL  0x00001000
+#define FPSR_EXC_UNFL  0x00000800
+#define FPSR_EXC_DZ    0x00000400
+#define FPSR_EXC_INEX2 0x00000200
+#define FPSR_EXC_INEX1 0x00000100
+#define FPSR_EXC_MASK  0x0000ff00
+
+/* Accrued exception byte */
+#define FPSR_AEXC_IOP  0x00000080
+#define FPSR_AEXC_OVFL 0x00000040
+#define FPSR_AEXC_UNFL 0x00000020
+#define FPSR_AEXC_DZ   0x00000010
+#define FPSR_AEXC_INEX 0x00000008
+#define FPSR_AEXC_MASK 0x000000f8
+
 /* Floating-Point Control Register */
 /* Rounding mode */
 #define FPCR_RND_MASK   0x0030

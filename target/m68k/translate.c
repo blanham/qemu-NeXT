@@ -5181,7 +5181,8 @@ static void gen_fcc_cond(DisasCompare *c, DisasContext *s, int cond)
     TCGv fpsr;
     int imm = 0;
 
-    /* TODO: Raise BSUN exception.  */
+    gen_helper_fcc_check(tcg_env, tcg_constant_i32(cond),
+                         tcg_constant_i32(s->base.pc_next));
     fpsr = tcg_temp_new();
     gen_load_fcr(s, fpsr, M68K_FPSR);
     c->v1 = fpsr;
