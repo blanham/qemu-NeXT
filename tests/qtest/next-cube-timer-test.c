@@ -19,6 +19,10 @@
 #define NEXT_TIMER_ENABLE     0x80
 #define NEXT_TIMER_UPDATE     0x40
 #define NEXT_SCR2_TIMER_IPL7  0x00008000
+#define NEXT_SCR2_SOFTINT0    0x01000000
+#define NEXT_SCR2_SOFTINT1    0x02000000
+#define NEXT_INTR_SOFTINT0    0x00000001
+#define NEXT_INTR_SOFTINT1    0x00000002
 #define NEXT_INTR_TIMER       0x20000000
 #define NEXT_TIMER_TICK_NS    INT64_C(1000)
 #define NEXT_EVENT_MASK       0x000fffff
@@ -305,6 +309,33 @@ static void test_reset_cancels_deadline(void)
     qtest_quit(qts);
 }
 
+static void test_scr2_soft_interrupts(void)
+{
+    QTestState *qts = next_cube_timer_start();
+    uint32_t scr2 = qtest_readl(qts, NEXT_SCR2);
+    uint32_t softints = NEXT_INTR_SOFTINT0 | NEXT_INTR_SOFTINT1;
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & softints, ==, 0);
+
+    qtest_writel(qts, NEXT_SCR2, scr2 | NEXT_SCR2_SOFTINT0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & softints, ==,
+                    NEXT_INTR_SOFTINT0);
+
+    qtest_writel(qts, NEXT_SCR2,
+                 scr2 | NEXT_SCR2_SOFTINT0 | NEXT_SCR2_SOFTINT1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & softints, ==,
+                    NEXT_INTR_SOFTINT0 | NEXT_INTR_SOFTINT1);
+
+    qtest_writel(qts, NEXT_SCR2, scr2 | NEXT_SCR2_SOFTINT1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & softints, ==,
+                    NEXT_INTR_SOFTINT1);
+
+    qtest_writel(qts, NEXT_SCR2, scr2);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & softints, ==, 0);
+
+    qtest_quit(qts);
+}
+
 static void test_migration_pending_irq_and_active_timer(void)
 {
     const int64_t timer_b_ticks = 1000;
@@ -394,6 +425,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/timer/event-counter", test_event_counter);
     qtest_add_func("/next-cube/timer/reset-cancels-deadline",
                    test_reset_cancels_deadline);
+    qtest_add_func("/next-cube/timer/scr2-soft-interrupts",
+                   test_scr2_soft_interrupts);
     qtest_add_func("/next-cube/timer/migration-pending-irq-and-active-timer",
                    test_migration_pending_irq_and_active_timer);
     return g_test_run();

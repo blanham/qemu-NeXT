@@ -63,6 +63,8 @@
 #define NEXT_TIMER_FULL_PERIOD  0x10000
 #define NEXT_TIMER_IRQ_STATUS   0x20000000
 #define NEXT_SCR2_TIMER_IPL7    0x00008000
+#define NEXT_SCR2_SOFTINT_SHIFT 24
+#define NEXT_IRQ_SOFTINT_MASK   0x00000003
 #define NEXT_EVENTC_MASK        0x000fffff
 
 #define NEXT_RTC_STATUS_NEW_CLOCK  0x80
@@ -306,6 +308,15 @@ static void next_update_irq(NeXTPC *s)
     m68k_set_irq_level(s->cpu, level, level ? level + 24 : 0);
 }
 
+static void next_scr2_update_softints(NeXTPC *s)
+{
+    uint32_t softints = extract32(s->scr2, NEXT_SCR2_SOFTINT_SHIFT, 2);
+
+    s->int_status &= ~NEXT_IRQ_SOFTINT_MASK;
+    s->int_status |= softints;
+    next_update_irq(s);
+}
+
 static void next_timer_reroute_irq(NeXTPC *s)
 {
     int level = next_timer_irq_level(s);
@@ -383,6 +394,7 @@ static void next_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                             size << 3, val);
         next_scr2_led_update(s);
         next_scr2_rtc_update(s);
+        next_scr2_update_softints(s);
         if (s->timer_irq_pending &&
             ((previous_scr2 ^ s->scr2) & NEXT_SCR2_TIMER_IPL7)) {
             next_timer_reroute_irq(s);
@@ -1662,6 +1674,7 @@ static void next_pc_reset_hold(Object *obj, ResetType type)
     s->timer_counter = 0;
     s->timer_csr = 0;
     s->eventc_latched = 0;
+    next_scr2_update_softints(s);
     next_timer_set_irq(s, false, true);
 }
 
@@ -1790,6 +1803,8 @@ static const Property next_pc_properties[] = {
 static int next_pc_post_load(void *opaque, int version_id)
 {
     NeXTPC *s = opaque;
+
+    next_scr2_update_softints(s);
 
     if (version_id < 5) {
         timer_del(&s->system_timer);
