@@ -6,6 +6,10 @@
 #define NEXT_DSP_BASE      0x02108000
 #define NEXT_DSP_SIZE      8
 #define NEXT_DSP_ICR       (NEXT_DSP_BASE + 0)
+#define NEXT_PRINTER_BASE  0x0200f000
+#define NEXT_PRINTER_CSR   (NEXT_PRINTER_BASE + 0)
+#define NEXT_PRINTER_CMD   (NEXT_PRINTER_BASE + 3)
+#define NEXT_PRINTER_DATA  (NEXT_PRINTER_BASE + 4)
 #define NEXT_ESP_CMD       0x02114003
 #define NEXT_ESP_BUSID     0x02114004
 #define NEXT_ESP_STAT      0x02114004
@@ -212,6 +216,27 @@ static void test_dsp_mmio_mapping(void)
     qtest_quit(qts);
 }
 
+static void test_printer_mmio_mapping(void)
+{
+    QTestState *qts = next_cube_scsi_start();
+    g_autofree char *flatview = qtest_hmp(qts, "info mtree -f");
+
+    g_assert_nonnull(strstr(flatview,
+        "0000000002005000-000000000200dfff (prio 0, i/o): next.mmio"));
+    g_assert_nonnull(strstr(flatview,
+        "000000000200f000-000000000200f007 (prio 0, i/o): next.printer"));
+
+    qtest_writeb(qts, NEXT_PRINTER_CMD, 0xff);
+    g_assert_cmphex(qtest_readb(qts, NEXT_PRINTER_CMD), ==, 0);
+
+    qtest_writel(qts, NEXT_PRINTER_CSR, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, NEXT_PRINTER_CSR), ==, 0);
+    qtest_writel(qts, NEXT_PRINTER_DATA, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, NEXT_PRINTER_DATA), ==, 0);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -226,5 +251,7 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/scsi/immediate-replacement-cancels-timeout",
                    test_immediate_replacement_cancels_selection_timeout);
     qtest_add_func("/next-cube/mmio/dsp-mapping", test_dsp_mmio_mapping);
+    qtest_add_func("/next-cube/mmio/printer-mapping",
+                   test_printer_mmio_mapping);
     return g_test_run();
 }
