@@ -268,6 +268,34 @@ static uint32_t *next_dma_channel_register(NextDMAChannelState *c,
     }
 }
 
+static const char *next_dma_register_name(NextDMARegister reg)
+{
+    switch (reg) {
+    case NEXT_DMA_REGISTER_CSR:
+        return "csr";
+    case NEXT_DMA_REGISTER_SAVED_NEXT:
+        return "saved-next";
+    case NEXT_DMA_REGISTER_SAVED_LIMIT:
+        return "saved-limit";
+    case NEXT_DMA_REGISTER_SAVED_START:
+        return "saved-start";
+    case NEXT_DMA_REGISTER_SAVED_STOP:
+        return "saved-stop";
+    case NEXT_DMA_REGISTER_NEXT:
+        return "next";
+    case NEXT_DMA_REGISTER_LIMIT:
+        return "limit";
+    case NEXT_DMA_REGISTER_START:
+        return "start";
+    case NEXT_DMA_REGISTER_STOP:
+        return "stop";
+    case NEXT_DMA_REGISTER_NEXT_INIT:
+        return "next-init";
+    default:
+        g_assert_not_reached();
+    }
+}
+
 static void next_dma_resolve(NextDMAState *s, NextDMAChannel channel,
                              NextDMARegister reg,
                              NextDMAResolvedRegister *resolved)
@@ -430,6 +458,9 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
     if (resolved.channel == NEXT_DMA_SCSI) {
         next_dma_trace_scsi_register_write(s, addr, value);
     }
+    trace_next_dma_reg_write(NEXT_DMA_MMIO_BASE + addr,
+                             next_dma_channels[resolved.channel].name,
+                             next_dma_register_name(resolved.reg), value);
 }
 
 static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)

@@ -293,6 +293,8 @@ static void test_inert_channels(void)
     QTestState *qts = next_dma_start();
     size_t channel;
 
+    qtest_irq_intercept_out_named(qts, "/machine/next-dma", "sysbus-irq");
+
     for (channel = 0; channel < ARRAY_SIZE(channels); channel++) {
         uint32_t canary = 0x40000000 | channel << 8 | 4;
         uint32_t ram_address = NEXT_TEST_RAM_BASE + channel * 0x100;
@@ -334,6 +336,7 @@ static void test_inert_channels(void)
             g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
                             (1U << channels[channel].irq_bit), ==, 0);
         }
+        g_assert_false(qtest_get_irq(qts, channel));
         g_assert_cmphex(qtest_readl(qts,
                                    channel_address(&channels[channel], 0x4200)),
                         ==, ram_address);

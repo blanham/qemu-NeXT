@@ -15,6 +15,7 @@
 #define NEXT_DMA_LIMIT     0x02004014
 #define NEXT_DMA_START     0x02004018
 #define NEXT_DMA_STOP      0x0200401c
+#define NEXT_DMA_NEXT_INIT 0x02004210
 #define NEXT_INTR_STATUS   0x02007000
 #define NEXT_INTR_MASK     0x02007800
 #define NEXT_ESP_TCLO      0x02114000
@@ -34,6 +35,7 @@
 #define NEXT_DISK_SIZE     (512 * 1024)
 #define NEXT_DMA_BUFFER    0x04002000
 #define NEXT_DMA_BUFFER2   0x04004000
+#define NEXT_DMA_BUFFER3   0x04006000
 #define NEXT_SECTOR_SIZE   512
 
 #define ESP_CMD_RESET      0x02
@@ -52,6 +54,7 @@
 #define DMA_DEV2M          0x00040000
 #define DMA_CLRCOMPLETE    0x00080000
 #define DMA_RESET          0x00100000
+#define DMA_INITBUF        0x00200000
 #define DMA_ENABLE         0x01000000
 #define DMA_SUPDATE        0x02000000
 #define DMA_COMPLETE       0x08000000
@@ -677,6 +680,113 @@ static void finish_scsi_command(QTestState *qts)
     qtest_readb(qts, NEXT_ESP_INTR);
 }
 
+static void test_scsi_dma_reset_clears_next_init_valid(void)
+{
+    enum {
+        TRANSFER_LENGTH = 16,
+    };
+    uint8_t current[TRANSFER_LENGTH];
+    uint8_t init[TRANSFER_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    bool current_changed = false;
+    int i;
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, sizeof(current));
+    qtest_memset(qts, NEXT_DMA_BUFFER2, 0x5a, sizeof(init));
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + TRANSFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_NEXT_INIT, NEXT_DMA_BUFFER2);
+
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
+                    NEXT_DMA_BUFFER2);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+
+    qtest_memread(qts, NEXT_DMA_BUFFER, current, sizeof(current));
+    qtest_memread(qts, NEXT_DMA_BUFFER2, init, sizeof(init));
+    for (i = 0; i < sizeof(current); i++) {
+        current_changed |= current[i] != 0xa5;
+        g_assert_cmphex(init[i], ==, 0x5a);
+    }
+    g_assert_true(current_changed);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + TRANSFER_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
+                    NEXT_DMA_BUFFER2);
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
+static void test_scsi_dma_initbuf_preserves_next_init(void)
+{
+    enum {
+        TRANSFER_LENGTH = 16,
+        STAGED_LENGTH = 8,
+    };
+    uint8_t expected[TRANSFER_LENGTH];
+    uint8_t actual[TRANSFER_LENGTH];
+    uint8_t staged[TRANSFER_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    bool reference_changed = false;
+    int i;
+
+    qtest_memset(qts, NEXT_DMA_BUFFER3, 0x3c, sizeof(expected));
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER3);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER3 + TRANSFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+    qtest_memread(qts, NEXT_DMA_BUFFER3, expected, sizeof(expected));
+    for (i = 0; i < sizeof(expected); i++) {
+        reference_changed |= expected[i] != 0x3c;
+    }
+    g_assert_true(reference_changed);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, sizeof(staged));
+    qtest_memset(qts, NEXT_DMA_BUFFER2, 0x5a, sizeof(actual));
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + TRANSFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    issue_inquiry_dma(qts, STAGED_LENGTH);
+    finish_scsi_command(qts);
+    qtest_memread(qts, NEXT_DMA_BUFFER, staged, sizeof(staged));
+    for (i = 0; i < sizeof(staged); i++) {
+        g_assert_cmphex(staged[i], ==, 0xa5);
+    }
+
+    qtest_writel(qts, NEXT_DMA_NEXT_INIT, NEXT_DMA_BUFFER2);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER2 + TRANSFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_INITBUF | DMA_DEV2M);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
+                    NEXT_DMA_BUFFER2);
+
+    issue_inquiry_dma(qts, TRANSFER_LENGTH);
+    finish_scsi_command(qts);
+    qtest_memread(qts, NEXT_DMA_BUFFER2, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER2 + TRANSFER_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
+                    NEXT_DMA_BUFFER2);
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
 static void test_scsi_dma_chain_states(void)
 {
     enum {
@@ -976,6 +1086,10 @@ int main(int argc, char **argv)
                    test_scsi_dma_short_tail_flush_rechecks_limit);
     qtest_add_func("/next-cube/scsi/read-dma-chain",
                    test_scsi_read_dma_chain);
+    qtest_add_func("/next-cube/scsi/dma-reset-clears-next-init-valid",
+                   test_scsi_dma_reset_clears_next_init_valid);
+    qtest_add_func("/next-cube/scsi/dma-initbuf-preserves-next-init",
+                   test_scsi_dma_initbuf_preserves_next_init);
     qtest_add_func("/next-cube/scsi/dma-chain-states",
                    test_scsi_dma_chain_states);
     qtest_add_func("/next-cube/scsi/write-dma-chain",

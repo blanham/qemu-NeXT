@@ -8,6 +8,10 @@
 #define NEXT_DMA_CSR   0x02000010
 #define NEXT_DMA_NEXT  0x02004010
 #define NEXT_DMA_LIMIT 0x02004014
+#define NEXT_DMA_SND_OUT_NEXT 0x02004040
+#define NEXT_DMA_SND_IN_NEXT  0x02004080
+#define NEXT_DMA_SCC_NEXT     0x020040c0
+#define NEXT_DMA_R2M_NEXT     0x020041c0
 #define NEXT_ESP_TCLO  0x02114000
 #define NEXT_ESP_TCMID 0x02114001
 #define NEXT_ESP_FIFO  0x02114002
@@ -81,7 +85,7 @@ static AccessResults run_accesses(const char *rom_path, const char *log_path,
     AccessResults results;
 
     if (enable_tracing) {
-        trace_arg = g_strdup_printf("next_scsi_dma_reg_*%s",
+        trace_arg = g_strdup_printf("next_*dma_reg_*%s",
                                     simple_trace_file);
         quoted_trace_arg = g_shell_quote(trace_arg);
         qts = qtest_initf("-machine next-cube -bios %s "
@@ -110,6 +114,11 @@ static AccessResults run_accesses(const char *rom_path, const char *log_path,
     g_assert_cmphex(results.dma_next, ==, 0x04002000);
 
     results.dma_csr = qtest_readl(qts, NEXT_DMA_CSR);
+
+    qtest_writel(qts, NEXT_DMA_SND_OUT_NEXT, 0x11111111);
+    qtest_writel(qts, NEXT_DMA_SND_IN_NEXT, 0x22222222);
+    qtest_writel(qts, NEXT_DMA_SCC_NEXT, 0x33333333);
+    qtest_writel(qts, NEXT_DMA_R2M_NEXT, 0x44444444);
     qtest_quit(qts);
 
 #ifdef CONFIG_TRACE_SIMPLE
@@ -335,6 +344,8 @@ static void test_next_cube_scsi_trace(void)
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_dma_reg_read"));
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
+                               "next_dma_reg_write"));
+    g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_dma_transfer"));
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_dma_read"));
@@ -364,6 +375,22 @@ static void test_next_cube_scsi_trace(void)
     g_assert_nonnull(g_strstr_len(
         enabled_log, enabled_log_len,
         "next_scsi_dma_reg_read addr=0x2000010 value=0x0 csr=0x0"));
+    g_assert_nonnull(g_strstr_len(
+        enabled_log, enabled_log_len,
+        "next_dma_reg_write addr=0x2004040 owner=snd-out/next "
+        "value=0x11111111"));
+    g_assert_nonnull(g_strstr_len(
+        enabled_log, enabled_log_len,
+        "next_dma_reg_write addr=0x2004080 owner=snd-in/next "
+        "value=0x22222222"));
+    g_assert_nonnull(g_strstr_len(
+        enabled_log, enabled_log_len,
+        "next_dma_reg_write addr=0x20040c0 owner=scc/next "
+        "value=0x33333333"));
+    g_assert_nonnull(g_strstr_len(
+        enabled_log, enabled_log_len,
+        "next_dma_reg_write addr=0x20041c0 owner=r2m/next "
+        "value=0x44444444"));
 
     g_assert_nonnull(g_strstr_len(
         completion_log, completion_log_len,
