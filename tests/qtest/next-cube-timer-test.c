@@ -44,7 +44,7 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_cube_timer_start(void)
+static QTestState *next_cube_timer_start_with_args(const char *args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -62,8 +62,44 @@ static QTestState *next_cube_timer_start(void)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    qts = qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
+    qts = qtest_initf("-machine next-cube -bios %s %s",
+                      quoted_rom_path, args ?: "");
     return qts;
+}
+
+static QTestState *next_cube_timer_start(void)
+{
+    return next_cube_timer_start_with_args(NULL);
+}
+
+static void unrealize_next_kbd(QTestState *qts)
+{
+    g_autoptr(QDict) response = NULL;
+    g_autofree char *path = NULL;
+    QList *children;
+    QListEntry *entry;
+
+    response = qtest_qmp(
+        qts, "{ 'execute': 'qom-list', "
+        "'arguments': { 'path': '/machine/unattached' } }");
+    g_assert_nonnull(response);
+    g_assert_true(qdict_haskey(response, "return"));
+    children = qdict_get_qlist(response, "return");
+    QLIST_FOREACH_ENTRY(children, entry) {
+        QDict *child = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(child, "type"), "child<next-kbd>")) {
+            g_assert_null(path);
+            path = g_strdup_printf("/machine/unattached/%s",
+                                   qdict_get_str(child, "name"));
+        }
+    }
+    g_assert_nonnull(path);
+
+    qtest_qmp_assert_success(
+        qts,
+        "{ 'execute': 'qom-set', 'arguments': { "
+        "'path': %s, 'property': 'realized', 'value': false } }", path);
 }
 
 static uint32_t timer_status(QTestState *qts)
@@ -269,6 +305,83 @@ static void test_reset_cancels_deadline(void)
     qtest_quit(qts);
 }
 
+static void test_migration_pending_irq_and_active_timer(void)
+{
+    const int64_t timer_b_ticks = 1000;
+    const int64_t elapsed_b_ticks = 400;
+    const int64_t remaining_b_ticks = timer_b_ticks - elapsed_b_ticks;
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    QTestState *source;
+    QTestState *destination;
+    int64_t source_clock;
+
+    tmpdir = g_dir_make_tmp("next-cube-timer-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_timer_start_with_args(incoming_args);
+    source = next_cube_timer_start();
+
+    /*
+     * The fixed next-kbd device has no VMState yet.  It is unrelated to
+     * this test, so unrealize it on both ends before migrating next-pc.
+     */
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+
+    arm_timer(source, 1);
+    qtest_clock_step(source, NEXT_TIMER_TICK_NS);
+    g_assert_cmphex(timer_status(source), ==, NEXT_INTR_TIMER);
+
+    write_timer_latch(source, timer_b_ticks);
+    qtest_writeb(source, NEXT_TIMER_CSR,
+                 NEXT_TIMER_ENABLE | NEXT_TIMER_UPDATE);
+    source_clock =
+        qtest_clock_step(source, elapsed_b_ticks * NEXT_TIMER_TICK_NS);
+    g_assert_cmphex(timer_status(source), ==, NEXT_INTR_TIMER);
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
+
+    /*
+     * The qtest accelerator's manually advanced clock is not VMState.
+     * Match the destination test clock to the migrated timer's timebase.
+     */
+    qtest_clock_set(destination, source_clock);
+
+    g_assert_cmphex(timer_status(destination), ==, NEXT_INTR_TIMER);
+    g_assert_cmphex(qtest_readb(destination, NEXT_TIMER_CSR), ==,
+                    NEXT_TIMER_ENABLE);
+    g_assert_cmphex(timer_status(destination), ==, 0);
+
+    qtest_clock_step(destination,
+                     remaining_b_ticks * NEXT_TIMER_TICK_NS - 1);
+    g_assert_cmphex(read_timer_count(destination), ==, 1);
+    g_assert_cmphex(timer_status(destination), ==, 0);
+    qtest_clock_step(destination, 1);
+    g_assert_cmphex(timer_status(destination), ==, NEXT_INTR_TIMER);
+    g_assert_cmphex(qtest_readb(destination, NEXT_TIMER_CSR), ==,
+                    NEXT_TIMER_ENABLE);
+    g_assert_cmphex(timer_status(destination), ==, 0);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -281,5 +394,7 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/timer/event-counter", test_event_counter);
     qtest_add_func("/next-cube/timer/reset-cancels-deadline",
                    test_reset_cancels_deadline);
+    qtest_add_func("/next-cube/timer/migration-pending-irq-and-active-timer",
+                   test_migration_pending_irq_and_active_timer);
     return g_test_run();
 }
