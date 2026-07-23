@@ -23,6 +23,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/dma/next-dma.h"
+#include "hw/net/next-mb8795.h"
 #include "hw/scsi/esp.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
@@ -39,6 +40,7 @@
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
 #include "migration/vmstate.h"
+#include "net/net.h"
 #include "trace.h"
 
 /* #define DEBUG_NEXT */
@@ -152,7 +154,6 @@ struct NeXTPC {
     MemoryRegion floppy_mem;
     MemoryRegion system_timer_mem;
     MemoryRegion eventc_mem;
-    MemoryRegion dummyen_mem;
     MemoryRegion dsp_mem;
     MemoryRegion printer_mem;
     MemoryRegion mmiomem;
@@ -196,6 +197,7 @@ struct NeXTState {
     MemoryRegion bmapm2;
 
     NextDMAState *dma;
+    NextMB8795State *mb8795;
 };
 
 /* Thanks to NeXT forums for this */
@@ -939,37 +941,6 @@ static const MemoryRegionOps next_eventc_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
-static void next_dummy_en_write(void *opaque, hwaddr addr, uint64_t val,
-                                unsigned size)
-{
-    /* Do nothing */
-}
-
-static uint64_t next_dummy_en_read(void *opaque, hwaddr addr, unsigned size)
-{
-    uint64_t val;
-
-    switch (addr) {
-    case 0:
-        /* For now return dummy byte to allow the Ethernet test to timeout */
-        val = 0xff;
-        break;
-
-    default:
-        val = 0;
-    }
-
-    return val;
-}
-
-static const MemoryRegionOps next_dummy_en_ops = {
-    .read = next_dummy_en_read,
-    .write = next_dummy_en_write,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-    .endianness = DEVICE_BIG_ENDIAN,
-};
-
 static void next_dsp_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
@@ -1355,10 +1326,6 @@ static void next_pc_init(Object *obj)
                           "next.mmio", 0x9000);
     sysbus_init_mmio(sbd, &s->mmiomem);
 
-    memory_region_init_io(&s->dummyen_mem, OBJECT(s), &next_dummy_en_ops, s,
-                          "next.en", 0x20);
-    sysbus_init_mmio(sbd, &s->dummyen_mem);
-
     memory_region_init_io(&s->dsp_mem, OBJECT(s), &next_dsp_ops, s,
                           "next.dsp", 8);
     sysbus_init_mmio(sbd, &s->dsp_mem);
@@ -1516,6 +1483,7 @@ static void next_cube_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     const char *bios_name = machine->firmware ?: ROM_FILE;
     DeviceState *dma_dev;
+    DeviceState *mbdev;
     DeviceState *pcdev;
     int channel;
 
@@ -1553,6 +1521,22 @@ static void next_cube_init(MachineState *machine)
         }
     }
 
+    /* Ethernet controller */
+    mbdev = qdev_new(TYPE_NEXT_MB8795);
+    m->mb8795 = NEXT_MB8795(mbdev);
+    object_property_add_child(OBJECT(machine), "mb8795", OBJECT(mbdev));
+    object_property_set_link(OBJECT(mbdev), "dma",
+                             OBJECT(m->dma), &error_abort);
+    qemu_configure_nic_device(mbdev, true, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(mbdev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(m->mb8795), 0, 0x02106000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(m->mb8795), 0,
+                       qdev_get_gpio_in(pcdev, NEXT_ENTX_I));
+    sysbus_connect_irq(SYS_BUS_DEVICE(m->mb8795), 1,
+                       qdev_get_gpio_in(pcdev, NEXT_ENRX_I));
+    next_dma_set_ethernet_notify(m->dma, &next_mb8795_dma_notify,
+                                 m->mb8795);
+
     /* 64MB RAM starting at 0x04000000  */
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);
 
@@ -1562,14 +1546,11 @@ static void next_cube_init(MachineState *machine)
     /* MMIO */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 0, 0x02005000);
 
-    /* en network (dummy) */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 1, 0x02106000);
-
     /* DSP host interface */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, 0x02108000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 1, 0x02108000);
 
     /* Printer interface */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, 0x0200f000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, 0x0200f000);
 
     /* unknown: Brightness control register? */
     empty_slot_init("next.unknown.0", 0x02110000, 0x10);
@@ -1577,18 +1558,18 @@ static void next_cube_init(MachineState *machine)
     empty_slot_init("next.unknown.1", 0x02112000, 0x10);
 
     /* SCSI */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, NEXT_SCSI_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, NEXT_SCSI_BASE);
     /* Floppy */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02114108);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02114108);
     /* ESCC */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x02118000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02118000);
 
     /* unknown: Serial clock configuration register? */
     empty_slot_init("next.unknown.2", 0x02118004, 0x10);
 
     /* System timer and event counter */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 7, 0x02116000);
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 8, 0x0211a000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x02116000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 7, 0x0211a000);
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",
@@ -1643,6 +1624,7 @@ static void next_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_size = RAM_SIZE;
     mc->default_ram_id = "next.ram";
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
+    mc->default_nic = TYPE_NEXT_MB8795;
     mc->no_cdrom = true;
 }
 

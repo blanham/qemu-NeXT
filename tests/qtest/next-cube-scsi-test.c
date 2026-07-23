@@ -1021,6 +1021,8 @@ static void test_dsp_mmio_mapping(void)
     unsigned int offset;
 
     g_assert_nonnull(strstr(flatview,
+        "0000000002106000-000000000210600f (prio 0, i/o): next.mb8795"));
+    g_assert_null(strstr(flatview,
         "0000000002106000-000000000210601f (prio 0, i/o): next.en"));
     g_assert_nonnull(strstr(flatview,
         "0000000002108000-0000000002108007 (prio 0, i/o): next.dsp"));

@@ -1405,8 +1405,14 @@ F: hw/m68k/next-*.c
 F: hw/m68k/trace-events
 F: hw/m68k/trace.h
 F: hw/display/next-fb.c
+F: hw/dma/next-dma.c
+F: hw/net/next-mb8795.c
+F: include/hw/dma/next-dma.h
 F: include/hw/m68k/next-cube.h
+F: include/hw/net/next-mb8795.h
 F: tests/functional/m68k/test_nextcube.py
+F: tests/qtest/next-dma-test.c
+F: tests/qtest/next-mb8795-test.c
 F: tests/qtest/next-cube-*.c
 
 q800
