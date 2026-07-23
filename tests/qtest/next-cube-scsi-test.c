@@ -335,25 +335,29 @@ static void test_scsi_write_dma(void)
     cleanup_test_disk(disk);
 }
 
-static void test_scsi_dma_clear_complete(void)
+static void test_scsi_dma_irq_level_invariant(void)
 {
     uint8_t source[NEXT_SECTOR_SIZE] = { 0 };
     TestDisk *disk = &test_disk;
     QTestState *qts = start_scsi_write_dma(disk, source);
 
-    assert_scsi_dma_completed(qts);
-
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE,
+                    ==, DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCSI_DMA_IRQ,
+                    ==, NEXT_SCSI_DMA_IRQ);
     qtest_writel(qts, NEXT_DMA_CSR, DMA_CLRCOMPLETE);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE, ==, 0);
-    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
-                    (NEXT_SCSI_DMA_IRQ | NEXT_SCSI_IRQ),
-                    ==, NEXT_SCSI_IRQ);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCSI_DMA_IRQ,
+                    ==, 0);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCSI_DMA_IRQ,
+                    ==, 0);
 
     qtest_quit(qts);
     cleanup_test_disk(disk);
 }
 
-static void test_scsi_inquiry_dma_tail(void)
+static void test_scsi_dma_tail_four_fifofl_edges(void)
 {
     static const uint8_t inquiry[6] = { 0x12, 0, 0, 0, 66, 0 };
     enum {
@@ -425,19 +429,19 @@ static void test_scsi_inquiry_dma_tail(void)
         qtest_writeb(qts, NEXT_SCSI_CSR,
                      SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA |
                      SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                        NEXT_DMA_BUFFER + DMA_INITIAL_TRANSFER);
         qtest_writeb(qts, NEXT_SCSI_CSR,
                      SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA |
                      SCSI_CSR_DMADIR);
-        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
-                        NEXT_DMA_BUFFER + DMA_INITIAL_TRANSFER);
     }
     qtest_writeb(qts, NEXT_SCSI_CSR,
                  SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA |
                  SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
-    qtest_writeb(qts, NEXT_SCSI_CSR,
-                 SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA | SCSI_CSR_DMADIR);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
                     NEXT_DMA_BUFFER + DMA_FLUSHED_TRANSFER);
+    qtest_writeb(qts, NEXT_SCSI_CSR,
+                 SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA | SCSI_CSR_DMADIR);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
                     (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
                     ==, DMA_ENABLE);
@@ -832,10 +836,10 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/scsi/disabled-dma-does-not-complete",
                    test_scsi_disabled_dma_does_not_complete);
     qtest_add_func("/next-cube/scsi/write-dma", test_scsi_write_dma);
-    qtest_add_func("/next-cube/scsi/dma-clear-complete",
-                   test_scsi_dma_clear_complete);
-    qtest_add_func("/next-cube/scsi/inquiry-66-dma-tail",
-                   test_scsi_inquiry_dma_tail);
+    qtest_add_func("/next-cube/scsi/dma-irq-level-invariant",
+                   test_scsi_dma_irq_level_invariant);
+    qtest_add_func("/next-cube/scsi/tail-four-fifofl-edges",
+                   test_scsi_dma_tail_four_fifofl_edges);
     qtest_add_func("/next-cube/scsi/read-dma-chain",
                    test_scsi_read_dma_chain);
     qtest_add_func("/next-cube/scsi/dma-chain-states",

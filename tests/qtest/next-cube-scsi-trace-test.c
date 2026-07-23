@@ -7,16 +7,26 @@
 #define NEXT_SCSI_CSR2 0x02114021
 #define NEXT_DMA_CSR   0x02000010
 #define NEXT_DMA_NEXT  0x02004010
+#define NEXT_DMA_LIMIT 0x02004014
+#define NEXT_ESP_TCLO  0x02114000
+#define NEXT_ESP_TCMID 0x02114001
 #define NEXT_ESP_FIFO  0x02114002
 #define NEXT_ESP_CMD   0x02114003
 #define NEXT_ESP_BUSID 0x02114004
 #define NEXT_ESP_INTR  0x02114005
+#define NEXT_ESP_TCHI  0x0211400e
 #define NEXT_ROM_SIZE  (128 * 1024)
 #define NEXT_DISK_SIZE (512 * 1024)
+#define NEXT_DMA_BUFFER 0x04002000
 
 #define ESP_CMD_SEL 0x41
+#define ESP_CMD_TI_DMA 0x90
 #define ESP_CMD_ICCS 0x11
 #define ESP_CMD_MSGACC 0x12
+
+#define DMA_SETENABLE 0x00010000
+#define DMA_DEV2M     0x00040000
+#define DMA_RESET     0x00100000
 
 #ifndef _WIN32
 #define DEV_NULL "/dev/null"
@@ -131,6 +141,34 @@ static uint8_t submit_cdb(QTestState *qts, const uint8_t cdb[6])
     return status;
 }
 
+static void issue_dma_cdb(QTestState *qts, const uint8_t *cdb,
+                          size_t cdb_len, uint32_t transfer_len)
+{
+    int i;
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, 0);
+    for (i = 0; i < cdb_len; i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, cdb[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SEL);
+    qtest_readb(qts, NEXT_ESP_INTR);
+
+    qtest_writeb(qts, NEXT_ESP_TCLO, transfer_len);
+    qtest_writeb(qts, NEXT_ESP_TCMID, transfer_len >> 8);
+    qtest_writeb(qts, NEXT_ESP_TCHI, transfer_len >> 16);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+}
+
+static void finish_dma_cdb(QTestState *qts)
+{
+    qtest_readb(qts, NEXT_ESP_INTR);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_ICCS);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_FIFO), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_FIFO), ==, 0);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_MSGACC);
+    qtest_readb(qts, NEXT_ESP_INTR);
+}
+
 static void run_completion_commands(const char *rom_path,
                                     const char *disk_path,
                                     const char *log_path)
@@ -142,6 +180,10 @@ static void run_completion_commands(const char *rom_path,
 #endif
     static const uint8_t test_unit_ready[6] = { 0 };
     static const uint8_t invalid_opcode[6] = { 0x1f };
+    static const uint8_t inquiry[6] = { 0x12, 0, 0, 0, 64, 0 };
+    static const uint8_t write_10[10] = {
+        0x2a, 0, 0, 0, 0, 1, 0, 0, 1, 0,
+    };
     g_autofree char *quoted_rom_path = g_shell_quote(rom_path);
     g_autofree char *quoted_disk_path = g_shell_quote(disk_path);
     g_autofree char *quoted_log_path = g_shell_quote(log_path);
@@ -155,7 +197,9 @@ static void run_completion_commands(const char *rom_path,
 
     qts = qtest_initf("-machine next-cube -bios %s "
                       "-drive file=%s,if=scsi,format=raw "
-                      "-trace %s -D %s",
+                      "-trace next_scsi_dma_transfer "
+                      "-trace next_scsi_dma_read "
+                      "-trace next_scsi_irq -trace %s -D %s",
                       quoted_rom_path, quoted_disk_path, quoted_trace_arg,
                       quoted_log_path);
 #ifdef CONFIG_TRACE_SIMPLE
@@ -167,6 +211,21 @@ static void run_completion_commands(const char *rom_path,
     g_assert_cmphex(submit_cdb(qts, test_unit_ready), ==, 0x02);
     g_assert_cmphex(submit_cdb(qts, invalid_opcode), ==, 0x02);
     g_assert_cmphex(submit_cdb(qts, test_unit_ready), ==, 0x00);
+
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 64);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    issue_dma_cdb(qts, inquiry, sizeof(inquiry), 64);
+    finish_dma_cdb(qts);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0, 512);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 512);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE);
+    issue_dma_cdb(qts, write_10, sizeof(write_10), 512);
+    finish_dma_cdb(qts);
 
     qtest_quit(qts);
 
@@ -278,6 +337,8 @@ static void test_next_cube_scsi_trace(void)
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_dma_transfer"));
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
+                               "next_scsi_dma_read"));
+    g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "next_scsi_irq"));
     g_assert_null(g_strstr_len(disabled_log, disabled_log_len,
                                "scsi_req_complete"));
@@ -312,6 +373,12 @@ static void test_next_cube_scsi_trace(void)
         completion_log, completion_log_len,
         "scsi_req_complete target=0 lun=0 tag=0x0 status=0x0 residual=0 "
         "sense_len=0 key=0x00 asc=0x00 ascq=0x00"));
+    g_assert_nonnull(g_strstr_len(completion_log, completion_log_len,
+                                  "next_scsi_dma_transfer"));
+    g_assert_nonnull(g_strstr_len(completion_log, completion_log_len,
+                                  "next_scsi_dma_read"));
+    g_assert_nonnull(g_strstr_len(completion_log, completion_log_len,
+                                  "next_scsi_irq"));
 
     cleanup_test_files(files);
 }
