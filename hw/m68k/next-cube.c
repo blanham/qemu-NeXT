@@ -1377,8 +1377,71 @@ static const MemoryRegionOps next_printer_ops = {
 
 static bool next_rtc_cmd_is_write(uint8_t cmd)
 {
-    return (cmd >= 0x80 && cmd <= 0x9f) ||
-           (cmd == 0xb1);
+    return cmd & 0x80;
+}
+
+static void next_rtc_load_read_value(NeXTRTC *rtc)
+{
+    uint8_t addr = rtc->command & 0x3f;
+
+    rtc->retval = 0;
+    if (addr <= 0x1f) {
+        rtc->retval = rtc->ram[addr];
+    } else if (addr <= 0x2f) {
+        time_t time_h = time(NULL);
+        struct tm *info = localtime(&time_h);
+
+        switch (addr) {
+        case 0x20:
+            rtc->retval = SCR2_TOBCD(info->tm_sec);
+            break;
+        case 0x21:
+            rtc->retval = SCR2_TOBCD(info->tm_min);
+            break;
+        case 0x22:
+            rtc->retval = SCR2_TOBCD(info->tm_hour);
+            break;
+        case 0x24:
+            rtc->retval = SCR2_TOBCD(info->tm_mday);
+            break;
+        case 0x25:
+            rtc->retval = SCR2_TOBCD((info->tm_mon + 1));
+            break;
+        case 0x26:
+            rtc->retval = SCR2_TOBCD((info->tm_year - 100));
+            break;
+        }
+    } else if (addr == 0x30) {
+        rtc->retval = rtc->status;
+    } else if (addr == 0x31) {
+        rtc->retval = rtc->control;
+    }
+}
+
+static void next_rtc_store_write_value(NeXTRTC *rtc)
+{
+    uint8_t addr = rtc->command & 0x3f;
+
+    if (addr <= 0x1f) {
+        rtc->ram[addr] = rtc->value;
+    } else if (addr == 0x31) {
+        rtc->control = rtc->value;
+        if (rtc->value & 0x04) {
+            rtc->status &= ~0x18;
+            qemu_irq_lower(rtc->power_irq);
+        }
+    }
+}
+
+static void next_rtc_advance_byte(NeXTRTC *rtc)
+{
+    rtc->command = (rtc->command & 0x80) |
+                   ((rtc->command + 1) & 0x3f);
+    rtc->phase = 8;
+    rtc->value = 0;
+    if (!next_rtc_cmd_is_write(rtc->command)) {
+        next_rtc_load_read_value(rtc);
+    }
 }
 
 static void next_rtc_data_in_irq(void *opaque, int n, int level)
@@ -1387,55 +1450,17 @@ static void next_rtc_data_in_irq(void *opaque, int n, int level)
 
     if (rtc->phase < 8) {
         rtc->command = (rtc->command << 1) | level;
-
-        if (rtc->phase == 7 && !next_rtc_cmd_is_write(rtc->command)) {
-            if (rtc->command <= 0x1f) {
-                /* RAM registers */
-                rtc->retval = rtc->ram[rtc->command];
-            }
-            if ((rtc->command >= 0x20) && (rtc->command <= 0x2f)) {
-                /* RTC */
-                time_t time_h = time(NULL);
-                struct tm *info = localtime(&time_h);
-                rtc->retval = 0;
-
-                switch (rtc->command) {
-                case 0x20:
-                    rtc->retval = SCR2_TOBCD(info->tm_sec);
-                    break;
-                case 0x21:
-                    rtc->retval = SCR2_TOBCD(info->tm_min);
-                    break;
-                case 0x22:
-                    rtc->retval = SCR2_TOBCD(info->tm_hour);
-                    break;
-                case 0x24:
-                    rtc->retval = SCR2_TOBCD(info->tm_mday);
-                    break;
-                case 0x25:
-                    rtc->retval = SCR2_TOBCD((info->tm_mon + 1));
-                    break;
-                case 0x26:
-                    rtc->retval = SCR2_TOBCD((info->tm_year - 100));
-                    break;
-                }
-            }
-            if (rtc->command == 0x30) {
-                /* read the status 0x30 */
-                rtc->retval = rtc->status;
-            }
-            if (rtc->command == 0x31) {
-                /* read the control 0x31 */
-                rtc->retval = rtc->control;
-            }
+        rtc->phase++;
+        if (rtc->phase == 8 && !next_rtc_cmd_is_write(rtc->command)) {
+            next_rtc_load_read_value(rtc);
         }
+        return;
     }
+
     if (rtc->phase >= 8 && rtc->phase < 16) {
         if (next_rtc_cmd_is_write(rtc->command)) {
-            /* Shift in value to write */
             rtc->value = (rtc->value << 1) | level;
         } else {
-            /* Shift out value to read */
             if (rtc->retval & (0x80 >> (rtc->phase - 8))) {
                 qemu_irq_raise(rtc->data_out_irq);
             } else {
@@ -1445,19 +1470,11 @@ static void next_rtc_data_in_irq(void *opaque, int n, int level)
     }
 
     rtc->phase++;
-    if (rtc->phase == 16 && next_rtc_cmd_is_write(rtc->command)) {
-        if (rtc->command >= 0x80 && rtc->command <= 0x9f) {
-            /* RAM registers */
-            rtc->ram[rtc->command - 0x80] = rtc->value;
+    if (rtc->phase == 16) {
+        if (next_rtc_cmd_is_write(rtc->command)) {
+            next_rtc_store_write_value(rtc);
         }
-        if (rtc->command == 0xb1) {
-            /* write to 0x30 register */
-            if (rtc->value & 0x04) {
-                /* clear FTU */
-                rtc->status = rtc->status & (~0x18);
-                qemu_irq_lower(rtc->power_irq);
-            }
-        }
+        next_rtc_advance_byte(rtc);
     }
 }
 
