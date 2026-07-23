@@ -31,6 +31,7 @@
 #include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
 #include "migration/vmstate.h"
@@ -53,6 +54,13 @@
 #define NEXT_SCSI_CSR_OFFSET 0x20
 #define NEXT_SCSI_CSR_BASE   (NEXT_SCSI_BASE + NEXT_SCSI_CSR_OFFSET)
 #define NEXT_ESP_CLOCK_HZ    20000000
+
+#define NEXT_TIMER_ENABLE       0x80
+#define NEXT_TIMER_UPDATE       0x40
+#define NEXT_TIMER_TICK_NS      INT64_C(1000)
+#define NEXT_TIMER_FULL_PERIOD  0x10000
+#define NEXT_SCR2_TIMER_IPL7    0x00008000
+#define NEXT_EVENTC_MASK        0x000fffff
 
 
 #define TYPE_NEXT_RTC "next-rtc"
@@ -107,7 +115,8 @@ struct NeXTPC {
     M68kCPU *cpu;
 
     MemoryRegion floppy_mem;
-    MemoryRegion timer_mem;
+    MemoryRegion system_timer_mem;
+    MemoryRegion eventc_mem;
     MemoryRegion dummyen_mem;
     MemoryRegion dsp_mem;
     MemoryRegion printer_mem;
@@ -120,6 +129,13 @@ struct NeXTPC {
     uint32_t int_mask;
     uint32_t int_status;
     uint32_t led;
+
+    QEMUTimer system_timer;
+    uint16_t timer_latch;
+    uint32_t timer_counter;
+    uint8_t timer_csr;
+    bool timer_irq_pending;
+    uint32_t eventc_latched;
 
     NeXTSCSI next_scsi;
 
@@ -223,6 +239,25 @@ static void next_scr2_rtc_update(NeXTPC *s)
     }
 }
 
+static int next_timer_irq_level(const NeXTPC *s)
+{
+    return s->scr2 & NEXT_SCR2_TIMER_IPL7 ? 7 : 6;
+}
+
+static int next_timer_irq_vector(const NeXTPC *s)
+{
+    return next_timer_irq_level(s) == 7 ? 31 : 30;
+}
+
+static void next_timer_reroute_irq(NeXTPC *s)
+{
+    int level = next_timer_irq_level(s);
+    int vector = next_timer_irq_vector(s);
+
+    m68k_set_irq_level(s->cpu, level, vector);
+    trace_next_timer_irq(1, level, vector, s->int_status, s->scr2);
+}
+
 static uint64_t next_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     NeXTPC *s = NEXT_PC(opaque);
@@ -282,12 +317,20 @@ static void next_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     case 0x8000 ... 0x8003:    /* 0x200d000 */
+    {
+        uint32_t previous_scr2 = s->scr2;
+
         s->scr2 = deposit32(s->scr2, (4 - (addr - 0x8000) - size) << 3,
                             size << 3, val);
         next_scr2_led_update(s);
         next_scr2_rtc_update(s);
+        if (s->timer_irq_pending &&
+            ((previous_scr2 ^ s->scr2) & NEXT_SCR2_TIMER_IPL7)) {
+            next_timer_reroute_irq(s);
+        }
         s->old_scr2 = s->scr2;
         break;
+    }
 
     default:
         DPRINTF("MMIO Write @ 0x%"HWADDR_PRIx " with 0x%x size %u\n", addr,
@@ -563,7 +606,7 @@ static void next_irq(void *opaque, int number, int level)
         shift = 12;
         break;
     case NEXT_CLK_I:
-        shift = 5;
+        shift = 29;
         break;
 
     /* level 5 - scc (serial) */
@@ -593,25 +636,30 @@ static void next_irq(void *opaque, int number, int level)
      * this HAS to be wrong, the interrupt handlers in mach and together
      * int_status and int_mask and return if there is a hit
      */
-    if (s->int_mask & (1 << shift)) {
-        DPRINTF("%x interrupt masked @ %x\n", 1 << shift, cpu->env.pc);
+    if (s->int_mask & (1U << shift)) {
+        DPRINTF("%x interrupt masked @ %x\n", 1U << shift, cpu->env.pc);
         /* return; */
     }
 
     /* second switch triggers the correct interrupt */
     if (level) {
-        s->int_status |= 1 << shift;
+        s->int_status |= 1U << shift;
 
         switch (number) {
-        /* level 3 - floppy, kbd/mouse, power, ether rx/tx, scsi, clock */
+        /* level 3 - floppy, kbd/mouse, power, ether rx/tx, scsi */
         case NEXT_FD_I:
         case NEXT_KBD_I:
         case NEXT_PWR_I:
         case NEXT_ENRX_I:
         case NEXT_ENTX_I:
         case NEXT_SCSI_I:
-        case NEXT_CLK_I:
             m68k_set_irq_level(cpu, 3, 27);
+            break;
+
+        /* level 6/7 - system timer, selected by SCR2 */
+        case NEXT_CLK_I:
+            m68k_set_irq_level(cpu, next_timer_irq_level(s),
+                               next_timer_irq_vector(s));
             break;
 
         /* level 5 - scc (serial) */
@@ -629,7 +677,7 @@ static void next_irq(void *opaque, int number, int level)
             break;
         }
     } else {
-        s->int_status &= ~(1 << shift);
+        s->int_status &= ~(1U << shift);
         cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD);
     }
 
@@ -637,6 +685,20 @@ static void next_irq(void *opaque, int number, int level)
         trace_next_scsi_irq(number == NEXT_SCSI_I ? "esp" : "dma", level,
                             s->int_status, s->int_mask, cpu->env.pc);
     }
+}
+
+static void next_timer_set_irq(NeXTPC *s, bool pending, bool force)
+{
+    int level = next_timer_irq_level(s);
+    int vector = next_timer_irq_vector(s);
+
+    if (!force && s->timer_irq_pending == pending) {
+        return;
+    }
+
+    s->timer_irq_pending = pending;
+    next_irq(s, NEXT_CLK_I, pending);
+    trace_next_timer_irq(pending, level, vector, s->int_status, s->scr2);
 }
 
 static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
@@ -969,47 +1031,154 @@ static const MemoryRegionOps next_floppy_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
-static void next_timer_write(void *opaque, hwaddr addr, uint64_t val,
+static uint32_t next_system_timer_remaining(NeXTPC *s)
+{
+    int64_t now;
+    int64_t deadline;
+    uint64_t remaining;
+
+    if (!(s->timer_csr & NEXT_TIMER_ENABLE) ||
+        !timer_pending(&s->system_timer)) {
+        return s->timer_counter;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    deadline = timer_expire_time_ns(&s->system_timer);
+    if (deadline <= now) {
+        return 0;
+    }
+
+    remaining = DIV_ROUND_UP((uint64_t)(deadline - now),
+                             NEXT_TIMER_TICK_NS);
+    return MIN(remaining, (uint64_t)NEXT_TIMER_FULL_PERIOD);
+}
+
+static void next_system_timer_schedule(NeXTPC *s)
+{
+    int64_t now;
+
+    timer_del(&s->system_timer);
+    if (!(s->timer_csr & NEXT_TIMER_ENABLE) || !s->timer_counter) {
+        return;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_mod(&s->system_timer,
+              now + s->timer_counter * NEXT_TIMER_TICK_NS);
+}
+
+static void next_system_timer_expire(void *opaque)
+{
+    NeXTPC *s = opaque;
+
+    s->timer_counter = 0;
+    next_timer_set_irq(s, true, false);
+}
+
+static void next_system_timer_write(void *opaque, hwaddr addr, uint64_t val,
+                                    unsigned size)
+{
+    NeXTPC *s = opaque;
+    bool was_enabled;
+
+    switch (addr) {
+    case 0:
+        s->timer_latch = deposit32(s->timer_latch, 8, 8, val);
+        break;
+    case 1:
+        s->timer_latch = deposit32(s->timer_latch, 0, 8, val);
+        break;
+    case 2:
+    case 3:
+        break;
+    case 4:
+        was_enabled = s->timer_csr & NEXT_TIMER_ENABLE;
+        s->timer_counter = next_system_timer_remaining(s);
+
+        if (val & NEXT_TIMER_UPDATE) {
+            s->timer_counter = s->timer_latch ?
+                               s->timer_latch : NEXT_TIMER_FULL_PERIOD;
+        }
+
+        s->timer_csr = val & NEXT_TIMER_ENABLE;
+        if (!(s->timer_csr & NEXT_TIMER_ENABLE)) {
+            timer_del(&s->system_timer);
+        } else if ((val & NEXT_TIMER_UPDATE) || !was_enabled) {
+            next_system_timer_schedule(s);
+        }
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static uint64_t next_system_timer_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    NeXTPC *s = opaque;
+    uint32_t counter;
+    uint8_t csr;
+
+    switch (addr) {
+    case 0:
+        counter = next_system_timer_remaining(s);
+        return extract32(counter, 8, 8);
+    case 1:
+        counter = next_system_timer_remaining(s);
+        return extract32(counter, 0, 8);
+    case 2:
+    case 3:
+        return 0;
+    case 4:
+        csr = s->timer_csr & NEXT_TIMER_ENABLE;
+        if (s->timer_irq_pending) {
+            next_timer_set_irq(s, false, false);
+        }
+        return csr;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static const MemoryRegionOps next_system_timer_ops = {
+    .read = next_system_timer_read,
+    .write = next_system_timer_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 1,
+    .endianness = DEVICE_BIG_ENDIAN,
+};
+
+static void next_eventc_write(void *opaque, hwaddr addr, uint64_t val,
                               unsigned size)
 {
-    switch (addr) {
-    case 0 ... 3:
-        /* Hardware timer latch - not implemented yet */
-        break;
-
-    default:
-        g_assert_not_reached();
-    }
 }
 
-static uint64_t next_timer_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t next_eventc_read(void *opaque, hwaddr addr, unsigned size)
 {
-    uint64_t val;
+    NeXTPC *s = opaque;
 
     switch (addr) {
-    case 0 ... 3:
-        /*
-         * These 4 registers are the hardware timer, not sure which register
-         * is the latch instead of data, but no problems so far.
-         *
-         * Hack: We need to have the LSB change consistently to make it work
-         */
-        val = extract32(clock(), (4 - addr - size) << 3,
-                        size << 3);
-        break;
-
+    case 0:
+        s->eventc_latched =
+            (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / NEXT_TIMER_TICK_NS) &
+            NEXT_EVENTC_MASK;
+        return 0;
+    case 1:
+        return extract32(s->eventc_latched, 16, 4);
+    case 2:
+        return extract32(s->eventc_latched, 8, 8);
+    case 3:
+        return extract32(s->eventc_latched, 0, 8);
     default:
         g_assert_not_reached();
     }
-
-    return val;
 }
 
-static const MemoryRegionOps next_timer_ops = {
-    .read = next_timer_read,
-    .write = next_timer_write,
+static const MemoryRegionOps next_eventc_ops = {
+    .read = next_eventc_read,
+    .write = next_eventc_write,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
+    .valid.max_access_size = 1,
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
@@ -1255,11 +1424,18 @@ static void next_pc_reset_hold(Object *obj, ResetType type)
 {
     NeXTPC *s = NEXT_PC(obj);
 
+    timer_del(&s->system_timer);
+
     /* Set internal registers to initial values */
     /*     0x0000XX00 << vital bits */
     s->scr1 = 0x00011102;
     s->scr2 = 0x00ff0c80;
     s->old_scr2 = s->scr2;
+    s->timer_latch = 0;
+    s->timer_counter = 0;
+    s->timer_csr = 0;
+    s->eventc_latched = 0;
+    next_timer_set_irq(s, false, true);
 }
 
 static void next_pc_realize(DeviceState *dev, Error **errp)
@@ -1352,9 +1528,17 @@ static void next_pc_init(Object *obj)
     sysbus_init_mmio(sbd,
                      sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->escc), 0));
 
-    memory_region_init_io(&s->timer_mem, OBJECT(s), &next_timer_ops, s,
-                          "next.timer", 4);
-    sysbus_init_mmio(sbd, &s->timer_mem);
+    timer_init_ns(&s->system_timer, QEMU_CLOCK_VIRTUAL,
+                  next_system_timer_expire, s);
+
+    memory_region_init_io(&s->system_timer_mem, OBJECT(s),
+                          &next_system_timer_ops, s,
+                          "next.system-timer", 5);
+    sysbus_init_mmio(sbd, &s->system_timer_mem);
+
+    memory_region_init_io(&s->eventc_mem, OBJECT(s), &next_eventc_ops, s,
+                          "next.event-counter", 4);
+    sysbus_init_mmio(sbd, &s->eventc_mem);
 
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_NEXT_RTC);
 
@@ -1376,10 +1560,44 @@ static const Property next_pc_properties[] = {
     DEFINE_PROP_LINK("cpu", NeXTPC, cpu, TYPE_M68K_CPU, M68kCPU *),
 };
 
+static int next_pc_post_load(void *opaque, int version_id)
+{
+    NeXTPC *s = opaque;
+    bool timer_irq_pending;
+
+    if (version_id < 5) {
+        timer_del(&s->system_timer);
+        s->timer_latch = 0;
+        s->timer_counter = 0;
+        s->timer_csr = 0;
+        s->eventc_latched = 0;
+        next_timer_set_irq(s, false, true);
+        return 0;
+    }
+
+    if (s->timer_counter > NEXT_TIMER_FULL_PERIOD) {
+        return -EINVAL;
+    }
+
+    s->timer_csr &= NEXT_TIMER_ENABLE;
+    s->eventc_latched &= NEXT_EVENTC_MASK;
+    if (!(s->timer_csr & NEXT_TIMER_ENABLE) || !s->timer_counter ||
+        s->timer_irq_pending) {
+        timer_del(&s->system_timer);
+    } else if (!timer_pending(&s->system_timer)) {
+        next_system_timer_schedule(s);
+    }
+
+    timer_irq_pending = s->timer_irq_pending;
+    next_timer_set_irq(s, timer_irq_pending, true);
+    return 0;
+}
+
 static const VMStateDescription next_pc_vmstate = {
     .name = "next-pc",
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 4,
+    .post_load = next_pc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(scr1, NeXTPC),
         VMSTATE_UINT32(scr2, NeXTPC),
@@ -1387,6 +1605,12 @@ static const VMStateDescription next_pc_vmstate = {
         VMSTATE_UINT32(int_mask, NeXTPC),
         VMSTATE_UINT32(int_status, NeXTPC),
         VMSTATE_UINT32(led, NeXTPC),
+        VMSTATE_TIMER_V(system_timer, NeXTPC, 5),
+        VMSTATE_UINT16_V(timer_latch, NeXTPC, 5),
+        VMSTATE_UINT32_V(timer_counter, NeXTPC, 5),
+        VMSTATE_UINT8_V(timer_csr, NeXTPC, 5),
+        VMSTATE_BOOL_V(timer_irq_pending, NeXTPC, 5),
+        VMSTATE_UINT32_V(eventc_latched, NeXTPC, 5),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1470,8 +1694,9 @@ static void next_cube_init(MachineState *machine)
     /* unknown: Serial clock configuration register? */
     empty_slot_init("next.unknown.2", 0x02118004, 0x10);
 
-    /* Timer */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 7, 0x0211a000);
+    /* System timer and event counter */
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 7, 0x02116000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 8, 0x0211a000);
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",
