@@ -144,7 +144,7 @@ static uint8_t submit_cdb(QTestState *qts, const uint8_t cdb[6])
 static void issue_dma_cdb(QTestState *qts, const uint8_t *cdb,
                           size_t cdb_len, uint32_t transfer_len)
 {
-    int i;
+    size_t i;
 
     qtest_writeb(qts, NEXT_ESP_BUSID, 0);
     for (i = 0; i < cdb_len; i++) {
@@ -373,12 +373,17 @@ static void test_next_cube_scsi_trace(void)
         completion_log, completion_log_len,
         "scsi_req_complete target=0 lun=0 tag=0x0 status=0x0 residual=0 "
         "sense_len=0 key=0x00 asc=0x00 ascq=0x00"));
-    g_assert_nonnull(g_strstr_len(completion_log, completion_log_len,
-                                  "next_scsi_dma_transfer"));
-    g_assert_nonnull(g_strstr_len(completion_log, completion_log_len,
-                                  "next_scsi_dma_read"));
-    g_assert_nonnull(g_strstr_len(completion_log, completion_log_len,
-                                  "next_scsi_irq"));
+    g_assert_nonnull(g_strstr_len(
+        completion_log, completion_log_len,
+        "next_scsi_dma_transfer stage=complete direction=device-to-memory "
+        "requested=64 aligned=64"));
+    g_assert_nonnull(g_strstr_len(
+        completion_log, completion_log_len,
+        "next_scsi_dma_read stage=complete direction=memory-to-device "
+        "requested=512 transferred=512"));
+    g_assert_nonnull(g_strstr_len(
+        completion_log, completion_log_len,
+        "next_scsi_irq source=dma level=1"));
 
     cleanup_test_files(files);
 }

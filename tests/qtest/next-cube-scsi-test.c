@@ -434,6 +434,8 @@ static void test_scsi_dma_tail_four_fifofl_edges(void)
         qtest_writeb(qts, NEXT_SCSI_CSR,
                      SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA |
                      SCSI_CSR_DMADIR);
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                        NEXT_DMA_BUFFER + DMA_INITIAL_TRANSFER);
     }
     qtest_writeb(qts, NEXT_SCSI_CSR,
                  SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA |
@@ -442,6 +444,8 @@ static void test_scsi_dma_tail_four_fifofl_edges(void)
                     NEXT_DMA_BUFFER + DMA_FLUSHED_TRANSFER);
     qtest_writeb(qts, NEXT_SCSI_CSR,
                  SCSI_CSR_INTMASK | SCSI_CSR_CPUDMA | SCSI_CSR_DMADIR);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + DMA_FLUSHED_TRANSFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
                     (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
                     ==, DMA_ENABLE);
