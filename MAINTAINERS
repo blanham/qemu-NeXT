@@ -1407,7 +1407,7 @@ F: hw/m68k/trace.h
 F: hw/display/next-fb.c
 F: include/hw/m68k/next-cube.h
 F: tests/functional/m68k/test_nextcube.py
-F: tests/qtest/next-cube-scsi-trace-test.c
+F: tests/qtest/next-cube-*.c
 
 q800
 M: Laurent Vivier <laurent@vivier.eu>
