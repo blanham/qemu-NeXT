@@ -15,6 +15,7 @@
 #include "exec/cpu-common.h"
 #include "exec/cpu-interrupt.h"
 #include "system/physmem.h"
+#include "system/rtc.h"
 #include "system/system.h"
 #include "system/qtest.h"
 #include "hw/core/irq.h"
@@ -31,6 +32,7 @@
 #include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
@@ -63,6 +65,19 @@
 #define NEXT_SCR2_TIMER_IPL7    0x00008000
 #define NEXT_EVENTC_MASK        0x000fffff
 
+#define NEXT_RTC_STATUS_NEW_CLOCK  0x80
+#define NEXT_RTC_CONTROL_START     0x80
+#define NEXT_RTC_CONTROL_AUTO_PON  0x20
+#define NEXT_RTC_CONTROL_ALARM_EN  0x10
+#define NEXT_RTC_CONTROL_ALARM_CLR 0x08
+#define NEXT_RTC_CONTROL_FTU_CLR   0x04
+#define NEXT_RTC_CONTROL_LOW_BATT  0x02
+#define NEXT_RTC_CONTROL_RPD_CLR   0x01
+#define NEXT_RTC_CONTROL_STORED    (NEXT_RTC_CONTROL_START | \
+                                    NEXT_RTC_CONTROL_AUTO_PON | \
+                                    NEXT_RTC_CONTROL_ALARM_EN | \
+                                    NEXT_RTC_CONTROL_LOW_BATT)
+
 #define NEXT_IRQ_IPL7_MASK      0xc0000000
 #define NEXT_IRQ_IPL6_MASK      0x3ffc0000
 #define NEXT_IRQ_IPL5_MASK      0x00038000
@@ -85,6 +100,10 @@ struct NeXTRTC {
     uint8_t status;
     uint8_t control;
     uint8_t retval;
+    uint32_t counter;
+    uint32_t counter_latch;
+    uint32_t alarm;
+    int64_t counter_ref_ns;
 
     qemu_irq data_out_irq;
     qemu_irq power_irq;
@@ -214,7 +233,6 @@ static const uint8_t rtc_ram2[32] = {
 
 #define SCR2_RTCLK 0x2
 #define SCR2_RTDATA 0x4
-#define SCR2_TOBCD(x) (((x / 10) << 4) + (x % 10))
 
 static void next_scr2_led_update(NeXTPC *s)
 {
@@ -1380,6 +1398,43 @@ static bool next_rtc_cmd_is_write(uint8_t cmd)
     return cmd & 0x80;
 }
 
+static uint32_t next_rtc_counter_value(NeXTRTC *rtc)
+{
+    int64_t elapsed_ns;
+
+    if (!(rtc->control & NEXT_RTC_CONTROL_START)) {
+        return rtc->counter;
+    }
+
+    elapsed_ns = qemu_clock_get_ns(rtc_clock) - rtc->counter_ref_ns;
+    return rtc->counter + elapsed_ns / NANOSECONDS_PER_SECOND;
+}
+
+static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
+{
+    bool was_running = rtc->control & NEXT_RTC_CONTROL_START;
+    bool now_running = value & NEXT_RTC_CONTROL_START;
+    int64_t now = qemu_clock_get_ns(rtc_clock);
+
+    if (was_running && !now_running) {
+        rtc->counter = next_rtc_counter_value(rtc);
+    } else if (!was_running && now_running) {
+        rtc->counter_ref_ns = now;
+    }
+
+    rtc->control = value & NEXT_RTC_CONTROL_STORED;
+    if (value & NEXT_RTC_CONTROL_FTU_CLR) {
+        rtc->status &= ~0x18;
+        qemu_irq_lower(rtc->power_irq);
+    }
+    if (value & NEXT_RTC_CONTROL_ALARM_CLR) {
+        rtc->status &= ~0x02;
+    }
+    if (value & NEXT_RTC_CONTROL_RPD_CLR) {
+        rtc->status &= ~0x01;
+    }
+}
+
 static void next_rtc_load_read_value(NeXTRTC *rtc)
 {
     uint8_t addr = rtc->command & 0x3f;
@@ -1387,30 +1442,17 @@ static void next_rtc_load_read_value(NeXTRTC *rtc)
     rtc->retval = 0;
     if (addr <= 0x1f) {
         rtc->retval = rtc->ram[addr];
-    } else if (addr <= 0x2f) {
-        time_t time_h = time(NULL);
-        struct tm *info = localtime(&time_h);
+    } else if (addr <= 0x23) {
+        unsigned int shift = (0x23 - addr) * 8;
 
-        switch (addr) {
-        case 0x20:
-            rtc->retval = SCR2_TOBCD(info->tm_sec);
-            break;
-        case 0x21:
-            rtc->retval = SCR2_TOBCD(info->tm_min);
-            break;
-        case 0x22:
-            rtc->retval = SCR2_TOBCD(info->tm_hour);
-            break;
-        case 0x24:
-            rtc->retval = SCR2_TOBCD(info->tm_mday);
-            break;
-        case 0x25:
-            rtc->retval = SCR2_TOBCD((info->tm_mon + 1));
-            break;
-        case 0x26:
-            rtc->retval = SCR2_TOBCD((info->tm_year - 100));
-            break;
+        if (addr == 0x20) {
+            rtc->counter_latch = next_rtc_counter_value(rtc);
         }
+        rtc->retval = rtc->counter_latch >> shift;
+    } else if (addr <= 0x27) {
+        unsigned int shift = (0x27 - addr) * 8;
+
+        rtc->retval = rtc->alarm >> shift;
     } else if (addr == 0x30) {
         rtc->retval = rtc->status;
     } else if (addr == 0x31) {
@@ -1424,12 +1466,17 @@ static void next_rtc_store_write_value(NeXTRTC *rtc)
 
     if (addr <= 0x1f) {
         rtc->ram[addr] = rtc->value;
+    } else if (addr <= 0x23) {
+        unsigned int shift = (0x23 - addr) * 8;
+
+        rtc->counter = deposit32(rtc->counter, shift, 8, rtc->value);
+        rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    } else if (addr <= 0x27) {
+        unsigned int shift = (0x27 - addr) * 8;
+
+        rtc->alarm = deposit32(rtc->alarm, shift, 8, rtc->value);
     } else if (addr == 0x31) {
-        rtc->control = rtc->value;
-        if (rtc->value & 0x04) {
-            rtc->status &= ~0x18;
-            qemu_irq_lower(rtc->power_irq);
-        }
+        next_rtc_set_control(rtc, rtc->value);
     }
 }
 
@@ -1492,11 +1539,45 @@ static void next_rtc_cmd_reset_irq(void *opaque, int n, int level)
 static void next_rtc_reset_hold(Object *obj, ResetType type)
 {
     NeXTRTC *rtc = NEXT_RTC(obj);
+    struct tm tm;
 
-    rtc->status = 0x90;
+    rtc->status = NEXT_RTC_STATUS_NEW_CLOCK;
+    rtc->control = NEXT_RTC_CONTROL_START;
+    qemu_get_timedate(&tm, 0);
+    rtc->counter = mktimegm(&tm);
+    rtc->counter_latch = rtc->counter;
+    rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    rtc->alarm = 0;
 
     /* Load RTC RAM - TODO: provide possibility to load contents from file */
     memcpy(rtc->ram, rtc_ram2, 32);
+}
+
+static int next_rtc_pre_save(void *opaque)
+{
+    NeXTRTC *rtc = opaque;
+
+    if (rtc->control & NEXT_RTC_CONTROL_START) {
+        rtc->counter = next_rtc_counter_value(rtc);
+        rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    }
+    return 0;
+}
+
+static int next_rtc_post_load(void *opaque, int version_id)
+{
+    NeXTRTC *rtc = opaque;
+
+    if (version_id < 4) {
+        struct tm tm;
+
+        qemu_get_timedate(&tm, 0);
+        rtc->counter = mktimegm(&tm);
+        rtc->counter_latch = rtc->counter;
+        rtc->alarm = 0;
+    }
+    rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    return 0;
 }
 
 static void next_rtc_init(Object *obj)
@@ -1515,8 +1596,10 @@ static void next_rtc_init(Object *obj)
 
 static const VMStateDescription next_rtc_vmstate = {
     .name = "next-rtc",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 3,
+    .pre_save = next_rtc_pre_save,
+    .post_load = next_rtc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_INT8(phase, NeXTRTC),
         VMSTATE_UINT8_ARRAY(ram, NeXTRTC, 32),
@@ -1525,6 +1608,9 @@ static const VMStateDescription next_rtc_vmstate = {
         VMSTATE_UINT8(status, NeXTRTC),
         VMSTATE_UINT8(control, NeXTRTC),
         VMSTATE_UINT8(retval, NeXTRTC),
+        VMSTATE_UINT32_V(counter, NeXTRTC, 4),
+        VMSTATE_UINT32_V(counter_latch, NeXTRTC, 4),
+        VMSTATE_UINT32_V(alarm, NeXTRTC, 4),
         VMSTATE_END_OF_LIST()
     },
 };

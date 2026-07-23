@@ -2,12 +2,15 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qemu/timer.h"
 
 #define NEXT_SCR2          0x0200d000
 #define NEXT_SCR2_RTCE     0x00000100
 #define NEXT_SCR2_RTCLK    0x00000200
 #define NEXT_SCR2_RTDATA   0x00000400
 #define NEXT_ROM_SIZE      (128 * 1024)
+#define NEXT_RTC_START     0x80
+#define NEXT_RTC_NEW_CLOCK 0x80
 
 typedef struct TestROM {
     int fd;
@@ -36,7 +39,7 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_cube_rtc_start(void)
+static QTestState *next_cube_rtc_start_with_args(const char *args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -54,8 +57,14 @@ static QTestState *next_cube_rtc_start(void)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    qts = qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
+    qts = qtest_initf("-machine next-cube -bios %s %s",
+                      quoted_rom_path, args ?: "");
     return qts;
+}
+
+static QTestState *next_cube_rtc_start(void)
+{
+    return next_cube_rtc_start_with_args(NULL);
 }
 
 static uint32_t rtc_begin(QTestState *qts)
@@ -157,10 +166,76 @@ static void test_nvram_block_transfer(void)
     qtest_quit(qts);
 }
 
+static uint32_t rtc_read_counter(QTestState *qts)
+{
+    uint8_t bytes[4];
+
+    rtc_block_read(qts, 0x20, bytes, sizeof(bytes));
+    return ((uint32_t)bytes[0] << 24) |
+           ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) |
+           bytes[3];
+}
+
+static uint32_t rtc_read_counter_with_step(QTestState *qts, int64_t step)
+{
+    uint32_t scr2 = rtc_begin(qts);
+    uint8_t bytes[4];
+    int i;
+
+    rtc_send_byte(qts, scr2, 0x20);
+    bytes[0] = rtc_receive_byte(qts, scr2);
+    qtest_clock_step(qts, step);
+    for (i = 1; i < 4; i++) {
+        bytes[i] = rtc_receive_byte(qts, scr2);
+    }
+    rtc_end(qts, scr2);
+
+    return ((uint32_t)bytes[0] << 24) |
+           ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) |
+           bytes[3];
+}
+
+static void test_mcs1850_counter(void)
+{
+    static const uint8_t replacement[4] = { 0x12, 0x34, 0x56, 0x78 };
+    QTestState *qts = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint8_t value;
+
+    rtc_block_read(qts, 0x30, &value, 1);
+    g_assert_cmphex(value, ==, NEXT_RTC_NEW_CLOCK);
+    rtc_block_read(qts, 0x31, &value, 1);
+    g_assert_cmphex(value, ==, NEXT_RTC_START);
+
+    g_assert_cmphex(rtc_read_counter(qts), ==, 946782245);
+    g_assert_cmphex(
+        rtc_read_counter_with_step(qts, 2 * NANOSECONDS_PER_SECOND),
+        ==, 946782245);
+    qtest_clock_step(qts, 2 * NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_counter(qts), ==, 946782249);
+
+    value = 0;
+    rtc_block_write(qts, 0xb1, &value, 1);
+    rtc_block_write(qts, 0xa0, replacement, sizeof(replacement));
+    qtest_clock_step(qts, 2 * NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_counter(qts), ==, 0x12345678);
+
+    value = NEXT_RTC_START;
+    rtc_block_write(qts, 0xb1, &value, 1);
+    qtest_clock_step(qts, 3 * NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_counter(qts), ==, 0x1234567b);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/next-cube/rtc/nvram-block-transfer",
                    test_nvram_block_transfer);
+    qtest_add_func("/next-cube/rtc/mcs1850-counter",
+                   test_mcs1850_counter);
     return g_test_run();
 }
