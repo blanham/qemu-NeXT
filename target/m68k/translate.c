@@ -958,11 +958,20 @@ static void gen_load_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
         tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
         break;
     case OS_PACKED:
-        /*
-         * unimplemented data type on 68040/ColdFire
-         * FIXME if needed for another FPU
-         */
-        gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+        if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
+            TCGv word0 = tcg_temp_new();
+            TCGv word1 = tcg_temp_new();
+            TCGv word2 = tcg_temp_new();
+
+            tcg_gen_qemu_ld_i32(word0, addr, index, MO_TEUL);
+            tcg_gen_addi_i32(tmp, addr, 4);
+            tcg_gen_qemu_ld_i32(word1, tmp, index, MO_TEUL);
+            tcg_gen_addi_i32(tmp, addr, 8);
+            tcg_gen_qemu_ld_i32(word2, tmp, index, MO_TEUL);
+            gen_helper_extp96(tcg_env, fp, word0, word1, word2);
+        } else {
+            gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+        }
         break;
     default:
         g_assert_not_reached();

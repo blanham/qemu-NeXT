@@ -79,6 +79,102 @@ void HELPER(extf64)(CPUM68KState *env, FPReg *res, float64 val)
     res->d = float64_to_floatx80(val, &env->fp_status);
 }
 
+/*
+ * Convert the 68881/68882 96-bit packed-decimal format to extended
+ * precision.  The finite format contains a 17-digit BCD significand and a
+ * signed three-digit decimal exponent:
+ *
+ *     value = significand * 10 ** (exponent - 16)
+ *
+ * The 68040 implements this conversion through its FPSP exception path.
+ * QEMU already executes the other software-assisted 68040 operations
+ * directly, so doing the conversion here avoids requiring a guest FPSP while
+ * preserving the architectural result.
+ */
+void HELPER(extp96)(CPUM68KState *env, FPReg *res,
+                    uint32_t word0, uint32_t word1, uint32_t word2)
+{
+    const bool sign = word0 >> 31;
+    const bool exp_sign = extract32(word0, 30, 1);
+    uint64_t significand = word0 & 0xf;
+    float128 value, ten, scale;
+    int exponent, decimal_scale;
+    int shift;
+
+    /*
+     * Infinity and NaN use SE=y=1 and an all-ones exponent.  A zero
+     * significand selects infinity; a nonzero significand selects NaN.
+     */
+    if ((word0 & 0x7fff0000) == 0x7fff0000) {
+        if ((word0 & 0xf) == 0 && word1 == 0 && word2 == 0) {
+            res->d = packFloatx80(sign, 0x7fff, 0);
+        } else {
+            res->d = floatx80_default_nan(&env->fp_status);
+            res->d.high = deposit32(res->d.high, 15, 1, sign);
+        }
+        return;
+    }
+
+    exponent = extract32(word0, 24, 4) * 100 +
+               extract32(word0, 20, 4) * 10 +
+               extract32(word0, 16, 4);
+    if ((word0 & 0xf) > 9 ||
+        extract32(word0, 24, 4) > 9 ||
+        extract32(word0, 20, 4) > 9 ||
+        extract32(word0, 16, 4) > 9) {
+        float_raise(float_flag_invalid, &env->fp_status);
+        res->d = floatx80_default_nan(&env->fp_status);
+        return;
+    }
+
+    for (shift = 28; shift >= 0; shift -= 4) {
+        unsigned digit = extract32(word1, shift, 4);
+
+        if (digit > 9) {
+            float_raise(float_flag_invalid, &env->fp_status);
+            res->d = floatx80_default_nan(&env->fp_status);
+            return;
+        }
+        significand = significand * 10 + digit;
+    }
+    for (shift = 28; shift >= 0; shift -= 4) {
+        unsigned digit = extract32(word2, shift, 4);
+
+        if (digit > 9) {
+            float_raise(float_flag_invalid, &env->fp_status);
+            res->d = floatx80_default_nan(&env->fp_status);
+            return;
+        }
+        significand = significand * 10 + digit;
+    }
+
+    if (significand == 0) {
+        res->d = packFloatx80(sign, 0, 0);
+        return;
+    }
+
+    decimal_scale = (exp_sign ? -exponent : exponent) - 16;
+    value = uint64_to_float128(significand, &env->fp_status);
+    ten = int64_to_float128(10, &env->fp_status);
+    scale = int64_to_float128(1, &env->fp_status);
+
+    for (unsigned power = decimal_scale < 0 ? -decimal_scale : decimal_scale;
+         power != 0; power >>= 1) {
+        if (power & 1) {
+            scale = float128_mul(scale, ten, &env->fp_status);
+        }
+        ten = float128_mul(ten, ten, &env->fp_status);
+    }
+    if (decimal_scale < 0) {
+        value = float128_div(value, scale, &env->fp_status);
+    } else {
+        value = float128_mul(value, scale, &env->fp_status);
+    }
+
+    res->d = float128_to_floatx80(value, &env->fp_status);
+    res->d.high = deposit32(res->d.high, 15, 1, sign);
+}
+
 float64 HELPER(redf64)(CPUM68KState *env, FPReg *val)
 {
     return floatx80_to_float64(val->d, &env->fp_status);
