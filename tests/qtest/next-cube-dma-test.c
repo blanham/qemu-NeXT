@@ -86,6 +86,20 @@ static void test_dma_register_roundtrip(void)
         NEXT_DMA_STOP,
         NEXT_DMA_NEXT_INIT,
     };
+    static const uint32_t all_channel_csrs[] = {
+        NEXT_DMA_BASE + 0x010,
+        NEXT_DMA_BASE + 0x040,
+        NEXT_DMA_BASE + 0x050,
+        NEXT_DMA_BASE + 0x080,
+        NEXT_DMA_BASE + 0x090,
+        NEXT_DMA_BASE + 0x0c0,
+        NEXT_DMA_BASE + 0x0d0,
+        NEXT_DMA_BASE + 0x110,
+        NEXT_DMA_BASE + 0x150,
+        NEXT_DMA_BASE + 0x180,
+        NEXT_DMA_BASE + 0x1c0,
+        NEXT_DMA_BASE + 0x1d0,
+    };
     QTestState *qts = next_cube_dma_start();
     size_t channel;
     size_t reg;
@@ -97,8 +111,22 @@ static void test_dma_register_roundtrip(void)
                                register_offsets[reg];
 
             qtest_writel(qts, address, value);
-            g_assert_cmphex(qtest_readl(qts, address), ==, value);
+            if (channel == 1 &&
+                (register_offsets[reg] == NEXT_DMA_SAVED_START ||
+                 register_offsets[reg] == NEXT_DMA_SAVED_STOP)) {
+                g_assert_cmphex(qtest_readl(qts, address), ==, 0);
+            } else {
+                g_assert_cmphex(qtest_readl(qts, address), ==, value);
+            }
         }
+    }
+
+    for (channel = 0; channel < ARRAY_SIZE(all_channel_csrs); channel++) {
+        uint32_t address = all_channel_csrs[channel] +
+                           NEXT_DMA_NEXT_INIT + 4;
+
+        qtest_writel(qts, address, 0xdeadbeef);
+        g_assert_cmphex(qtest_readl(qts, address), ==, 0);
     }
 
     qtest_quit(qts);

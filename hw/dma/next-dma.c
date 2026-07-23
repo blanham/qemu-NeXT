@@ -41,10 +41,6 @@
 #define NEXT_DMA_MMIO_BASE        0x02000000
 #define NEXT_DMA_MMIO_SIZE        0x5000
 
-#define NEXT_DMA_COMPAT_SCSI_BASE 0x0010
-#define NEXT_DMA_COMPAT_ENTX_BASE 0x0110
-#define NEXT_DMA_COMPAT_ENRX_BASE 0x0150
-
 #define NEXT_DMA_REG_CSR          0x0000
 #define NEXT_DMA_REG_SAVED_NEXT   0x3ff0
 #define NEXT_DMA_REG_SAVED_LIMIT  0x3ff4
@@ -58,17 +54,79 @@
 
 #define NEXT_DMA_CMD_SETENABLE    0x00010000
 #define NEXT_DMA_CMD_SETSUPDATE   0x00020000
-#define NEXT_DMA_CMD_DEV2M        0x00040000
+#define NEXT_DMA_CMD_READ         0x00040000
 #define NEXT_DMA_CMD_CLRCOMPLETE  0x00080000
 #define NEXT_DMA_CMD_RESET        0x00100000
+#define NEXT_DMA_CMD_INITBUF      0x00200000
 
 #define NEXT_DMA_CSR_ENABLE       0x01000000
 #define NEXT_DMA_CSR_SUPDATE      0x02000000
 #define NEXT_DMA_CSR_READ         0x04000000
 #define NEXT_DMA_CSR_COMPLETE     0x08000000
+#define NEXT_DMA_CSR_BUSEXC       0x10000000
 
 #define NEXT_DMA_SCSI_BEAT        16
 #define NEXT_DMA_SCSI_FLUSH_EDGES 4
+
+typedef enum NextDMASavedCapability {
+    NEXT_DMA_SAVED_NONE,
+    NEXT_DMA_SAVED_TWO,
+    NEXT_DMA_SAVED_FOUR,
+} NextDMASavedCapability;
+
+typedef enum NextDMATransferPolicy {
+    NEXT_DMA_TRANSFER_INERT,
+    NEXT_DMA_TRANSFER_SCSI,
+    NEXT_DMA_TRANSFER_ENTX,
+    NEXT_DMA_TRANSFER_ENRX,
+} NextDMATransferPolicy;
+
+typedef struct NextDMAChannelDesc {
+    const char *name;
+    hwaddr csr;
+    int irq_bit;
+    NextDMASavedCapability saved;
+    NextDMATransferPolicy transfer;
+} NextDMAChannelDesc;
+
+static const NextDMAChannelDesc next_dma_channels[NEXT_DMA_CHANNEL_COUNT] = {
+    [NEXT_DMA_SCSI] = {
+        "scsi", 0x010, 26, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_SCSI,
+    },
+    [NEXT_DMA_SOUND_OUT] = {
+        "snd-out", 0x040, 23, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_OPTICAL] = {
+        "optical", 0x050, 25, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_SOUND_IN] = {
+        "snd-in", 0x080, 22, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_PRINTER] = {
+        "printer", 0x090, 24, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_SCC] = {
+        "scc", 0x0c0, 21, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_DSP] = {
+        "dsp", 0x0d0, 20, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_ENTX] = {
+        "entx", 0x110, 28, NEXT_DMA_SAVED_FOUR, NEXT_DMA_TRANSFER_ENTX,
+    },
+    [NEXT_DMA_ENRX] = {
+        "enrx", 0x150, 27, NEXT_DMA_SAVED_TWO, NEXT_DMA_TRANSFER_ENRX,
+    },
+    [NEXT_DMA_VIDEO] = {
+        "video", 0x180, -1, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_R2M] = {
+        "r2m", 0x1c0, 18, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+    [NEXT_DMA_M2R] = {
+        "m2r", 0x1d0, 19, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+    },
+};
 
 typedef struct NextDMAChannelState {
     uint32_t csr;
@@ -162,74 +220,166 @@ static bool next_dma_advance(NextDMAState *s, NextDMAChannel channel,
     return true;
 }
 
+typedef enum NextDMARegister {
+    NEXT_DMA_REGISTER_CSR,
+    NEXT_DMA_REGISTER_SAVED_NEXT,
+    NEXT_DMA_REGISTER_SAVED_LIMIT,
+    NEXT_DMA_REGISTER_SAVED_START,
+    NEXT_DMA_REGISTER_SAVED_STOP,
+    NEXT_DMA_REGISTER_NEXT,
+    NEXT_DMA_REGISTER_LIMIT,
+    NEXT_DMA_REGISTER_START,
+    NEXT_DMA_REGISTER_STOP,
+    NEXT_DMA_REGISTER_NEXT_INIT,
+} NextDMARegister;
+
+typedef struct NextDMAResolvedRegister {
+    NextDMAChannel channel;
+    NextDMARegister reg;
+    uint32_t *value;
+} NextDMAResolvedRegister;
+
 static uint32_t *next_dma_channel_register(NextDMAChannelState *c,
-                                           hwaddr reg)
+                                           NextDMARegister reg)
 {
     switch (reg) {
-    case NEXT_DMA_REG_CSR:
+    case NEXT_DMA_REGISTER_CSR:
         return &c->csr;
-    case NEXT_DMA_REG_SAVED_NEXT:
+    case NEXT_DMA_REGISTER_SAVED_NEXT:
         return &c->saved_next;
-    case NEXT_DMA_REG_SAVED_LIMIT:
+    case NEXT_DMA_REGISTER_SAVED_LIMIT:
         return &c->saved_limit;
-    case NEXT_DMA_REG_SAVED_START:
+    case NEXT_DMA_REGISTER_SAVED_START:
         return &c->saved_start;
-    case NEXT_DMA_REG_SAVED_STOP:
+    case NEXT_DMA_REGISTER_SAVED_STOP:
         return &c->saved_stop;
-    case NEXT_DMA_REG_NEXT:
+    case NEXT_DMA_REGISTER_NEXT:
         return &c->next;
-    case NEXT_DMA_REG_LIMIT:
+    case NEXT_DMA_REGISTER_LIMIT:
         return &c->limit;
-    case NEXT_DMA_REG_START:
+    case NEXT_DMA_REGISTER_START:
         return &c->start;
-    case NEXT_DMA_REG_STOP:
+    case NEXT_DMA_REGISTER_STOP:
         return &c->stop;
-    case NEXT_DMA_REG_NEXT_INIT:
+    case NEXT_DMA_REGISTER_NEXT_INIT:
         return &c->next_initbuf;
     default:
-        return NULL;
+        g_assert_not_reached();
     }
 }
 
-static uint32_t *next_dma_compat_enet_register(NextDMAState *s, hwaddr addr,
-                                               NextDMAChannel *channel,
-                                               hwaddr *reg)
+static void next_dma_resolve(NextDMAState *s, NextDMAChannel channel,
+                             NextDMARegister reg,
+                             NextDMAResolvedRegister *resolved)
+{
+    resolved->channel = channel;
+    resolved->reg = reg;
+    resolved->value = next_dma_channel_register(&s->channel[channel], reg);
+}
+
+static unsigned next_dma_saved_word_count(NextDMASavedCapability capability)
+{
+    switch (capability) {
+    case NEXT_DMA_SAVED_NONE:
+        return 0;
+    case NEXT_DMA_SAVED_TWO:
+        return 2;
+    case NEXT_DMA_SAVED_FOUR:
+        return 4;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static bool next_dma_resolve_register(NextDMAState *s, hwaddr addr,
+                                      NextDMAResolvedRegister *resolved)
 {
     static const struct {
-        hwaddr base;
-        NextDMAChannel channel;
-    } map[] = {
-        { NEXT_DMA_COMPAT_ENTX_BASE, NEXT_DMA_ENTX },
-        { NEXT_DMA_COMPAT_ENRX_BASE, NEXT_DMA_ENRX },
+        hwaddr offset;
+        NextDMARegister reg;
+    } current[] = {
+        { NEXT_DMA_REG_NEXT, NEXT_DMA_REGISTER_NEXT },
+        { NEXT_DMA_REG_LIMIT, NEXT_DMA_REGISTER_LIMIT },
+        { NEXT_DMA_REG_START, NEXT_DMA_REGISTER_START },
+        { NEXT_DMA_REG_STOP, NEXT_DMA_REGISTER_STOP },
     };
-    size_t i;
+    static const struct {
+        hwaddr offset;
+        NextDMARegister reg;
+    } saved[] = {
+        { NEXT_DMA_REG_SAVED_NEXT, NEXT_DMA_REGISTER_SAVED_NEXT },
+        { NEXT_DMA_REG_SAVED_LIMIT, NEXT_DMA_REGISTER_SAVED_LIMIT },
+        { NEXT_DMA_REG_SAVED_START, NEXT_DMA_REGISTER_SAVED_START },
+        { NEXT_DMA_REG_SAVED_STOP, NEXT_DMA_REGISTER_SAVED_STOP },
+    };
+    NextDMAChannel channel;
+    size_t reg;
 
-    for (i = 0; i < ARRAY_SIZE(map); i++) {
-        uint32_t *value;
-
-        if (addr < map[i].base) {
-            continue;
-        }
-
-        *reg = addr - map[i].base;
-        value = next_dma_channel_register(&s->channel[map[i].channel], *reg);
-        if (value) {
-            *channel = map[i].channel;
-            return value;
+    /* Exact CSR words take precedence over every bank. */
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        if (addr == next_dma_channels[channel].csr + NEXT_DMA_REG_CSR) {
+            next_dma_resolve(s, channel, NEXT_DMA_REGISTER_CSR, resolved);
+            return true;
         }
     }
 
-    return NULL;
+    /* Current registers are physical words and win saved-bank collisions. */
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        for (reg = 0; reg < ARRAY_SIZE(current); reg++) {
+            if (addr == next_dma_channels[channel].csr +
+                        current[reg].offset) {
+                next_dma_resolve(s, channel, current[reg].reg, resolved);
+                return true;
+            }
+        }
+    }
+
+    /* NEXT_INIT is a single physical word, not the start of a pair. */
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        if (addr == next_dma_channels[channel].csr +
+                    NEXT_DMA_REG_NEXT_INIT) {
+            next_dma_resolve(s, channel, NEXT_DMA_REGISTER_NEXT_INIT,
+                             resolved);
+            return true;
+        }
+    }
+
+    /* Only ENTX and ENRX expose the saved capabilities in the descriptor. */
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        unsigned words =
+            next_dma_saved_word_count(next_dma_channels[channel].saved);
+
+        for (reg = 0; reg < words; reg++) {
+            if (addr == next_dma_channels[channel].csr +
+                        saved[reg].offset) {
+                next_dma_resolve(s, channel, saved[reg].reg, resolved);
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
-static void next_dma_write_enet_csr(NextDMAState *s,
-                                    NextDMAChannel channel, uint32_t value)
+static void next_dma_clear_staging(NextDMAChannelState *c)
+{
+    c->scsi_stage_len = 0;
+    c->scsi_stage_flushes = 0;
+}
+
+static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
+                               uint32_t value)
 {
     NextDMAChannelState *c = &s->channel[channel];
 
     if (value & NEXT_DMA_CMD_RESET) {
-        c->csr &= ~(NEXT_DMA_CSR_COMPLETE | NEXT_DMA_CSR_SUPDATE |
-                    NEXT_DMA_CSR_ENABLE);
+        c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE |
+                    NEXT_DMA_CSR_COMPLETE | NEXT_DMA_CSR_BUSEXC);
+        next_dma_clear_staging(c);
+        c->next_initbuf_valid = false;
+    }
+    if (value & NEXT_DMA_CMD_INITBUF) {
+        next_dma_clear_staging(c);
     }
     if (value & NEXT_DMA_CMD_SETENABLE) {
         c->csr |= NEXT_DMA_CSR_ENABLE;
@@ -242,127 +392,60 @@ static void next_dma_write_enet_csr(NextDMAState *s,
     }
 
     c->csr &= ~NEXT_DMA_CSR_READ;
-    if (value & NEXT_DMA_CMD_DEV2M) {
+    if (value & NEXT_DMA_CMD_READ) {
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_set_irq(s, channel);
 }
 
-static void next_dma_write_scsi_csr(NextDMAState *s, uint32_t value)
+static void next_dma_trace_scsi_register_write(NextDMAState *s, hwaddr addr,
+                                               uint64_t value)
 {
-    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+    NextDMAChannelState *scsi = &s->channel[NEXT_DMA_SCSI];
 
-    if (value & NEXT_DMA_CMD_SETENABLE) {
-        c->csr |= NEXT_DMA_CSR_ENABLE;
-    }
-    if (value & NEXT_DMA_CMD_SETSUPDATE) {
-        c->csr |= NEXT_DMA_CSR_SUPDATE;
-    }
-    if (value & NEXT_DMA_CMD_CLRCOMPLETE) {
-        c->csr &= ~NEXT_DMA_CSR_COMPLETE;
-    }
-    if (value & NEXT_DMA_CMD_RESET) {
-        c->csr &= ~(NEXT_DMA_CSR_COMPLETE | NEXT_DMA_CSR_SUPDATE |
-                    NEXT_DMA_CSR_ENABLE);
-        c->scsi_stage_len = 0;
-        c->scsi_stage_flushes = 0;
-    }
-    next_dma_set_irq(s, NEXT_DMA_SCSI);
+    trace_next_scsi_dma_reg_write(
+        NEXT_DMA_MMIO_BASE + addr, value, scsi->csr, scsi->next,
+        scsi->next_initbuf, scsi->limit, scsi->start, scsi->stop);
 }
 
 static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
                            unsigned int size)
 {
     NextDMAState *s = NEXT_DMA(opaque);
-    NextDMAChannelState *scsi = &s->channel[NEXT_DMA_SCSI];
-    NextDMAChannel enet_channel;
-    hwaddr reg;
-    uint32_t *enet_value;
-    bool scsi_reg = true;
+    NextDMAResolvedRegister resolved;
 
-    enet_value = next_dma_compat_enet_register(s, addr, &enet_channel, &reg);
-    if (enet_value) {
-        if (reg == NEXT_DMA_REG_CSR) {
-            next_dma_write_enet_csr(s, enet_channel, value);
-        } else {
-            *enet_value = value;
-        }
+    if (!next_dma_resolve_register(s, addr, &resolved)) {
         return;
     }
 
-    switch (addr) {
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_CSR:
-        next_dma_write_scsi_csr(s, value);
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_NEXT:
-        scsi->next = value;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_LIMIT:
-        scsi->limit = value;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_START:
-        scsi->start = value;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_STOP:
-        scsi->stop = value;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_NEXT_INIT:
-        scsi->next_initbuf = value;
-        scsi->next_initbuf_valid = true;
-        break;
-    default:
-        scsi_reg = false;
-        break;
+    if (resolved.reg == NEXT_DMA_REGISTER_CSR) {
+        next_dma_write_csr(s, resolved.channel, value);
+    } else {
+        *resolved.value = value;
+        if (resolved.reg == NEXT_DMA_REGISTER_NEXT_INIT) {
+            s->channel[resolved.channel].next_initbuf_valid = true;
+        }
     }
 
-    if (scsi_reg) {
-        trace_next_scsi_dma_reg_write(
-            NEXT_DMA_MMIO_BASE + addr, value, scsi->csr, scsi->next,
-            scsi->next_initbuf, scsi->limit, scsi->start, scsi->stop);
+    if (resolved.channel == NEXT_DMA_SCSI) {
+        next_dma_trace_scsi_register_write(s, addr, value);
     }
 }
 
 static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NextDMAState *s = NEXT_DMA(opaque);
-    NextDMAChannelState *scsi = &s->channel[NEXT_DMA_SCSI];
-    NextDMAChannel enet_channel;
-    hwaddr reg;
-    uint32_t *enet_value;
-    uint64_t value = 0;
-    bool scsi_reg = true;
+    NextDMAResolvedRegister resolved;
+    uint64_t value;
 
-    enet_value = next_dma_compat_enet_register(s, addr, &enet_channel, &reg);
-    if (enet_value) {
-        return *enet_value;
+    if (!next_dma_resolve_register(s, addr, &resolved)) {
+        return 0;
     }
+    value = *resolved.value;
 
-    switch (addr) {
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_CSR:
-        value = scsi->csr;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_NEXT:
-        value = scsi->next;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_LIMIT:
-        value = scsi->limit;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_START:
-        value = scsi->start;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_STOP:
-        value = scsi->stop;
-        break;
-    case NEXT_DMA_COMPAT_SCSI_BASE + NEXT_DMA_REG_NEXT_INIT:
-        value = scsi->next_initbuf;
-        break;
-    default:
-        scsi_reg = false;
-        break;
-    }
-
-    if (scsi_reg &&
+    if (resolved.channel == NEXT_DMA_SCSI &&
         trace_event_get_state_backends(TRACE_NEXT_SCSI_DMA_REG_READ)) {
+        NextDMAChannelState *scsi = &s->channel[NEXT_DMA_SCSI];
         hwaddr trace_addr = NEXT_DMA_MMIO_BASE + addr;
 
         if (next_dma_trace_read_now(&s->trace_scsi_dma_read,
