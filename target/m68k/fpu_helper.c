@@ -636,7 +636,8 @@ void HELPER(fcmp)(CPUM68KState *env, FPReg *val0, FPReg *val1)
 {
     FloatRelation float_compare;
 
-    float_compare = floatx80_compare(val1->d, val0->d, &env->fp_status);
+    float_compare = floatx80_compare_quiet(val1->d, val0->d,
+                                           &env->fp_status);
     env->fpsr = (env->fpsr & ~FPSR_CC_MASK) | float_comp_to_cc(float_compare);
 }
 

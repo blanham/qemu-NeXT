@@ -4969,7 +4969,6 @@ DISAS_INSN(fpu)
                       EA_STORE, IS_USER(s)) == -1) {
             gen_addr_fault(s);
         }
-        gen_helper_ftst(tcg_env, cpu_src);
         return;
     case 4: /* fmove to control register.  */
     case 5: /* fmove from control register.  */
