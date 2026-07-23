@@ -280,8 +280,7 @@ static int next_mb8795_post_load(void *opaque, int version_id)
     NextMB8795State *s = opaque;
 
     if (s->reset &&
-        (s->tx_status || s->tx_mask || s->rx_status || s->rx_mask ||
-         s->tx_mode || s->rx_mode || timer_pending(&s->tx_timer))) {
+        (s->tx_status || s->rx_status || timer_pending(&s->tx_timer))) {
         return -EINVAL;
     }
 

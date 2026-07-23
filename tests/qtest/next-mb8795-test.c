@@ -437,6 +437,78 @@ static void test_migration_register_state(void)
     g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
 }
 
+static void test_migration_reset_programming(void)
+{
+    static const uint8_t station[6] = {
+        0x00, 0x00, 0x0f, 0xa5, 0x5a, 0xc3,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    QTestState *source;
+    QTestState *destination;
+    size_t i;
+
+    tmpdir = g_dir_make_tmp("next-mb8795-reset-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_mb8795_start_with_args(incoming_args);
+    source = next_mb8795_start();
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+
+    g_assert_cmphex(en_readb(source, EN_RESET), ==, EN_RESET_MODE);
+    en_writeb(source, EN_TXMASK, EN_TXSTAT_READY | EN_TXSTAT_UNDERFLOW);
+    en_writeb(source, EN_RXMASK, EN_RXSTAT_OK | EN_RXSTAT_OVERFLOW);
+    en_writeb(source, EN_TXMODE, 0xa5);
+    en_writeb(source, EN_RXMODE, 0x5a);
+    for (i = 0; i < ARRAY_SIZE(station); i++) {
+        en_writeb(source, EN_ADDR + i, station[i]);
+    }
+    g_assert_cmphex(en_readb(source, EN_RESET), ==, EN_RESET_MODE);
+    g_assert_cmphex(en_readb(source, EN_TXSTAT), ==, 0);
+    g_assert_cmphex(en_readb(source, EN_TXMASK), ==,
+                    EN_TXSTAT_READY | EN_TXSTAT_UNDERFLOW);
+    g_assert_cmphex(en_readb(source, EN_RXSTAT), ==, 0);
+    g_assert_cmphex(en_readb(source, EN_RXMASK), ==,
+                    EN_RXSTAT_OK | EN_RXSTAT_OVERFLOW);
+    g_assert_cmphex(en_readb(source, EN_TXMODE), ==, 0xa5);
+    g_assert_cmphex(en_readb(source, EN_RXMODE), ==, 0x5a);
+    for (i = 0; i < ARRAY_SIZE(station); i++) {
+        g_assert_cmphex(en_readb(source, EN_ADDR + i), ==, station[i]);
+    }
+    g_assert_cmphex(controller_irqs(source), ==, 0);
+
+    migrate_wait(source, destination, uri);
+
+    g_assert_cmphex(en_readb(destination, EN_RESET), ==, EN_RESET_MODE);
+    g_assert_cmphex(en_readb(destination, EN_TXSTAT), ==, 0);
+    g_assert_cmphex(en_readb(destination, EN_TXMASK), ==,
+                    EN_TXSTAT_READY | EN_TXSTAT_UNDERFLOW);
+    g_assert_cmphex(en_readb(destination, EN_RXSTAT), ==, 0);
+    g_assert_cmphex(en_readb(destination, EN_RXMASK), ==,
+                    EN_RXSTAT_OK | EN_RXSTAT_OVERFLOW);
+    g_assert_cmphex(en_readb(destination, EN_TXMODE), ==, 0xa5);
+    g_assert_cmphex(en_readb(destination, EN_RXMODE), ==, 0x5a);
+    for (i = 0; i < ARRAY_SIZE(station); i++) {
+        g_assert_cmphex(en_readb(destination, EN_ADDR + i), ==, station[i]);
+    }
+    g_assert_cmphex(controller_irqs(destination), ==, 0);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -454,5 +526,7 @@ int main(int argc, char **argv)
                    test_mtree_window);
     qtest_add_func("/next-cube/mb8795/migration-register-state",
                    test_migration_register_state);
+    qtest_add_func("/next-cube/mb8795/migration-reset-programming",
+                   test_migration_reset_programming);
     return g_test_run();
 }
