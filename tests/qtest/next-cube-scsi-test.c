@@ -3,6 +3,9 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 
+#define NEXT_DSP_BASE      0x02108000
+#define NEXT_DSP_ICR       (NEXT_DSP_BASE + 0)
+#define NEXT_DSP_CVR       (NEXT_DSP_BASE + 1)
 #define NEXT_ESP_CMD       0x02114003
 #define NEXT_ESP_BUSID     0x02114004
 #define NEXT_ESP_STAT      0x02114004
@@ -188,6 +191,23 @@ static void test_immediate_replacement_cancels_selection_timeout(void)
     qtest_quit(qts);
 }
 
+static void test_dsp_mmio_mapping(void)
+{
+    QTestState *qts = next_cube_scsi_start();
+    g_autofree char *flatview = qtest_hmp(qts, "info mtree -f");
+
+    g_assert_nonnull(strstr(flatview,
+        "0000000002108000-0000000002108007 (prio 0, i/o): next.dsp"));
+
+    qtest_writeb(qts, NEXT_DSP_ICR, 0x00);
+    g_assert_cmphex(qtest_readb(qts, NEXT_DSP_ICR), ==, 0);
+    qtest_writeb(qts, NEXT_DSP_ICR, 0xff);
+    g_assert_cmphex(qtest_readb(qts, NEXT_DSP_ICR), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_DSP_CVR), ==, 0);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -201,5 +221,6 @@ int main(int argc, char **argv)
                    test_new_selection_replaces_selection_timeout);
     qtest_add_func("/next-cube/scsi/immediate-replacement-cancels-timeout",
                    test_immediate_replacement_cancels_selection_timeout);
+    qtest_add_func("/next-cube/mmio/dsp-mapping", test_dsp_mmio_mapping);
     return g_test_run();
 }
