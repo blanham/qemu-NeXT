@@ -31,6 +31,16 @@ the destination.  A channel's DMA interrupt is asserted exactly when its
 ``COMPLETE`` status bit is set; register programming alone does not complete
 a transfer.
 
-SCSI is the only functional DMA client at present.  The Ethernet transmit and
-receive channels expose their register banks and reserve typed hooks for the
-MB8795 implementation, but do not yet transfer packets.
+The ESP SCSI controller and 82077 floppy controller share the physical SCSI
+DMA channel at ``0x02000010``.  Selection and direction gates ensure that only
+one controller can use the channel at a time.  Floppy reads and writes support
+incremental descriptors and chained transfers through the channel's
+``NEXT``/``LIMIT`` and ``START``/``STOP`` register pairs.  Descriptor
+completion raises DMA interrupt bit 26; completion of the floppy command
+raises peripheral interrupt bit 7.
+
+The floppy controller register block is at ``0x02114100`` and its NeXT media
+control register is at ``0x02114108``.  Attach raw 720 KiB or 1.44 MiB media
+with ``-drive if=floppy,format=raw,file=IMAGE``.  Media capacity is reported
+through the control register.  The guest-visible eject bit is implemented as
+a latch, but it does not remove media from the QEMU block backend.
