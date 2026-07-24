@@ -35,12 +35,18 @@
 
 #define NEXT_INTR_STATUS  0x02007000
 #define NEXT_KBD_CSR      0x0200e000
+#define NEXT_MON_DATA     0x0200e004
 #define NEXT_KBD_DATA     0x0200e008
 #define NEXT_INTR_KBD     0x00000008
+#define NEXT_INTR_SND_OVR 0x00000100
+#define NEXT_DMAOUT_DMAEN 0x80000000
+#define NEXT_DMAOUT_OVR   0x20000000
 #define NEXT_KBD_INT      0x00800000
 #define NEXT_KBD_DAV      0x00400000
 #define NEXT_KBD_OVR      0x00200000
+#define NEXT_MON_CTX_PEND 0x00002000
 #define NEXT_KBD_CTX      0x00001000
+#define NEXT_MON_DTX      0x00004000
 #define NEXT_KBD_VALID    0x00008000
 #define NEXT_KBD_LSHIFT   0x00000200
 #define NEXT_KBD_DEVICE_1 0x10000000
@@ -50,6 +56,9 @@
 #define NEXT_KEY_A        0x39
 #define NEXT_KEY_UP       0x80
 #define NEXT_ROM_SIZE     (128 * 1024)
+
+#define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
+#define SOUT_ENAB                  0x01
 
 typedef struct TestROM {
     int fd;
@@ -150,6 +159,44 @@ static void test_idle_csr_ctx_clear(void)
     g_assert_cmphex(ctx_byte, ==, (csr >> 8) & 0xff);
     g_assert_cmphex(ctx_byte & 0x10, ==, 0);
     g_assert_cmphex(csr & NEXT_KBD_CTX, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_monitor_handshake_and_overrun(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+    uint32_t csr;
+
+    csr = qtest_readl(qts, NEXT_KBD_CSR);
+    g_assert_cmphex(csr & (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR), ==, 0);
+
+    qtest_writeb(qts, NEXT_KBD_CSR, NEXT_DMAOUT_DMAEN >> 24);
+    g_assert_cmphex(qtest_readb(qts, NEXT_KBD_CSR), ==,
+                    NEXT_DMAOUT_DMAEN >> 24);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) & NEXT_DMAOUT_DMAEN,
+                    ==, NEXT_DMAOUT_DMAEN);
+
+    qtest_writeb(qts, NEXT_KBD_CSR + 3, MON_SNDOUT_CTRL(SOUT_ENAB));
+    qtest_writel(qts, NEXT_MON_DATA, 0);
+
+    csr = qtest_readl(qts, NEXT_KBD_CSR);
+    g_assert_cmphex(csr & (NEXT_MON_CTX_PEND | NEXT_KBD_CTX | NEXT_MON_DTX),
+                    ==, 0);
+    g_assert_cmphex(csr & NEXT_DMAOUT_OVR, ==, NEXT_DMAOUT_OVR);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_SND_OVR,
+                    ==, NEXT_INTR_SND_OVR);
+
+    qtest_writeb(qts, NEXT_KBD_CSR,
+                 (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR) >> 24);
+    csr = qtest_readl(qts, NEXT_KBD_CSR);
+    g_assert_cmphex(csr & NEXT_DMAOUT_DMAEN, ==, NEXT_DMAOUT_DMAEN);
+    g_assert_cmphex(csr & NEXT_DMAOUT_OVR, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_SND_OVR,
+                    ==, 0);
+
+    qtest_writeb(qts, NEXT_KBD_CSR, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) & NEXT_DMAOUT_DMAEN, ==, 0);
 
     qtest_quit(qts);
 }
@@ -331,6 +378,8 @@ int main(int argc, char **argv)
                    test_key_dequeue_modifiers);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
                    test_idle_csr_ctx_clear);
+    qtest_add_func("/next-cube/monitor/sound-handshake-and-overrun",
+                   test_sound_monitor_handshake_and_overrun);
     qtest_add_func("/next-cube/mouse/packet-irq-and-data",
                    test_mouse_packet_irq_and_data);
     qtest_add_func("/next-cube/mouse/dequeue-modifier-isolation",

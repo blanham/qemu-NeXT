@@ -35,6 +35,8 @@
 
 #define NEXT_DMA_BASE       0x02000000
 #define NEXT_INTR_STATUS    0x02007000
+#define NEXT_MON_CSR        0x0200e000
+#define NEXT_MON_DATA       0x0200e004
 #define NEXT_ESP_TCLO       0x02114000
 #define NEXT_ESP_TCMID      0x02114001
 #define NEXT_ESP_FIFO       0x02114002
@@ -47,9 +49,11 @@
 #define NEXT_DISK_SIZE      (512 * 1024)
 #define NEXT_TEST_RAM_BASE  0x04010000
 #define NEXT_SCSI_DMA_IRQ   (1U << 26)
+#define NEXT_SOUND_DMA_IRQ  (1U << 23)
 #define NEXT_VIDEO_IRQ      (1U << 5)
 #define NEXT_VIDEO_RETRACE_NS (INT64_C(1000000000) / 68)
 #define NEXT_VIDEO_LIMIT    0xea
+#define NEXT_SOUND_OUT_CHANNEL 1
 
 #define ESP_CMD_SEL         0x41
 #define ESP_CMD_TI_DMA      0x90
@@ -73,6 +77,9 @@
 #define DMA_COMPLETE        0x08000000
 #define DMA_BUSEXC          0x10000000
 
+#define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
+#define SOUT_ENAB                  0x01
+
 typedef struct TestChannel {
     const char *name;
     uint32_t csr;
@@ -83,7 +90,7 @@ typedef struct TestChannel {
 
 static const TestChannel channels[] = {
     { "scsi",     0x010, 26, 0, true  },
-    { "snd-out",  0x040, 23, 0, false },
+    { "snd-out",  0x040, 23, 0, true  },
     { "optical",  0x050, 25, 0, false },
     { "snd-in",   0x080, 22, 0, false },
     { "printer",  0x090, 24, 0, false },
@@ -563,6 +570,129 @@ static void test_video_retrace_interrupt(void)
     qtest_clock_step(qts, 2 * NEXT_VIDEO_RETRACE_NS);
     g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void enable_sound_output(QTestState *qts)
+{
+    qtest_writeb(qts, NEXT_MON_CSR, 0x80);
+    qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SNDOUT_CTRL(SOUT_ENAB));
+    qtest_writel(qts, NEXT_MON_DATA, 0);
+}
+
+static void test_sound_output_final_segment(void)
+{
+    static const uint8_t samples[16] = {
+        0x10, 0x00, 0xf0, 0x00,
+        0x20, 0x00, 0xe0, 0x00,
+        0x30, 0x00, 0xd0, 0x00,
+        0x40, 0x00, 0xc0, 0x00,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+
+    intercept_next_pc_inputs(qts);
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, sizeof(samples));
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + sizeof(samples));
+    qtest_writel(qts, csr, DMA_SETENABLE);
+
+    enable_sound_output(qts);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + sizeof(samples));
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_true(qtest_get_irq(qts, dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, NEXT_SOUND_DMA_IRQ);
+
+    qtest_writel(qts, csr, DMA_CLRCOMPLETE);
+    g_assert_false(qtest_get_irq(qts,
+                                 dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_output_chained_segments(void)
+{
+    static const uint8_t samples[32] = {
+        0x10, 0x00, 0xf0, 0x00, 0x20, 0x00, 0xe0, 0x00,
+        0x30, 0x00, 0xd0, 0x00, 0x40, 0x00, 0xc0, 0x00,
+        0x50, 0x00, 0xb0, 0x00, 0x60, 0x00, 0xa0, 0x00,
+        0x70, 0x00, 0x90, 0x00, 0x7f, 0xff, 0x80, 0x00,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+    uint64_t start = channel_address(sound, 0x4008);
+    uint64_t stop = channel_address(sound, 0x400c);
+
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, sizeof(samples));
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + 16);
+    qtest_writel(qts, start, NEXT_TEST_RAM_BASE + 16);
+    qtest_writel(qts, stop, NEXT_TEST_RAM_BASE + sizeof(samples));
+    qtest_writel(qts, csr, DMA_SETENABLE | DMA_SETSUPDATE);
+
+    enable_sound_output(qts);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==, NEXT_TEST_RAM_BASE + 16);
+    g_assert_cmphex(qtest_readl(qts, limit), ==,
+                    NEXT_TEST_RAM_BASE + sizeof(samples));
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE | DMA_COMPLETE);
+
+    qtest_writel(qts, csr, DMA_CLRCOMPLETE);
+    qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SNDOUT_CTRL(SOUT_ENAB));
+    qtest_writel(qts, NEXT_MON_DATA, 0);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + sizeof(samples));
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_output_range_error_and_reset(void)
+{
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+
+    intercept_next_pc_inputs(qts);
+    qtest_writel(qts, channel_address(sound, 0x4000),
+                 NEXT_TEST_RAM_BASE + 16);
+    qtest_writel(qts, channel_address(sound, 0x4004), NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, csr, DMA_SETENABLE);
+
+    enable_sound_output(qts);
+
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE | DMA_BUSEXC);
+    g_assert_true(qtest_get_irq(qts, dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, NEXT_SOUND_DMA_IRQ);
+
+    qtest_writel(qts, csr, DMA_RESET);
+    g_assert_cmphex(qtest_readl(qts, csr), ==, 0);
+    g_assert_false(qtest_get_irq(qts,
+                                 dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
                     ==, 0);
 
     qtest_quit(qts);
@@ -1173,6 +1303,12 @@ int main(int argc, char **argv)
                    test_inert_channels);
     qtest_add_func("/next-cube/dma/video-retrace-interrupt",
                    test_video_retrace_interrupt);
+    qtest_add_func("/next-cube/dma/sound-output-final-segment",
+                   test_sound_output_final_segment);
+    qtest_add_func("/next-cube/dma/sound-output-chained-segments",
+                   test_sound_output_chained_segments);
+    qtest_add_func("/next-cube/dma/sound-output-range-error-and-reset",
+                   test_sound_output_range_error_and_reset);
     qtest_add_func("/next-cube/dma/zero-next-init-valid",
                    test_zero_next_init_valid);
     qtest_add_func("/next-cube/dma/device-reset-all-channels",
