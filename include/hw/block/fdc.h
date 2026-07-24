@@ -14,7 +14,8 @@ void isa_fdc_init_drives(ISADevice *fdc, DriveInfo **fds);
 void fdctrl_init_sysbus(qemu_irq irq, hwaddr mmio_base, DriveInfo **fds);
 DeviceState *fdctrl_init_sysbus_dma(qemu_irq irq, hwaddr mmio_base,
                                     DriveInfo **fds, IsaDma *dma,
-                                    int dma_chann);
+                                    int dma_chann,
+                                    bool dma_enable_active_low);
 bool sysbus_fdc_get_media_info(DeviceState *dev, unsigned unit,
                                bool *drive_present, int64_t *media_size);
 void sun4m_fdctrl_init(qemu_irq irq, hwaddr io_base,

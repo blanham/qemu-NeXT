@@ -101,7 +101,8 @@ static void fdctrl_handle_tc(void *opaque, int irq, int level)
 static DeviceState *fdctrl_init_sysbus_common(qemu_irq irq,
                                               hwaddr mmio_base,
                                               DriveInfo **fds, IsaDma *dma,
-                                              int dma_chann)
+                                              int dma_chann,
+                                              bool dma_enable_active_low)
 {
     DeviceState *dev;
     SysBusDevice *sbd;
@@ -117,6 +118,8 @@ static DeviceState *fdctrl_init_sysbus_common(qemu_irq irq,
     if (dma_chann != -1) {
         qdev_prop_set_int32(dev, "dma-channel", dma_chann);
     }
+    qdev_prop_set_bit(dev, "dma-enable-active-low",
+                      dma_enable_active_low);
     sysbus_realize_and_unref(sbd, &error_fatal);
     sysbus_connect_irq(sbd, 0, irq);
     sysbus_mmio_map(sbd, 0, mmio_base);
@@ -127,14 +130,16 @@ static DeviceState *fdctrl_init_sysbus_common(qemu_irq irq,
 
 void fdctrl_init_sysbus(qemu_irq irq, hwaddr mmio_base, DriveInfo **fds)
 {
-    fdctrl_init_sysbus_common(irq, mmio_base, fds, NULL, -1);
+    fdctrl_init_sysbus_common(irq, mmio_base, fds, NULL, -1, false);
 }
 
 DeviceState *fdctrl_init_sysbus_dma(qemu_irq irq, hwaddr mmio_base,
                                     DriveInfo **fds, IsaDma *dma,
-                                    int dma_chann)
+                                    int dma_chann,
+                                    bool dma_enable_active_low)
 {
-    return fdctrl_init_sysbus_common(irq, mmio_base, fds, dma, dma_chann);
+    return fdctrl_init_sysbus_common(irq, mmio_base, fds, dma, dma_chann,
+                                     dma_enable_active_low);
 }
 
 bool sysbus_fdc_get_media_info(DeviceState *dev, unsigned unit,
@@ -278,6 +283,8 @@ static const Property sysbus_fdc_properties[] = {
     DEFINE_PROP_LINK("dma-controller", FDCtrlSysBus, state.dma,
                      TYPE_ISADMA, IsaDma *),
     DEFINE_PROP_INT32("dma-channel", FDCtrlSysBus, state.dma_chann, -1),
+    DEFINE_PROP_BOOL("dma-enable-active-low", FDCtrlSysBus,
+                     state.dma_enable_active_low, false),
     DEFINE_PROP_SIGNED("fdtypeA", FDCtrlSysBus, state.qdev_for_drives[0].type,
                         FLOPPY_DRIVE_TYPE_AUTO, qdev_prop_fdc_drive_type,
                         FloppyDriveType),

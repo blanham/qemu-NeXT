@@ -96,6 +96,7 @@ struct FDCtrl {
     int dma_chann;
     uint8_t phase;
     IsaDma *dma;
+    bool dma_enable_active_low;
     /* Controller's identification */
     uint8_t version;
     /* HW */

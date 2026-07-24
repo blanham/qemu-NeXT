@@ -713,6 +713,22 @@ enum {
     FD_DOR_MOTEN3   = 0x80,
 };
 
+static bool fdctrl_dma_enabled(const FDCtrl *fdctrl)
+{
+    bool asserted = fdctrl->dor & FD_DOR_DMAEN;
+
+    return fdctrl->dma_enable_active_low ? !asserted : asserted;
+}
+
+static void fdctrl_set_dma_enabled(FDCtrl *fdctrl, bool enabled)
+{
+    if (enabled == !fdctrl->dma_enable_active_low) {
+        fdctrl->dor |= FD_DOR_DMAEN;
+    } else {
+        fdctrl->dor &= ~FD_DOR_DMAEN;
+    }
+}
+
 enum {
 #if MAX_FD == 4
     FD_TDR_BOOTSEL  = 0x0c,
@@ -1106,7 +1122,7 @@ void fdctrl_reset(FDCtrl *fdctrl, int do_irq)
     }
     fdctrl->cur_drv = 0;
     fdctrl->dor = FD_DOR_nRESET;
-    fdctrl->dor |= (fdctrl->dma_chann != -1) ? FD_DOR_DMAEN : 0;
+    fdctrl_set_dma_enabled(fdctrl, fdctrl->dma_chann != -1);
     fdctrl->msr = FD_MSR_RQM;
     fdctrl->reset_sensei = 0;
     timer_del(fdctrl->result_timer);
@@ -1547,7 +1563,7 @@ static void fdctrl_start_transfer(FDCtrl *fdctrl, int direction)
         fdctrl->data_len *= tmp;
     }
     fdctrl->eot = fdctrl->fifo[6];
-    if (fdctrl->dor & FD_DOR_DMAEN) {
+    if (fdctrl_dma_enabled(fdctrl)) {
         /* DMA transfer is enabled. */
         IsaDmaClass *k = ISADMA_GET_CLASS(fdctrl->dma);
 
@@ -2025,10 +2041,7 @@ static void fdctrl_handle_specify(FDCtrl *fdctrl, int direction)
 {
     fdctrl->timer0 = (fdctrl->fifo[1] >> 4) & 0xF;
     fdctrl->timer1 = fdctrl->fifo[2] >> 1;
-    if (fdctrl->fifo[2] & 1)
-        fdctrl->dor &= ~FD_DOR_DMAEN;
-    else
-        fdctrl->dor |= FD_DOR_DMAEN;
+    fdctrl_set_dma_enabled(fdctrl, !(fdctrl->fifo[2] & 1));
     /* No result back */
     fdctrl_to_command_phase(fdctrl);
 }
