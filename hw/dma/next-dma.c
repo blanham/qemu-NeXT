@@ -1400,8 +1400,6 @@ static void next_dma_reset_hold(Object *obj, ResetType type)
     s->floppy_callback_position = 0;
     s->floppy_callback_address = 0;
     s->floppy_callback_limit = 0;
-    s->scsi_control = 0;
-    s->floppy_selected = false;
     s->floppy_dreq = false;
     s->floppy_in_callback = false;
     s->floppy_running = false;
