@@ -913,7 +913,19 @@ static void next_dma_floppy_run(void *opaque)
         s->floppy_dma_position = new_position;
     }
     if (c->next == c->limit) {
-        next_dma_complete_segment(s, NEXT_DMA_SCSI);
+        if ((c->csr & NEXT_DMA_CSR_SUPDATE) && !s->floppy_dreq) {
+            /*
+             * The FDC ended the command exactly at the current limit.  Its
+             * staged continuation is an unused FIFO safety tail, not the
+             * next active descriptor.  Preserve next at the completed data
+             * buffer so the ROM can calculate the transfer length.
+             */
+            c->csr |= NEXT_DMA_CSR_COMPLETE;
+            c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+            next_dma_update_irq(s, NEXT_DMA_SCSI);
+        } else {
+            next_dma_complete_segment(s, NEXT_DMA_SCSI);
+        }
     }
 
 out:

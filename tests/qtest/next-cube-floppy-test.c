@@ -691,6 +691,54 @@ static void test_chained_media_to_ram_dma(void)
     qtest_quit(qts);
 }
 
+static void test_unused_chained_tail_preserves_completed_next(void)
+{
+    static const uint8_t read_command[] = {
+        0x46, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1b, 0xff,
+    };
+    static const uint8_t expected_result[] = {
+        0x20, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02,
+    };
+    const uint32_t tail_buffer = NEXT_DMA_BUFFER + 0x1000;
+    TestFixture *fixture = fixture_new();
+    uint8_t received[NEXT_SECTOR_SIZE];
+    QTestState *qts;
+
+    assert_controller_mapped(fixture);
+    qts = next_cube_start(fixture, true);
+    prepare_dma_fdc(qts);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, NEXT_MEMORY_SENTINEL,
+                 NEXT_SECTOR_SIZE);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_SETREAD);
+    qtest_writel(qts, NEXT_DMA_NEXT_INIT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
+    qtest_writel(qts, NEXT_DMA_START, tail_buffer);
+    qtest_writel(qts, NEXT_DMA_STOP, tail_buffer + 32);
+    qtest_writel(qts, NEXT_DMA_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE | DMA_SETREAD);
+
+    fdc_send_command(qts, read_command, sizeof(read_command));
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x18);
+    wait_interrupts(qts, NEXT_RELEVANT_IRQS, NEXT_RELEVANT_IRQS,
+                    "single-sector chained floppy transfer");
+
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, sizeof(received));
+    g_assert_cmpmem(received, sizeof(received),
+                    fixture->disk_pattern, sizeof(fixture->disk_pattern));
+    /*
+     * The FDC released DREQ exactly at the current descriptor's limit.
+     * The continuation is a safety tail and was never requested, so the
+     * guest-visible next pointer must describe the completed data buffer.
+     */
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
+    fdc_read_result(qts, expected_result, sizeof(expected_result));
+
+    qtest_quit(qts);
+}
+
 static void test_chained_scan_equal_compares_full_sector(void)
 {
     static const uint8_t scan_command[] = {
@@ -850,6 +898,9 @@ int main(int argc, char **argv)
                    test_reset_cancels_gated_dma_request);
     qtest_add_func("/next-cube/floppy/chained-media-to-ram-dma",
                    test_chained_media_to_ram_dma);
+    qtest_add_func(
+        "/next-cube/floppy/unused-chained-tail-preserves-completed-next",
+        test_unused_chained_tail_preserves_completed_next);
     qtest_add_func("/next-cube/floppy/chained-scan-equal-full-sector",
                    test_chained_scan_equal_compares_full_sector);
     qtest_add_func("/next-cube/floppy/migrate-pending-gated-dma-request",
