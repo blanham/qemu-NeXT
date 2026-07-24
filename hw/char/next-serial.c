@@ -76,12 +76,18 @@ static void next_serial_set_irq(void *opaque, int n, int level)
 
 static void next_serial_apply_clocks(NextSerialState *s)
 {
-    s->escc.chn[0].clock =
+    uint32_t pclk_hz =
+        s->clock_select & NEXT_SERIAL_PCLK_ESCLK ?
+        NEXT_SERIAL_RTXC_HZ : NEXT_SERIAL_PCLK_HZ;
+    uint32_t ch_b_rtxc_hz =
         s->clock_select & (NEXT_SERIAL_B_4MHZ | NEXT_SERIAL_B_ESCLK) ?
         NEXT_SERIAL_RTXC_HZ : NEXT_SERIAL_PCLK_HZ;
-    s->escc.chn[1].clock =
+    uint32_t ch_a_rtxc_hz =
         s->clock_select & (NEXT_SERIAL_A_4MHZ | NEXT_SERIAL_A_ESCLK) ?
         NEXT_SERIAL_RTXC_HZ : NEXT_SERIAL_PCLK_HZ;
+
+    escc_set_clock_inputs(&s->escc, pclk_hz,
+                          ch_b_rtxc_hz, ch_a_rtxc_hz);
 }
 
 static uint64_t next_serial_clock_read(void *opaque, hwaddr addr,

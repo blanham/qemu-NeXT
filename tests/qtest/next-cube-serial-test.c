@@ -99,6 +99,17 @@ static QTestState *next_cube_serial_start_with_backend(int *sock_fd)
     return qtest_init_with_serial(args, sock_fd);
 }
 
+#ifdef CONFIG_TRACE_LOG
+static QTestState *next_cube_serial_start_with_backend_args(
+    const char *extra_args, int *sock_fd)
+{
+    g_autofree char *base_args = next_cube_serial_args();
+    g_autofree char *args = g_strdup_printf("%s %s", base_args, extra_args);
+
+    return qtest_init_with_serial(args, sock_fd);
+}
+#endif
+
 static void scc_write_reg(QTestState *qts, uint64_t control,
                           uint8_t reg, uint8_t value)
 {
@@ -127,16 +138,60 @@ static void assert_scc_irq(QTestState *qts, bool level)
 
 static void test_clock_select(void)
 {
-    QTestState *qts = next_cube_serial_start();
+    int sock_fd;
+#ifdef CONFIG_TRACE_LOG
+    g_autofree char *log = NULL;
+    g_autofree char *log_path = NULL;
+    g_autofree char *quoted_log_path = NULL;
+    g_autofree char *trace_args = NULL;
+    gsize log_len;
+    const char *pclk_trace;
+    const char *rtxc_trace;
+    int log_fd;
+    QTestState *qts;
+
+    log_fd = g_file_open_tmp("next-serial-clock-XXXXXX",
+                             &log_path, NULL);
+    g_assert_cmpint(log_fd, >=, 0);
+    close(log_fd);
+    quoted_log_path = g_shell_quote(log_path);
+    trace_args = g_strdup_printf("-trace escc_update_parameters -D %s",
+                                 quoted_log_path);
+    qts = next_cube_serial_start_with_backend_args(trace_args, &sock_fd);
+#else
+    QTestState *qts = next_cube_serial_start_with_backend(&sock_fd);
+#endif
 
     g_assert_cmphex(qtest_readb(qts, NEXT_SCC_CLOCK), ==, 0);
     qtest_writeb(qts, NEXT_SCC_CLOCK, 0x0a);
     g_assert_cmphex(qtest_readb(qts, NEXT_SCC_CLOCK), ==, 0x0a);
 
+    /*
+     * With a zero time constant and x16 clock, the baud-rate generator
+     * must use PCLK/2/(2*16) when WR14_BRPCLK is set, then RTxC/2/(2*16)
+     * when it is clear.
+     */
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 4, 0x44);
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 12, 0);
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 13, 0);
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 14, 0x02);
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 14, 0x00);
+
     qtest_system_reset(qts);
     g_assert_cmphex(qtest_readb(qts, NEXT_SCC_CLOCK), ==, 0);
 
+    close(sock_fd);
     qtest_quit(qts);
+
+#ifdef CONFIG_TRACE_LOG
+    g_assert_true(g_file_get_contents(log_path, &log, &log_len, NULL));
+    pclk_trace = g_strstr_len(log, log_len,
+                             "channel a: speed=57562");
+    g_assert_nonnull(pclk_trace);
+    rtxc_trace = strstr(pclk_trace, "channel a: speed=62500");
+    g_assert_nonnull(rtxc_trace);
+    g_unlink(log_path);
+#endif
 }
 
 static void test_local_loopback(uint64_t control, uint64_t data)
@@ -179,12 +234,18 @@ static void wait_for_rx_available(QTestState *qts)
 static void test_serial0_backend_round_trip(void)
 {
     int sock_fd;
+    GPollFD pollfd = {
+        .events = G_IO_IN,
+    };
     uint8_t byte;
     QTestState *qts = next_cube_serial_start_with_backend(&sock_fd);
 
     scc_configure_rx_tx(qts, NEXT_SCC_A_CTRL, false);
 
     qtest_writeb(qts, NEXT_SCC_A_DATA, 'T');
+    pollfd.fd = sock_fd;
+    g_assert_cmpint(g_poll(&pollfd, 1, 1000), ==, 1);
+    g_assert_true(pollfd.revents & G_IO_IN);
     g_assert_cmpint(recv(sock_fd, &byte, 1, 0), ==, 1);
     g_assert_cmphex(byte, ==, 'T');
 

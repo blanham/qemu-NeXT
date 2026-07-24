@@ -39,6 +39,9 @@ typedef struct ESCCChannelState {
     CharFrontend chr;
     int e0_mode, led_mode, caps_lock_mode, num_lock_mode;
     int disabled;
+    /* Baud-rate generator inputs after the SCC's divide-by-two stage. */
+    int pclk;
+    int rtxc;
     int clock;
     uint32_t vmstate_dummy;
     ESCCChnID chn; /* this channel, A (base+4) or B (base+0) */
@@ -61,5 +64,9 @@ struct ESCCState {
     uint32_t disabled;
     uint32_t frequency;
 };
+
+void escc_set_clock_inputs(ESCCState *s, uint32_t pclk_hz,
+                           uint32_t ch_b_rtxc_hz,
+                           uint32_t ch_a_rtxc_hz);
 
 #endif

@@ -197,6 +197,13 @@ static uint8_t sunkbd_layout_dip_switch(const char *sunkbd_layout);
 static void handle_kbd_command(ESCCChannelState *s, int val);
 static int serial_can_receive(void *opaque);
 static void serial_receive_byte(ESCCChannelState *s, int ch);
+static void escc_update_parameters(ESCCChannelState *s);
+
+static void escc_update_clock(ESCCChannelState *s)
+{
+    s->clock = s->wregs[W_MISC2] & MISC2_BRG_SRC ?
+               s->pclk : s->rtxc;
+}
 
 static int reg_shift(ESCCState *s)
 {
@@ -321,6 +328,7 @@ static void escc_soft_reset_chn(ESCCChannelState *s)
     s->rregs[R_SPEC] |= SPEC_BITS8;
     s->rregs[R_INTR] = 0;
     s->rregs[R_MISC] &= MISC_2CLKMISS;
+    escc_update_parameters(s);
 }
 
 static void escc_hard_reset_chn(ESCCChannelState *s)
@@ -338,6 +346,7 @@ static void escc_hard_reset_chn(ESCCChannelState *s)
     s->wregs[W_CLOCK] = CLOCK_TRXC;
     s->wregs[W_MISC2] &= MISC2_PLLCMD1 | MISC2_PLLCMD2;
     s->wregs[W_MISC2] |= MISC2_LCL_LOOP | MISC2_PLLCMD0;
+    escc_update_parameters(s);
 }
 
 static void escc_reset(DeviceState *d)
@@ -371,6 +380,7 @@ static void escc_reset(DeviceState *d)
         cs->rregs[R_STATUS] |= STATUS_TXEMPTY;
 
         escc_reset_chn(cs);
+        escc_update_parameters(cs);
     }
 }
 
@@ -480,6 +490,7 @@ static void escc_update_parameters(ESCCChannelState *s)
     int speed, parity, data_bits, stop_bits;
     QEMUSerialSetParams ssp;
 
+    escc_update_clock(s);
     if (!qemu_chr_fe_backend_connected(&s->chr) || s->type != escc_serial) {
         return;
     }
@@ -536,6 +547,19 @@ static void escc_update_parameters(ESCCChannelState *s)
     qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
 }
 
+void escc_set_clock_inputs(ESCCState *s, uint32_t pclk_hz,
+                           uint32_t ch_b_rtxc_hz,
+                           uint32_t ch_a_rtxc_hz)
+{
+    s->chn[0].pclk = pclk_hz / 2;
+    s->chn[0].rtxc = ch_b_rtxc_hz / 2;
+    s->chn[1].pclk = pclk_hz / 2;
+    s->chn[1].rtxc = ch_a_rtxc_hz / 2;
+
+    escc_update_parameters(&s->chn[0]);
+    escc_update_parameters(&s->chn[1]);
+}
+
 static void escc_mem_write(void *opaque, hwaddr addr,
                            uint64_t val, unsigned size)
 {
@@ -587,8 +611,12 @@ static void escc_mem_write(void *opaque, hwaddr addr,
         case W_INTR ... W_IVEC:
         case W_SYNC1 ... W_TXBUF:
         case W_MISC1 ... W_CLOCK:
-        case W_MISC2 ... W_EXTINT:
+        case W_EXTINT:
             s->wregs[s->reg] = val;
+            break;
+        case W_MISC2:
+            s->wregs[s->reg] = val;
+            escc_update_parameters(s);
             break;
         case W_TXCTRL1:
             s->wregs[s->reg] = val;
@@ -783,10 +811,20 @@ static const VMStateDescription vmstate_escc_chn = {
     }
 };
 
+static int escc_post_load(void *opaque, int version_id)
+{
+    ESCCState *s = opaque;
+
+    escc_update_parameters(&s->chn[0]);
+    escc_update_parameters(&s->chn[1]);
+    return 0;
+}
+
 static const VMStateDescription vmstate_escc = {
     .name = "escc",
     .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = escc_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(chn, ESCCState, 2, 2, vmstate_escc_chn,
                              ESCCChannelState),
@@ -1067,12 +1105,12 @@ static void escc_realize(DeviceState *dev, Error **errp)
 
     for (i = 0; i < 2; i++) {
         if (qemu_chr_fe_backend_connected(&s->chn[i].chr)) {
-            s->chn[i].clock = s->frequency / 2;
             qemu_chr_fe_set_handlers(&s->chn[i].chr, serial_can_receive,
                                      serial_receive1, serial_event, NULL,
                                      &s->chn[i], NULL, true);
         }
     }
+    escc_set_clock_inputs(s, s->frequency, s->frequency, s->frequency);
 
     if (s->chn[0].type == escc_mouse) {
         s->chn[0].hs = qemu_input_handler_register((DeviceState *)(&s->chn[0]),
