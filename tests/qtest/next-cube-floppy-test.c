@@ -41,6 +41,9 @@
 #define NEXT_FDC_CCR           (NEXT_FDC_BASE + 7)
 #define NEXT_FLOPPY_CONTROL    (NEXT_FDC_BASE + 8)
 #define NEXT_SCSI_CONTROL      0x02114020
+#define NEXT_SCSI_STATUS       0x02114021
+#define NEXT_ROM_SCSI_CONTROL  0x02014020
+#define NEXT_ROM_SCSI_STATUS   0x02014021
 
 #define NEXT_DMA_CSR           0x02000010
 #define NEXT_DMA_NEXT          0x02004010
@@ -386,6 +389,32 @@ static void test_controller_and_media(void)
     qtest_quit(qts);
 }
 
+static void test_rom_scsi_dma_control_alias(void)
+{
+    TestFixture *fixture = fixture_new();
+    QTestState *qts = next_cube_start(fixture, false);
+
+    /*
+     * The v66 ROM and NeXT floppy driver use the 0x02014020 window.  It is
+     * the same SCSI/floppy control and status pair also decoded at
+     * 0x02114020, including clock select, DMA direction/mode, and FIFO flush.
+     */
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x9c);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ROM_SCSI_CONTROL), ==, 0x9c);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CONTROL), ==, 0x9c);
+
+    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x50);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ROM_SCSI_CONTROL), ==, 0x50);
+
+    qtest_writeb(qts, NEXT_ROM_SCSI_STATUS, 0xa5);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_STATUS), ==, 0xa5);
+
+    qtest_writeb(qts, NEXT_SCSI_STATUS, 0x3c);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ROM_SCSI_STATUS), ==, 0x3c);
+
+    qtest_quit(qts);
+}
+
 static void test_media_to_ram_dma(void)
 {
     static const uint8_t read_command[] = {
@@ -416,7 +445,7 @@ static void test_media_to_ram_dma(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE, ==, 0);
 
-    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x18);
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x18);
     wait_dma_state(qts, DMA_COMPLETE, DMA_COMPLETE,
                    "floppy media-to-memory completion");
 
@@ -469,7 +498,7 @@ static void test_ram_to_media_dma(void)
     fdc_send_command(qts, write_command, sizeof(write_command));
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
 
-    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x10);
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x10);
     wait_interrupts(qts, NEXT_FLOPPY_IRQ, NEXT_FLOPPY_IRQ,
                     "floppy memory-to-media interrupt");
 
@@ -531,7 +560,7 @@ static void test_reset_cancels_gated_dma_request(void)
                 NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE, DMA_SETREAD);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
                     DMA_ENABLE | DMA_READ);
-    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x18);
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x18);
     for (i = 0; i < NEXT_RESET_POLL_STEPS; i++) {
         qtest_clock_step(qts, 1);
         g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE,
@@ -576,7 +605,7 @@ static void test_chained_media_to_ram_dma(void)
                  DMA_SETENABLE | DMA_SETSUPDATE | DMA_SETREAD);
 
     fdc_send_command(qts, read_command, sizeof(read_command));
-    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x18);
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x18);
     wait_dma_state(qts, DMA_COMPLETE, DMA_COMPLETE,
                    "first chained floppy segment");
 
@@ -643,7 +672,7 @@ static void test_chained_scan_equal_compares_full_sector(void)
                  DMA_SETENABLE | DMA_SETSUPDATE);
 
     fdc_send_command(qts, scan_command, sizeof(scan_command));
-    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x10);
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x10);
     wait_dma_state(qts, DMA_COMPLETE, DMA_COMPLETE,
                    "first chained SCAN segment");
 
@@ -730,7 +759,7 @@ static void test_migrate_pending_gated_dma_request(void)
                     ==, DMA_ENABLE | DMA_READ);
     assert_relevant_interrupts(destination, 0);
 
-    qtest_writeb(destination, NEXT_SCSI_CONTROL, 0x18);
+    qtest_writeb(destination, NEXT_ROM_SCSI_CONTROL, 0x18);
     wait_dma_state(destination, DMA_COMPLETE, DMA_COMPLETE,
                    "migrated floppy DMA completion");
 
@@ -760,6 +789,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/floppy/controller-and-media",
                    test_controller_and_media);
+    qtest_add_func("/next-cube/floppy/rom-scsi-dma-control-alias",
+                   test_rom_scsi_dma_control_alias);
     qtest_add_func("/next-cube/floppy/media-to-ram-dma",
                    test_media_to_ram_dma);
     qtest_add_func("/next-cube/floppy/ram-to-media-dma",

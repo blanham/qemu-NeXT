@@ -60,6 +60,7 @@
 #define ROM_FILE    "Rev_2.5_v66.bin"
 
 #define NEXT_DMA_BASE        0x02000000
+#define NEXT_SCSI_ROM_CSR_BASE 0x02014020
 #define NEXT_SCSI_BASE       0x02114000
 #define NEXT_SCSI_CSR_OFFSET 0x20
 #define NEXT_SCSI_CSR_BASE   (NEXT_SCSI_BASE + NEXT_SCSI_CSR_OFFSET)
@@ -161,6 +162,7 @@ struct NeXTPC {
     MemoryRegion printer_mem;
     MemoryRegion mmiomem;
     MemoryRegion scrmem;
+    MemoryRegion scsi_csr_rom_alias;
 
     uint32_t scr1;
     uint32_t scr2;
@@ -1328,6 +1330,11 @@ static void next_pc_init(Object *obj)
                           "next.event-counter", 4);
     sysbus_init_mmio(sbd, &s->eventc_mem);
 
+    memory_region_init_alias(&s->scsi_csr_rom_alias, OBJECT(s),
+                             "next.scsi-csr-rom-alias",
+                             &s->next_scsi.scsi_csr_mem, 0, 2);
+    sysbus_init_mmio(sbd, &s->scsi_csr_rom_alias);
+
     object_initialize_child(obj, "rtc", &s->rtc, TYPE_NEXT_RTC);
 
     qdev_init_gpio_in_named(DEVICE(obj), next_pc_rtc_data_in_irq,
@@ -1584,6 +1591,8 @@ static void next_cube_init(MachineState *machine)
     /* System timer and event counter */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02116000);
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x0211a000);
+    /* The v66 ROM and NeXT floppy driver use this SCSI CSR decode. */
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, NEXT_SCSI_ROM_CSR_BASE);
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",
