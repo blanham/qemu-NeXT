@@ -32,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 #define NEXT_FDC_BASE          0x02114100
 #define NEXT_FDC_DOR           (NEXT_FDC_BASE + 2)
@@ -85,6 +86,7 @@ typedef struct TestFixture {
     int floppy_fd;
     char *rom_path;
     char *floppy_path;
+    char *migration_path;
     uint8_t disk_pattern[NEXT_SECTOR_SIZE];
 } TestFixture;
 
@@ -106,6 +108,10 @@ static void cleanup_fixture(void *opaque)
     if (fixture->floppy_path) {
         g_unlink(fixture->floppy_path);
         g_free(fixture->floppy_path);
+    }
+    if (fixture->migration_path) {
+        g_unlink(fixture->migration_path);
+        g_free(fixture->migration_path);
     }
     g_free(fixture);
 }
@@ -158,12 +164,20 @@ static QTestState *next_cube_start(TestFixture *fixture, bool with_media)
     return qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
 }
 
-/*
- * Until next-cube consumes IF_FLOPPY drives, attaching the required fixture
- * terminates QEMU before qtest can connect.  Probe the controller map without
- * media first so the RED failure identifies the missing hardware, not merely
- * the rejected legacy drive.
- */
+static QTestState *next_cube_start_migration(TestFixture *fixture,
+                                             bool incoming)
+{
+    g_autofree char *quoted_rom_path = g_shell_quote(fixture->rom_path);
+    g_autofree char *quoted_floppy_path =
+        g_shell_quote(fixture->floppy_path);
+
+    return qtest_initf("-machine next-cube -bios %s "
+                       "-drive if=floppy,format=raw,readonly=on,file=%s %s",
+                       quoted_rom_path, quoted_floppy_path,
+                       incoming ? "-incoming defer" : "");
+}
+
+/* Keep controller mapping failures distinct from media-attachment failures. */
 static void assert_controller_mapped(TestFixture *fixture)
 {
     QTestState *qts = next_cube_start(fixture, false);
@@ -268,6 +282,30 @@ static uint32_t wait_dma_state(QTestState *qts, uint32_t mask,
     return 0;
 }
 
+static void wait_migration_complete(QTestState *qts, const char *operation)
+{
+    unsigned int i;
+
+    for (i = 0; i < NEXT_POLL_LIMIT; i++) {
+        QDict *response = qtest_qmp_assert_success_ref(
+            qts, "{ 'execute': 'query-migrate' }");
+        const char *status = qdict_get_str(response, "status");
+
+        if (!strcmp(status, "completed")) {
+            qobject_unref(response);
+            return;
+        }
+        if (!strcmp(status, "failed") || !strcmp(status, "cancelled")) {
+            g_error("%s migration entered terminal state '%s'",
+                    operation, status);
+        }
+        qobject_unref(response);
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for %s migration", operation);
+}
+
 static void prepare_dma_fdc(QTestState *qts)
 {
     static const uint8_t configure[] = { 0x13, 0x00, 0x58, 0x00 };
@@ -325,6 +363,10 @@ static void test_controller_and_media(void)
 
     fdc_send_command(qts, version, sizeof(version));
     g_assert_cmphex(fdc_read_fifo(qts), ==, 0x90);
+    g_assert_cmphex(qtest_readb(qts, NEXT_FLOPPY_CONTROL), ==, 0x42);
+    qtest_writeb(qts, NEXT_FLOPPY_CONTROL, 0xc0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_FLOPPY_CONTROL), ==, 0xc2);
+    qtest_writeb(qts, NEXT_FLOPPY_CONTROL, 0x40);
     g_assert_cmphex(qtest_readb(qts, NEXT_FLOPPY_CONTROL), ==, 0x42);
 
     fdc_send_command(qts, seek, sizeof(seek));
@@ -571,6 +613,90 @@ static void test_chained_media_to_ram_dma(void)
     qtest_quit(qts);
 }
 
+static void test_migrate_pending_gated_dma_request(void)
+{
+    static const uint8_t read_command[] = {
+        0x46, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1b, 0xff,
+    };
+    static const uint8_t expected_result[] = {
+        0x20, 0x00, 0x00, 0x01, 0x00, 0x01, 0x02,
+    };
+    TestFixture *fixture = fixture_new();
+    g_autofree char *outgoing_uri = NULL;
+    g_autofree char *incoming_uri = NULL;
+    g_autofree char *quoted_migration_path = NULL;
+    uint8_t received[NEXT_SECTOR_SIZE];
+    QTestState *source;
+    QTestState *destination;
+    int migration_fd;
+    unsigned int i;
+
+    assert_controller_mapped(fixture);
+    source = next_cube_start_migration(fixture, false);
+    prepare_dma_fdc(source);
+    qtest_memset(source, NEXT_DMA_BUFFER, NEXT_MEMORY_SENTINEL,
+                 NEXT_SECTOR_SIZE);
+    program_dma(source, NEXT_DMA_BUFFER,
+                NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE, DMA_SETREAD);
+    fdc_send_command(source, read_command, sizeof(read_command));
+
+    assert_guest_memory_filled(source, NEXT_MEMORY_SENTINEL);
+    g_assert_cmphex(qtest_readl(source, NEXT_DMA_NEXT), ==, 0);
+    g_assert_cmphex(qtest_readl(source, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
+                    DMA_ENABLE | DMA_READ);
+    assert_relevant_interrupts(source, 0);
+
+    migration_fd = g_file_open_tmp("next-floppy-migration-XXXXXX",
+                                   &fixture->migration_path, NULL);
+    g_assert_cmpint(migration_fd, >=, 0);
+    close(migration_fd);
+    quoted_migration_path = g_shell_quote(fixture->migration_path);
+    outgoing_uri = g_strdup_printf("exec: cat > %s",
+                                   quoted_migration_path);
+    qtest_qmp_assert_success(
+        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }",
+        outgoing_uri);
+    wait_migration_complete(source, "outgoing");
+    qtest_quit(source);
+
+    destination = next_cube_start_migration(fixture, true);
+    incoming_uri = g_strdup_printf("exec: cat %s", quoted_migration_path);
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        incoming_uri);
+    wait_migration_complete(destination, "incoming");
+
+    assert_guest_memory_filled(destination, NEXT_MEMORY_SENTINEL);
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_NEXT), ==, 0);
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_CSR) & DMA_STATE_MASK,
+                    ==, DMA_ENABLE | DMA_READ);
+    assert_relevant_interrupts(destination, 0);
+
+    qtest_writeb(destination, NEXT_SCSI_CONTROL, 0x18);
+    wait_dma_state(destination, DMA_COMPLETE, DMA_COMPLETE,
+                   "migrated floppy DMA completion");
+
+    qtest_memread(destination, NEXT_DMA_BUFFER, received, sizeof(received));
+    g_assert_cmpmem(received, sizeof(received),
+                    fixture->disk_pattern, sizeof(fixture->disk_pattern));
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
+    wait_interrupts(destination, NEXT_RELEVANT_IRQS, NEXT_RELEVANT_IRQS,
+                    "migrated floppy and shared-DMA interrupts");
+    fdc_read_result(destination, expected_result, sizeof(expected_result));
+    qtest_writel(destination, NEXT_DMA_CSR,
+                 DMA_CLRCOMPLETE | DMA_SETREAD);
+    for (i = 0; i < NEXT_RESET_POLL_STEPS; i++) {
+        qtest_clock_step(destination, 1);
+    }
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
+    assert_relevant_interrupts(destination, 0);
+
+    qtest_quit(destination);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -585,6 +711,8 @@ int main(int argc, char **argv)
                    test_reset_cancels_gated_dma_request);
     qtest_add_func("/next-cube/floppy/chained-media-to-ram-dma",
                    test_chained_media_to_ram_dma);
+    qtest_add_func("/next-cube/floppy/migrate-pending-gated-dma-request",
+                   test_migrate_pending_gated_dma_request);
 
     return g_test_run();
 }
