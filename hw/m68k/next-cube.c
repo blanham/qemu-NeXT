@@ -32,6 +32,8 @@
 #include "qom/object.h"
 #include "hw/char/next-serial.h"
 #include "hw/block/fdc.h"
+#include "hw/block/next-floppy.h"
+#include "hw/isa/isa.h"
 #include "hw/misc/empty_slot.h"
 #include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
@@ -153,7 +155,6 @@ struct NeXTPC {
     M68kCPU *cpu;
     NextDMAState *dma;
 
-    MemoryRegion floppy_mem;
     MemoryRegion system_timer_mem;
     MemoryRegion eventc_mem;
     MemoryRegion dsp_mem;
@@ -619,6 +620,7 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
             !!(val & SCSICSR_DMADIR), !!(val & SCSICSR_CPUDMA),
             !!(val & SCSICSR_INTMASK));
         s->scsi_csr_1 = val;
+        next_dma_set_scsi_control(s->dma, val);
         break;
 
     case 1:
@@ -724,10 +726,28 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
     scsi_bus_legacy_handle_cmdline(&s->sysbus_esp.esp.bus);
 }
 
+static void next_scsi_reset(DeviceState *dev)
+{
+    NeXTSCSI *s = NEXT_SCSI(dev);
+
+    s->scsi_csr_1 = 0;
+    s->scsi_csr_2 = 0;
+    next_dma_set_scsi_control(s->dma, 0);
+}
+
+static int next_scsi_post_load(void *opaque, int version_id)
+{
+    NeXTSCSI *s = opaque;
+
+    next_dma_set_scsi_control(s->dma, s->scsi_csr_1);
+    return 0;
+}
+
 static const VMStateDescription next_scsi_vmstate = {
     .name = "next-scsi",
     .version_id = 0,
     .minimum_version_id = 0,
+    .post_load = next_scsi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(scsi_csr_1, NeXTSCSI),
         VMSTATE_UINT8(scsi_csr_2, NeXTSCSI),
@@ -745,6 +765,7 @@ static void next_scsi_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "NeXT SCSI Controller";
     dc->realize = next_scsi_realize;
+    device_class_set_legacy_reset(dc, next_scsi_reset);
     device_class_set_props(dc, next_scsi_properties);
     dc->vmsd = &next_scsi_vmstate;
 }
@@ -755,47 +776,6 @@ static const TypeInfo next_scsi_info = {
     .instance_init = next_scsi_init,
     .instance_size = sizeof(NeXTSCSI),
     .class_init = next_scsi_class_init,
-};
-
-static void next_floppy_write(void *opaque, hwaddr addr, uint64_t val,
-                              unsigned size)
-{
-    switch (addr) {
-    case 0:
-        DPRINTF("FDCSR Write: %"PRIx64 "\n", val);
-        if (val == 0x0) {
-            /* qemu_irq_raise(s->fd_irq[0]); */
-        }
-        break;
-
-    default:
-        g_assert_not_reached();
-    }
-}
-
-static uint64_t next_floppy_read(void *opaque, hwaddr addr, unsigned size)
-{
-    uint64_t val;
-
-    switch (addr) {
-    case 0:
-        DPRINTF("FD read @ %x\n", (unsigned int)addr);
-        val = 0x40 | 0x04 | 0x2 | 0x1;
-        break;
-
-    default:
-        g_assert_not_reached();
-    }
-
-    return val;
-}
-
-static const MemoryRegionOps next_floppy_ops = {
-    .read = next_floppy_read,
-    .write = next_floppy_write,
-    .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
-    .endianness = DEVICE_BIG_ENDIAN,
 };
 
 static uint32_t next_system_timer_remaining(NeXTPC *s)
@@ -1336,10 +1316,6 @@ static void next_pc_init(Object *obj)
     sysbus_init_mmio(sbd,
                      sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->next_scsi), 0));
 
-    memory_region_init_io(&s->floppy_mem, OBJECT(s), &next_floppy_ops, s,
-                          "next.floppy", 4);
-    sysbus_init_mmio(sbd, &s->floppy_mem);
-
     timer_init_ns(&s->system_timer, QEMU_CLOCK_VIRTUAL,
                   next_system_timer_expire, s);
 
@@ -1477,12 +1453,15 @@ static void next_cube_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     const char *bios_name = machine->firmware ?: ROM_FILE;
     DeviceState *dma_dev;
+    DeviceState *fdc_dev;
+    DeviceState *floppy_ctrl_dev;
     DeviceState *kbd_dev;
     DeviceState *mbdev;
     DeviceState *memctl_dev;
     DeviceState *pcdev;
     DeviceState *serial_dev;
     DeviceState *sound_dev;
+    DriveInfo *fds[MAX_FD];
     int channel;
 
     /* Initialize the cpu core */
@@ -1518,6 +1497,21 @@ static void next_cube_init(MachineState *machine)
                                                 dma_irq_inputs[channel]));
         }
     }
+
+    /* The 82077 and ESP share the physical SCSI DMA channel. */
+    fds[0] = drive_get(IF_FLOPPY, 0, 0);
+    fds[1] = drive_get(IF_FLOPPY, 0, 1);
+    fdc_dev = fdctrl_init_sysbus_dma(
+        qdev_get_gpio_in(pcdev, NEXT_FD_I), 0x02114100, fds,
+        ISADMA(m->dma), NEXT_DMA_SCSI, true);
+
+    floppy_ctrl_dev = qdev_new(TYPE_NEXT_FLOPPY_CTRL);
+    object_property_set_link(OBJECT(floppy_ctrl_dev), "fdc",
+                             OBJECT(fdc_dev), &error_abort);
+    object_property_set_link(OBJECT(floppy_ctrl_dev), "dma",
+                             OBJECT(m->dma), &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(floppy_ctrl_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(floppy_ctrl_dev), 0, 0x02114108);
 
     /* Serial ports and clock select */
     serial_dev = qdev_new(TYPE_NEXT_SERIAL);
@@ -1587,11 +1581,9 @@ static void next_cube_init(MachineState *machine)
 
     /* SCSI */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, NEXT_SCSI_BASE);
-    /* Floppy */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02114108);
     /* System timer and event counter */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02116000);
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x0211a000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02116000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x0211a000);
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",
