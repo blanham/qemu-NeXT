@@ -76,6 +76,7 @@
 #define FDC_MSR_COMMAND_BUSY   0x10
 #define FDC_RESULT_MSR         (FDC_MSR_RQM | FDC_MSR_DIO | \
                                 FDC_MSR_COMMAND_BUSY)
+#define FDC_SRA_NWRITE_PROTECT 0x02
 
 #define NEXT_ROM_SIZE          (128 * 1024)
 #define NEXT_FLOPPY_SIZE       1474560
@@ -167,6 +168,17 @@ static QTestState *next_cube_start(TestFixture *fixture, bool with_media)
     }
 
     return qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
+}
+
+static QTestState *next_cube_start_readonly(TestFixture *fixture)
+{
+    g_autofree char *quoted_rom_path = g_shell_quote(fixture->rom_path);
+    g_autofree char *quoted_floppy_path =
+        g_shell_quote(fixture->floppy_path);
+
+    return qtest_initf("-machine next-cube -bios %s "
+                       "-drive if=floppy,format=raw,readonly=on,file=%s",
+                       quoted_rom_path, quoted_floppy_path);
 }
 
 static QTestState *next_cube_start_migration(TestFixture *fixture,
@@ -391,6 +403,22 @@ static void test_controller_and_media(void)
     qtest_quit(qts);
 }
 
+static void test_sra_write_protect_tracks_backend(void)
+{
+    TestFixture *fixture = fixture_new();
+    QTestState *qts = next_cube_start(fixture, true);
+
+    g_assert_cmphex(qtest_readb(qts, NEXT_FDC_SRA) &
+                    FDC_SRA_NWRITE_PROTECT, ==,
+                    FDC_SRA_NWRITE_PROTECT);
+    qtest_quit(qts);
+
+    qts = next_cube_start_readonly(fixture);
+    g_assert_cmphex(qtest_readb(qts, NEXT_FDC_SRA) &
+                    FDC_SRA_NWRITE_PROTECT, ==, 0);
+    qtest_quit(qts);
+}
+
 static void test_rom_scsi_dma_control_alias(void)
 {
     TestFixture *fixture = fixture_new();
@@ -460,6 +488,35 @@ static void test_rom_reset_configure_recalibrate(void)
     fdc_send_command(qts, sense, sizeof(sense));
     fdc_read_result(qts, recalibrate_result, sizeof(recalibrate_result));
     g_assert_cmphex(qtest_readb(qts, NEXT_FDC_SRA) & 0x10, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_dpoll_preserves_late_or_consumed_reset_results(void)
+{
+    static const uint8_t configure[] = { 0x13, 0x00, 0x58, 0x00 };
+    static const uint8_t sense[] = { 0x08 };
+    static const uint8_t first_reset_result[] = { 0xc0, 0x00 };
+    static const uint8_t second_reset_result[] = { 0xc1, 0x00 };
+    TestFixture *fixture = fixture_new();
+    QTestState *qts = next_cube_start(fixture, true);
+
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x00);
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x04);
+    qtest_clock_step(qts, NEXT_ROM_RESET_HOLD_NS + 1);
+    fdc_send_command(qts, configure, sizeof(configure));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_FLOPPY_IRQ, ==, NEXT_FLOPPY_IRQ);
+    fdc_send_command(qts, sense, sizeof(sense));
+    fdc_read_result(qts, first_reset_result, sizeof(first_reset_result));
+
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x00);
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x04);
+    fdc_send_command(qts, sense, sizeof(sense));
+    fdc_read_result(qts, first_reset_result, sizeof(first_reset_result));
+    fdc_send_command(qts, configure, sizeof(configure));
+    fdc_send_command(qts, sense, sizeof(sense));
+    fdc_read_result(qts, second_reset_result, sizeof(second_reset_result));
 
     qtest_quit(qts);
 }
@@ -880,14 +937,99 @@ static void test_migrate_pending_gated_dma_request(void)
     qtest_quit(destination);
 }
 
+static void test_migrate_reset_poll_suppression_window(void)
+{
+    static const uint8_t configure[] = { 0x13, 0x00, 0x58, 0x00 };
+    static const uint8_t sense[] = { 0x08 };
+    static const uint8_t invalid_sense_result[] = { 0x80 };
+    static const uint8_t first_reset_result[] = { 0xc0, 0x00 };
+    TestFixture *fixture = fixture_new();
+    g_autofree char *quoted_migration_path = NULL;
+    g_autofree char *outgoing_uri = NULL;
+    g_autofree char *incoming_uri = NULL;
+    QTestState *source = next_cube_start_migration(fixture, false);
+    QTestState *destination;
+    int migration_fd;
+
+    qtest_writeb(source, NEXT_FDC_DOR, 0x00);
+    qtest_writeb(source, NEXT_FDC_DOR, 0x04);
+    wait_interrupts(source, NEXT_FLOPPY_IRQ, NEXT_FLOPPY_IRQ,
+                    "pre-migration reset polling interrupt");
+
+    migration_fd = g_file_open_tmp("next-floppy-reset-migration-XXXXXX",
+                                   &fixture->migration_path, NULL);
+    g_assert_cmpint(migration_fd, >=, 0);
+    close(migration_fd);
+    quoted_migration_path = g_shell_quote(fixture->migration_path);
+    outgoing_uri = g_strdup_printf("exec: cat > %s",
+                                   quoted_migration_path);
+    qtest_qmp_assert_success(
+        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }",
+        outgoing_uri);
+    wait_migration_complete(source, "outgoing reset polling");
+    qtest_quit(source);
+
+    destination = next_cube_start_migration(fixture, true);
+    incoming_uri = g_strdup_printf("exec: cat %s", quoted_migration_path);
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        incoming_uri);
+    wait_migration_complete(destination, "incoming reset polling");
+
+    fdc_send_command(destination, configure, sizeof(configure));
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_FLOPPY_IRQ, ==, 0);
+    fdc_send_command(destination, sense, sizeof(sense));
+    fdc_read_result(destination, invalid_sense_result,
+                    sizeof(invalid_sense_result));
+
+    qtest_quit(destination);
+
+    source = next_cube_start_migration(fixture, false);
+    qtest_writeb(source, NEXT_FDC_DOR, 0x00);
+    qtest_writeb(source, NEXT_FDC_DOR, 0x04);
+    qtest_clock_step(source, NEXT_ROM_RESET_HOLD_NS + 1);
+    fdc_send_command(source, configure, sizeof(configure));
+    g_assert_cmphex(qtest_readl(source, NEXT_INTR_STATUS) &
+                    NEXT_FLOPPY_IRQ, ==, NEXT_FLOPPY_IRQ);
+
+    qtest_qmp_assert_success(
+        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }",
+        outgoing_uri);
+    wait_migration_complete(source, "outgoing expired reset polling");
+    qtest_quit(source);
+
+    destination = next_cube_start_migration(fixture, true);
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        incoming_uri);
+    wait_migration_complete(destination, "incoming expired reset polling");
+
+    fdc_send_command(destination, configure, sizeof(configure));
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_FLOPPY_IRQ, ==, NEXT_FLOPPY_IRQ);
+    fdc_send_command(destination, sense, sizeof(sense));
+    fdc_read_result(destination, first_reset_result,
+                    sizeof(first_reset_result));
+
+    qtest_quit(destination);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/next-cube/floppy/controller-and-media",
                    test_controller_and_media);
+    qtest_add_func("/next-cube/floppy/sra-write-protect-tracks-backend",
+                   test_sra_write_protect_tracks_backend);
     qtest_add_func("/next-cube/floppy/rom-reset-configure-recalibrate",
                    test_rom_reset_configure_recalibrate);
+    qtest_add_func(
+        "/next-cube/floppy/dpoll-preserves-late-or-consumed-reset-results",
+        test_dpoll_preserves_late_or_consumed_reset_results);
     qtest_add_func("/next-cube/floppy/rom-scsi-dma-control-alias",
                    test_rom_scsi_dma_control_alias);
     qtest_add_func("/next-cube/floppy/media-to-ram-dma",
@@ -905,6 +1047,8 @@ int main(int argc, char **argv)
                    test_chained_scan_equal_compares_full_sector);
     qtest_add_func("/next-cube/floppy/migrate-pending-gated-dma-request",
                    test_migrate_pending_gated_dma_request);
+    qtest_add_func("/next-cube/floppy/migrate-reset-poll-suppression-window",
+                   test_migrate_reset_poll_suppression_window);
 
     return g_test_run();
 }

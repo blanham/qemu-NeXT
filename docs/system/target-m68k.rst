@@ -43,9 +43,13 @@ limit, so ROM transfer accounting continues to see the completed data
 buffer.
 
 The floppy controller register block is at ``0x02114100`` and its NeXT media
-control register is at ``0x02114108``.  Attach raw 720 KiB or 1.44 MiB media
-with ``-drive if=floppy,format=raw,file=IMAGE``.  Media capacity is reported
-through the control register.  The guest-visible eject bit is implemented as
-a latch, but it does not remove media from the QEMU block backend.  The v66
-ROM's SCSI/floppy control and status window at ``0x02014020``--``0x02014021``
-aliases the operating system window at ``0x02114020``--``0x02114021``.
+control register is at ``0x02114108``.  Attach raw 720 KiB, 1.44 MiB, or
+2.88 MiB media with ``-drive if=floppy,format=raw,file=IMAGE``.  Media capacity
+is reported through the control register, while status register A reports the
+backend's live write permission on the active-low write-protect input.  An
+82077 ``CONFIGURE`` command with ``DPOLL`` suppresses reset polling only when
+it arrives within 250 microseconds and before any reset result was consumed.
+The guest-visible eject bit is implemented as a latch, but it does not remove
+media from the QEMU block backend.  The v66 ROM's SCSI/floppy control and
+status window at ``0x02014020``--``0x02014021`` aliases the operating system
+window at ``0x02114020``--``0x02114021``.

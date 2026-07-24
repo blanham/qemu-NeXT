@@ -135,6 +135,7 @@ struct FDCtrl {
         FloppyDriveType type;
     } qdev_for_drives[MAX_FD];
     int reset_sensei;
+    int64_t reset_poll_deadline_ns;
     FloppyDriveType fallback; /* type=auto failure fallback */
     /* Timers state */
     uint8_t timer0;

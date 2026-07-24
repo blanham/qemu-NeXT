@@ -53,6 +53,7 @@
 /* debug Floppy devices */
 
 #define DEBUG_FLOPPY 0
+#define FD_RESET_POLL_WINDOW_NS (250 * SCALE_US)
 
 #define FLOPPY_DPRINTF(fmt, ...)                                \
     do {                                                        \
@@ -965,7 +966,9 @@ static int fdc_pre_save(void *opaque)
 static int fdc_pre_load(void *opaque)
 {
     FDCtrl *s = opaque;
+
     s->phase = FD_PHASE_RECONSTRUCT;
+    s->reset_poll_deadline_ns = -1;
     return 0;
 }
 
@@ -978,6 +981,18 @@ static int fdc_post_load(void *opaque, int version_id)
 
     if (s->phase == FD_PHASE_RECONSTRUCT) {
         s->phase = reconstruct_phase(s);
+    }
+    if (s->reset_poll_deadline_ns < 0 &&
+        s->reset_sensei == FD_RESET_SENSEI_COUNT) {
+        /*
+         * Older migration streams carried the reset results but no polling
+         * deadline.  Preserve their suppressible state after resume.
+         */
+        s->reset_poll_deadline_ns =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+            FD_RESET_POLL_WINDOW_NS;
+    } else if (s->reset_poll_deadline_ns < 0) {
+        s->reset_poll_deadline_ns = 0;
     }
 
     return 0;
@@ -997,6 +1012,24 @@ static const VMStateDescription vmstate_fdc_reset_sensei = {
     .needed = fdc_reset_sensei_needed,
     .fields = (const VMStateField[]) {
         VMSTATE_INT32(reset_sensei, FDCtrl),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool fdc_reset_poll_deadline_needed(void *opaque)
+{
+    FDCtrl *s = opaque;
+
+    return s->reset_sensei != 0;
+}
+
+static const VMStateDescription vmstate_fdc_reset_poll_deadline = {
+    .name = "fdc/reset_poll_deadline",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = fdc_reset_poll_deadline_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT64(reset_poll_deadline_ns, FDCtrl),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1077,6 +1110,7 @@ const VMStateDescription vmstate_fdc = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_fdc_reset_sensei,
+        &vmstate_fdc_reset_poll_deadline,
         &vmstate_fdc_result_timer,
         &vmstate_fdc_phase,
         NULL
@@ -1128,6 +1162,7 @@ void fdctrl_reset(FDCtrl *fdctrl, int do_irq)
     fdctrl_set_dma_enabled(fdctrl, fdctrl->dma_chann != -1);
     fdctrl->msr = FD_MSR_RQM;
     fdctrl->reset_sensei = 0;
+    fdctrl->reset_poll_deadline_ns = 0;
     timer_del(fdctrl->result_timer);
     /* FIFO state */
     fdctrl->data_pos = 0;
@@ -1141,6 +1176,9 @@ void fdctrl_reset(FDCtrl *fdctrl, int do_irq)
         fdctrl->status0 |= FD_SR0_RDYCHG;
         fdctrl_raise_irq(fdctrl);
         fdctrl->reset_sensei = FD_RESET_SENSEI_COUNT;
+        fdctrl->reset_poll_deadline_ns =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+            FD_RESET_POLL_WINDOW_NS;
     }
 }
 
@@ -1209,6 +1247,17 @@ static FDrive *get_cur_drv(FDCtrl *fdctrl)
 static uint32_t fdctrl_read_statusA(FDCtrl *fdctrl)
 {
     uint32_t retval = fdctrl->sra;
+    FDrive *cur_drv = get_cur_drv(fdctrl);
+
+    /*
+     * nWP is a live, active-low drive input.  Reflect the attached
+     * backend's current write permission instead of latching it at reset.
+     */
+    if (cur_drv->blk && blk_is_writable(cur_drv->blk)) {
+        retval |= FD_SRA_nWP;
+    } else {
+        retval &= ~FD_SRA_nWP;
+    }
 
     FLOPPY_DPRINTF("status register A: 0x%02x\n", retval);
 
@@ -2103,6 +2152,7 @@ static void fdctrl_handle_sense_interrupt_status(FDCtrl *fdctrl, int direction)
         fdctrl->fifo[0] =
             FD_SR0_RDYCHG + FD_RESET_SENSEI_COUNT - fdctrl->reset_sensei;
         fdctrl->reset_sensei--;
+        fdctrl->reset_poll_deadline_ns = 0;
     } else if (!(fdctrl->sra & FD_SRA_INTPEND)) {
         fdctrl->fifo[0] = FD_SR0_INVCMD;
         fdctrl_to_result_phase(fdctrl, 1);
@@ -2153,9 +2203,16 @@ static void fdctrl_handle_configure(FDCtrl *fdctrl, int direction)
      * An 82077 CONFIGURE with DPOLL issued within 250 us of reset suppresses
      * drive polling and its four pending SENSE INTERRUPT STATUS results.
      */
-    if ((fdctrl->config & FD_CONFIG_DPOLL) && fdctrl->reset_sensei) {
-        fdctrl_reset_irq(fdctrl);
-        fdctrl->reset_sensei = 0;
+    if ((fdctrl->config & FD_CONFIG_DPOLL) &&
+        fdctrl->reset_sensei == FD_RESET_SENSEI_COUNT) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (fdctrl->reset_poll_deadline_ns &&
+            now <= fdctrl->reset_poll_deadline_ns) {
+            fdctrl_reset_irq(fdctrl);
+            fdctrl->reset_sensei = 0;
+        }
+        fdctrl->reset_poll_deadline_ns = 0;
     }
     /* No result back */
     fdctrl_to_command_phase(fdctrl);
