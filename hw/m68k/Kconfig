@@ -17,6 +17,8 @@ config NEXTCUBE
     default y
     depends on M68K
     select FRAMEBUFFER
+    select FDC_SYSBUS
+    select ISA_BUS
     select ESCC
     select EMPTY_SLOT
 
