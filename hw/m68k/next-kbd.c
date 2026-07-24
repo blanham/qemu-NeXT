@@ -449,10 +449,15 @@ static int nextkbd_mouse_delta(int64_t *delta)
 static void nextkbd_sync(DeviceState *dev)
 {
     NextKBDState *s = NEXTKBD(dev);
+    int64_t scaled_dx = s->mouse_dx / 3;
+    int64_t scaled_dy = s->mouse_dy / 3;
 
-    while (s->mouse_dx || s->mouse_dy || s->mouse_button_pending) {
-        int raw_dx = nextkbd_mouse_delta(&s->mouse_dx);
-        int raw_dy = nextkbd_mouse_delta(&s->mouse_dy);
+    s->mouse_dx %= 3;
+    s->mouse_dy %= 3;
+
+    while (scaled_dx || scaled_dy || s->mouse_button_pending) {
+        int raw_dx = nextkbd_mouse_delta(&scaled_dx);
+        int raw_dy = nextkbd_mouse_delta(&scaled_dy);
         uint32_t packet;
 
         packet = 0x11000000 |
@@ -461,6 +466,8 @@ static void nextkbd_sync(DeviceState *dev)
                  ((raw_dx & 0x7f) << 1) |
                  (s->mouse_left ? 0 : 1);
         if (!nextkbd_put_packet(s, packet, false)) {
+            scaled_dx = 0;
+            scaled_dy = 0;
             s->mouse_dx = 0;
             s->mouse_dy = 0;
         }
