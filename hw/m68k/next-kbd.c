@@ -1,25 +1,35 @@
-/*
+/* SPDX-License-Identifier: NCSA
+ *
  * QEMU NeXT Keyboard/Mouse emulation
  *
- * Copyright (c) 2011 Bryce Lanham
+ * Copyright (c) 2011-2026 Bryce Lanham
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal with the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute,
+ * sublicense, and/or sell copies of the Software, and to permit persons to
+ * whom the Software is furnished to do so, subject to the following
+ * conditions:
  *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
+ * Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimers.
+ *
+ * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimers in the
+ * documentation and/or other materials provided with the distribution.
+ *
+ * Neither the names of the University of Illinois/NCSA nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * Software without specific prior written permission.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS WITH THE SOFTWARE.
  */
 
 /*
@@ -29,6 +39,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/m68k/next-cube.h"
 #include "standard-headers/linux/input-event-codes.h"
@@ -41,6 +52,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 /* following definitions from next68k netbsd */
 #define CSR_INT 0x00800000
 #define CSR_DATA 0x00400000
+#define CSR_OVR 0x00200000
+#define CSR_BASE 0xA0109300
 
 #define KD_KEYMASK    0x007f
 #define KD_DIRECTION  0x0080 /* pressed or released */
@@ -66,20 +79,40 @@ struct NextKBDState {
     SysBusDevice sbd;
     MemoryRegion mr;
     QemuInputHandlerState *hs;
+    qemu_irq irq;
     KBDQueue queue;
     uint16_t shift;
+    bool overrun;
 };
 
+static uint32_t nextkbd_csr(NextKBDState *s)
+{
+    uint32_t value = CSR_BASE;
+
+    if (s->queue.count || s->overrun) {
+        value |= CSR_INT;
+    }
+    if (s->queue.count) {
+        value |= CSR_DATA;
+    }
+    if (s->overrun) {
+        value |= CSR_OVR;
+    }
+
+    return value;
+}
 
 /* lots of magic numbers here */
 static uint32_t kbd_read_byte(void *opaque, hwaddr addr)
 {
+    NextKBDState *s = NEXTKBD(opaque);
+
     switch (addr & 0x3) {
     case 0x0:   /* 0xe000 */
-        return 0x80 | 0x20;
+        return nextkbd_csr(s) >> 24;
 
     case 0x1:   /* 0xe001 */
-        return 0x80 | 0x40 | 0x20 | 0x10;
+        return (nextkbd_csr(s) >> 16) & 0xff;
 
     case 0x2:   /* 0xe002 */
         /* returning 0x40 caused mach to hang */
@@ -101,13 +134,14 @@ static uint32_t kbd_read_word(void *opaque, hwaddr addr)
 /* even more magic numbers */
 static uint32_t kbd_read_long(void *opaque, hwaddr addr)
 {
-    int key = 0;
+    uint32_t data;
+    int key;
     NextKBDState *s = NEXTKBD(opaque);
     KBDQueue *q = &s->queue;
 
     switch (addr & 0xf) {
     case 0x0:   /* 0xe000 */
-        return 0xA0F09300;
+        return nextkbd_csr(s);
 
     case 0x8:   /* 0xe008 */
         /* get keycode from buffer */
@@ -123,11 +157,9 @@ static uint32_t kbd_read_long(void *opaque, hwaddr addr)
                 key |= s->shift;
             }
 
-            if (key & 0x80) {
-                return 0;
-            } else {
-                return 0x10000000 | KD_VALID | key;
-            }
+            data = 0x10000000 | KD_VALID | key;
+            qemu_set_irq(s->irq, q->count || s->overrun);
+            return data;
         } else {
             return 0;
         }
@@ -155,6 +187,21 @@ static uint64_t kbd_readfn(void *opaque, hwaddr addr, unsigned size)
 static void kbd_writefn(void *opaque, hwaddr addr, uint64_t value,
                         unsigned size)
 {
+    NextKBDState *s = NEXTKBD(opaque);
+    bool clear_overrun = false;
+
+    if ((addr & 0xf) == 0 && size == 4) {
+        clear_overrun = value & CSR_OVR;
+    } else if ((addr & 0xf) == 0 && size == 2) {
+        clear_overrun = value & (CSR_OVR >> 16);
+    } else if ((addr & 0xf) == 1 && size == 1) {
+        clear_overrun = value & (CSR_OVR >> 16);
+    }
+    if (clear_overrun) {
+        s->overrun = false;
+        qemu_set_irq(s->irq, s->queue.count > 0);
+    }
+
     qemu_log_mask(LOG_UNIMP, "NeXT kbd write: size=%u addr=0x%"HWADDR_PRIx
                   "val=0x%"PRIx64"\n", size, addr, value);
 }
@@ -227,6 +274,8 @@ static void nextkbd_put_keycode(NextKBDState *s, int keycode)
     KBDQueue *q = &s->queue;
 
     if (q->count >= KBD_QUEUE_SIZE) {
+        s->overrun = true;
+        qemu_irq_raise(s->irq);
         return;
     }
 
@@ -236,12 +285,7 @@ static void nextkbd_put_keycode(NextKBDState *s, int keycode)
     }
 
     q->count++;
-
-    /*
-     * might need to actually trigger the NeXT irq, but as the keyboard works
-     * at the moment, I'll worry about it later
-     */
-    /* s->update_irq(s->update_arg, 1); */
+    qemu_irq_raise(s->irq);
 }
 
 static void nextkbd_event(DeviceState *dev, QemuConsole *src,
@@ -296,6 +340,8 @@ static void nextkbd_reset(DeviceState *dev)
 
     memset(&nks->queue, 0, sizeof(KBDQueue));
     nks->shift = 0;
+    nks->overrun = false;
+    qemu_irq_lower(nks->irq);
 }
 
 static void nextkbd_realize(DeviceState *dev, Error **errp)
@@ -304,6 +350,7 @@ static void nextkbd_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->mr, OBJECT(dev), &kbd_ops, s, "next.kbd", 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mr);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
     s->hs = qemu_input_handler_register(dev, &nextkbd_handler);
 }
