@@ -37,10 +37,15 @@ one controller can use the channel at a time.  Floppy reads and writes support
 incremental descriptors and chained transfers through the channel's
 ``NEXT``/``LIMIT`` and ``START``/``STOP`` register pairs.  Descriptor
 completion raises DMA interrupt bit 26; completion of the floppy command
-raises peripheral interrupt bit 7.
+raises peripheral interrupt bit 7.  A staged continuation is not promoted
+when the floppy controller drops its DMA request exactly at the current
+limit, so ROM transfer accounting continues to see the completed data
+buffer.
 
 The floppy controller register block is at ``0x02114100`` and its NeXT media
 control register is at ``0x02114108``.  Attach raw 720 KiB or 1.44 MiB media
 with ``-drive if=floppy,format=raw,file=IMAGE``.  Media capacity is reported
 through the control register.  The guest-visible eject bit is implemented as
-a latch, but it does not remove media from the QEMU block backend.
+a latch, but it does not remove media from the QEMU block backend.  The v66
+ROM's SCSI/floppy control and status window at ``0x02014020``--``0x02014021``
+aliases the operating system window at ``0x02114020``--``0x02114021``.
