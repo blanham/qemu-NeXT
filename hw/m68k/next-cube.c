@@ -30,7 +30,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/clock.h"
 #include "qom/object.h"
-#include "hw/char/escc.h" /* ZILOG 8530 Serial Emulation */
+#include "hw/char/next-serial.h"
 #include "hw/block/fdc.h"
 #include "hw/misc/empty_slot.h"
 #include "hw/core/qdev-properties.h"
@@ -179,8 +179,6 @@ struct NeXTPC {
 
     qemu_irq scsi_reset;
     qemu_irq scsi_dma;
-
-    ESCCState escc;
 
     NeXTRTC rtc;
     qemu_irq rtc_data_irq;
@@ -1297,23 +1295,6 @@ static void next_pc_realize(DeviceState *dev, Error **errp)
     s->scsi_reset = qdev_get_gpio_in(d, 0);
     s->scsi_dma = qdev_get_gpio_in(d, 1);
 
-    /* ESCC */
-    d = DEVICE(&s->escc);
-    qdev_prop_set_uint32(d, "disabled", 0);
-    qdev_prop_set_uint32(d, "frequency", 9600 * 384);
-    qdev_prop_set_uint32(d, "it_shift", 0);
-    qdev_prop_set_bit(d, "bit_swap", true);
-    qdev_prop_set_chr(d, "chrB", serial_hd(1));
-    qdev_prop_set_chr(d, "chrA", serial_hd(0));
-    qdev_prop_set_uint32(d, "chnBtype", escc_serial);
-    qdev_prop_set_uint32(d, "chnAtype", escc_serial);
-
-    sbd = SYS_BUS_DEVICE(d);
-    if (!sysbus_realize(sbd, errp)) {
-        return;
-    }
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(dev, NEXT_SCC_I));
-
     /* RTC */
     d = DEVICE(&s->rtc);
     if (!sysbus_realize(SYS_BUS_DEVICE(d), errp)) {
@@ -1358,10 +1339,6 @@ static void next_pc_init(Object *obj)
     memory_region_init_io(&s->floppy_mem, OBJECT(s), &next_floppy_ops, s,
                           "next.floppy", 4);
     sysbus_init_mmio(sbd, &s->floppy_mem);
-
-    object_initialize_child(obj, "escc", &s->escc, TYPE_ESCC);
-    sysbus_init_mmio(sbd,
-                     sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->escc), 0));
 
     timer_init_ns(&s->system_timer, QEMU_CLOCK_VIRTUAL,
                   next_system_timer_expire, s);
@@ -1504,6 +1481,7 @@ static void next_cube_init(MachineState *machine)
     DeviceState *mbdev;
     DeviceState *memctl_dev;
     DeviceState *pcdev;
+    DeviceState *serial_dev;
     DeviceState *sound_dev;
     int channel;
 
@@ -1540,6 +1518,15 @@ static void next_cube_init(MachineState *machine)
                                                 dma_irq_inputs[channel]));
         }
     }
+
+    /* Serial ports and clock select */
+    serial_dev = qdev_new(TYPE_NEXT_SERIAL);
+    qdev_prop_set_chr(serial_dev, "chrA", serial_hd(0));
+    qdev_prop_set_chr(serial_dev, "chrB", serial_hd(1));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, 0x02118000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(serial_dev), 0,
+                       qdev_get_gpio_in(pcdev, NEXT_SCC_I));
 
     /* Sound output */
     sound_dev = qdev_new(TYPE_NEXT_SOUND);
@@ -1602,15 +1589,9 @@ static void next_cube_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, NEXT_SCSI_BASE);
     /* Floppy */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02114108);
-    /* ESCC */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02118000);
-
-    /* unknown: Serial clock configuration register? */
-    empty_slot_init("next.unknown.2", 0x02118004, 0x10);
-
     /* System timer and event counter */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x02116000);
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 7, 0x0211a000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x02116000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, 0x0211a000);
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",
