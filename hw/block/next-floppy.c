@@ -114,7 +114,7 @@ static void next_floppy_write(void *opaque, hwaddr addr, uint64_t value,
 static const MemoryRegionOps next_floppy_ops = {
     .read = next_floppy_read,
     .write = next_floppy_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
