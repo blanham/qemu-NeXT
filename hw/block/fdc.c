@@ -655,7 +655,7 @@ enum {
 enum {
     FD_CONFIG_PRETRK = 0xff, /* Pre-compensation set to track 0 */
     FD_CONFIG_FIFOTHR = 0x0f, /* FIFO threshold set to 1 byte */
-    FD_CONFIG_POLL  = 0x10, /* Poll enabled */
+    FD_CONFIG_DPOLL = 0x10, /* Disable drive polling */
     FD_CONFIG_EFIFO = 0x20, /* FIFO disabled */
     FD_CONFIG_EIS   = 0x40, /* No implied seeks */
 };
@@ -2149,6 +2149,14 @@ static void fdctrl_handle_configure(FDCtrl *fdctrl, int direction)
 {
     fdctrl->config = fdctrl->fifo[2];
     fdctrl->precomp_trk =  fdctrl->fifo[3];
+    /*
+     * An 82077 CONFIGURE with DPOLL issued within 250 us of reset suppresses
+     * drive polling and its four pending SENSE INTERRUPT STATUS results.
+     */
+    if ((fdctrl->config & FD_CONFIG_DPOLL) && fdctrl->reset_sensei) {
+        fdctrl_reset_irq(fdctrl);
+        fdctrl->reset_sensei = 0;
+    }
     /* No result back */
     fdctrl_to_command_phase(fdctrl);
 }

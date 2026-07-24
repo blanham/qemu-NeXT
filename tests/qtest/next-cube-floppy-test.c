@@ -35,6 +35,7 @@
 #include "qobject/qdict.h"
 
 #define NEXT_FDC_BASE          0x02114100
+#define NEXT_FDC_SRA           (NEXT_FDC_BASE + 0)
 #define NEXT_FDC_DOR           (NEXT_FDC_BASE + 2)
 #define NEXT_FDC_MSR_DSR       (NEXT_FDC_BASE + 4)
 #define NEXT_FDC_FIFO          (NEXT_FDC_BASE + 5)
@@ -79,6 +80,7 @@
 #define NEXT_ROM_SIZE          (128 * 1024)
 #define NEXT_FLOPPY_SIZE       1474560
 #define NEXT_SECTOR_SIZE       512
+#define NEXT_ROM_RESET_HOLD_NS (250 * 1000)
 #define NEXT_DMA_BUFFER        0x04010000
 #define NEXT_POLL_LIMIT        10000
 #define NEXT_RESET_POLL_STEPS  256
@@ -411,6 +413,53 @@ static void test_rom_scsi_dma_control_alias(void)
 
     qtest_writeb(qts, NEXT_SCSI_STATUS, 0x3c);
     g_assert_cmphex(qtest_readb(qts, NEXT_ROM_SCSI_STATUS), ==, 0x3c);
+
+    qtest_quit(qts);
+}
+
+static void test_rom_reset_configure_recalibrate(void)
+{
+    static const uint8_t configure[] = { 0x13, 0x00, 0x58, 0x00 };
+    static const uint8_t specify_2880k[] = { 0x03, 0xa4, 0x20 };
+    static const uint8_t specify_720k[] = { 0x03, 0xe1, 0x08 };
+    static const uint8_t recalibrate[] = { 0x07, 0x00 };
+    static const uint8_t sense[] = { 0x08 };
+    static const uint8_t recalibrate_result[] = { 0x20, 0x00 };
+    TestFixture *fixture = fixture_new();
+    QTestState *qts;
+
+    assert_controller_mapped(fixture);
+    qts = next_cube_start(fixture, true);
+
+    /*
+     * NeXT ROM fc_82077_reset(): CONFIGURE within 250 us suppresses the
+     * controller's reset polling interrupt before the ROM installs its
+     * interrupt handler.
+     */
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x00);
+    qtest_clock_step(qts, NEXT_ROM_RESET_HOLD_NS);
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x04);
+    qtest_writeb(qts, NEXT_FDC_MSR_DSR, 0x00);
+    qtest_writeb(qts, NEXT_FDC_CCR, 0x00);
+    qtest_writeb(qts, NEXT_FLOPPY_CONTROL, 0x40);
+    fdc_send_command(qts, configure, sizeof(configure));
+    fdc_send_command(qts, specify_2880k, sizeof(specify_2880k));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_FLOPPY_IRQ, ==, 0);
+
+    /*
+     * fd_attach() changes to 720K timing, starts the motor, recalibrates,
+     * and services the seek interrupt with SENSE INTERRUPT STATUS.
+     */
+    fdc_send_command(qts, configure, sizeof(configure));
+    fdc_send_command(qts, specify_720k, sizeof(specify_720k));
+    qtest_writeb(qts, NEXT_FDC_DOR, 0x14);
+    fdc_send_command(qts, recalibrate, sizeof(recalibrate));
+    wait_interrupts(qts, NEXT_FLOPPY_IRQ, NEXT_FLOPPY_IRQ,
+                    "ROM recalibrate interrupt");
+    fdc_send_command(qts, sense, sizeof(sense));
+    fdc_read_result(qts, recalibrate_result, sizeof(recalibrate_result));
+    g_assert_cmphex(qtest_readb(qts, NEXT_FDC_SRA) & 0x10, ==, 0);
 
     qtest_quit(qts);
 }
@@ -789,6 +838,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/floppy/controller-and-media",
                    test_controller_and_media);
+    qtest_add_func("/next-cube/floppy/rom-reset-configure-recalibrate",
+                   test_rom_reset_configure_recalibrate);
     qtest_add_func("/next-cube/floppy/rom-scsi-dma-control-alias",
                    test_rom_scsi_dma_control_alias);
     qtest_add_func("/next-cube/floppy/media-to-ram-dma",
