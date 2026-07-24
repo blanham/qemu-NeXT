@@ -34,7 +34,9 @@
 #include "hw/dma/next-dma.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "hw/isa/isa.h"
 #include "migration/vmstate.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
@@ -69,6 +71,8 @@
 
 #define NEXT_DMA_SCSI_BEAT        16
 #define NEXT_DMA_SCSI_FLUSH_EDGES 4
+#define NEXT_DMA_SCSI_DMAMODE     0x10
+#define NEXT_DMA_SCSI_DMAREAD     0x08
 
 #define NEXT_DMA_ENET_ADDR_MASK   0x0fffffff
 #define NEXT_DMA_ENTX_EOP         0x80000000
@@ -106,6 +110,7 @@ typedef struct NextDMAChannelDesc {
 } NextDMAChannelDesc;
 
 static const NextDMAChannelDesc next_dma_channels[NEXT_DMA_CHANNEL_COUNT] = {
+    /* The physical channel is shared by the SCSI and floppy controllers. */
     [NEXT_DMA_SCSI] = {
         "scsi", 0x010, 26, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_SCSI,
     },
@@ -180,7 +185,22 @@ struct NextDMAState {
     bool rx_keep_enabled;
     QEMUTimer video_retrace_timer;
     NextDMATraceReadSampler trace_scsi_dma_read;
+    IsaDmaTransferHandler floppy_transfer_handler;
+    void *floppy_transfer_opaque;
+    QEMUBH *floppy_bh;
+    int32_t floppy_dma_position;
+    int32_t floppy_callback_position;
+    uint32_t floppy_callback_address;
+    uint32_t floppy_callback_limit;
+    uint8_t scsi_control;
+    bool floppy_selected;
+    bool floppy_dreq;
+    bool floppy_in_callback;
+    bool floppy_running;
+    bool floppy_reschedule;
 };
+
+static void next_dma_floppy_schedule_request(NextDMAState *s);
 
 static int next_dma_trace_int(size_t value)
 {
@@ -613,6 +633,7 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
 
     if (resolved.channel == NEXT_DMA_SCSI) {
         next_dma_trace_scsi_register_write(s, addr, value);
+        next_dma_floppy_schedule_request(s);
     }
     if (resolved.channel == NEXT_DMA_ENRX &&
         resolved.reg != NEXT_DMA_REGISTER_CSR) {
@@ -673,6 +694,235 @@ static uint32_t next_dma_begin_scsi_transfer(NextDMAChannelState *c)
         c->next_initbuf_valid = false;
     }
     return c->next;
+}
+
+static void next_dma_floppy_error(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+
+    c->csr |= NEXT_DMA_CSR_BUSEXC | NEXT_DMA_CSR_COMPLETE;
+    c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+    next_dma_update_irq(s, NEXT_DMA_SCSI);
+}
+
+static bool next_dma_floppy_gates_open(const NextDMAState *s)
+{
+    const NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+    bool dma_read = c->csr & NEXT_DMA_CSR_READ;
+
+    return s->floppy_dreq &&
+           s->floppy_selected &&
+           (s->scsi_control & NEXT_DMA_SCSI_DMAMODE) &&
+           (!!(s->scsi_control & NEXT_DMA_SCSI_DMAREAD) == dma_read) &&
+           (c->csr & NEXT_DMA_CSR_ENABLE) &&
+           !(c->csr & NEXT_DMA_CSR_COMPLETE);
+}
+
+static void next_dma_floppy_schedule_request(NextDMAState *s)
+{
+    if (!s->floppy_dreq || !s->floppy_bh) {
+        return;
+    }
+    if (s->floppy_running) {
+        s->floppy_reschedule = true;
+        return;
+    }
+    qemu_bh_schedule(s->floppy_bh);
+}
+
+void next_dma_set_scsi_control(NextDMAState *s, uint8_t control)
+{
+    s->scsi_control = control;
+    next_dma_floppy_schedule_request(s);
+}
+
+void next_dma_set_floppy_selected(NextDMAState *s, bool selected)
+{
+    s->floppy_selected = selected;
+    next_dma_floppy_schedule_request(s);
+}
+
+static bool next_dma_floppy_channel_valid(int nchan)
+{
+    return nchan == NEXT_DMA_SCSI;
+}
+
+static bool next_dma_floppy_has_autoinitialization(IsaDma *obj, int nchan)
+{
+    g_assert(next_dma_floppy_channel_valid(nchan));
+    return false;
+}
+
+static int next_dma_floppy_memory(IsaDma *obj, int nchan, void *buf, int pos,
+                                  int len, bool write)
+{
+    NextDMAState *s = NEXT_DMA(obj);
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+    uint64_t relative;
+    uint64_t address;
+    bool dma_read = c->csr & NEXT_DMA_CSR_READ;
+    MemTxResult result;
+
+    g_assert(next_dma_floppy_channel_valid(nchan));
+    if (!s->floppy_in_callback || !buf || pos < s->floppy_callback_position ||
+        len < 0 || write != dma_read) {
+        next_dma_floppy_error(s);
+        return 0;
+    }
+
+    relative = (uint32_t)(pos - s->floppy_callback_position);
+    address = (uint64_t)s->floppy_callback_address + relative;
+    if (relative > s->floppy_callback_limit - s->floppy_callback_address ||
+        (uint64_t)len >
+        s->floppy_callback_limit - s->floppy_callback_address - relative ||
+        address > UINT32_MAX ||
+        !address_space_access_valid(s->as, address, len, write,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+        next_dma_floppy_error(s);
+        return 0;
+    }
+
+    if (write) {
+        result = address_space_write(s->as, address, MEMTXATTRS_UNSPECIFIED,
+                                     buf, len);
+    } else {
+        result = address_space_read(s->as, address, MEMTXATTRS_UNSPECIFIED,
+                                    buf, len);
+    }
+    if (result != MEMTX_OK) {
+        next_dma_floppy_error(s);
+        return 0;
+    }
+    return len;
+}
+
+static int next_dma_floppy_read_memory(IsaDma *obj, int nchan, void *buf,
+                                       int pos, int len)
+{
+    return next_dma_floppy_memory(obj, nchan, buf, pos, len, false);
+}
+
+static int next_dma_floppy_write_memory(IsaDma *obj, int nchan, void *buf,
+                                        int pos, int len)
+{
+    return next_dma_floppy_memory(obj, nchan, buf, pos, len, true);
+}
+
+static void next_dma_floppy_hold_dreq(IsaDma *obj, int nchan)
+{
+    NextDMAState *s = NEXT_DMA(obj);
+
+    g_assert(next_dma_floppy_channel_valid(nchan));
+    if (!s->floppy_dreq) {
+        s->floppy_dma_position = 0;
+        s->floppy_dreq = true;
+    }
+    next_dma_floppy_schedule_request(s);
+}
+
+static void next_dma_floppy_release_dreq(IsaDma *obj, int nchan)
+{
+    NextDMAState *s = NEXT_DMA(obj);
+
+    g_assert(next_dma_floppy_channel_valid(nchan));
+    s->floppy_dreq = false;
+    s->floppy_dma_position = 0;
+}
+
+static void next_dma_floppy_schedule(IsaDma *obj)
+{
+    next_dma_floppy_schedule_request(NEXT_DMA(obj));
+}
+
+static void next_dma_floppy_register_channel(
+    IsaDma *obj, int nchan, IsaDmaTransferHandler transfer_handler,
+    void *opaque)
+{
+    NextDMAState *s = NEXT_DMA(obj);
+
+    g_assert(next_dma_floppy_channel_valid(nchan));
+    s->floppy_transfer_handler = transfer_handler;
+    s->floppy_transfer_opaque = opaque;
+}
+
+static void next_dma_floppy_run(void *opaque)
+{
+    NextDMAState *s = opaque;
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+    uint32_t descriptor_start;
+    uint32_t descriptor_length;
+    int callback_start;
+    int callback_end;
+    int new_position;
+    uint32_t moved;
+
+    if (s->floppy_running) {
+        s->floppy_reschedule = true;
+        return;
+    }
+    s->floppy_running = true;
+    s->floppy_reschedule = false;
+
+    if (!next_dma_floppy_gates_open(s)) {
+        goto out;
+    }
+
+    descriptor_start = c->next_initbuf_valid ? c->next_initbuf : c->next;
+    if ((descriptor_start & 3) || (c->limit & 15) || (c->stop & 15) ||
+        descriptor_start >= c->limit) {
+        next_dma_floppy_error(s);
+        goto out;
+    }
+    descriptor_length = c->limit - descriptor_start;
+    callback_start = s->floppy_dma_position;
+    if (!s->floppy_transfer_handler || callback_start < 0 ||
+        descriptor_length > INT_MAX ||
+        callback_start > INT_MAX - (int)descriptor_length ||
+        !address_space_access_valid(s->as, descriptor_start,
+                                    descriptor_length,
+                                    c->csr & NEXT_DMA_CSR_READ,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+        next_dma_floppy_error(s);
+        goto out;
+    }
+    callback_end = callback_start + descriptor_length;
+
+    c->next = descriptor_start;
+    c->next_initbuf_valid = false;
+    s->floppy_callback_position = callback_start;
+    s->floppy_callback_address = descriptor_start;
+    s->floppy_callback_limit = c->limit;
+    s->floppy_in_callback = true;
+    new_position = s->floppy_transfer_handler(s->floppy_transfer_opaque,
+                                               NEXT_DMA_SCSI,
+                                               callback_start,
+                                               callback_end);
+    s->floppy_in_callback = false;
+
+    if (c->csr & NEXT_DMA_CSR_BUSEXC) {
+        goto out;
+    }
+    if (new_position < callback_start || new_position > callback_end) {
+        next_dma_floppy_error(s);
+        goto out;
+    }
+
+    moved = new_position - callback_start;
+    c->next += moved;
+    if (s->floppy_dreq) {
+        s->floppy_dma_position = new_position;
+    }
+    if (c->next == c->limit) {
+        next_dma_complete_segment(s, NEXT_DMA_SCSI);
+    }
+
+out:
+    s->floppy_in_callback = false;
+    s->floppy_running = false;
+    if (s->floppy_reschedule) {
+        s->floppy_reschedule = false;
+        next_dma_floppy_schedule_request(s);
+    }
 }
 
 static bool next_dma_scsi_beat_fits(const NextDMAChannelState *c)
@@ -1142,9 +1392,20 @@ static void next_dma_reset_hold(Object *obj, ResetType type)
     NextDMAState *s = NEXT_DMA(obj);
     int channel;
 
+    qemu_bh_cancel(s->floppy_bh);
     memset(s->channel, 0, sizeof(s->channel));
     memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
     s->rx_keep_enabled = false;
+    s->floppy_dma_position = 0;
+    s->floppy_callback_position = 0;
+    s->floppy_callback_address = 0;
+    s->floppy_callback_limit = 0;
+    s->scsi_control = 0;
+    s->floppy_selected = false;
+    s->floppy_dreq = false;
+    s->floppy_in_callback = false;
+    s->floppy_running = false;
+    s->floppy_reschedule = false;
     timer_del(&s->video_retrace_timer);
 
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
@@ -1158,6 +1419,9 @@ static int next_dma_post_load(void *opaque, int version_id)
     NextDMAState *s = opaque;
     int channel;
 
+    if (s->floppy_dma_position < 0) {
+        return -EINVAL;
+    }
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
         NextDMAChannelState *c = &s->channel[channel];
 
@@ -1183,6 +1447,15 @@ static int next_dma_post_load(void *opaque, int version_id)
     s->rx_ready = false;
     s->rx_keep_enabled = false;
     next_dma_recompute_rx_ready(s);
+    s->floppy_callback_position = 0;
+    s->floppy_callback_address = 0;
+    s->floppy_callback_limit = 0;
+    s->floppy_in_callback = false;
+    s->floppy_running = false;
+    s->floppy_reschedule = false;
+    if (s->floppy_dreq && next_dma_floppy_gates_open(s)) {
+        next_dma_floppy_schedule_request(s);
+    }
 
     return 0;
 }
@@ -1214,7 +1487,7 @@ static const VMStateDescription vmstate_next_dma_channel = {
 static const VMStateDescription vmstate_next_dma = {
     .name = "next-dma",
     .priority = MIG_PRI_LOW,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = next_dma_post_load,
     .fields = (const VMStateField[]) {
@@ -1222,6 +1495,10 @@ static const VMStateDescription vmstate_next_dma = {
                              vmstate_next_dma_channel,
                              NextDMAChannelState),
         VMSTATE_TIMER_V(video_retrace_timer, NextDMAState, 2),
+        VMSTATE_INT32_V(floppy_dma_position, NextDMAState, 3),
+        VMSTATE_UINT8_V(scsi_control, NextDMAState, 3),
+        VMSTATE_BOOL_V(floppy_selected, NextDMAState, 3),
+        VMSTATE_BOOL_V(floppy_dreq, NextDMAState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1238,19 +1515,36 @@ static void next_dma_init(Object *obj)
     sysbus_init_mmio(sbd, &s->mmio);
     timer_init_ns(&s->video_retrace_timer, QEMU_CLOCK_VIRTUAL,
                   next_dma_video_retrace, s);
+    s->floppy_bh = qemu_bh_new(next_dma_floppy_run, s);
 
     for (i = 0; i < NEXT_DMA_CHANNEL_COUNT; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
     }
 }
 
+static void next_dma_finalize(Object *obj)
+{
+    NextDMAState *s = NEXT_DMA(obj);
+
+    qemu_bh_delete(s->floppy_bh);
+}
+
 static void next_dma_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    IsaDmaClass *idc = ISADMA_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->vmsd = &vmstate_next_dma;
     rc->phases.hold = next_dma_reset_hold;
+    idc->has_autoinitialization =
+        next_dma_floppy_has_autoinitialization;
+    idc->read_memory = next_dma_floppy_read_memory;
+    idc->write_memory = next_dma_floppy_write_memory;
+    idc->hold_DREQ = next_dma_floppy_hold_dreq;
+    idc->release_DREQ = next_dma_floppy_release_dreq;
+    idc->schedule = next_dma_floppy_schedule;
+    idc->register_channel = next_dma_floppy_register_channel;
 }
 
 static const TypeInfo next_dma_info = {
@@ -1258,7 +1552,12 @@ static const TypeInfo next_dma_info = {
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(NextDMAState),
     .instance_init = next_dma_init,
+    .instance_finalize = next_dma_finalize,
     .class_init = next_dma_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_ISADMA },
+        { }
+    },
 };
 
 static void next_dma_register_types(void)

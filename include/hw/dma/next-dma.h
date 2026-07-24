@@ -70,6 +70,8 @@ void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len);
 void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len);
 void next_dma_scsi_fifo_reset(NextDMAState *s);
 void next_dma_scsi_fifo_flush(NextDMAState *s);
+void next_dma_set_scsi_control(NextDMAState *s, uint8_t control);
+void next_dma_set_floppy_selected(NextDMAState *s, bool selected);
 
 NextDMAResult next_dma_sound_out_read(NextDMAState *s, uint8_t *samples,
                                       size_t capacity, size_t *length);
