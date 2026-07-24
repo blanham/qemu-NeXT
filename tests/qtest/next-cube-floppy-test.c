@@ -613,6 +613,63 @@ static void test_chained_media_to_ram_dma(void)
     qtest_quit(qts);
 }
 
+static void test_chained_scan_equal_compares_full_sector(void)
+{
+    static const uint8_t scan_command[] = {
+        0x51, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1b, 0xff,
+    };
+    static const uint8_t expected_result[] = {
+        0x20, 0x00, 0x04, 0x01, 0x00, 0x01, 0x02,
+    };
+    TestFixture *fixture = fixture_new();
+    uint8_t compare[NEXT_SECTOR_SIZE];
+    QTestState *qts;
+
+    memcpy(compare, fixture->disk_pattern, sizeof(compare));
+    compare[300] ^= 0xff;
+
+    assert_controller_mapped(fixture);
+    qts = next_cube_start(fixture, true);
+    prepare_dma_fdc(qts);
+    qtest_memwrite(qts, NEXT_DMA_BUFFER, compare, sizeof(compare));
+
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET);
+    qtest_writel(qts, NEXT_DMA_NEXT_INIT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 256);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_DMA_BUFFER + 256);
+    qtest_writel(qts, NEXT_DMA_STOP,
+                 NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
+    qtest_writel(qts, NEXT_DMA_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE);
+
+    fdc_send_command(qts, scan_command, sizeof(scan_command));
+    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x10);
+    wait_dma_state(qts, DMA_COMPLETE, DMA_COMPLETE,
+                   "first chained SCAN segment");
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + 256);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
+                    DMA_ENABLE | DMA_COMPLETE);
+    assert_relevant_interrupts(qts, NEXT_SCSI_DMA_IRQ);
+    g_assert_cmphex(qtest_readb(qts, NEXT_FDC_MSR_DSR) &
+                    (FDC_MSR_RQM | FDC_MSR_DIO), ==, 0);
+
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_CLRCOMPLETE);
+    wait_dma_state(qts, DMA_COMPLETE, DMA_COMPLETE,
+                   "final chained SCAN segment");
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
+                    DMA_COMPLETE);
+    wait_interrupts(qts, NEXT_RELEVANT_IRQS, NEXT_RELEVANT_IRQS,
+                    "final SCAN and shared-DMA interrupts");
+    fdc_read_result(qts, expected_result, sizeof(expected_result));
+
+    qtest_quit(qts);
+}
+
 static void test_migrate_pending_gated_dma_request(void)
 {
     static const uint8_t read_command[] = {
@@ -711,6 +768,8 @@ int main(int argc, char **argv)
                    test_reset_cancels_gated_dma_request);
     qtest_add_func("/next-cube/floppy/chained-media-to-ram-dma",
                    test_chained_media_to_ram_dma);
+    qtest_add_func("/next-cube/floppy/chained-scan-equal-full-sector",
+                   test_chained_scan_equal_compares_full_sector);
     qtest_add_func("/next-cube/floppy/migrate-pending-gated-dma-request",
                    test_migrate_pending_gated_dma_request);
 

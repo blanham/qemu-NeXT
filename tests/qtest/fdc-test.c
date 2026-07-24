@@ -36,6 +36,15 @@
 #define FLOPPY_BASE 0x3f0
 #define FLOPPY_IRQ 6
 
+#define DMA_CHANNEL_2_ADDR  0x04
+#define DMA_CHANNEL_2_COUNT 0x05
+#define DMA_CHANNEL_MASK    0x0a
+#define DMA_CHANNEL_MODE    0x0b
+#define DMA_CLEAR_FF        0x0c
+#define DMA_CHANNEL_2_PAGE  0x81
+#define DMA_BUFFER          0x10000
+#define DMA_TEST_SIZE       256
+
 enum {
     reg_sra         = 0x0,
     reg_srb         = 0x1,
@@ -531,6 +540,122 @@ static void test_verify(void)
     g_assert(ret == 0);
 }
 
+static void test_dma_terminal_count_completes_transfer(void)
+{
+    static const uint8_t read_command[] = {
+        0x46, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1b, 0xff,
+    };
+    uint8_t received[DMA_TEST_SIZE];
+    uint8_t msr = 0;
+    unsigned int i;
+
+    qtest_qmp_assert_success(global_qtest,
+                             "{'execute':'eject', 'arguments':{"
+                             " 'id':'floppy0' }}");
+    qtest_qmp_assert_success(
+        global_qtest,
+        "{'execute':'blockdev-change-medium', 'arguments':{"
+        " 'id':'floppy0', 'filename': %s, 'format': 'raw' }}",
+        test_image);
+    send_seek(1);
+    send_seek(0);
+    qtest_memset(global_qtest, DMA_BUFFER, 0xa5, DMA_TEST_SIZE);
+
+    /* Program ISA DMA channel 2 for a short device-to-memory transfer. */
+    outb(DMA_CHANNEL_MASK, 0x06);
+    outb(DMA_CLEAR_FF, 0);
+    outb(DMA_CHANNEL_2_ADDR, DMA_BUFFER & 0xff);
+    outb(DMA_CHANNEL_2_ADDR, (DMA_BUFFER >> 8) & 0xff);
+    outb(DMA_CHANNEL_2_PAGE, DMA_BUFFER >> 16);
+    outb(DMA_CLEAR_FF, 0);
+    outb(DMA_CHANNEL_2_COUNT, (DMA_TEST_SIZE - 1) & 0xff);
+    outb(DMA_CHANNEL_2_COUNT, (DMA_TEST_SIZE - 1) >> 8);
+    outb(DMA_CHANNEL_MODE, 0x46);
+    outb(DMA_CHANNEL_MASK, 0x02);
+
+    outb(FLOPPY_BASE + reg_dor,
+         inb(FLOPPY_BASE + reg_dor) | 0x0c);
+    for (i = 0; i < ARRAY_SIZE(read_command); i++) {
+        floppy_send(read_command[i]);
+    }
+
+    for (i = 0; i < 10000; i++) {
+        msr = inb(FLOPPY_BASE + reg_msr);
+        if (msr == (BUSY | RQM | DIO)) {
+            break;
+        }
+    }
+    g_assert_cmphex(msr, ==, BUSY | RQM | DIO);
+    g_assert(get_irq(FLOPPY_IRQ));
+
+    for (i = 0; i < 7; i++) {
+        floppy_recv();
+    }
+    g_assert(!get_irq(FLOPPY_IRQ));
+
+    qtest_memread(global_qtest, DMA_BUFFER, received, sizeof(received));
+    for (i = 0; i < sizeof(received); i++) {
+        g_assert_cmphex(received[i], ==, 0);
+    }
+    outb(DMA_CHANNEL_MASK, 0x06);
+}
+
+static void test_dma_terminal_count_preserves_scan_result(void)
+{
+    static const uint8_t scan_command[] = {
+        0x51, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1b, 0xff,
+    };
+    uint8_t result[7];
+    uint8_t msr = 0;
+    unsigned int i;
+
+    qtest_qmp_assert_success(global_qtest,
+                             "{'execute':'eject', 'arguments':{"
+                             " 'id':'floppy0' }}");
+    qtest_qmp_assert_success(
+        global_qtest,
+        "{'execute':'blockdev-change-medium', 'arguments':{"
+        " 'id':'floppy0', 'filename': %s, 'format': 'raw' }}",
+        test_image);
+    send_seek(1);
+    send_seek(0);
+    qtest_memset(global_qtest, DMA_BUFFER, 0, DMA_TEST_SIZE);
+
+    /* Program ISA DMA channel 2 for a short memory-to-device transfer. */
+    outb(DMA_CHANNEL_MASK, 0x06);
+    outb(DMA_CLEAR_FF, 0);
+    outb(DMA_CHANNEL_2_ADDR, DMA_BUFFER & 0xff);
+    outb(DMA_CHANNEL_2_ADDR, (DMA_BUFFER >> 8) & 0xff);
+    outb(DMA_CHANNEL_2_PAGE, DMA_BUFFER >> 16);
+    outb(DMA_CLEAR_FF, 0);
+    outb(DMA_CHANNEL_2_COUNT, (DMA_TEST_SIZE - 1) & 0xff);
+    outb(DMA_CHANNEL_2_COUNT, (DMA_TEST_SIZE - 1) >> 8);
+    outb(DMA_CHANNEL_MODE, 0x4a);
+    outb(DMA_CHANNEL_MASK, 0x02);
+
+    outb(FLOPPY_BASE + reg_dor,
+         inb(FLOPPY_BASE + reg_dor) | 0x0c);
+    for (i = 0; i < ARRAY_SIZE(scan_command); i++) {
+        floppy_send(scan_command[i]);
+    }
+
+    for (i = 0; i < 10000; i++) {
+        msr = inb(FLOPPY_BASE + reg_msr);
+        if (msr == (BUSY | RQM | DIO)) {
+            break;
+        }
+    }
+    g_assert_cmphex(msr, ==, BUSY | RQM | DIO);
+    g_assert(get_irq(FLOPPY_IRQ));
+
+    for (i = 0; i < ARRAY_SIZE(result); i++) {
+        result[i] = floppy_recv();
+    }
+    g_assert_cmphex(result[2], ==, 0x08);
+    g_assert(!get_irq(FLOPPY_IRQ));
+    outb(DMA_CHANNEL_MASK, 0x06);
+}
+
 /* success if no crash or abort */
 static void fuzz_registers(void)
 {
@@ -627,6 +752,10 @@ int main(int argc, char **argv)
     qtest_add_func("/fdc/read_id", test_read_id);
     qtest_add_func("/fdc/verify", test_verify);
     qtest_add_func("/fdc/media_insert", test_media_insert);
+    qtest_add_func("/fdc/dma-terminal-count-completes-transfer",
+                   test_dma_terminal_count_completes_transfer);
+    qtest_add_func("/fdc/dma-terminal-count-preserves-scan-result",
+                   test_dma_terminal_count_preserves_scan_result);
     qtest_add_func("/fdc/read_no_dma_1", test_read_no_dma_1);
     qtest_add_func("/fdc/read_no_dma_18", test_read_no_dma_18);
     qtest_add_func("/fdc/read_no_dma_19", test_read_no_dma_19);

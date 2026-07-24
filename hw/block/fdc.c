@@ -600,8 +600,11 @@ enum {
 };
 
 enum {
-    FD_STATE_MULTI  = 0x01, /* multi track flag */
-    FD_STATE_FORMAT = 0x02, /* format flag */
+    FD_STATE_MULTI    = 0x01, /* multi track flag */
+    FD_STATE_FORMAT   = 0x02, /* format flag */
+    FD_STATE_SCAN_LT  = 0x04,
+    FD_STATE_SCAN_GT  = 0x08,
+    FD_STATE_SCAN_CMP = FD_STATE_SCAN_LT | FD_STATE_SCAN_GT,
 };
 
 enum {
@@ -1544,6 +1547,7 @@ static void fdctrl_start_transfer(FDCtrl *fdctrl, int direction)
         fdctrl->data_state |= FD_STATE_MULTI;
     else
         fdctrl->data_state &= ~FD_STATE_MULTI;
+    fdctrl->data_state &= ~FD_STATE_SCAN_CMP;
     if (fdctrl->fifo[5] == 0) {
         fdctrl->data_len = fdctrl->fifo[8];
     } else {
@@ -1612,6 +1616,7 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
     FDCtrl *fdctrl;
     FDrive *cur_drv;
     int dma_cursor, len, moved, rel_pos;
+    bool scan_command;
     bool transfer_done = false;
     uint8_t status0 = 0x00, status1 = 0x00, status2 = 0x00;
     IsaDmaClass *k;
@@ -1623,9 +1628,12 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
     }
     k = ISADMA_GET_CLASS(fdctrl->dma);
     cur_drv = get_cur_drv(fdctrl);
-    if (fdctrl->data_dir == FD_DIR_SCANE || fdctrl->data_dir == FD_DIR_SCANL ||
-        fdctrl->data_dir == FD_DIR_SCANH)
+    scan_command = fdctrl->data_dir == FD_DIR_SCANE ||
+                   fdctrl->data_dir == FD_DIR_SCANL ||
+                   fdctrl->data_dir == FD_DIR_SCANH;
+    if (scan_command) {
         status2 = FD_SR2_SNS;
+    }
     if (dma_pos < 0 || dma_len < dma_pos) {
         FLOPPY_DPRINTF("Invalid DMA range: %d..%d\n", dma_pos, dma_len);
         fdctrl_stop_transfer(fdctrl, FD_SR0_ABNTERM, FD_SR1_MA, 0x00);
@@ -1704,20 +1712,10 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
                     break;
                 }
                 ret = memcmp(tmpbuf, fdctrl->fifo + rel_pos, moved);
-                if (ret == 0) {
-                    fdctrl->data_pos += moved;
-                    dma_cursor += moved;
-                    status2 = FD_SR2_SEH;
-                    transfer_done = true;
-                    goto end_transfer;
-                }
-                if ((ret < 0 && fdctrl->data_dir == FD_DIR_SCANL) ||
-                    (ret > 0 && fdctrl->data_dir == FD_DIR_SCANH)) {
-                    fdctrl->data_pos += moved;
-                    dma_cursor += moved;
-                    status2 = 0x00;
-                    transfer_done = true;
-                    goto end_transfer;
+                if (!(fdctrl->data_state & FD_STATE_SCAN_CMP) && ret) {
+                    fdctrl->data_state |= ret < 0 ?
+                                          FD_STATE_SCAN_LT :
+                                          FD_STATE_SCAN_GT;
                 }
             }
             break;
@@ -1748,6 +1746,21 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
 
         rel_pos = fdctrl->data_pos % FD_SECTOR_LEN;
         if (rel_pos == 0) {
+            if (scan_command) {
+                bool equal = !(fdctrl->data_state & FD_STATE_SCAN_CMP);
+                bool scan_hit = equal ||
+                    (fdctrl->data_dir == FD_DIR_SCANL &&
+                     (fdctrl->data_state & FD_STATE_SCAN_LT)) ||
+                    (fdctrl->data_dir == FD_DIR_SCANH &&
+                     (fdctrl->data_state & FD_STATE_SCAN_GT));
+
+                if (scan_hit) {
+                    status2 = equal ? FD_SR2_SEH : 0x00;
+                    transfer_done = true;
+                    break;
+                }
+                fdctrl->data_state &= ~FD_STATE_SCAN_CMP;
+            }
             /* Seek to next sector */
             if (!fdctrl_seek_to_next_sect(fdctrl, cur_drv)) {
                 transfer_done = true;
@@ -1760,16 +1773,23 @@ int fdctrl_transfer_handler(void *opaque, int nchan, int dma_pos, int dma_len)
     }
 
     transfer_done |= fdctrl->data_pos == fdctrl->data_len;
- end_transfer:
+    if (!transfer_done && dma_cursor == dma_len &&
+        !fdctrl->dma_resumable) {
+        /*
+         * The ISA DMA controller has no descriptor chaining protocol.
+         * Terminal count therefore ends the FDC command even when the guest
+         * programmed less DMA than the command requested.
+         */
+        transfer_done = true;
+        if (scan_command) {
+            status2 = FD_SR2_SEH;
+        }
+    }
     FLOPPY_DPRINTF("end transfer %d %d %d\n",
                    fdctrl->data_pos, dma_cursor - dma_pos, fdctrl->data_len);
     if (!transfer_done) {
         return dma_cursor;
     }
-    if (fdctrl->data_dir == FD_DIR_SCANE ||
-        fdctrl->data_dir == FD_DIR_SCANL ||
-        fdctrl->data_dir == FD_DIR_SCANH)
-        status2 = FD_SR2_SEH;
     fdctrl_stop_transfer(fdctrl, status0, status1, status2);
 
     return dma_cursor;

@@ -198,14 +198,6 @@ static void sysbus_fdc_common_instance_init(Object *obj)
     FDCtrlSysBus *sys = SYSBUS_FDC(obj);
     FDCtrl *fdctrl = &sys->state;
 
-    /*
-     * DMA is not currently supported for sysbus floppy controllers.
-     * If we wanted to add support then probably the best approach is
-     * to have a QOM link property 'dma-controller' which the board
-     * code can set to an instance of IsaDmaClass, and an integer
-     * property 'dma-channel', so that we can set fdctrl->dma and
-     * fdctrl->dma_chann accordingly.
-     */
     fdctrl->dma_chann = -1;
 
     qdev_set_legacy_instance_id(dev, 0 /* io */, 2); /* FIXME */
@@ -243,6 +235,7 @@ static void sysbus_fdc_realize(DeviceState *dev, Error **errp)
     }
 
     if (fdctrl->dma) {
+        fdctrl->dma_resumable = true;
         k = ISADMA_GET_CLASS(fdctrl->dma);
         k->register_channel(fdctrl->dma, fdctrl->dma_chann,
                             fdctrl_transfer_handler, fdctrl);
