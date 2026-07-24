@@ -36,6 +36,7 @@
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "trace.h"
 
@@ -77,6 +78,10 @@
 #define NEXT_DMA_ENRX_BOP         0x40000000
 #define NEXT_DMA_ENRX_EOP         0x80000000
 #define NEXT_DMA_ENRX_MAX_FRAME   1518
+
+#define NEXT_DMA_VIDEO_RETRACE_HZ 68
+#define NEXT_DMA_VIDEO_RETRACE_NS \
+    (NANOSECONDS_PER_SECOND / NEXT_DMA_VIDEO_RETRACE_HZ)
 
 typedef enum NextDMASavedCapability {
     NEXT_DMA_SAVED_NONE,
@@ -128,7 +133,7 @@ static const NextDMAChannelDesc next_dma_channels[NEXT_DMA_CHANNEL_COUNT] = {
         "enrx", 0x150, 27, NEXT_DMA_SAVED_TWO, NEXT_DMA_TRANSFER_ENRX,
     },
     [NEXT_DMA_VIDEO] = {
-        "video", 0x180, -1, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+        "video", 0x180, 5, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
     },
     [NEXT_DMA_R2M] = {
         "r2m", 0x1c0, 18, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
@@ -171,6 +176,7 @@ struct NextDMAState {
     void *enet_opaque;
     bool rx_ready;
     bool rx_keep_enabled;
+    QEMUTimer video_retrace_timer;
     NextDMATraceReadSampler trace_scsi_dma_read;
 };
 
@@ -201,6 +207,40 @@ static void next_dma_update_irq(NextDMAState *s, NextDMAChannel channel)
                      !!(s->channel[channel].csr &
                         NEXT_DMA_CSR_COMPLETE));
     }
+}
+
+static bool next_dma_video_retrace_enabled(const NextDMAState *s)
+{
+    return s->channel[NEXT_DMA_VIDEO].limit != 0;
+}
+
+static void next_dma_video_retrace_schedule(NextDMAState *s)
+{
+    if (!next_dma_video_retrace_enabled(s)) {
+        timer_del(&s->video_retrace_timer);
+        return;
+    }
+    if (!timer_pending(&s->video_retrace_timer)) {
+        timer_mod(&s->video_retrace_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NEXT_DMA_VIDEO_RETRACE_NS);
+    }
+}
+
+static void next_dma_video_retrace(void *opaque)
+{
+    NextDMAState *s = opaque;
+    NextDMAChannelState *video = &s->channel[NEXT_DMA_VIDEO];
+
+    if (!next_dma_video_retrace_enabled(s)) {
+        return;
+    }
+
+    video->csr |= NEXT_DMA_CSR_COMPLETE;
+    next_dma_update_irq(s, NEXT_DMA_VIDEO);
+    timer_mod(&s->video_retrace_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NEXT_DMA_VIDEO_RETRACE_NS);
 }
 
 typedef struct NextDMAEnetRxRange {
@@ -562,6 +602,10 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
         *resolved.value = value;
         if (resolved.reg == NEXT_DMA_REGISTER_NEXT_INIT) {
             s->channel[resolved.channel].next_initbuf_valid = true;
+        }
+        if (resolved.channel == NEXT_DMA_VIDEO &&
+            resolved.reg == NEXT_DMA_REGISTER_LIMIT) {
+            next_dma_video_retrace_schedule(s);
         }
     }
 
@@ -1048,6 +1092,7 @@ static void next_dma_reset_hold(Object *obj, ResetType type)
     memset(s->channel, 0, sizeof(s->channel));
     memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
     s->rx_keep_enabled = false;
+    timer_del(&s->video_retrace_timer);
 
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
         qemu_irq_lower(s->irq[channel]);
@@ -1073,6 +1118,12 @@ static int next_dma_post_load(void *opaque, int version_id)
     memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
         next_dma_update_irq(s, channel);
+    }
+    if (next_dma_video_retrace_enabled(s) &&
+        !timer_pending(&s->video_retrace_timer)) {
+        next_dma_video_retrace_schedule(s);
+    } else if (!next_dma_video_retrace_enabled(s)) {
+        timer_del(&s->video_retrace_timer);
     }
 
     /* Host callbacks and their opaque are deliberately not VMState. */
@@ -1110,13 +1161,14 @@ static const VMStateDescription vmstate_next_dma_channel = {
 static const VMStateDescription vmstate_next_dma = {
     .name = "next-dma",
     .priority = MIG_PRI_LOW,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = next_dma_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(channel, NextDMAState, NEXT_DMA_CHANNEL_COUNT, 1,
                              vmstate_next_dma_channel,
                              NextDMAChannelState),
+        VMSTATE_TIMER_V(video_retrace_timer, NextDMAState, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1131,6 +1183,8 @@ static void next_dma_init(Object *obj)
     memory_region_init_io(&s->mmio, obj, &next_dma_ops, s,
                           "next.dma", NEXT_DMA_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
+    timer_init_ns(&s->video_retrace_timer, QEMU_CLOCK_VIRTUAL,
+                  next_dma_video_retrace, s);
 
     for (i = 0; i < NEXT_DMA_CHANNEL_COUNT; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);

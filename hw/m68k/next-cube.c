@@ -454,6 +454,9 @@ static void next_irq(void *opaque, int number, int level)
     case NEXT_SCSI_I:
         shift = 12;
         break;
+    case NEXT_VIDEO_I:
+        shift = 5;
+        break;
     case NEXT_CLK_I:
         shift = 29;
         break;
@@ -1482,7 +1485,7 @@ static void next_cube_init(MachineState *machine)
         [NEXT_DMA_DSP] = NEXT_DSP_DMA_I,
         [NEXT_DMA_ENTX] = NEXT_ENTX_DMA_I,
         [NEXT_DMA_ENRX] = NEXT_ENRX_DMA_I,
-        [NEXT_DMA_VIDEO] = -1,
+        [NEXT_DMA_VIDEO] = NEXT_VIDEO_I,
         [NEXT_DMA_R2M] = NEXT_R2M_DMA_I,
         [NEXT_DMA_M2R] = NEXT_M2R_DMA_I,
     };

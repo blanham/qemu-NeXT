@@ -47,6 +47,9 @@
 #define NEXT_DISK_SIZE      (512 * 1024)
 #define NEXT_TEST_RAM_BASE  0x04010000
 #define NEXT_SCSI_DMA_IRQ   (1U << 26)
+#define NEXT_VIDEO_IRQ      (1U << 5)
+#define NEXT_VIDEO_RETRACE_NS (INT64_C(1000000000) / 68)
+#define NEXT_VIDEO_LIMIT    0xea
 
 #define ESP_CMD_SEL         0x41
 #define ESP_CMD_TI_DMA      0x90
@@ -88,14 +91,14 @@ static const TestChannel channels[] = {
     { "dsp",      0x0d0, 20, 0, false },
     { "entx",     0x110, 28, 4, true  },
     { "enrx",     0x150, 27, 2, true  },
-    { "video",    0x180, -1, 0, false },
+    { "video",    0x180,  5, 0, true  },
     { "r2m",      0x1c0, 18, 0, false },
     { "m2r",      0x1d0, 19, 0, false },
 };
 
 /* enum next_irqs input indices, kept in stable NextDMAChannel order. */
 static const int dma_board_inputs[] = {
-    10, 12, 13, 14, 15, 11, 16, 8, 9, -1, 17, 18,
+    10, 12, 13, 14, 15, 11, 16, 8, 9, 19, 17, 18,
 };
 
 G_STATIC_ASSERT(ARRAY_SIZE(dma_board_inputs) == ARRAY_SIZE(channels));
@@ -514,6 +517,53 @@ static void test_inert_channels(void)
                             &canary, sizeof(canary));
         }
     }
+
+    qtest_quit(qts);
+}
+
+static void test_video_retrace_interrupt(void)
+{
+    QTestState *qts = next_dma_start();
+    const TestChannel *video = &channels[9];
+    uint64_t csr = NEXT_DMA_BASE + video->csr;
+    uint64_t limit = channel_address(video, 0x4004);
+
+    intercept_next_pc_inputs(qts);
+
+    g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, 0);
+
+    qtest_writel(qts, limit, NEXT_VIDEO_LIMIT);
+    qtest_clock_step(qts, NEXT_VIDEO_RETRACE_NS - 1);
+    g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, 0);
+
+    qtest_clock_step(qts, 1);
+    g_assert_true(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, NEXT_VIDEO_IRQ);
+
+    qtest_writel(qts, csr, DMA_RESET);
+    g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, 0);
+
+    qtest_clock_step(qts, NEXT_VIDEO_RETRACE_NS);
+    g_assert_true(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, NEXT_VIDEO_IRQ);
+
+    qtest_writel(qts, limit, 0);
+    g_assert_true(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, NEXT_VIDEO_IRQ);
+    qtest_writel(qts, csr, DMA_RESET);
+    qtest_clock_step(qts, 2 * NEXT_VIDEO_RETRACE_NS);
+    g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
+                    ==, 0);
 
     qtest_quit(qts);
 }
@@ -1121,6 +1171,8 @@ int main(int argc, char **argv)
                    test_access_contract);
     qtest_add_func("/next-cube/dma/inert-never-completes",
                    test_inert_channels);
+    qtest_add_func("/next-cube/dma/video-retrace-interrupt",
+                   test_video_retrace_interrupt);
     qtest_add_func("/next-cube/dma/zero-next-init-valid",
                    test_zero_next_init_valid);
     qtest_add_func("/next-cube/dma/device-reset-all-channels",
