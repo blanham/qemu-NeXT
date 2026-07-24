@@ -481,6 +481,14 @@ static void test_reset_cancels_gated_dma_request(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==, 0);
     assert_relevant_interrupts(qts, 0);
 
+    /*
+     * Re-arm DMA without issuing another FDC command.  Opening the gate must
+     * not resurrect the pre-reset DREQ.
+     */
+    program_dma(qts, NEXT_DMA_BUFFER,
+                NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE, DMA_SETREAD);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
+                    DMA_ENABLE | DMA_READ);
     qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x18);
     for (i = 0; i < NEXT_RESET_POLL_STEPS; i++) {
         qtest_clock_step(qts, 1);
@@ -490,7 +498,8 @@ static void test_reset_cancels_gated_dma_request(void)
 
     assert_guest_memory_filled(qts, NEXT_MEMORY_SENTINEL);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
+                    DMA_ENABLE | DMA_READ);
     assert_relevant_interrupts(qts, 0);
 
     qtest_quit(qts);
@@ -540,8 +549,7 @@ static void test_chained_media_to_ram_dma(void)
                     NEXT_DMA_BUFFER + 256);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_LIMIT), ==,
                     NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE);
-    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
-                    NEXT_FLOPPY_IRQ, ==, 0);
+    assert_relevant_interrupts(qts, NEXT_SCSI_DMA_IRQ);
     g_assert_cmphex(qtest_readb(qts, NEXT_FDC_MSR_DSR) &
                     (FDC_MSR_RQM | FDC_MSR_DIO), ==, 0);
 
