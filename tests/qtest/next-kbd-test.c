@@ -32,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
 
 #define NEXT_INTR_STATUS  0x02007000
 #define NEXT_KBD_CSR      0x0200e000
@@ -56,6 +57,7 @@
 #define NEXT_KEY_A        0x39
 #define NEXT_KEY_UP       0x80
 #define NEXT_ROM_SIZE     (128 * 1024)
+#define NEXT_POLL_LIMIT   10000
 
 #define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
 #define SOUT_ENAB                  0x01
@@ -80,7 +82,7 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_cube_kbd_start(void)
+static QTestState *next_cube_kbd_start_with_args(const char *extra_args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -97,8 +99,38 @@ static QTestState *next_cube_kbd_start(void)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    qts = qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
+    qts = qtest_initf("-machine next-cube -bios %s %s",
+                      quoted_rom_path, extra_args);
     return qts;
+}
+
+static QTestState *next_cube_kbd_start(void)
+{
+    return next_cube_kbd_start_with_args("");
+}
+
+static void wait_migration_complete(QTestState *qts, const char *operation)
+{
+    unsigned int i;
+
+    for (i = 0; i < NEXT_POLL_LIMIT; i++) {
+        QDict *response = qtest_qmp_assert_success_ref(
+            qts, "{ 'execute': 'query-migrate' }");
+        const char *status = qdict_get_str(response, "status");
+
+        if (!strcmp(status, "completed")) {
+            qobject_unref(response);
+            return;
+        }
+        if (!strcmp(status, "failed") || !strcmp(status, "cancelled")) {
+            g_error("%s migration entered terminal state '%s'",
+                    operation, status);
+        }
+        qobject_unref(response);
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for %s migration", operation);
 }
 
 static void send_key(QTestState *qts, const char *qcode, bool down)
@@ -402,6 +434,88 @@ static void test_mouse_large_motion(void)
     qtest_quit(qts);
 }
 
+static void test_migrate_queued_input(void)
+{
+    g_autofree char *migration_path = NULL;
+    g_autofree char *quoted_migration_path = NULL;
+    g_autofree char *outgoing_uri = NULL;
+    g_autofree char *incoming_uri = NULL;
+    QTestState *source = next_cube_kbd_start();
+    QTestState *destination;
+    uint32_t csr;
+    int migration_fd;
+
+    send_key(source, "a", true);
+    send_mouse_motion_and_button(source, 3, -3, "left", true);
+    send_key(source, "a", false);
+
+    /*
+     * Preserve a signed sub-packet remainder across migration.  These first
+     * two motions are below the 3:1 scale threshold, so they do not enqueue
+     * packets.
+     */
+    send_mouse_motion(source, 1, -1);
+    send_mouse_motion(source, 1, -1);
+
+    csr = qtest_readl(source, NEXT_KBD_CSR);
+    g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV),
+                    ==, NEXT_KBD_INT | NEXT_KBD_DAV);
+    g_assert_cmphex(csr & NEXT_KBD_OVR, ==, 0);
+    g_assert_cmphex(qtest_readl(source, NEXT_INTR_STATUS) & NEXT_INTR_KBD,
+                    ==, NEXT_INTR_KBD);
+
+    migration_fd = g_file_open_tmp("next-kbd-migration-XXXXXX",
+                                   &migration_path, NULL);
+    g_assert_cmpint(migration_fd, >=, 0);
+    close(migration_fd);
+    quoted_migration_path = g_shell_quote(migration_path);
+    outgoing_uri = g_strdup_printf("exec: cat > %s",
+                                   quoted_migration_path);
+    qtest_qmp_assert_success(
+        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }",
+        outgoing_uri);
+    wait_migration_complete(source, "outgoing");
+    qtest_quit(source);
+
+    destination = next_cube_kbd_start_with_args("-incoming defer");
+    incoming_uri = g_strdup_printf("exec: cat %s", quoted_migration_path);
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        incoming_uri);
+    wait_migration_complete(destination, "incoming");
+
+    csr = qtest_readl(destination, NEXT_KBD_CSR);
+    g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV),
+                    ==, NEXT_KBD_INT | NEXT_KBD_DAV);
+    g_assert_cmphex(csr & NEXT_KBD_OVR, ==, 0);
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_INTR_KBD, ==, NEXT_INTR_KBD);
+
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_INTR_KBD, ==, NEXT_INTR_KBD);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==, 0x110003fe);
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) &
+                    NEXT_INTR_KBD, ==, NEXT_INTR_KBD);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    assert_mouse_queue_empty(destination);
+
+    /*
+     * The third sub-threshold motion must combine with the migrated signed
+     * remainder, while retaining the migrated pressed-left button state.
+     */
+    send_mouse_motion(destination, 1, -1);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==, 0x110003fe);
+    assert_mouse_queue_empty(destination);
+
+    qtest_quit(destination);
+    g_assert_cmpint(g_unlink(migration_path), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -424,5 +538,7 @@ int main(int argc, char **argv)
                    test_mouse_scaled_signed_remainder);
     qtest_add_func("/next-cube/mouse/large-motion",
                    test_mouse_large_motion);
+    qtest_add_func("/next-cube/kbd/migrate-queued-input",
+                   test_migrate_queued_input);
     return g_test_run();
 }
