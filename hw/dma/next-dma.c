@@ -491,6 +491,11 @@ static void next_dma_clear_staging(NextDMAChannelState *c)
     c->scsi_stage_flushes = 0;
 }
 
+void next_dma_scsi_fifo_reset(NextDMAState *s)
+{
+    next_dma_clear_staging(&s->channel[NEXT_DMA_SCSI]);
+}
+
 static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
                                uint32_t value)
 {
@@ -499,7 +504,6 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
     if (value & NEXT_DMA_CMD_RESET) {
         c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE |
                     NEXT_DMA_CSR_COMPLETE | NEXT_DMA_CSR_BUSEXC);
-        next_dma_clear_staging(c);
         c->next_initbuf_valid = false;
     }
     if (value & NEXT_DMA_CMD_INITBUF) {
@@ -684,6 +688,14 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         continue_segment = next_dma_advance(s, NEXT_DMA_SCSI,
                                             NEXT_DMA_SCSI_BEAT);
         if (!continue_segment && remaining) {
+            if (!c->scsi_stage_len &&
+                remaining <= NEXT_DMA_SCSI_BEAT) {
+                memcpy(c->scsi_stage, buf, remaining);
+                c->scsi_stage_len = remaining;
+                c->scsi_stage_flushes = NEXT_DMA_SCSI_FLUSH_EDGES;
+                buf += remaining;
+                remaining = 0;
+            }
             break;
         }
     }

@@ -61,6 +61,7 @@
 #define NEXT_SCSI_IRQ      (1U << 12)
 #define NEXT_SCSI_DMA_IRQ  (1U << 26)
 
+#define SCSI_CSR_RESET      0x02
 #define SCSI_CSR_CPUDMA     0x10
 #define SCSI_CSR_INTMASK    0x20
 #define SCSI_CSR_FIFOFL     0x04
@@ -458,6 +459,50 @@ static void test_scsi_dma_tail_four_fifofl_edges(void)
     g_assert_cmphex(received[64], ==, 0);
     g_assert_cmphex(received[65], ==, 0);
     for (i = DMA_FLUSHED_TRANSFER; i < sizeof(received); i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
+static void test_scsi_reset_clears_staged_tail(void)
+{
+    enum {
+        INQUIRY_LENGTH = 66,
+        DMA_WINDOW_LENGTH = 96,
+        DMA_INITIAL_TRANSFER = 64,
+    };
+    uint8_t received[DMA_WINDOW_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    int i;
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, sizeof(received));
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + DMA_WINDOW_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+
+    issue_inquiry_dma(qts, INQUIRY_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + DMA_INITIAL_TRANSFER);
+
+    for (i = 0; i < 3; i++) {
+        qtest_writeb(qts, NEXT_SCSI_CSR,
+                     SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                        NEXT_DMA_BUFFER + DMA_INITIAL_TRANSFER);
+        qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DMADIR);
+    }
+    qtest_writeb(qts, NEXT_SCSI_CSR,
+                 SCSI_CSR_RESET | SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + DMA_INITIAL_TRANSFER);
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, sizeof(received));
+    for (i = DMA_INITIAL_TRANSFER; i < sizeof(received); i++) {
         g_assert_cmphex(received[i], ==, 0xa5);
     }
 
@@ -1207,6 +1252,8 @@ int main(int argc, char **argv)
                    test_scsi_dma_irq_level_invariant);
     qtest_add_func("/next-cube/scsi/tail-four-fifofl-edges",
                    test_scsi_dma_tail_four_fifofl_edges);
+    qtest_add_func("/next-cube/scsi/reset-clears-staged-tail",
+                   test_scsi_reset_clears_staged_tail);
     qtest_add_func("/next-cube/scsi/full-beat-short-limit-not-staged",
                    test_scsi_dma_full_beat_short_limit_not_staged);
     qtest_add_func("/next-cube/scsi/short-tail-window-not-staged",

@@ -552,6 +552,14 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
     switch (addr) {
     case 0:
         old = s->scsi_csr_1;
+        if (val & SCSICSR_RESET) {
+            DPRINTF("SCSICSR Reset\n");
+            /* I think this should set DMADIR. CPUDMA and INTMASK to 0 */
+            next_dma_scsi_fifo_reset(s->dma);
+            qemu_irq_raise(pc->scsi_reset);
+            s->scsi_csr_1 &= ~(SCSICSR_INTMASK | 0x80 | 0x1);
+            qemu_irq_lower(pc->scsi_reset);
+        }
         if (val & SCSICSR_FIFOFL) {
             DPRINTF("SCSICSR FIFO Flush\n");
             if (!(old & SCSICSR_FIFOFL)) {
@@ -573,13 +581,6 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
          *     s->scsi_csr_1 &= ~SCSICSR_ENABLE;
          */
 
-        if (val & SCSICSR_RESET) {
-            DPRINTF("SCSICSR Reset\n");
-            /* I think this should set DMADIR. CPUDMA and INTMASK to 0 */
-            qemu_irq_raise(pc->scsi_reset);
-            s->scsi_csr_1 &= ~(SCSICSR_INTMASK | 0x80 | 0x1);
-            qemu_irq_lower(pc->scsi_reset);
-        }
         if (val & SCSICSR_DMADIR) {
             DPRINTF("SCSICSR DMAdir\n");
         }
