@@ -78,6 +78,9 @@
 #define DMA_BUSEXC          0x10000000
 
 #define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
+#define MON_SOUND_OUT              0xc7
+#define NEXT_DMAOUT_DMAEN          0x80000000
+#define NEXT_DMAOUT_OVR            0x20000000
 #define SOUT_ENAB                  0x01
 
 typedef struct TestChannel {
@@ -617,6 +620,117 @@ static void test_sound_output_final_segment(void)
     g_assert_false(qtest_get_irq(qts,
                                  dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_output_direct_kickstart(void)
+{
+    static const uint8_t samples[16] = {
+        0x10, 0x00, 0xf0, 0x00,
+        0x20, 0x00, 0xe0, 0x00,
+        0x30, 0x00, 0xd0, 0x00,
+        0x40, 0x00, 0xc0, 0x00,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+
+    intercept_next_pc_inputs(qts);
+
+    /*
+     * Mach uses MON_SOUND_OUT as a kickstart fallback if snd_start() has
+     * enabled output before DMA has begun advancing.  Reproduce that order:
+     * first latch underrun, then arm DMA, and finally send the direct frame.
+     */
+    enable_sound_output(qts);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) &
+                    (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR),
+                    ==, NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR);
+    qtest_writeb(qts, NEXT_MON_CSR,
+                 (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR) >> 24);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) &
+                    (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR),
+                    ==, NEXT_DMAOUT_DMAEN);
+
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, sizeof(samples));
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + sizeof(samples));
+    qtest_writel(qts, csr, DMA_SETENABLE);
+    g_assert_cmphex(qtest_readl(qts, next), ==, NEXT_TEST_RAM_BASE);
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE);
+
+    qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SOUND_OUT);
+    qtest_writel(qts, NEXT_MON_DATA, 0);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + sizeof(samples));
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_true(qtest_get_irq(qts,
+                                dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, NEXT_SOUND_DMA_IRQ);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
+                    ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_output_direct_kickstart_backpressure(void)
+{
+    static const uint8_t samples[16] = {
+        0x10, 0x00, 0xf0, 0x00,
+        0x20, 0x00, 0xe0, 0x00,
+        0x30, 0x00, 0xd0, 0x00,
+        0x40, 0x00, 0xc0, 0x00,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+
+    intercept_next_pc_inputs(qts);
+
+    enable_sound_output(qts);
+    qtest_writeb(qts, NEXT_MON_CSR,
+                 (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR) >> 24);
+
+    /*
+     * Qtest's noaudio backend has a 1024-frame output ring.  Fill it and
+     * leave one direct frame pending so MON_SOUND_OUT must not depend on a
+     * host write before it requests the newly armed DMA.
+     */
+    for (size_t i = 0; i <= 1024; i++) {
+        qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SOUND_OUT);
+        qtest_writel(qts, NEXT_MON_DATA, i);
+    }
+
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, sizeof(samples));
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + sizeof(samples));
+    qtest_writel(qts, csr, DMA_SETENABLE);
+
+    qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SOUND_OUT);
+    qtest_writel(qts, NEXT_MON_DATA, 0);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + sizeof(samples));
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_true(qtest_get_irq(qts,
+                                dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, NEXT_SOUND_DMA_IRQ);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
                     ==, 0);
 
     qtest_quit(qts);
@@ -1305,6 +1419,10 @@ int main(int argc, char **argv)
                    test_video_retrace_interrupt);
     qtest_add_func("/next-cube/dma/sound-output-final-segment",
                    test_sound_output_final_segment);
+    qtest_add_func("/next-cube/dma/sound-output-direct-kickstart",
+                   test_sound_output_direct_kickstart);
+    qtest_add_func("/next-cube/dma/sound-output-direct-kickstart-backpressure",
+                   test_sound_output_direct_kickstart_backpressure);
     qtest_add_func("/next-cube/dma/sound-output-chained-segments",
                    test_sound_output_chained_segments);
     qtest_add_func("/next-cube/dma/sound-output-range-error-and-reset",

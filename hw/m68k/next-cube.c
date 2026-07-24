@@ -22,6 +22,7 @@
 #include "hw/m68k/next-cube.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
+#include "hw/audio/next-sound.h"
 #include "hw/dma/next-dma.h"
 #include "hw/misc/next-memctl.h"
 #include "hw/net/next-mb8795.h"
@@ -198,6 +199,7 @@ struct NeXTState {
     MemoryRegion bmapm2;
 
     NextDMAState *dma;
+    NextSoundState *sound;
     NextMB8795State *mb8795;
 };
 
@@ -453,6 +455,9 @@ static void next_irq(void *opaque, int number, int level)
         break;
     case NEXT_SCSI_I:
         shift = 12;
+        break;
+    case NEXT_SOUND_OVRUN_I:
+        shift = 8;
         break;
     case NEXT_VIDEO_I:
         shift = 5;
@@ -1495,9 +1500,11 @@ static void next_cube_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     const char *bios_name = machine->firmware ?: ROM_FILE;
     DeviceState *dma_dev;
+    DeviceState *kbd_dev;
     DeviceState *mbdev;
     DeviceState *memctl_dev;
     DeviceState *pcdev;
+    DeviceState *sound_dev;
     int channel;
 
     /* Initialize the cpu core */
@@ -1533,6 +1540,20 @@ static void next_cube_init(MachineState *machine)
                                                 dma_irq_inputs[channel]));
         }
     }
+
+    /* Sound output */
+    sound_dev = qdev_new(TYPE_NEXT_SOUND);
+    m->sound = NEXT_SOUND(sound_dev);
+    object_property_add_child(OBJECT(machine), "next-sound",
+                              OBJECT(sound_dev));
+    object_property_set_link(OBJECT(sound_dev), "dma", OBJECT(m->dma),
+                             &error_abort);
+    if (machine->audiodev) {
+        qdev_prop_set_string(sound_dev, "audiodev", machine->audiodev);
+    }
+    qdev_realize_and_unref(sound_dev, NULL, &error_fatal);
+    qdev_connect_gpio_out(sound_dev, 0,
+                          qdev_get_gpio_in(pcdev, NEXT_SOUND_OVRUN_I));
 
     /* Ethernet controller */
     mbdev = qdev_new(TYPE_NEXT_MB8795);
@@ -1600,9 +1621,14 @@ static void next_cube_init(MachineState *machine)
                              0x0, 64);
     memory_region_add_subregion(sysmem, 0x820c0000, &m->bmapm2);
 
-    /* KBD */
-    sysbus_create_simple(TYPE_NEXTKBD, 0x0200e000,
-                         qdev_get_gpio_in(pcdev, NEXT_KBD_I));
+    /* Monitor keyboard, mouse, and sound command interface */
+    kbd_dev = qdev_new(TYPE_NEXTKBD);
+    object_property_set_link(OBJECT(kbd_dev), "sound", OBJECT(m->sound),
+                             &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(kbd_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(kbd_dev), 0, 0x0200e000);
+    sysbus_connect_irq(SYS_BUS_DEVICE(kbd_dev), 0,
+                       qdev_get_gpio_in(pcdev, NEXT_KBD_I));
 
     /* Load ROM here */
     memory_region_init_rom(&m->rom, NULL, "next.rom", 0x20000, &error_fatal);
@@ -1647,6 +1673,7 @@ static void next_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
     mc->default_nic = TYPE_NEXT_MB8795;
     mc->no_cdrom = true;
+    machine_add_audiodev_property(mc);
 }
 
 static const TypeInfo next_typeinfo = {

@@ -92,6 +92,7 @@ typedef enum NextDMASavedCapability {
 typedef enum NextDMATransferPolicy {
     NEXT_DMA_TRANSFER_INERT,
     NEXT_DMA_TRANSFER_SCSI,
+    NEXT_DMA_TRANSFER_SOUND_OUT,
     NEXT_DMA_TRANSFER_ENTX,
     NEXT_DMA_TRANSFER_ENRX,
 } NextDMATransferPolicy;
@@ -109,7 +110,8 @@ static const NextDMAChannelDesc next_dma_channels[NEXT_DMA_CHANNEL_COUNT] = {
         "scsi", 0x010, 26, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_SCSI,
     },
     [NEXT_DMA_SOUND_OUT] = {
-        "snd-out", 0x040, 23, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+        "snd-out", 0x040, 23, NEXT_DMA_SAVED_NONE,
+        NEXT_DMA_TRANSFER_SOUND_OUT,
     },
     [NEXT_DMA_OPTICAL] = {
         "optical", 0x050, 25, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
@@ -837,6 +839,57 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
     trace_next_scsi_dma_transfer(
         "flush", staged, sizeof(beat), base, c->csr, c->next,
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
+}
+
+static NextDMAResult next_dma_sound_out_error(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SOUND_OUT];
+
+    c->csr |= NEXT_DMA_CSR_BUSEXC | NEXT_DMA_CSR_COMPLETE;
+    c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+    next_dma_update_irq(s, NEXT_DMA_SOUND_OUT);
+    return NEXT_DMA_RANGE_ERROR;
+}
+
+NextDMAResult next_dma_sound_out_read(NextDMAState *s, uint8_t *samples,
+                                      size_t capacity, size_t *length)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SOUND_OUT];
+    uint32_t start;
+    size_t available;
+    size_t chunk;
+
+    *length = 0;
+    if (!(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE)) {
+        return NEXT_DMA_NOT_READY;
+    }
+    if ((c->csr & NEXT_DMA_CSR_READ) || !samples || capacity < 4) {
+        return next_dma_sound_out_error(s);
+    }
+
+    start = c->next_initbuf_valid ? c->next_initbuf : c->next;
+    if ((start & 3) || (c->limit & 15) || c->limit <= start) {
+        return next_dma_sound_out_error(s);
+    }
+
+    available = c->limit - start;
+    chunk = MIN(available, capacity) & ~(size_t)3;
+    if (!chunk ||
+        !address_space_access_valid(s->as, start, chunk, false,
+                                    MEMTXATTRS_UNSPECIFIED) ||
+        address_space_read(s->as, start, MEMTXATTRS_UNSPECIFIED,
+                           samples, chunk) != MEMTX_OK) {
+        return next_dma_sound_out_error(s);
+    }
+
+    if (c->next_initbuf_valid) {
+        c->next = start;
+        c->next_initbuf_valid = false;
+    }
+    next_dma_advance(s, NEXT_DMA_SOUND_OUT, chunk);
+    *length = chunk;
+    return NEXT_DMA_OK;
 }
 
 typedef struct NextDMAEnetTxRange {

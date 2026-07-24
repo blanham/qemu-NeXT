@@ -35,7 +35,9 @@
 #include "qemu/osdep.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
+#include "hw/audio/next-sound.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/m68k/next-cube.h"
 #include "standard-headers/linux/input-event-codes.h"
@@ -49,7 +51,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 #define CSR_INT 0x00800000
 #define CSR_DATA 0x00400000
 #define CSR_OVR 0x00200000
-#define CSR_BASE 0xA0108300
+#define CSR_BASE 0x00008300
 
 #define KD_KEYMASK    0x007f
 #define KD_DIRECTION  0x0080 /* pressed or released */
@@ -81,7 +83,10 @@ struct NextKBDState {
     MemoryRegion mr;
     QemuInputHandlerState *hs;
     qemu_irq irq;
+    NextSoundState *sound;
     KBDQueue queue;
+    uint8_t command;
+    uint32_t monitor_data;
     uint16_t shift;
     bool overrun;
     int64_t mouse_dx;
@@ -93,7 +98,11 @@ struct NextKBDState {
 
 static uint32_t nextkbd_csr(NextKBDState *s)
 {
-    uint32_t value = CSR_BASE;
+    uint32_t value = CSR_BASE | s->command;
+
+    if (s->sound) {
+        value |= next_sound_monitor_csr(s->sound);
+    }
 
     if (s->queue.count || s->overrun) {
         value |= CSR_INT;
@@ -112,26 +121,28 @@ static uint32_t nextkbd_csr(NextKBDState *s)
 static uint32_t kbd_read_byte(void *opaque, hwaddr addr)
 {
     NextKBDState *s = NEXTKBD(opaque);
+    unsigned offset = addr & 0xf;
 
-    switch (addr & 0x3) {
-    case 0x0:   /* 0xe000 */
-        return nextkbd_csr(s) >> 24;
-
-    case 0x1:   /* 0xe001 */
-        return (nextkbd_csr(s) >> 16) & 0xff;
-
-    case 0x2:   /* 0xe002 */
-        return (nextkbd_csr(s) >> 8) & 0xff;
-
-    default:
-        qemu_log_mask(LOG_UNIMP, "NeXT kbd read byte %"HWADDR_PRIx"\n", addr);
+    if (offset < 4) {
+        return nextkbd_csr(s) >> ((3 - offset) * 8) & 0xff;
     }
 
+    qemu_log_mask(LOG_UNIMP, "NeXT kbd read byte %"HWADDR_PRIx"\n", addr);
     return 0;
 }
 
 static uint32_t kbd_read_word(void *opaque, hwaddr addr)
 {
+    NextKBDState *s = NEXTKBD(opaque);
+    unsigned offset = addr & 0xf;
+
+    if (offset == 0) {
+        return nextkbd_csr(s) >> 16;
+    }
+    if (offset == 2) {
+        return nextkbd_csr(s) & 0xffff;
+    }
+
     qemu_log_mask(LOG_UNIMP, "NeXT kbd read word %"HWADDR_PRIx"\n", addr);
     return 0;
 }
@@ -146,6 +157,9 @@ static uint32_t kbd_read_long(void *opaque, hwaddr addr)
     switch (addr & 0xf) {
     case 0x0:   /* 0xe000 */
         return nextkbd_csr(s);
+
+    case 0x4:   /* 0xe004 */
+        return s->monitor_data;
 
     case 0x8:   /* 0xe008 */
         if (q->count > 0) {
@@ -166,6 +180,9 @@ static uint32_t kbd_read_long(void *opaque, hwaddr addr)
         } else {
             return 0;
         }
+
+    case 0xc:   /* 0xe00c */
+        return 0;
 
     default:
         qemu_log_mask(LOG_UNIMP, "NeXT kbd read long %"HWADDR_PRIx"\n", addr);
@@ -191,18 +208,41 @@ static void kbd_writefn(void *opaque, hwaddr addr, uint64_t value,
                         unsigned size)
 {
     NextKBDState *s = NEXTKBD(opaque);
-    bool clear_overrun = false;
+    unsigned offset = addr & 0xf;
 
-    if ((addr & 0xf) == 0 && size == 4) {
-        clear_overrun = value & CSR_OVR;
-    } else if ((addr & 0xf) == 0 && size == 2) {
-        clear_overrun = value & (CSR_OVR >> 16);
-    } else if ((addr & 0xf) == 1 && size == 1) {
-        clear_overrun = value & (CSR_OVR >> 16);
+    if (offset < 4 && offset + size <= 4) {
+        for (unsigned i = 0; i < size; i++) {
+            uint8_t byte = value >> ((size - i - 1) * 8);
+
+            switch (offset + i) {
+            case 0:
+                if (s->sound) {
+                    next_sound_monitor_csr_write(s->sound, byte);
+                }
+                break;
+            case 1:
+                if (byte & (CSR_OVR >> 16)) {
+                    s->overrun = false;
+                    qemu_set_irq(s->irq, s->queue.count > 0);
+                }
+                break;
+            case 3:
+                s->command = byte;
+                break;
+            default:
+                break;
+            }
+        }
+        return;
     }
-    if (clear_overrun) {
-        s->overrun = false;
-        qemu_set_irq(s->irq, s->queue.count > 0);
+
+    if (offset == 4 && size == 4) {
+        s->monitor_data = value;
+        if (s->sound) {
+            next_sound_monitor_command(s->sound, s->command,
+                                       s->monitor_data);
+        }
+        return;
     }
 
     qemu_log_mask(LOG_UNIMP, "NeXT kbd write: size=%u addr=0x%"HWADDR_PRIx
@@ -443,6 +483,8 @@ static void nextkbd_reset(DeviceState *dev)
     memset(&nks->queue, 0, sizeof(KBDQueue));
     nks->shift = 0;
     nks->overrun = false;
+    nks->command = 0;
+    nks->monitor_data = 0;
     nks->mouse_dx = 0;
     nks->mouse_dy = 0;
     nks->mouse_left = false;
@@ -474,6 +516,11 @@ static const VMStateDescription nextkbd_vmstate = {
     .unmigratable = 1,    /* TODO: Implement this when m68k CPU is migratable */
 };
 
+static const Property nextkbd_properties[] = {
+    DEFINE_PROP_LINK("sound", NextKBDState, sound, TYPE_NEXT_SOUND,
+                     NextSoundState *),
+};
+
 static void nextkbd_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -482,6 +529,7 @@ static void nextkbd_class_init(ObjectClass *oc, const void *data)
     dc->vmsd = &nextkbd_vmstate;
     dc->realize = nextkbd_realize;
     dc->unrealize = nextkbd_unrealize;
+    device_class_set_props(dc, nextkbd_properties);
     device_class_set_legacy_reset(dc, nextkbd_reset);
 }
 
