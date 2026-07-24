@@ -42,6 +42,7 @@
 #define NEXT_KBD_OVR      0x00200000
 #define NEXT_KBD_CTX      0x00001000
 #define NEXT_KBD_VALID    0x00008000
+#define NEXT_KBD_LSHIFT   0x00000200
 #define NEXT_KBD_DEVICE_1 0x10000000
 #define NEXT_MOUSE_PACKET         0x11000000
 #define NEXT_MOUSE_RIGHT_RELEASED 0x00000100
@@ -187,6 +188,26 @@ static void test_key_irq_and_data(void)
     qtest_quit(qts);
 }
 
+static void test_key_dequeue_modifiers(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_key(qts, "a", true);
+    send_key(qts, "shift", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_LSHIFT | NEXT_KEY_A);
+
+    send_key(qts, "a", false);
+    send_key(qts, "shift", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
+
+    qtest_quit(qts);
+}
+
 static void test_mouse_packet_irq_and_data(void)
 {
     QTestState *qts = next_cube_kbd_start();
@@ -213,6 +234,19 @@ static void test_mouse_packet_irq_and_data(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
     csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_mouse_dequeue_modifier_isolation(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_mouse_motion(qts, 0, -2);
+    send_key(qts, "shift", true);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x11000501);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
 
     qtest_quit(qts);
 }
@@ -293,10 +327,14 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/kbd/key-irq-and-data",
                    test_key_irq_and_data);
+    qtest_add_func("/next-cube/kbd/key-dequeue-modifiers",
+                   test_key_dequeue_modifiers);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
                    test_idle_csr_ctx_clear);
     qtest_add_func("/next-cube/mouse/packet-irq-and-data",
                    test_mouse_packet_irq_and_data);
+    qtest_add_func("/next-cube/mouse/dequeue-modifier-isolation",
+                   test_mouse_dequeue_modifier_isolation);
     qtest_add_func("/next-cube/mouse/button-only",
                    test_mouse_button_only);
     qtest_add_func("/next-cube/mouse/large-motion",

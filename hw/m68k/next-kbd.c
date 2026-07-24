@@ -32,12 +32,8 @@
  * OTHER DEALINGS WITH THE SOFTWARE.
  */
 
-/*
- * This is admittedly hackish, but works well enough for basic input. Mouse
- * support will be added once we can boot something that needs the mouse.
- */
-
 #include "qemu/osdep.h"
+#include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
@@ -53,7 +49,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 #define CSR_INT 0x00800000
 #define CSR_DATA 0x00400000
 #define CSR_OVR 0x00200000
-#define CSR_BASE 0xA0109300
+#define CSR_BASE 0xA0108300
 
 #define KD_KEYMASK    0x007f
 #define KD_DIRECTION  0x0080 /* pressed or released */
@@ -70,7 +66,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 #define KBD_QUEUE_SIZE 256
 
 typedef struct {
-    uint8_t data[KBD_QUEUE_SIZE];
+    uint32_t data;
+    bool keyboard;
+} KBDQueueEntry;
+
+typedef struct {
+    KBDQueueEntry entries[KBD_QUEUE_SIZE];
     int rptr, wptr, count;
 } KBDQueue;
 
@@ -83,6 +84,11 @@ struct NextKBDState {
     KBDQueue queue;
     uint16_t shift;
     bool overrun;
+    int64_t mouse_dx;
+    int64_t mouse_dy;
+    bool mouse_left;
+    bool mouse_right;
+    bool mouse_button_pending;
 };
 
 static uint32_t nextkbd_csr(NextKBDState *s)
@@ -115,8 +121,7 @@ static uint32_t kbd_read_byte(void *opaque, hwaddr addr)
         return (nextkbd_csr(s) >> 16) & 0xff;
 
     case 0x2:   /* 0xe002 */
-        /* returning 0x40 caused mach to hang */
-        return 0x10 | 0x2 | 0x1;
+        return (nextkbd_csr(s) >> 8) & 0xff;
 
     default:
         qemu_log_mask(LOG_UNIMP, "NeXT kbd read byte %"HWADDR_PRIx"\n", addr);
@@ -135,7 +140,6 @@ static uint32_t kbd_read_word(void *opaque, hwaddr addr)
 static uint32_t kbd_read_long(void *opaque, hwaddr addr)
 {
     uint32_t data;
-    int key;
     NextKBDState *s = NEXTKBD(opaque);
     KBDQueue *q = &s->queue;
 
@@ -144,20 +148,19 @@ static uint32_t kbd_read_long(void *opaque, hwaddr addr)
         return nextkbd_csr(s);
 
     case 0x8:   /* 0xe008 */
-        /* get keycode from buffer */
         if (q->count > 0) {
-            key = q->data[q->rptr];
+            KBDQueueEntry *entry = &q->entries[q->rptr];
+
+            data = entry->data;
+            if (entry->keyboard) {
+                data &= ~(KD_LSHIFT | KD_RSHIFT);
+                data |= s->shift;
+            }
             if (++q->rptr == KBD_QUEUE_SIZE) {
                 q->rptr = 0;
             }
 
             q->count--;
-
-            if (s->shift) {
-                key |= s->shift;
-            }
-
-            data = 0x10000000 | KD_VALID | key;
             qemu_set_irq(s->irq, q->count || s->overrun);
             return data;
         } else {
@@ -269,29 +272,30 @@ static const int linux_to_nextkbd_keycode[] = {
     [KEY_SPACE]      = 0x38,
 };
 
-static void nextkbd_put_keycode(NextKBDState *s, int keycode)
+static bool nextkbd_put_packet(NextKBDState *s, uint32_t packet,
+                               bool keyboard)
 {
     KBDQueue *q = &s->queue;
 
     if (q->count >= KBD_QUEUE_SIZE) {
         s->overrun = true;
         qemu_irq_raise(s->irq);
-        return;
+        return false;
     }
 
-    q->data[q->wptr] = keycode;
+    q->entries[q->wptr].data = packet;
+    q->entries[q->wptr].keyboard = keyboard;
     if (++q->wptr == KBD_QUEUE_SIZE) {
         q->wptr = 0;
     }
 
     q->count++;
     qemu_irq_raise(s->irq);
+    return true;
 }
 
-static void nextkbd_event(DeviceState *dev, QemuConsole *src,
-                          QemuInputEvent *evt)
+static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
 {
-    NextKBDState *s = NEXTKBD(dev);
     int keycode;
 
     if (evt->key.key >= ARRAY_SIZE(linux_to_nextkbd_keycode)) {
@@ -325,13 +329,111 @@ static void nextkbd_event(DeviceState *dev, QemuConsole *src,
         keycode |= 0x80;
     }
 
-    nextkbd_put_keycode(s, keycode);
+    nextkbd_put_packet(s, 0x10000000 | KD_VALID | s->shift | keycode, true);
+}
+
+static void nextkbd_button_event(NextKBDState *s, QemuInputEvent *evt)
+{
+    bool *button;
+
+    switch (evt->btn.button) {
+    case INPUT_BUTTON_LEFT:
+        button = &s->mouse_left;
+        break;
+    case INPUT_BUTTON_RIGHT:
+        button = &s->mouse_right;
+        break;
+    default:
+        return;
+    }
+
+    if (*button != evt->btn.down) {
+        *button = evt->btn.down;
+        s->mouse_button_pending = true;
+    }
+}
+
+static void nextkbd_relative_event(NextKBDState *s, QemuInputEvent *evt)
+{
+    int64_t *delta;
+
+    if (evt->rel.axis == INPUT_AXIS_X) {
+        delta = &s->mouse_dx;
+    } else if (evt->rel.axis == INPUT_AXIS_Y) {
+        delta = &s->mouse_dy;
+    } else {
+        return;
+    }
+
+    if (sadd64_overflow(*delta, evt->rel.value, delta)) {
+        *delta = evt->rel.value < 0 ? INT64_MIN : INT64_MAX;
+    }
+}
+
+static void nextkbd_event(DeviceState *dev, QemuConsole *src,
+                          QemuInputEvent *evt)
+{
+    NextKBDState *s = NEXTKBD(dev);
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_KEY:
+        nextkbd_key_event(s, evt);
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        nextkbd_button_event(s, evt);
+        break;
+    case INPUT_EVENT_KIND_REL:
+        nextkbd_relative_event(s, evt);
+        break;
+    default:
+        break;
+    }
+}
+
+static int nextkbd_mouse_delta(int64_t *delta)
+{
+    int raw;
+
+    if (*delta > 64) {
+        raw = -64;
+    } else if (*delta < -63) {
+        raw = 63;
+    } else {
+        raw = -*delta;
+    }
+
+    *delta += raw;
+    return raw;
+}
+
+static void nextkbd_sync(DeviceState *dev)
+{
+    NextKBDState *s = NEXTKBD(dev);
+
+    while (s->mouse_dx || s->mouse_dy || s->mouse_button_pending) {
+        int raw_dx = nextkbd_mouse_delta(&s->mouse_dx);
+        int raw_dy = nextkbd_mouse_delta(&s->mouse_dy);
+        uint32_t packet;
+
+        packet = 0x11000000 |
+                 ((raw_dy & 0x7f) << 9) |
+                 ((s->mouse_right ? 0 : 1) << 8) |
+                 ((raw_dx & 0x7f) << 1) |
+                 (s->mouse_left ? 0 : 1);
+        if (!nextkbd_put_packet(s, packet, false)) {
+            s->mouse_dx = 0;
+            s->mouse_dy = 0;
+        }
+        s->mouse_button_pending = false;
+    }
 }
 
 static const QemuInputHandler nextkbd_handler = {
-    .name  = "QEMU NeXT Keyboard",
-    .mask  = INPUT_EVENT_MASK_KEY,
+    .name  = "QEMU NeXT Keyboard/Mouse",
+    .mask  = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN |
+             INPUT_EVENT_MASK_REL,
     .event = nextkbd_event,
+    .sync  = nextkbd_sync,
 };
 
 static void nextkbd_reset(DeviceState *dev)
@@ -341,6 +443,11 @@ static void nextkbd_reset(DeviceState *dev)
     memset(&nks->queue, 0, sizeof(KBDQueue));
     nks->shift = 0;
     nks->overrun = false;
+    nks->mouse_dx = 0;
+    nks->mouse_dy = 0;
+    nks->mouse_left = false;
+    nks->mouse_right = false;
+    nks->mouse_button_pending = false;
     qemu_irq_lower(nks->irq);
 }
 
