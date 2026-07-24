@@ -77,6 +77,7 @@
 #define NEXT_SECTOR_SIZE       512
 #define NEXT_DMA_BUFFER        0x04010000
 #define NEXT_POLL_LIMIT        10000
+#define NEXT_RESET_POLL_STEPS  256
 #define NEXT_MEMORY_SENTINEL   0xa5
 
 typedef struct TestFixture {
@@ -295,6 +296,17 @@ static void assert_relevant_interrupts(QTestState *qts, uint32_t expected)
                     NEXT_RELEVANT_IRQS, ==, expected);
 }
 
+static void assert_guest_memory_filled(QTestState *qts, uint8_t value)
+{
+    uint8_t received[NEXT_SECTOR_SIZE];
+    size_t i;
+
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, sizeof(received));
+    for (i = 0; i < sizeof(received); i++) {
+        g_assert_cmphex(received[i], ==, value);
+    }
+}
+
 static void test_controller_and_media(void)
 {
     static const uint8_t version[] = { 0x10 };
@@ -307,6 +319,7 @@ static void test_controller_and_media(void)
     assert_controller_mapped(fixture);
     qts = next_cube_start(fixture, true);
 
+    g_assert_cmphex(qtest_readb(qts, NEXT_FDC_DOR), ==, 0x04);
     qtest_writeb(qts, NEXT_FDC_DOR, 0x04);
     g_assert_cmphex(qtest_readb(qts, NEXT_FDC_MSR_DSR), ==, FDC_MSR_RQM);
 
@@ -324,6 +337,9 @@ static void test_controller_and_media(void)
 
     fdc_send_command(qts, sense, sizeof(sense));
     g_assert_cmphex(fdc_read_fifo(qts), ==, 0x80);
+    g_assert_cmphex(wait_fdc_msr(qts, 0xff, FDC_MSR_RQM,
+                                 "one-byte SENSE completion"),
+                    ==, FDC_MSR_RQM);
 
     qtest_quit(qts);
 }
@@ -435,6 +451,51 @@ static void test_ram_to_media_dma(void)
     g_assert_cmpmem(stored, sizeof(stored), source, sizeof(source));
 }
 
+static void test_reset_cancels_gated_dma_request(void)
+{
+    static const uint8_t read_command[] = {
+        0x46, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1b, 0xff,
+    };
+    TestFixture *fixture = fixture_new();
+    QTestState *qts;
+    unsigned int i;
+
+    assert_controller_mapped(fixture);
+    qts = next_cube_start(fixture, true);
+    prepare_dma_fdc(qts);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, NEXT_MEMORY_SENTINEL,
+                 NEXT_SECTOR_SIZE);
+    program_dma(qts, NEXT_DMA_BUFFER,
+                NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE, DMA_SETREAD);
+    fdc_send_command(qts, read_command, sizeof(read_command));
+
+    assert_guest_memory_filled(qts, NEXT_MEMORY_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
+                    DMA_ENABLE | DMA_READ);
+    assert_relevant_interrupts(qts, 0);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==, 0);
+    assert_relevant_interrupts(qts, 0);
+
+    qtest_writeb(qts, NEXT_SCSI_CONTROL, 0x18);
+    for (i = 0; i < NEXT_RESET_POLL_STEPS; i++) {
+        qtest_clock_step(qts, 1);
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE,
+                        ==, 0);
+    }
+
+    assert_guest_memory_filled(qts, NEXT_MEMORY_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==, 0);
+    assert_relevant_interrupts(qts, 0);
+
+    qtest_quit(qts);
+}
+
 static void test_chained_media_to_ram_dma(void)
 {
     static const uint8_t read_command[] = {
@@ -512,6 +573,8 @@ int main(int argc, char **argv)
                    test_media_to_ram_dma);
     qtest_add_func("/next-cube/floppy/ram-to-media-dma",
                    test_ram_to_media_dma);
+    qtest_add_func("/next-cube/floppy/reset-cancels-gated-dma-request",
+                   test_reset_cancels_gated_dma_request);
     qtest_add_func("/next-cube/floppy/chained-media-to-ram-dma",
                    test_chained_media_to_ram_dma);
 
