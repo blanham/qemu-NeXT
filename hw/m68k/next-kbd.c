@@ -518,9 +518,56 @@ static void nextkbd_unrealize(DeviceState *dev)
     g_clear_pointer(&s->hs, qemu_input_handler_unregister);
 }
 
+static const VMStateDescription nextkbd_queue_entry_vmstate = {
+    .name = TYPE_NEXTKBD "/queue-entry",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(data, KBDQueueEntry),
+        VMSTATE_BOOL(keyboard, KBDQueueEntry),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static int nextkbd_post_load(void *opaque, int version_id)
+{
+    NextKBDState *s = opaque;
+
+    if (s->queue.rptr < 0 || s->queue.rptr >= KBD_QUEUE_SIZE ||
+        s->queue.wptr < 0 || s->queue.wptr >= KBD_QUEUE_SIZE ||
+        s->queue.count < 0 || s->queue.count > KBD_QUEUE_SIZE ||
+        (s->queue.rptr + s->queue.count) % KBD_QUEUE_SIZE !=
+            s->queue.wptr ||
+        (s->shift & ~(KD_LSHIFT | KD_RSHIFT))) {
+        return -EINVAL;
+    }
+
+    qemu_set_irq(s->irq, s->queue.count || s->overrun);
+    return 0;
+}
+
 static const VMStateDescription nextkbd_vmstate = {
     .name = TYPE_NEXTKBD,
-    .unmigratable = 1,    /* TODO: Implement this when m68k CPU is migratable */
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = nextkbd_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(queue.entries, NextKBDState, KBD_QUEUE_SIZE, 1,
+                             nextkbd_queue_entry_vmstate, KBDQueueEntry),
+        VMSTATE_INT32(queue.rptr, NextKBDState),
+        VMSTATE_INT32(queue.wptr, NextKBDState),
+        VMSTATE_INT32(queue.count, NextKBDState),
+        VMSTATE_UINT8(command, NextKBDState),
+        VMSTATE_UINT32(monitor_data, NextKBDState),
+        VMSTATE_UINT16(shift, NextKBDState),
+        VMSTATE_BOOL(overrun, NextKBDState),
+        VMSTATE_INT64(mouse_dx, NextKBDState),
+        VMSTATE_INT64(mouse_dy, NextKBDState),
+        VMSTATE_BOOL(mouse_left, NextKBDState),
+        VMSTATE_BOOL(mouse_right, NextKBDState),
+        VMSTATE_BOOL(mouse_button_pending, NextKBDState),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static const Property nextkbd_properties[] = {
