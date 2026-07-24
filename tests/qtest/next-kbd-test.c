@@ -354,8 +354,8 @@ static void test_mouse_button_only(void)
 
 static void test_mouse_large_motion(void)
 {
-    const int host_x = 150;
-    const int host_y = -130;
+    const int host_x = 450;
+    const int host_y = -391;
     QTestState *qts = next_cube_kbd_start();
     unsigned int packet_count = 0;
     int guest_x = 0;
@@ -390,7 +390,7 @@ static void test_mouse_large_motion(void)
         }
     } while (csr & NEXT_KBD_DAV);
 
-    g_assert_cmpuint(packet_count, ==, 1);
+    g_assert_cmpuint(packet_count, >, 1);
     g_assert_cmpint(-guest_x, ==, host_x / 3);
     g_assert_cmpint(-guest_y, ==, host_y / 3);
     assert_mouse_queue_empty(qts);
