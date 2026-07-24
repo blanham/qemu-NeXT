@@ -150,6 +150,14 @@ static int decode_mouse_delta(uint32_t field)
     return field & 0x40 ? (int)field - 0x80 : (int)field;
 }
 
+static void assert_mouse_queue_empty(QTestState *qts)
+{
+    uint32_t csr = qtest_readl(qts, NEXT_KBD_CSR);
+
+    g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
+}
+
 static void test_idle_csr_ctx_clear(void)
 {
     QTestState *qts = next_cube_kbd_start();
@@ -265,10 +273,10 @@ static void test_mouse_packet_irq_and_data(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
 
     /*
-     * Host motion (3, -2) is reported as raw (-3, 2).  Right is released
+     * Host motion (3, -3) is reported as raw (-1, 1).  Right is released
      * (bit 8 set) and left is pressed (bit 0 clear).
      */
-    send_mouse_motion_and_button(qts, 3, -2, "left", true);
+    send_mouse_motion_and_button(qts, 3, -3, "left", true);
 
     csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV),
@@ -277,7 +285,7 @@ static void test_mouse_packet_irq_and_data(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD,
                     ==, NEXT_INTR_KBD);
 
-    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x110005fa);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x110003fe);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
     csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
@@ -289,11 +297,34 @@ static void test_mouse_dequeue_modifier_isolation(void)
 {
     QTestState *qts = next_cube_kbd_start();
 
-    send_mouse_motion(qts, 0, -2);
+    send_mouse_motion(qts, 0, -6);
     send_key(qts, "shift", true);
 
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x11000501);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_mouse_scaled_signed_remainder(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_mouse_motion(qts, 1, -1);
+    assert_mouse_queue_empty(qts);
+    send_mouse_motion(qts, 1, -1);
+    assert_mouse_queue_empty(qts);
+    send_mouse_motion(qts, 1, -1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x110003ff);
+    assert_mouse_queue_empty(qts);
+
+    send_mouse_motion(qts, -1, 1);
+    assert_mouse_queue_empty(qts);
+    send_mouse_motion(qts, -1, 1);
+    assert_mouse_queue_empty(qts);
+    send_mouse_motion(qts, -1, 1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x1100ff03);
+    assert_mouse_queue_empty(qts);
 
     qtest_quit(qts);
 }
@@ -359,11 +390,14 @@ static void test_mouse_large_motion(void)
         }
     } while (csr & NEXT_KBD_DAV);
 
-    g_assert_cmpuint(packet_count, >, 1);
-    g_assert_cmpint(-guest_x, ==, host_x);
-    g_assert_cmpint(-guest_y, ==, host_y);
-    g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
-    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
+    g_assert_cmpuint(packet_count, ==, 1);
+    g_assert_cmpint(-guest_x, ==, host_x / 3);
+    g_assert_cmpint(-guest_y, ==, host_y / 3);
+    assert_mouse_queue_empty(qts);
+
+    send_mouse_motion(qts, 0, -2);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x11000301);
+    assert_mouse_queue_empty(qts);
 
     qtest_quit(qts);
 }
@@ -386,6 +420,8 @@ int main(int argc, char **argv)
                    test_mouse_dequeue_modifier_isolation);
     qtest_add_func("/next-cube/mouse/button-only",
                    test_mouse_button_only);
+    qtest_add_func("/next-cube/mouse/scaled-signed-remainder",
+                   test_mouse_scaled_signed_remainder);
     qtest_add_func("/next-cube/mouse/large-motion",
                    test_mouse_large_motion);
     return g_test_run();
