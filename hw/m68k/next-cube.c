@@ -23,6 +23,7 @@
 #include "hw/core/loader.h"
 #include "hw/audio/next-sound.h"
 #include "hw/dma/next-dma.h"
+#include "hw/display/next-fb.h"
 #include "hw/misc/next-memctl.h"
 #include "hw/net/next-mb8795.h"
 #include "hw/rtc/next-rtc.h"
@@ -42,6 +43,7 @@
 #include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
 #include "migration/vmstate.h"
@@ -57,8 +59,6 @@
 #endif
 
 #define ENTRY       0x0100001e
-#define RAM_SIZE    0x4000000
-#define ROM_FILE    "Rev_2.5_v66.bin"
 
 #define NEXT_DMA_BASE        0x02000000
 #define NEXT_SCSI_ROM_CSR_BASE 0x02014020
@@ -131,6 +131,7 @@ struct NeXTPC {
     MemoryRegion scsi_csr_rom_alias;
 
     uint32_t scr1;
+    uint32_t scr1_reset;
     uint32_t scr2;
     uint32_t old_scr2;
     uint32_t int_mask;
@@ -154,8 +155,46 @@ struct NeXTPC {
     qemu_irq rtc_cmd_reset_irq;
 };
 
-#define TYPE_NEXT_MACHINE MACHINE_TYPE_NAME("next-cube")
-OBJECT_DECLARE_SIMPLE_TYPE(NeXTState, NEXT_MACHINE)
+#define TYPE_NEXT_MACHINE "next-machine"
+#define TYPE_NEXT_CUBE_MACHINE MACHINE_TYPE_NAME("next-cube")
+#define TYPE_NEXT_STATION_MACHINE MACHINE_TYPE_NAME("next-station")
+#define TYPE_NEXT_STATION_COLOR_MACHINE \
+    MACHINE_TYPE_NAME("next-station-color")
+
+typedef enum NeXTVideoKind {
+    NEXT_VIDEO_MONO,
+    NEXT_VIDEO_COLOR,
+} NeXTVideoKind;
+
+typedef enum NeXTDiskMuxKind {
+    NEXT_DISK_MUX_FLPCTL,
+    NEXT_DISK_MUX_CUBE_OD,
+} NeXTDiskMuxKind;
+
+typedef struct NeXTBoardProfile {
+    const char *product_name;
+    const char *default_bios;
+    uint8_t slot_id;
+    uint8_t dma_revision;
+    uint8_t machine_type;
+    uint8_t board_revision;
+    uint8_t video_memory_speed;
+    uint8_t main_memory_speed;
+    uint8_t cpu_clock;
+    ram_addr_t default_ram_size;
+    ram_addr_t maximum_ram_size;
+    NeXTVideoKind video_kind;
+    NeXTDiskMuxKind disk_mux_kind;
+    bool has_nextbus;
+} NeXTBoardProfile;
+
+typedef struct NeXTMachineClass {
+    MachineClass parent_class;
+
+    const NeXTBoardProfile *profile;
+} NeXTMachineClass;
+
+OBJECT_DECLARE_TYPE(NeXTState, NeXTMachineClass, NEXT_MACHINE)
 
 struct NeXTState {
     MachineState parent;
@@ -172,6 +211,45 @@ struct NeXTState {
     NextRTCChip rtc_chip;
     bool rtc_chip_locked;
 };
+
+static const NeXTBoardProfile next_cube_profile = {
+    .product_name = "NeXTcube (68040, X15)",
+    .default_bios = "Rev_2.5_v66.bin",
+    .dma_revision = 1,
+    .machine_type = 2,
+    .board_revision = 0,
+    .cpu_clock = 2,
+    .default_ram_size = 64 * MiB,
+    .maximum_ram_size = 64 * MiB,
+    .video_kind = NEXT_VIDEO_MONO,
+    .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
+    .has_nextbus = true,
+};
+
+static const NeXTBoardProfile next_station_profile = {
+    .product_name = "NeXTstation (Warp 9)",
+    .default_bios = "Rev_2.5_v66.bin",
+    .dma_revision = 1,
+    .machine_type = 1,
+    .board_revision = 0,
+    .cpu_clock = 2,
+    .default_ram_size = 64 * MiB,
+    .maximum_ram_size = 64 * MiB,
+    .video_kind = NEXT_VIDEO_MONO,
+    .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
+    .has_nextbus = false,
+};
+
+static uint32_t next_profile_scr1(const NeXTBoardProfile *profile)
+{
+    return ((uint32_t)(profile->slot_id & 0xf) << 28) |
+           ((uint32_t)profile->dma_revision << 16) |
+           ((uint32_t)(profile->machine_type & 0xf) << 12) |
+           ((uint32_t)(profile->board_revision & 0xf) << 8) |
+           ((uint32_t)(profile->video_memory_speed & 0x3) << 6) |
+           ((uint32_t)(profile->main_memory_speed & 0x3) << 4) |
+           (uint32_t)(profile->cpu_clock & 0x3);
+}
 
 static const QEnumLookup next_machine_rtc_chip_lookup = {
     .array = (const char *const[]) {
@@ -960,7 +1038,7 @@ static void next_pc_reset_hold(Object *obj, ResetType type)
 
     /* Set internal registers to initial values */
     /*     0x0000XX00 << vital bits */
-    s->scr1 = 0x00011102;
+    s->scr1 = s->scr1_reset;
     s->scr2 = 0x00ff0c80;
     s->old_scr2 = s->scr2;
     s->timer_latch = 0;
@@ -1076,6 +1154,7 @@ static void next_pc_init(Object *obj)
 static const Property next_pc_properties[] = {
     DEFINE_PROP_LINK("cpu", NeXTPC, cpu, TYPE_M68K_CPU, M68kCPU *),
     DEFINE_PROP_LINK("dma", NeXTPC, dma, TYPE_NEXT_DMA, NextDMAState *),
+    DEFINE_PROP_UINT32("scr1-reset", NeXTPC, scr1_reset, 0x00011002),
 };
 
 static int next_pc_post_load(void *opaque, int version_id)
@@ -1160,7 +1239,30 @@ static const TypeInfo next_pc_info = {
     .class_init = next_pc_class_init,
 };
 
-static void next_cube_init(MachineState *machine)
+static void next_machine_create_fdc_and_flpctl(
+    MachineState *machine G_GNUC_UNUSED, NeXTState *m, DeviceState *pcdev)
+{
+    DeviceState *fdc_dev;
+    DeviceState *floppy_ctrl_dev;
+    DriveInfo *fds[MAX_FD];
+
+    /* The 82077 and ESP share the physical SCSI DMA channel. */
+    fds[0] = drive_get(IF_FLOPPY, 0, 0);
+    fds[1] = drive_get(IF_FLOPPY, 0, 1);
+    fdc_dev = fdctrl_init_sysbus_dma(
+        qdev_get_gpio_in(pcdev, NEXT_FD_I), 0x02114100, fds,
+        ISADMA(m->dma), NEXT_DMA_SCSI, true);
+
+    floppy_ctrl_dev = qdev_new(TYPE_NEXT_FLOPPY_CTRL);
+    object_property_set_link(OBJECT(floppy_ctrl_dev), "fdc",
+                             OBJECT(fdc_dev), &error_abort);
+    object_property_set_link(OBJECT(floppy_ctrl_dev), "dma",
+                             OBJECT(m->dma), &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(floppy_ctrl_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(floppy_ctrl_dev), 0, 0x02114108);
+}
+
+static void next_machine_init(MachineState *machine)
 {
     static const int dma_irq_inputs[NEXT_DMA_CHANNEL_COUNT] = {
         [NEXT_DMA_SCSI] = NEXT_SCSI_DMA_I,
@@ -1176,22 +1278,28 @@ static void next_cube_init(MachineState *machine)
         [NEXT_DMA_R2M] = NEXT_R2M_DMA_I,
         [NEXT_DMA_M2R] = NEXT_M2R_DMA_I,
     };
+    const NeXTBoardProfile *profile =
+        NEXT_MACHINE_GET_CLASS(machine)->profile;
     NeXTState *m = NEXT_MACHINE(machine);
     M68kCPU *cpu;
     CPUM68KState *env;
     MemoryRegion *sysmem = get_system_memory();
-    const char *bios_name = machine->firmware ?: ROM_FILE;
+    const char *bios_name = machine->firmware ?: profile->default_bios;
     DeviceState *dma_dev;
-    DeviceState *fdc_dev;
-    DeviceState *floppy_ctrl_dev;
     DeviceState *kbd_dev;
     DeviceState *mbdev;
     DeviceState *memctl_dev;
     DeviceState *pcdev;
     DeviceState *serial_dev;
     DeviceState *sound_dev;
-    DriveInfo *fds[MAX_FD];
     int channel;
+
+    if (machine->ram_size > profile->maximum_ram_size) {
+        error_report("%s supports at most %" PRIu64 " MiB of RAM",
+                     profile->product_name,
+                     profile->maximum_ram_size / MiB);
+        exit(EXIT_FAILURE);
+    }
 
     /* Initialize the cpu core */
     cpu = M68K_CPU(cpu_create(machine->cpu_type));
@@ -1216,6 +1324,7 @@ static void next_cube_init(MachineState *machine)
     object_property_set_link(OBJECT(pcdev), "cpu", OBJECT(cpu), &error_abort);
     object_property_set_link(OBJECT(pcdev), "dma", OBJECT(m->dma),
                              &error_abort);
+    qdev_prop_set_uint32(pcdev, "scr1-reset", next_profile_scr1(profile));
     if (m->nvram_file && m->nvram_file[0]) {
         qdev_prop_set_string(DEVICE(&NEXT_PC(pcdev)->rtc), "nvram-file",
                              m->nvram_file);
@@ -1236,20 +1345,14 @@ static void next_cube_init(MachineState *machine)
         }
     }
 
-    /* The 82077 and ESP share the physical SCSI DMA channel. */
-    fds[0] = drive_get(IF_FLOPPY, 0, 0);
-    fds[1] = drive_get(IF_FLOPPY, 0, 1);
-    fdc_dev = fdctrl_init_sysbus_dma(
-        qdev_get_gpio_in(pcdev, NEXT_FD_I), 0x02114100, fds,
-        ISADMA(m->dma), NEXT_DMA_SCSI, true);
-
-    floppy_ctrl_dev = qdev_new(TYPE_NEXT_FLOPPY_CTRL);
-    object_property_set_link(OBJECT(floppy_ctrl_dev), "fdc",
-                             OBJECT(fdc_dev), &error_abort);
-    object_property_set_link(OBJECT(floppy_ctrl_dev), "dma",
-                             OBJECT(m->dma), &error_abort);
-    sysbus_realize_and_unref(SYS_BUS_DEVICE(floppy_ctrl_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(floppy_ctrl_dev), 0, 0x02114108);
+    switch (profile->disk_mux_kind) {
+    case NEXT_DISK_MUX_FLPCTL:
+        next_machine_create_fdc_and_flpctl(machine, m, pcdev);
+        break;
+    case NEXT_DISK_MUX_CUBE_OD:
+    default:
+        g_assert_not_reached();
+    }
 
     /* Serial ports and clock select */
     serial_dev = qdev_new(TYPE_NEXT_SERIAL);
@@ -1301,7 +1404,9 @@ static void next_cube_init(MachineState *machine)
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);
 
     /* Framebuffer */
-    sysbus_create_simple(TYPE_NEXTFB, 0x0B000000, NULL);
+    if (profile->video_kind == NEXT_VIDEO_MONO) {
+        sysbus_create_simple(TYPE_NEXTFB, 0x0B000000, NULL);
+    }
 
     /* MMIO */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 0, 0x02005000);
@@ -1352,11 +1457,13 @@ static void next_cube_init(MachineState *machine)
     Error *local_err = NULL;
     if (load_image_targphys(bios_name, 0x01000000, 0x20000, &local_err) < 8) {
         if (!qtest_enabled()) {
+            error_report("Could not load ROM image '%s'", bios_name);
             if (local_err) {
                 error_report_err(local_err);
             } else {
                 error_report("Firmware image '%s' is too short.", bios_name);
             }
+            exit(EXIT_FAILURE);
         } else {
             error_free(local_err);
         }
@@ -1417,18 +1524,8 @@ static void next_machine_finalize(Object *obj)
 
 static void next_machine_class_init(ObjectClass *oc, const void *data)
 {
-    MachineClass *mc = MACHINE_CLASS(oc);
     ObjectProperty *prop;
 
-    mc->desc = "NeXT Cube";
-    mc->init = next_cube_init;
-    mc->block_default_type = IF_SCSI;
-    mc->default_ram_size = RAM_SIZE;
-    mc->default_ram_id = "next.ram";
-    mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
-    mc->default_nic = TYPE_NEXT_MB8795;
-    mc->no_cdrom = true;
-    machine_add_audiodev_property(mc);
     object_class_property_add_str(oc, "nvram-file",
                                   next_machine_get_nvram_file,
                                   next_machine_set_nvram_file);
@@ -1443,17 +1540,69 @@ static void next_machine_class_init(ObjectClass *oc, const void *data)
         oc, "rtc-chip", "NeXT RTC chip model (mcs1850 or mc68hc68t1)");
 }
 
-static const TypeInfo next_typeinfo = {
+static const char * const next_040_cpu_types[] = {
+    M68K_CPU_TYPE_NAME("m68040"),
+    NULL,
+};
+
+static void next_machine_common_class_init(
+    ObjectClass *oc, const NeXTBoardProfile *profile, const char *description)
+{
+    NeXTMachineClass *nmc = NEXT_MACHINE_CLASS(oc);
+    MachineClass *mc = MACHINE_CLASS(oc);
+
+    nmc->profile = profile;
+    mc->desc = description;
+    mc->init = next_machine_init;
+    mc->block_default_type = IF_SCSI;
+    mc->default_ram_size = profile->default_ram_size;
+    mc->default_ram_id = "next.ram";
+    mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
+    mc->valid_cpu_types = next_040_cpu_types;
+    mc->default_nic = TYPE_NEXT_MB8795;
+    mc->no_cdrom = true;
+    machine_add_audiodev_property(mc);
+}
+
+static void next_cube_machine_class_init(ObjectClass *oc, const void *data)
+{
+    next_machine_common_class_init(oc, &next_cube_profile,
+                                   "NeXTcube (68040, X15)");
+}
+
+static void next_station_machine_class_init(ObjectClass *oc, const void *data)
+{
+    next_machine_common_class_init(oc, &next_station_profile,
+                                   "NeXTstation (Warp 9)");
+}
+
+static const TypeInfo next_machine_typeinfo = {
     .name = TYPE_NEXT_MACHINE,
     .parent = TYPE_MACHINE,
+    .abstract = true,
     .class_init = next_machine_class_init,
+    .class_size = sizeof(NeXTMachineClass),
     .instance_size = sizeof(NeXTState),
     .instance_finalize = next_machine_finalize,
 };
 
+static const TypeInfo next_cube_machine_typeinfo = {
+    .name = TYPE_NEXT_CUBE_MACHINE,
+    .parent = TYPE_NEXT_MACHINE,
+    .class_init = next_cube_machine_class_init,
+};
+
+static const TypeInfo next_station_machine_typeinfo = {
+    .name = TYPE_NEXT_STATION_MACHINE,
+    .parent = TYPE_NEXT_MACHINE,
+    .class_init = next_station_machine_class_init,
+};
+
 static void next_register_type(void)
 {
-    type_register_static(&next_typeinfo);
+    type_register_static(&next_machine_typeinfo);
+    type_register_static(&next_cube_machine_typeinfo);
+    type_register_static(&next_station_machine_typeinfo);
     type_register_static(&next_pc_info);
     type_register_static(&next_scsi_info);
 }

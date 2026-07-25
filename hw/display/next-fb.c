@@ -27,7 +27,7 @@
 #include "hw/core/loader.h"
 #include "framebuffer.h"
 #include "ui/pixel_ops.h"
-#include "hw/m68k/next-cube.h"
+#include "hw/display/next-fb.h"
 #include "qom/object.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTFbState, NEXTFB)

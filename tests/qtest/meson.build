@@ -163,7 +163,8 @@ qtests_loongarch64 = qtests_filter + \
 qtests_m68k = ['boot-serial-test'] + \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_NEXTCUBE') ?
-   ['next-cube-scsi-test',
+   ['next-machine-test',
+    'next-cube-scsi-test',
     'next-dma-test',
     'next-kbd-test',
     'next-cube-serial-test',
