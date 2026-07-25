@@ -5,6 +5,8 @@
 #include "qemu/timer.h"
 
 #define NEXT_SCR2          0x0200d000
+#define NEXT_INTR_STATUS   0x02007000
+#define NEXT_INTR_PWR      0x00000004
 #define NEXT_SCR2_RTCE     0x00000100
 #define NEXT_SCR2_RTCLK    0x00000200
 #define NEXT_SCR2_RTDATA   0x00000400
@@ -12,9 +14,13 @@
 #define NEXT_RTC_START     0x80
 #define NEXT_RTC_NEW_CLOCK 0x80
 #define NEXT_RTC_XTAL      0x30
+#define NEXT_RTC_INTR      0x08
+#define NEXT_RTC_ALARM     0x02
 #define NEXT_RTC_AUTO_PON  0x20
 #define NEXT_RTC_ALARM_EN  0x10
-#define NEXT_RTC_LOW_BATT  0x02
+#define NEXT_RTC_ALARM_CLR 0x08
+#define NEXT_RTC_PDOWN     0x40
+#define NEXT_RTC_LBE       0x02
 
 typedef struct TestROM {
     int fd;
@@ -421,6 +427,15 @@ static void rtc_write_byte(QTestState *qts, uint8_t addr, uint8_t value)
     rtc_block_write(qts, addr | 0x80, &value, 1);
 }
 
+static void rtc_write_alarm(QTestState *qts, uint32_t value)
+{
+    uint8_t bytes[] = {
+        value >> 24, value >> 16, value >> 8, value,
+    };
+
+    rtc_block_write(qts, 0xa4, bytes, sizeof(bytes));
+}
+
 static void test_rtc_chip_selection_and_calendar_reads(void)
 {
     static const uint8_t old_calendar[] = {
@@ -808,7 +823,7 @@ static void test_mcs1850_retains_clock_state_across_system_reset(void)
     uint32_t scr2;
 
     rtc_write_byte(qts, 0x31,
-                   NEXT_RTC_AUTO_PON | NEXT_RTC_ALARM_EN | NEXT_RTC_LOW_BATT);
+                   NEXT_RTC_AUTO_PON | NEXT_RTC_ALARM_EN | NEXT_RTC_LBE);
     rtc_block_write(qts, 0xa0, counter, sizeof(counter));
     rtc_block_write(qts, 0xa4, alarm, sizeof(alarm));
 
@@ -820,7 +835,7 @@ static void test_mcs1850_retains_clock_state_across_system_reset(void)
 
     g_assert_cmphex(rtc_read_counter(qts), ==, 0x12345678);
     g_assert_cmphex(rtc_read_byte(qts, 0x31), ==,
-                    NEXT_RTC_AUTO_PON | NEXT_RTC_ALARM_EN | NEXT_RTC_LOW_BATT);
+                    NEXT_RTC_AUTO_PON | NEXT_RTC_ALARM_EN | NEXT_RTC_LBE);
     g_assert_cmphex(rtc_read_byte(qts, 0x24), ==, alarm[0]);
     g_assert_cmphex(rtc_read_byte(qts, 0x25), ==, alarm[1]);
     g_assert_cmphex(rtc_read_byte(qts, 0x26), ==, alarm[2]);
@@ -885,6 +900,108 @@ static void test_running_rtcs_remain_monotonic_across_system_reset(void)
     qtest_quit(old_qts);
 }
 
+static void test_mcs1850_alarm_irq_and_acknowledgement(void)
+{
+    QTestState *qts = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint32_t counter = rtc_read_counter(qts);
+
+    rtc_write_alarm(qts, counter + 2);
+    rtc_write_byte(qts, 0x31, NEXT_RTC_START | NEXT_RTC_ALARM_EN);
+    g_assert_cmphex(rtc_read_byte(qts, 0x30), ==, NEXT_RTC_NEW_CLOCK);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, 0);
+
+    qtest_clock_step(qts, NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(qts, 0x30), ==, NEXT_RTC_NEW_CLOCK);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, 0);
+
+    qtest_clock_step(qts, NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(qts, 0x30), ==,
+                    NEXT_RTC_NEW_CLOCK | NEXT_RTC_INTR | NEXT_RTC_ALARM);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, NEXT_INTR_PWR);
+
+    rtc_write_byte(qts, 0x31,
+                   NEXT_RTC_START | NEXT_RTC_ALARM_EN | NEXT_RTC_ALARM_CLR);
+    g_assert_cmphex(rtc_read_byte(qts, 0x30), ==, NEXT_RTC_NEW_CLOCK);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, 0);
+
+    counter = rtc_read_counter(qts);
+    rtc_write_alarm(qts, counter);
+    g_assert_cmphex(rtc_read_byte(qts, 0x30), ==,
+                    NEXT_RTC_NEW_CLOCK | NEXT_RTC_INTR | NEXT_RTC_ALARM);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, NEXT_INTR_PWR);
+
+    qtest_quit(qts);
+}
+
+static void test_rtc_power_down_requests_shutdown(void)
+{
+    QTestState *new_qts = next_cube_rtc_start_with_args("-no-shutdown");
+    QTestState *old_qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1", "-no-shutdown");
+
+    rtc_write_byte(new_qts, 0x31, NEXT_RTC_PDOWN);
+    qtest_qmp_eventwait(new_qts, "SHUTDOWN");
+    g_assert_cmphex(rtc_read_byte(new_qts, 0x31), ==, 0);
+
+    rtc_write_byte(old_qts, 0x32, NEXT_RTC_PDOWN);
+    qtest_qmp_eventwait(old_qts, "SHUTDOWN");
+    g_assert_cmphex(rtc_read_byte(old_qts, 0x32), ==, 0);
+
+    qtest_quit(new_qts);
+    qtest_quit(old_qts);
+}
+
+static void test_mcs1850_alarm_migration(void)
+{
+    g_autoptr(GError) err = NULL;
+    TestMigrationFiles *files = g_new0(TestMigrationFiles, 1);
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    QTestState *source;
+    QTestState *destination;
+    uint32_t counter;
+
+    qtest_add_abrt_handler(cleanup_test_migration_files, files);
+    g_test_queue_destroy(cleanup_test_migration_files, files);
+    files->tmpdir = g_dir_make_tmp("next-mcs-rtc-migration-XXXXXX", &err);
+    g_assert_no_error(err);
+    g_assert_nonnull(files->tmpdir);
+    files->ephemeral_socket =
+        g_build_filename(files->tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", files->ephemeral_socket);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-rtc clock=vm -incoming %s", quoted_uri);
+
+    destination = next_cube_rtc_start_full(NULL, incoming_args);
+    source = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    counter = rtc_read_counter(source);
+    rtc_write_alarm(source, counter + 2);
+    rtc_write_byte(source, 0x31, NEXT_RTC_START | NEXT_RTC_ALARM_EN);
+    migrate_wait(source, destination, uri);
+
+    qtest_clock_step(destination, 2 * NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(destination, 0x30), ==,
+                    NEXT_RTC_NEW_CLOCK | NEXT_RTC_INTR | NEXT_RTC_ALARM);
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, NEXT_INTR_PWR);
+    rtc_write_byte(destination, 0x31,
+                   NEXT_RTC_START | NEXT_RTC_ALARM_EN | NEXT_RTC_ALARM_CLR);
+    g_assert_cmphex(rtc_read_byte(destination, 0x30), ==, NEXT_RTC_NEW_CLOCK);
+    g_assert_cmphex(qtest_readl(destination, NEXT_INTR_STATUS) & NEXT_INTR_PWR,
+                    ==, 0);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -927,5 +1044,11 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/rtc/running-remains-monotonic-"
                    "across-system-reset",
                    test_running_rtcs_remain_monotonic_across_system_reset);
+    qtest_add_func("/next-cube/rtc/mcs1850-alarm-irq-and-acknowledgement",
+                   test_mcs1850_alarm_irq_and_acknowledgement);
+    qtest_add_func("/next-cube/rtc/power-down-requests-shutdown",
+                   test_rtc_power_down_requests_shutdown);
+    qtest_add_func("/next-cube/rtc/mcs1850-alarm-migration",
+                   test_mcs1850_alarm_migration);
     return g_test_run();
 }

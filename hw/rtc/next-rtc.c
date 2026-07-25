@@ -41,20 +41,27 @@
 #include "qemu/timer.h"
 #include "qapi/util.h"
 #include "system/rtc.h"
+#include "system/runstate.h"
 #include "system/system.h"
 
 #define NEXT_RTC_STATUS_NEW_CLOCK  0x80
+#define NEXT_RTC_STATUS_FTU        0x10
+#define NEXT_RTC_STATUS_INTR       0x08
+#define NEXT_RTC_STATUS_LOW_BATT   0x04
+#define NEXT_RTC_STATUS_ALARM      0x02
+#define NEXT_RTC_STATUS_RPD        0x01
 #define NEXT_RTC_CONTROL_START     0x80
+#define NEXT_RTC_CONTROL_PDOWN     0x40
 #define NEXT_RTC_CONTROL_AUTO_PON  0x20
 #define NEXT_RTC_CONTROL_ALARM_EN  0x10
 #define NEXT_RTC_CONTROL_ALARM_CLR 0x08
 #define NEXT_RTC_CONTROL_FTU_CLR   0x04
-#define NEXT_RTC_CONTROL_LOW_BATT  0x02
+#define NEXT_RTC_CONTROL_LBE       0x02
 #define NEXT_RTC_CONTROL_RPD_CLR   0x01
 #define NEXT_RTC_CONTROL_STORED    (NEXT_RTC_CONTROL_START | \
                                     NEXT_RTC_CONTROL_AUTO_PON | \
                                     NEXT_RTC_CONTROL_ALARM_EN | \
-                                    NEXT_RTC_CONTROL_LOW_BATT)
+                                    NEXT_RTC_CONTROL_LBE)
 #define NEXT_RTC_OLD_CONTROL_XTAL  0x30
 #define NEXT_RTC_OLD_CONTROL_STORED (NEXT_RTC_CONTROL_START | \
                                      NEXT_RTC_OLD_CONTROL_XTAL)
@@ -62,6 +69,7 @@
 #define NEXT_RTC_OLD_HOUR_PM       0x20
 #define NEXT_RTC_OLD_CALENDAR_START 0x20
 #define NEXT_RTC_OLD_CALENDAR_SIZE  7
+#define NEXT_RTC_OLD_INTCTL_PDOWN  0x40
 #define NEXT_RTC_SECONDS_PER_DAY    (24 * 60 * 60)
 
 static const QEnumLookup next_rtc_chip_lookup = {
@@ -87,6 +95,80 @@ static uint32_t next_rtc_counter_value(NeXTRTC *rtc)
 
     elapsed_ns = qemu_clock_get_ns(rtc_clock) - rtc->counter_ref_ns;
     return rtc->counter + elapsed_ns / NANOSECONDS_PER_SECOND;
+}
+
+static bool next_rtc_mcs_alarm_enabled(NeXTRTC *rtc)
+{
+    return (rtc->control & (NEXT_RTC_CONTROL_START |
+                            NEXT_RTC_CONTROL_ALARM_EN)) ==
+           (NEXT_RTC_CONTROL_START | NEXT_RTC_CONTROL_ALARM_EN);
+}
+
+static void next_rtc_update_power_irq(NeXTRTC *rtc)
+{
+    bool pending;
+
+    if (rtc->chip != NEXT_RTC_CHIP_MCS1850) {
+        qemu_irq_lower(rtc->power_irq);
+        return;
+    }
+
+    pending = rtc->status & (NEXT_RTC_STATUS_FTU |
+                              NEXT_RTC_STATUS_ALARM |
+                              NEXT_RTC_STATUS_RPD);
+    pending |= (rtc->status & NEXT_RTC_STATUS_LOW_BATT) &&
+               (rtc->control & NEXT_RTC_CONTROL_LBE);
+    if (pending) {
+        rtc->status |= NEXT_RTC_STATUS_INTR;
+        qemu_irq_raise(rtc->power_irq);
+    } else {
+        rtc->status &= ~NEXT_RTC_STATUS_INTR;
+        qemu_irq_lower(rtc->power_irq);
+    }
+}
+
+static void next_rtc_latch_alarm(NeXTRTC *rtc, bool due)
+{
+    if (due && next_rtc_mcs_alarm_enabled(rtc) &&
+        !(rtc->status & NEXT_RTC_STATUS_ALARM)) {
+        rtc->status |= NEXT_RTC_STATUS_ALARM;
+    }
+}
+
+static void next_rtc_recompute_events(NeXTRTC *rtc, bool latch_equal)
+{
+    uint32_t now;
+    uint32_t seconds;
+
+    if (rtc->chip != NEXT_RTC_CHIP_MCS1850) {
+        timer_del(rtc->alarm_timer);
+        next_rtc_update_power_irq(rtc);
+        return;
+    }
+
+    now = next_rtc_counter_value(rtc);
+    next_rtc_latch_alarm(rtc, latch_equal && now == rtc->alarm);
+    next_rtc_update_power_irq(rtc);
+
+    timer_del(rtc->alarm_timer);
+    if (!next_rtc_mcs_alarm_enabled(rtc) ||
+        (rtc->status & NEXT_RTC_STATUS_ALARM)) {
+        return;
+    }
+
+    seconds = rtc->alarm - now;
+    if (seconds) {
+        timer_mod(rtc->alarm_timer, qemu_clock_get_ns(rtc_clock) +
+                  (int64_t)seconds * NANOSECONDS_PER_SECOND);
+    }
+}
+
+static void next_rtc_alarm_timer(void *opaque)
+{
+    NeXTRTC *rtc = NEXT_RTC(opaque);
+
+    next_rtc_latch_alarm(rtc, true);
+    next_rtc_recompute_events(rtc, false);
 }
 
 static uint8_t next_rtc_to_bcd(unsigned int value)
@@ -319,6 +401,7 @@ static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
         } else {
             rtc->control = value & NEXT_RTC_OLD_CONTROL_STORED;
         }
+        next_rtc_recompute_events(rtc, false);
         return;
     }
 
@@ -330,15 +413,19 @@ static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
 
     rtc->control = value & NEXT_RTC_CONTROL_STORED;
     if (value & NEXT_RTC_CONTROL_FTU_CLR) {
-        rtc->status &= ~0x18;
-        qemu_irq_lower(rtc->power_irq);
+        rtc->status &= ~NEXT_RTC_STATUS_FTU;
     }
     if (value & NEXT_RTC_CONTROL_ALARM_CLR) {
-        rtc->status &= ~0x02;
+        rtc->status &= ~NEXT_RTC_STATUS_ALARM;
     }
     if (value & NEXT_RTC_CONTROL_RPD_CLR) {
-        rtc->status &= ~0x01;
+        rtc->status &= ~NEXT_RTC_STATUS_RPD;
     }
+    if (value & NEXT_RTC_CONTROL_PDOWN) {
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    }
+    next_rtc_recompute_events(rtc,
+                              !(value & NEXT_RTC_CONTROL_ALARM_CLR));
 }
 
 static void next_rtc_load_read_value(NeXTRTC *rtc, bool new_command)
@@ -392,17 +479,22 @@ static void next_rtc_store_write_value(NeXTRTC *rtc)
         } else if (addr == 0x31) {
             next_rtc_set_control(rtc, rtc->value);
         } else if (addr == 0x32) {
-            rtc->old_intctl = rtc->value;
+            rtc->old_intctl = rtc->value & ~NEXT_RTC_OLD_INTCTL_PDOWN;
+            if (rtc->value & NEXT_RTC_OLD_INTCTL_PDOWN) {
+                qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+            }
         }
     } else if (addr <= 0x23) {
         unsigned int shift = (0x23 - addr) * 8;
 
         rtc->counter = deposit32(rtc->counter, shift, 8, rtc->value);
         rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+        next_rtc_recompute_events(rtc, true);
     } else if (addr <= 0x27) {
         unsigned int shift = (0x27 - addr) * 8;
 
         rtc->alarm = deposit32(rtc->alarm, shift, 8, rtc->value);
+        next_rtc_recompute_events(rtc, true);
     } else if (addr == 0x31) {
         next_rtc_set_control(rtc, rtc->value);
     }
@@ -502,7 +594,7 @@ static void next_rtc_reset_exit(Object *obj, ResetType type)
     NeXTRTC *rtc = NEXT_RTC(obj);
 
     qemu_irq_lower(rtc->data_out_irq);
-    qemu_irq_lower(rtc->power_irq);
+    next_rtc_recompute_events(rtc, true);
 }
 
 static int next_rtc_pre_save(void *opaque)
@@ -537,7 +629,11 @@ static bool next_rtc_post_load_errp(void *opaque, int version_id, Error **errp)
     if (version_id < 6 && rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
         next_rtc_old_calendar_snapshot(rtc);
     }
-    return next_nvram_flush(&rtc->nvram, errp);
+    if (!next_nvram_flush(&rtc->nvram, errp)) {
+        return false;
+    }
+    next_rtc_recompute_events(rtc, true);
+    return true;
 }
 
 static void next_rtc_init(Object *obj)
@@ -563,12 +659,15 @@ static void next_rtc_realize(DeviceState *dev, Error **errp)
         return;
     }
     next_rtc_initialize_clock(rtc);
+    rtc->alarm_timer = timer_new_ns(rtc_clock, next_rtc_alarm_timer, rtc);
+    next_rtc_recompute_events(rtc, true);
 }
 
 static void next_rtc_unrealize(DeviceState *dev)
 {
     NeXTRTC *rtc = NEXT_RTC(dev);
 
+    timer_free(rtc->alarm_timer);
     next_nvram_unrealize(&rtc->nvram);
 }
 

@@ -35,6 +35,7 @@
 
 #include "hw/core/sysbus.h"
 #include "hw/nvram/next-nvram.h"
+#include "qemu/timer.h"
 
 #define TYPE_NEXT_RTC "next-rtc"
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTRTC, NEXT_RTC)
@@ -66,6 +67,7 @@ struct NeXTRTC {
     uint8_t old_weekday;
     uint32_t old_weekday_day;
     int64_t counter_ref_ns;
+    QEMUTimer *alarm_timer;
 
     qemu_irq data_out_irq;
     qemu_irq power_irq;
