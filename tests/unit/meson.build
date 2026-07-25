@@ -50,6 +50,7 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
   'test-envlist': [],
+  'test-icount-period': [],
 }
 
 if have_system or have_tools

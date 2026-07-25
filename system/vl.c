@@ -445,6 +445,9 @@ static QemuOptsList qemu_icount_opts = {
             .name = "shift",
             .type = QEMU_OPT_STRING,
         }, {
+            .name = "ns-per-insn",
+            .type = QEMU_OPT_NUMBER,
+        }, {
             .name = "align",
             .type = QEMU_OPT_BOOL,
         }, {

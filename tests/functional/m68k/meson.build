@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 tests_m68k_system_quick = [
+  'icount_period',
   'vmstate',
 ]
 

@@ -45,8 +45,6 @@
  * is TCG-specific, and does not need to be built for other accels.
  */
 static bool icount_sleep = true;
-/* Arbitrarily pick 1MIPS as the minimum allowable speed.  */
-#define MAX_ICOUNT_SHIFT 10
 
 bool icount_align_option;
 
@@ -155,6 +153,11 @@ int64_t icount_get(void)
 
 int64_t icount_to_ns(int64_t icount)
 {
+    uint32_t time_ns = qatomic_read(&timers_state.icount_time_ns);
+
+    if (time_ns) {
+        return icount_period_to_ns(icount, time_ns);
+    }
     return icount << qatomic_read(&timers_state.icount_time_shift);
 }
 
@@ -224,7 +227,12 @@ static void icount_adjust_vm(void *opaque)
 
 int64_t icount_round(int64_t count)
 {
+    uint32_t time_ns = qatomic_read(&timers_state.icount_time_ns);
     int shift = qatomic_read(&timers_state.icount_time_shift);
+
+    if (time_ns) {
+        return icount_period_round(count, time_ns);
+    }
     return (count + (1 << shift) - 1) >> shift;
 }
 
@@ -418,16 +426,30 @@ void icount_account_warp_timer(void)
 bool icount_configure(QemuOpts *opts, Error **errp)
 {
     const char *option = qemu_opt_get(opts, "shift");
+    const char *ns_option = qemu_opt_get(opts, "ns-per-insn");
     bool sleep = qemu_opt_get_bool(opts, "sleep", true);
     bool align = qemu_opt_get_bool(opts, "align", false);
+    uint64_t time_ns = qemu_opt_get_number(opts, "ns-per-insn", 0);
     long time_shift = -1;
 
-    if (!option) {
+    if (option && ns_option) {
+        error_setg(errp,
+                   "icount: shift and ns-per-insn are mutually exclusive");
+        return false;
+    }
+
+    if (!option && !ns_option) {
         if (qemu_opt_get(opts, "align") != NULL) {
-            error_setg(errp, "Please specify shift option when using align");
+            error_setg(errp,
+                       "Please specify shift or ns-per-insn when using align");
             return false;
         }
         return true;
+    }
+
+    if (ns_option && !icount_period_valid(time_ns)) {
+        error_setg(errp, "icount: Invalid ns-per-insn value");
+        return false;
     }
 
     if (align && !sleep) {
@@ -435,16 +457,16 @@ bool icount_configure(QemuOpts *opts, Error **errp)
         return false;
     }
 
-    if (strcmp(option, "auto") != 0) {
+    if (option && strcmp(option, "auto") != 0) {
         if (qemu_strtol(option, NULL, 0, &time_shift) < 0
             || time_shift < 0 || time_shift > MAX_ICOUNT_SHIFT) {
             error_setg(errp, "icount: Invalid shift value");
             return false;
         }
-    } else if (icount_align_option) {
+    } else if (option && icount_align_option) {
         error_setg(errp, "shift=auto and align=on are incompatible");
         return false;
-    } else if (!icount_sleep) {
+    } else if (option && !icount_sleep) {
         error_setg(errp, "shift=auto and sleep=off are incompatible");
         return false;
     }
@@ -457,12 +479,20 @@ bool icount_configure(QemuOpts *opts, Error **errp)
 
     icount_align_option = align;
 
+    if (time_ns) {
+        timers_state.icount_time_ns = time_ns;
+        icount_enable_precise();
+        return true;
+    }
+
     if (time_shift >= 0) {
+        timers_state.icount_time_ns = 0;
         timers_state.icount_time_shift = time_shift;
         icount_enable_precise();
         return true;
     }
 
+    timers_state.icount_time_ns = 0;
     icount_enable_adaptive();
 
     /*

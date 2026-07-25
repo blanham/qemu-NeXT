@@ -5314,17 +5314,20 @@ SRST
 ERST
 
 DEF("icount", HAS_ARG, QEMU_OPTION_icount, \
-    "-icount [shift=N|auto][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=<filename>[,rrsnapshot=<snapshot>]]\n" \
-    "                enable virtual instruction counter with 2^N clock ticks per\n" \
-    "                instruction, enable aligning the host and virtual clocks\n" \
+    "-icount [{shift=N|auto}|ns-per-insn=N][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=<filename>[,rrsnapshot=<snapshot>]]\n" \
+    "                enable virtual instruction counter with 2^N or exactly N\n" \
+    "                nanoseconds per instruction, enable aligning the host and virtual clocks\n" \
     "                or disable real time cpu sleeping, and optionally enable\n" \
     "                record-and-replay mode\n", QEMU_ARCH_ALL)
 SRST
-``-icount [shift=N|auto][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=filename[,rrsnapshot=snapshot]]``
+``-icount [{shift=N|auto}|ns-per-insn=N][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=filename[,rrsnapshot=snapshot]]``
     Enable virtual instruction counter. The virtual cpu will execute one
-    instruction every 2^N ns of virtual time. If ``auto`` is specified
-    then the virtual cpu speed will be automatically adjusted to keep
-    virtual time within a few seconds of real time.
+    instruction every 2^N ns of virtual time. Alternatively,
+    ``ns-per-insn=N`` selects an exact integer number from 1 through 1024
+    nanoseconds per instruction. ``shift`` and ``ns-per-insn`` are mutually
+    exclusive. If ``auto`` is specified then the virtual cpu speed will be
+    automatically adjusted to keep virtual time within a few seconds of real
+    time.
 
     Note that while this option can give deterministic behavior, it does
     not provide cycle accurate emulation. Modern CPUs contain

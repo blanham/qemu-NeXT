@@ -13,7 +13,7 @@
  * ICountMode: icount enablement state:
  *
  * @ICOUNT_DISABLED: Disabled - Do not count executed instructions.
- * @ICOUNT_PRECISE: Enabled - Fixed conversion of insn to ns via "shift" option
+ * @ICOUNT_PRECISE: Enabled - Fixed conversion of insn to ns
  * @ICOUNT_ADAPTATIVE: Enabled - Runtime adaptive algorithm to compute shift
  */
 typedef enum {
@@ -21,6 +21,26 @@ typedef enum {
     ICOUNT_PRECISE,
     ICOUNT_ADAPTATIVE,
 } ICountMode;
+
+#define MAX_ICOUNT_SHIFT 10
+#define MAX_ICOUNT_PERIOD_NS (1U << MAX_ICOUNT_SHIFT)
+
+static inline bool icount_period_valid(uint64_t period_ns)
+{
+    return period_ns > 0 && period_ns <= MAX_ICOUNT_PERIOD_NS;
+}
+
+static inline int64_t icount_period_to_ns(int64_t icount,
+                                         uint32_t period_ns)
+{
+    return icount * period_ns;
+}
+
+static inline int64_t icount_period_round(int64_t count,
+                                         uint32_t period_ns)
+{
+    return DIV_ROUND_UP(count, period_ns);
+}
 
 #ifdef CONFIG_TCG
 extern ICountMode use_icount;
@@ -49,10 +69,9 @@ int64_t icount_get_raw(void);
 /* return the virtual CPU time in ns, based on the instruction counter. */
 int64_t icount_get(void);
 /*
- * convert an instruction counter value to ns, based on the icount shift.
- * This shift is set as a fixed value with the icount "shift" option
- * (precise mode), or it is constantly approximated and corrected at
- * runtime in adaptive mode.
+ * Convert an instruction counter value to ns.  Precise mode uses either
+ * the power-of-two "shift" option or the exact "ns-per-insn" period.
+ * Adaptive mode constantly approximates and corrects the shift at runtime.
  */
 int64_t icount_to_ns(int64_t icount);
 

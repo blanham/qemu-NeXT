@@ -43,6 +43,11 @@ typedef struct TimersState {
 
     /* Conversion factor from emulated instructions to virtual clock ticks.  */
     int16_t icount_time_shift;
+    /*
+     * Exact fixed conversion factor, in nanoseconds per instruction.
+     * Zero selects the traditional power-of-two shift above.
+     */
+    uint32_t icount_time_ns;
     /* Icount delta used for shift auto adjust. */
     int64_t last_delta;
 
