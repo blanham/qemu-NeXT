@@ -78,6 +78,78 @@ static void test_settings_round_trip(void)
     g_assert_cmpint(actual.any_command, ==, expected.any_command);
 }
 
+static void test_settings_decode_layout(void)
+{
+    NextNVRAMState nvram;
+    NextNVRAMSettings settings;
+
+    next_nvram_init(&nvram);
+    /*
+     * 0xa95aaf5a:
+     * reset=0xa, alt=1, eject=0, vol_r=0x15, brightness=0x2a,
+     * password=0xb, vol_l=0x35, speaker=1, lowpass=0, boot_any=1, any=0.
+     */
+    nvram.data[NEXT_NVRAM_SETTINGS] = 0xa9;
+    nvram.data[NEXT_NVRAM_SETTINGS + 1] = 0x5a;
+    nvram.data[NEXT_NVRAM_SETTINGS + 2] = 0xaf;
+    nvram.data[NEXT_NVRAM_SETTINGS + 3] = 0x5a;
+
+    next_nvram_decode_settings(&nvram, &settings);
+
+    g_assert_cmpuint(settings.reset, ==, 0xa);
+    g_assert_true(settings.alt_console);
+    g_assert_false(settings.allow_eject);
+    g_assert_cmpuint(settings.volume_right, ==, 0x15);
+    g_assert_cmpuint(settings.brightness, ==, 0x2a);
+    g_assert_cmpuint(settings.hw_password, ==, 0xb);
+    g_assert_cmpuint(settings.volume_left, ==, 0x35);
+    g_assert_true(settings.speaker);
+    g_assert_false(settings.lowpass);
+    g_assert_true(settings.boot_any);
+    g_assert_false(settings.any_command);
+}
+
+static void test_settings_encode_layout(void)
+{
+    NextNVRAMState nvram;
+    const NextNVRAMSettings settings = {
+        .reset = 0x3,
+        .alt_console = false,
+        .allow_eject = true,
+        .volume_right = 0x2d,
+        .brightness = 0x13,
+        .hw_password = 0xe,
+        .volume_left = 0x26,
+        .speaker = false,
+        .lowpass = true,
+        .boot_any = false,
+        .any_command = true,
+    };
+    static const uint8_t expected[] = { 0x36, 0xd4, 0xfa, 0x65 };
+
+    next_nvram_init(&nvram);
+    next_nvram_encode_settings(&nvram, &settings);
+
+    g_assert_cmpmem(&nvram.data[NEXT_NVRAM_SETTINGS], sizeof(expected),
+                    expected, sizeof(expected));
+}
+
+static void test_clock_config_decode_layout(void)
+{
+    NextNVRAMState nvram;
+    NextNVRAMClockConfig config;
+
+    next_nvram_init(&nvram);
+    nvram.data[NEXT_NVRAM_CLOCK_CONFIG] = 0xab;
+
+    next_nvram_decode_clock_config(&nvram, &config);
+
+    g_assert_true(config.new_clock_chip);
+    g_assert_false(config.auto_poweron);
+    g_assert_true(config.use_console_slot);
+    g_assert_cmpuint(config.console_slot, ==, 1);
+}
+
 static void test_clock_config_round_trip(void)
 {
     NextNVRAMState nvram;
@@ -144,16 +216,20 @@ static void test_explicit_checksum_update(void)
 static void test_raw_out_of_range(void)
 {
     NextNVRAMState nvram;
-    uint8_t before[NEXT_NVRAM_SIZE];
+    NextNVRAMState before;
 
     next_nvram_init(&nvram);
-    memcpy(before, nvram.data, sizeof(before));
+    nvram.filename = (char *)(uintptr_t)UINTPTR_MAX;
+    nvram.fd = 0x12345678;
+    nvram.dirty = true;
+    nvram.write_error_reported = true;
+    memcpy(&before, &nvram, sizeof(before));
 
     g_assert_cmphex(next_nvram_read(&nvram, NEXT_NVRAM_SIZE), ==, 0);
     g_assert_cmphex(next_nvram_read(&nvram, UINT_MAX), ==, 0);
     next_nvram_write(&nvram, NEXT_NVRAM_SIZE, 0xff);
     next_nvram_write(&nvram, UINT_MAX, 0xff);
-    g_assert_cmpmem(nvram.data, sizeof(nvram.data), before, sizeof(before));
+    g_assert_cmpmem(&nvram, sizeof(nvram), &before, sizeof(before));
 }
 
 int main(int argc, char **argv)
@@ -163,6 +239,12 @@ int main(int argc, char **argv)
     g_test_add_func("/next-nvram/defaults", test_defaults);
     g_test_add_func("/next-nvram/settings-round-trip",
                     test_settings_round_trip);
+    g_test_add_func("/next-nvram/settings-decode-layout",
+                    test_settings_decode_layout);
+    g_test_add_func("/next-nvram/settings-encode-layout",
+                    test_settings_encode_layout);
+    g_test_add_func("/next-nvram/clock-config-decode-layout",
+                    test_clock_config_decode_layout);
     g_test_add_func("/next-nvram/clock-config-round-trip",
                     test_clock_config_round_trip);
     g_test_add_func("/next-nvram/simm-big-endian", test_simm_big_endian);
