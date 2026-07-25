@@ -7,7 +7,6 @@
 
 #define NEXT_SCR1             0x0200c000
 #define NEXT_RAM_BASE         0x04000000
-#define NEXT_RAM_SIZE         (64 * MiB)
 #define NEXT_ROM_SIZE         (128 * KiB)
 #define NEXT_FB_RANGE         \
     "000000000b000000-000000000b1cb0ff"
@@ -29,6 +28,8 @@ typedef struct ExpectedSCR1 {
 typedef struct MachineTest {
     const char *machine;
     const char *product_name;
+    uint64_t ram_size;
+    bool has_mono_framebuffer;
 } MachineTest;
 
 static void cleanup_test_rom(void *opaque)
@@ -83,6 +84,7 @@ static void test_machine_registration(void)
 
     g_assert_true(qtest_has_machine("next-cube"));
     g_assert_true(qtest_has_machine("next-station"));
+    g_assert_true(qtest_has_machine("next-station-color"));
     g_assert_false(qtest_has_machine("next-computer"));
 }
 
@@ -103,16 +105,22 @@ static void test_scr1(gconstpointer opaque)
 static void test_ram_and_framebuffer(gconstpointer opaque)
 {
     const MachineTest *test = opaque;
-    QTestState *qts = next_machine_start(test->machine, "-m 64M");
+    g_autofree char *args =
+        g_strdup_printf("-m %" PRIu64 "M", test->ram_size / MiB);
+    QTestState *qts = next_machine_start(test->machine, args);
     g_autofree char *flatview = qtest_hmp(qts, "info mtree -f");
     const uint64_t last_word =
-        NEXT_RAM_BASE + NEXT_RAM_SIZE - sizeof(uint32_t);
+        NEXT_RAM_BASE + test->ram_size - sizeof(uint32_t);
 
     qtest_writel(qts, NEXT_RAM_BASE, 0x01234567);
     qtest_writel(qts, last_word, 0x89abcdef);
     g_assert_cmphex(qtest_readl(qts, NEXT_RAM_BASE), ==, 0x01234567);
     g_assert_cmphex(qtest_readl(qts, last_word), ==, 0x89abcdef);
-    g_assert_nonnull(strstr(flatview, NEXT_FB_RANGE));
+    if (test->has_mono_framebuffer) {
+        g_assert_nonnull(strstr(flatview, NEXT_FB_RANGE));
+    } else {
+        g_assert_null(strstr(flatview, NEXT_FB_RANGE));
+    }
 
     qtest_quit(qts);
 }
@@ -123,8 +131,11 @@ static void test_ram_rejection(gconstpointer opaque)
     TestROM *rom = create_test_rom();
 
     if (g_test_subprocess()) {
+        g_autofree char *args =
+            g_strdup_printf("-m %" PRIu64 "M",
+                            test->ram_size / MiB + 1);
         QTestState *qts =
-            next_machine_start_with_rom(rom, test->machine, "-m 65M");
+            next_machine_start_with_rom(rom, test->machine, args);
 
         qtest_quit(qts);
         return;
@@ -134,8 +145,9 @@ static void test_ram_rejection(gconstpointer opaque)
     g_test_trap_assert_failed();
     {
         g_autofree char *pattern =
-            g_strdup_printf("*%s supports at most 64 MiB of RAM*",
-                            test->product_name);
+            g_strdup_printf("*%s supports at most %" PRIu64
+                            " MiB of RAM*",
+                            test->product_name, test->ram_size / MiB);
 
         g_test_trap_assert_stderr(pattern);
     }
@@ -219,15 +231,30 @@ int main(int argc, char **argv)
             .machine_type = 1,
             .board_revision = 0,
             .cpu_clock = 2,
+        }, {
+            .machine = "next-station-color",
+            .dma_revision = 1,
+            .machine_type = 3,
+            .board_revision = 0,
+            .cpu_clock = 2,
         },
     };
     static MachineTest machine_tests[] = {
         {
             .machine = "next-cube",
             .product_name = "NeXTcube (68040, X15)",
+            .ram_size = 64 * MiB,
+            .has_mono_framebuffer = true,
         }, {
             .machine = "next-station",
             .product_name = "NeXTstation (Warp 9)",
+            .ram_size = 64 * MiB,
+            .has_mono_framebuffer = true,
+        }, {
+            .machine = "next-station-color",
+            .product_name = "NeXTstation Color (Warp 9C)",
+            .ram_size = 32 * MiB,
+            .has_mono_framebuffer = false,
         },
     };
     size_t i;
@@ -246,8 +273,9 @@ int main(int argc, char **argv)
             g_strdup_printf("/next-machine/%s/ram-and-framebuffer",
                             machine_tests[i].machine);
         g_autofree char *reject_path =
-            g_strdup_printf("/next-machine/%s/reject-65m",
-                            machine_tests[i].machine);
+            g_strdup_printf("/next-machine/%s/reject-%" PRIu64 "m",
+                            machine_tests[i].machine,
+                            machine_tests[i].ram_size / MiB + 1);
 
         qtest_add_data_func_full(ram_path, &machine_tests[i],
                                  test_ram_and_framebuffer, NULL);

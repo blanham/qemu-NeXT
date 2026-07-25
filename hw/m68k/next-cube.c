@@ -23,6 +23,7 @@
 #include "hw/core/loader.h"
 #include "hw/audio/next-sound.h"
 #include "hw/dma/next-dma.h"
+#include "hw/display/next-color-video.h"
 #include "hw/display/next-fb.h"
 #include "hw/misc/next-memctl.h"
 #include "hw/misc/next-nbic.h"
@@ -238,6 +239,20 @@ static const NeXTBoardProfile next_station_profile = {
     .default_ram_size = 64 * MiB,
     .maximum_ram_size = 64 * MiB,
     .video_kind = NEXT_VIDEO_MONO,
+    .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
+    .has_nextbus = false,
+};
+
+static const NeXTBoardProfile next_station_color_profile = {
+    .product_name = "NeXTstation Color (Warp 9C)",
+    .default_bios = "Rev_2.5_v66.bin",
+    .dma_revision = 1,
+    .machine_type = 3,
+    .board_revision = 0,
+    .cpu_clock = 2,
+    .default_ram_size = 32 * MiB,
+    .maximum_ram_size = 32 * MiB,
+    .video_kind = NEXT_VIDEO_COLOR,
     .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
     .has_nextbus = false,
 };
@@ -503,6 +518,9 @@ static void next_irq(void *opaque, int number, int level)
         break;
     case NEXT_VIDEO_I:
         shift = 5;
+        break;
+    case NEXT_C16_VIDEO_I:
+        shift = 13;
         break;
     case NEXT_CLK_I:
         shift = 29;
@@ -1409,12 +1427,24 @@ static void next_machine_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(nbic_dev), 0, NEXT_NBIC_BASE);
     }
 
-    /* 64MB RAM starting at 0x04000000  */
+    /* RAM starting at 0x04000000 */
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);
 
     /* Framebuffer */
     if (profile->video_kind == NEXT_VIDEO_MONO) {
         sysbus_create_simple(TYPE_NEXTFB, 0x0B000000, NULL);
+    } else {
+        DeviceState *color_video_dev = qdev_new(TYPE_NEXT_COLOR_VIDEO);
+        SysBusDevice *color_video_sbd = SYS_BUS_DEVICE(color_video_dev);
+
+        sysbus_realize_and_unref(color_video_sbd, &error_fatal);
+        sysbus_mmio_map(color_video_sbd, 0, 0x2c000000);
+        sysbus_mmio_map(color_video_sbd, 1, 0x02118100);
+        sysbus_mmio_map(color_video_sbd, 2, 0x02118180);
+        sysbus_mmio_map(color_video_sbd, 3, 0x02118190);
+        sysbus_mmio_map(color_video_sbd, 4, 0x02118198);
+        sysbus_connect_irq(color_video_sbd, 0,
+                           qdev_get_gpio_in(pcdev, NEXT_C16_VIDEO_I));
     }
 
     /* MMIO */
@@ -1585,6 +1615,13 @@ static void next_station_machine_class_init(ObjectClass *oc, const void *data)
                                    "NeXTstation (Warp 9)");
 }
 
+static void next_station_color_machine_class_init(ObjectClass *oc,
+                                                  const void *data)
+{
+    next_machine_common_class_init(oc, &next_station_color_profile,
+                                   "NeXTstation Color (Warp 9C)");
+}
+
 static const TypeInfo next_machine_typeinfo = {
     .name = TYPE_NEXT_MACHINE,
     .parent = TYPE_MACHINE,
@@ -1607,11 +1644,18 @@ static const TypeInfo next_station_machine_typeinfo = {
     .class_init = next_station_machine_class_init,
 };
 
+static const TypeInfo next_station_color_machine_typeinfo = {
+    .name = TYPE_NEXT_STATION_COLOR_MACHINE,
+    .parent = TYPE_NEXT_MACHINE,
+    .class_init = next_station_color_machine_class_init,
+};
+
 static void next_register_type(void)
 {
     type_register_static(&next_machine_typeinfo);
     type_register_static(&next_cube_machine_typeinfo);
     type_register_static(&next_station_machine_typeinfo);
+    type_register_static(&next_station_color_machine_typeinfo);
     type_register_static(&next_pc_info);
     type_register_static(&next_scsi_info);
 }

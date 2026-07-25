@@ -56,6 +56,7 @@ enum next_irqs {
     NEXT_M2R_DMA_I,
     NEXT_VIDEO_I,
     NEXT_SOUND_OVRUN_I,
+    NEXT_C16_VIDEO_I,
     NEXT_NUM_IRQS
 };
 

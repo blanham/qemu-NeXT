@@ -164,6 +164,7 @@ qtests_m68k = ['boot-serial-test'] + \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_NEXTCUBE') ?
    ['next-machine-test',
+    'next-color-video-test',
     'next-nbic-test',
     'next-cube-scsi-test',
     'next-dma-test',
