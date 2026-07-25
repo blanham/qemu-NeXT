@@ -416,6 +416,44 @@ static uint32_t rtc_read_counter_with_step(QTestState *qts, int64_t step)
            bytes[3];
 }
 
+static void test_mcs1850_alarm_registers(void)
+{
+    static const uint8_t individual_values[4] = {
+        0xd3, 0x5a, 0xc7, 0x1e,
+    };
+    static const uint8_t write_order[4] = {
+        2, 0, 3, 1,
+    };
+    static const uint8_t block_values[4] = {
+        0x84, 0x2b, 0xf6, 0x49,
+    };
+    static const uint8_t zero[4];
+    QTestState *qts = next_cube_rtc_start();
+    uint8_t actual[4];
+    size_t i;
+
+    rtc_block_read(qts, 0x24, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), zero, sizeof(zero));
+
+    for (i = 0; i < G_N_ELEMENTS(write_order); i++) {
+        uint8_t reg = write_order[i];
+
+        rtc_block_write(qts, 0xa4 + reg, &individual_values[reg], 1);
+    }
+    rtc_block_read(qts, 0x24, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual),
+                    individual_values, sizeof(individual_values));
+
+    rtc_block_write(qts, 0xa4, block_values, sizeof(block_values));
+    for (i = 0; i < sizeof(actual); i++) {
+        rtc_block_read(qts, 0x24 + i, &actual[i], 1);
+    }
+    g_assert_cmpmem(actual, sizeof(actual),
+                    block_values, sizeof(block_values));
+
+    qtest_quit(qts);
+}
+
 static void test_mcs1850_counter(void)
 {
     static const uint8_t replacement[4] = { 0x12, 0x34, 0x56, 0x78 };
@@ -460,6 +498,8 @@ int main(int argc, char **argv)
                    test_nvram_file_relaunch);
     qtest_add_func("/next-cube/rtc/migration",
                    test_nvram_migration);
+    qtest_add_func("/next-cube/rtc/mcs1850-alarm-registers",
+                   test_mcs1850_alarm_registers);
     qtest_add_func("/next-cube/rtc/mcs1850-counter",
                    test_mcs1850_counter);
     return g_test_run();
