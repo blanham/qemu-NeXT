@@ -25,6 +25,7 @@
 #include "hw/dma/next-dma.h"
 #include "hw/display/next-fb.h"
 #include "hw/misc/next-memctl.h"
+#include "hw/misc/next-nbic.h"
 #include "hw/net/next-mb8795.h"
 #include "hw/rtc/next-rtc.h"
 #include "hw/scsi/esp.h"
@@ -61,6 +62,7 @@
 #define ENTRY       0x0100001e
 
 #define NEXT_DMA_BASE        0x02000000
+#define NEXT_NBIC_BASE       0x02020000
 #define NEXT_SCSI_ROM_CSR_BASE 0x02014020
 #define NEXT_SCSI_BASE       0x02114000
 #define NEXT_SCSI_CSR_OFFSET 0x20
@@ -1289,6 +1291,7 @@ static void next_machine_init(MachineState *machine)
     DeviceState *kbd_dev;
     DeviceState *mbdev;
     DeviceState *memctl_dev;
+    DeviceState *nbic_dev;
     DeviceState *pcdev;
     DeviceState *serial_dev;
     DeviceState *sound_dev;
@@ -1399,6 +1402,12 @@ static void next_machine_init(MachineState *machine)
                               OBJECT(memctl_dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(memctl_dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(memctl_dev), 0, 0x02106010);
+
+    if (profile->has_nextbus) {
+        nbic_dev = qdev_new(TYPE_NEXT_NBIC);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(nbic_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(nbic_dev), 0, NEXT_NBIC_BASE);
+    }
 
     /* 64MB RAM starting at 0x04000000  */
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);
