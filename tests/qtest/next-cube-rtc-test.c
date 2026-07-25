@@ -550,6 +550,19 @@ static void test_old_weekday_write_and_rollover(void)
     qtest_quit(qts);
 }
 
+static void test_old_running_weekday_write(void)
+{
+    QTestState *qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T00:00:00,clock=vm");
+
+    qtest_clock_step(qts, 2 * 24 * 60 * 60 * NANOSECONDS_PER_SECOND);
+    rtc_write_byte(qts, 0x23, 0x06);
+    g_assert_cmphex(rtc_read_byte(qts, 0x23), ==, 0x06);
+
+    qtest_quit(qts);
+}
+
 static void test_old_rtc_migration(void)
 {
     static const uint8_t alarm[] = { 0x12, 0x34, 0x56 };
@@ -810,6 +823,8 @@ int main(int argc, char **argv)
                    test_old_hour_format_and_private_registers);
     qtest_add_func("/next-cube/rtc/old-weekday-write-and-rollover",
                    test_old_weekday_write_and_rollover);
+    qtest_add_func("/next-cube/rtc/old-running-weekday-write",
+                   test_old_running_weekday_write);
     qtest_add_func("/next-cube/rtc/old-migration", test_old_rtc_migration);
     qtest_add_func("/next-cube/rtc/old-stopped-calendar-migration",
                    test_old_stopped_calendar_migration);

@@ -276,7 +276,8 @@ static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
         break;
     case 0x23:
         rtc->old_weekday = next_rtc_from_bcd(value & 0x07) % 7;
-        rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
+        rtc->old_weekday_day = next_rtc_counter_value(rtc) /
+                               NEXT_RTC_SECONDS_PER_DAY;
         next_rtc_old_calendar_snapshot(rtc);
         return;
     case 0x24:
