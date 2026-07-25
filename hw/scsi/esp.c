@@ -1359,7 +1359,7 @@ void esp_reg_write(ESPState *s, uint32_t saddr, uint64_t val)
     case ESP_CMD:
         s->rregs[saddr] = val;
         if (!esp_cmd_is_valid(s, s->rregs[saddr])) {
-            s->rregs[ESP_RSTAT] |= INTR_IL;
+            s->rregs[ESP_RINTR] |= INTR_IL;
             esp_raise_irq(s);
             break;
         }

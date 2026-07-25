@@ -47,6 +47,7 @@
 #define ESP_CMD_MSGACC     0x12
 #define ESP_STAT_INT       0x80
 #define ESP_INTR_DC        0x20
+#define ESP_INTR_IL        0x40
 #define ESP_CFG1_RESREPT   0x40
 
 #define DMA_SETENABLE      0x00010000
@@ -1083,6 +1084,26 @@ static void assert_esp_quiet(QTestState *qts)
     g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT) & ESP_STAT_INT, ==, 0);
 }
 
+static void test_illegal_command_interrupt(void)
+{
+    QTestState *qts = next_cube_scsi_start();
+
+    /*
+     * This is the illegal-command probe in the NeXT ROM's extended SCSI
+     * self-test.  The ESP must report the fault in the interrupt register,
+     * not in the status register alongside STAT_INT.
+     */
+    qtest_readb(qts, NEXT_ESP_INTR);
+    qtest_writeb(qts, NEXT_ESP_CMD, 0xff);
+
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT), ==, ESP_STAT_INT);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_INTR), ==, ESP_INTR_IL);
+    assert_esp_quiet(qts);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_INTR), ==, 0);
+
+    qtest_quit(qts);
+}
+
 static void test_missing_target_selection_timeout(void)
 {
     QTestState *qts = next_cube_scsi_start();
@@ -1233,6 +1254,8 @@ static void test_printer_mmio_mapping(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/next-cube/scsi/illegal-command-interrupt",
+                   test_illegal_command_interrupt);
     qtest_add_func("/next-cube/scsi/missing-target-selection-timeout",
                    test_missing_target_selection_timeout);
     qtest_add_func("/next-cube/scsi/bus-reset-cancels-selection-timeout",
