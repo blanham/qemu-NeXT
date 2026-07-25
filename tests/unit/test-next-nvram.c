@@ -136,18 +136,63 @@ static void test_settings_encode_layout(void)
 
 static void test_clock_config_decode_layout(void)
 {
-    NextNVRAMState nvram;
-    NextNVRAMClockConfig config;
+    static const struct {
+        uint8_t raw;
+        NextNVRAMClockConfig expected;
+    } cases[] = {
+        { 0x80, { .new_clock_chip = true } },
+        { 0x40, { .auto_poweron = true } },
+        { 0x20, { .use_console_slot = true } },
+        { 0x08, { .console_slot = 1 } },
+        { 0x10, { .console_slot = 2 } },
+        { 0x07, { 0 } },
+    };
+    unsigned i;
 
-    next_nvram_init(&nvram);
-    nvram.data[NEXT_NVRAM_CLOCK_CONFIG] = 0xab;
+    for (i = 0; i < ARRAY_SIZE(cases); i++) {
+        NextNVRAMState nvram;
+        NextNVRAMClockConfig config;
 
-    next_nvram_decode_clock_config(&nvram, &config);
+        next_nvram_init(&nvram);
+        nvram.data[NEXT_NVRAM_CLOCK_CONFIG] = cases[i].raw;
+        next_nvram_decode_clock_config(&nvram, &config);
 
-    g_assert_true(config.new_clock_chip);
-    g_assert_false(config.auto_poweron);
-    g_assert_true(config.use_console_slot);
-    g_assert_cmpuint(config.console_slot, ==, 1);
+        g_assert_cmpint(config.new_clock_chip, ==,
+                        cases[i].expected.new_clock_chip);
+        g_assert_cmpint(config.auto_poweron, ==,
+                        cases[i].expected.auto_poweron);
+        g_assert_cmpint(config.use_console_slot, ==,
+                        cases[i].expected.use_console_slot);
+        g_assert_cmpuint(config.console_slot, ==,
+                         cases[i].expected.console_slot);
+    }
+}
+
+static void test_clock_config_encode_layout(void)
+{
+    static const struct {
+        NextNVRAMClockConfig config;
+        uint8_t expected;
+    } cases[] = {
+        { { .new_clock_chip = true }, 0x87 },
+        { { .auto_poweron = true }, 0x47 },
+        { { .use_console_slot = true }, 0x27 },
+        { { .console_slot = 1 }, 0x0f },
+        { { .console_slot = 2 }, 0x17 },
+        { { 0 }, 0x07 },
+    };
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(cases); i++) {
+        NextNVRAMState nvram;
+
+        next_nvram_init(&nvram);
+        nvram.data[NEXT_NVRAM_CLOCK_CONFIG] = 0x07;
+        next_nvram_encode_clock_config(&nvram, &cases[i].config);
+
+        g_assert_cmphex(nvram.data[NEXT_NVRAM_CLOCK_CONFIG], ==,
+                        cases[i].expected);
+    }
 }
 
 static void test_clock_config_round_trip(void)
@@ -227,8 +272,8 @@ static void test_raw_out_of_range(void)
 
     g_assert_cmphex(next_nvram_read(&nvram, NEXT_NVRAM_SIZE), ==, 0);
     g_assert_cmphex(next_nvram_read(&nvram, UINT_MAX), ==, 0);
-    next_nvram_write(&nvram, NEXT_NVRAM_SIZE, 0xff);
-    next_nvram_write(&nvram, UINT_MAX, 0xff);
+    next_nvram_write(&nvram, NEXT_NVRAM_SIZE, 0x00);
+    next_nvram_write(&nvram, UINT_MAX, 0x5a);
     g_assert_cmpmem(&nvram, sizeof(nvram), &before, sizeof(before));
 }
 
@@ -245,6 +290,8 @@ int main(int argc, char **argv)
                     test_settings_encode_layout);
     g_test_add_func("/next-nvram/clock-config-decode-layout",
                     test_clock_config_decode_layout);
+    g_test_add_func("/next-nvram/clock-config-encode-layout",
+                    test_clock_config_encode_layout);
     g_test_add_func("/next-nvram/clock-config-round-trip",
                     test_clock_config_round_trip);
     g_test_add_func("/next-nvram/simm-big-endian", test_simm_big_endian);
