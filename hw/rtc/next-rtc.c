@@ -37,7 +37,6 @@
 #include "migration/vmstate.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
-#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "system/rtc.h"
@@ -236,10 +235,9 @@ static int next_rtc_pre_save(void *opaque)
     return 0;
 }
 
-static int next_rtc_post_load(void *opaque, int version_id)
+static bool next_rtc_post_load_errp(void *opaque, int version_id, Error **errp)
 {
     NeXTRTC *rtc = opaque;
-    Error *local_err = NULL;
 
     if (version_id < 4) {
         struct tm tm;
@@ -250,11 +248,7 @@ static int next_rtc_post_load(void *opaque, int version_id)
         rtc->alarm = 0;
     }
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
-    if (!next_nvram_flush(&rtc->nvram, &local_err)) {
-        error_report_err(local_err);
-        return -1;
-    }
-    return 0;
+    return next_nvram_flush(&rtc->nvram, errp);
 }
 
 static void next_rtc_init(Object *obj)
@@ -291,7 +285,7 @@ static const VMStateDescription next_rtc_vmstate = {
     .version_id = 4,
     .minimum_version_id = 3,
     .pre_save = next_rtc_pre_save,
-    .post_load = next_rtc_post_load,
+    .post_load_errp = next_rtc_post_load_errp,
     .fields = (const VMStateField[]) {
         VMSTATE_INT8(phase, NeXTRTC),
         VMSTATE_UINT8_ARRAY(nvram.data, NeXTRTC, NEXT_NVRAM_SIZE),
