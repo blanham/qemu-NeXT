@@ -12,6 +12,9 @@
 #define NEXT_RTC_START     0x80
 #define NEXT_RTC_NEW_CLOCK 0x80
 #define NEXT_RTC_XTAL      0x30
+#define NEXT_RTC_AUTO_PON  0x20
+#define NEXT_RTC_ALARM_EN  0x10
+#define NEXT_RTC_LOW_BATT  0x02
 
 typedef struct TestROM {
     int fd;
@@ -796,6 +799,92 @@ static void test_mcs1850_counter_lsb(void)
     qtest_quit(qts);
 }
 
+static void test_mcs1850_retains_clock_state_across_system_reset(void)
+{
+    static const uint8_t counter[] = { 0x12, 0x34, 0x56, 0x78 };
+    static const uint8_t alarm[] = { 0x87, 0x65, 0x43, 0x21 };
+    QTestState *qts = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint32_t scr2;
+
+    rtc_write_byte(qts, 0x31,
+                   NEXT_RTC_AUTO_PON | NEXT_RTC_ALARM_EN | NEXT_RTC_LOW_BATT);
+    rtc_block_write(qts, 0xa0, counter, sizeof(counter));
+    rtc_block_write(qts, 0xa4, alarm, sizeof(alarm));
+
+    scr2 = rtc_begin(qts);
+    rtc_send_byte(qts, scr2, 0x00);
+    g_assert_true(rtc_receive_bit(qts, scr2));
+    qtest_system_reset(qts);
+    g_assert_false(qtest_readl(qts, NEXT_SCR2) & NEXT_SCR2_RTDATA);
+
+    g_assert_cmphex(rtc_read_counter(qts), ==, 0x12345678);
+    g_assert_cmphex(rtc_read_byte(qts, 0x31), ==,
+                    NEXT_RTC_AUTO_PON | NEXT_RTC_ALARM_EN | NEXT_RTC_LOW_BATT);
+    g_assert_cmphex(rtc_read_byte(qts, 0x24), ==, alarm[0]);
+    g_assert_cmphex(rtc_read_byte(qts, 0x25), ==, alarm[1]);
+    g_assert_cmphex(rtc_read_byte(qts, 0x26), ==, alarm[2]);
+    g_assert_cmphex(rtc_read_byte(qts, 0x27), ==, alarm[3]);
+
+    qtest_quit(qts);
+}
+
+static void test_old_rtc_retains_clock_state_across_system_reset(void)
+{
+    static const uint8_t calendar[] = {
+        0x59, 0x58, 0x23, 0x06, 0x31, 0x12, 0x99,
+    };
+    static const uint8_t alarm[] = { 0x12, 0x34, 0x56 };
+    QTestState *qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint32_t scr2;
+    uint8_t actual[G_N_ELEMENTS(calendar)];
+
+    rtc_write_byte(qts, 0x31, NEXT_RTC_XTAL);
+    rtc_block_write(qts, 0xa0, calendar, sizeof(calendar));
+    rtc_block_write(qts, 0xa8, alarm, sizeof(alarm));
+    rtc_write_byte(qts, 0x32, 0x3f);
+
+    scr2 = rtc_begin(qts);
+    rtc_send_byte(qts, scr2, 0x00);
+    g_assert_true(rtc_receive_bit(qts, scr2));
+    qtest_system_reset(qts);
+    g_assert_false(qtest_readl(qts, NEXT_SCR2) & NEXT_SCR2_RTDATA);
+
+    rtc_block_read(qts, 0x20, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), calendar, sizeof(calendar));
+    g_assert_cmphex(rtc_read_byte(qts, 0x31), ==, NEXT_RTC_XTAL);
+    rtc_block_read(qts, 0x28, actual, sizeof(alarm));
+    g_assert_cmpmem(actual, sizeof(alarm), alarm, sizeof(alarm));
+    g_assert_cmphex(rtc_read_byte(qts, 0x32), ==, 0x3f);
+
+    qtest_quit(qts);
+}
+
+static void test_running_rtcs_remain_monotonic_across_system_reset(void)
+{
+    QTestState *new_qts = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    QTestState *old_qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint32_t new_before = rtc_read_counter(new_qts);
+    uint8_t old_before = rtc_read_byte(old_qts, 0x20);
+
+    qtest_system_reset(new_qts);
+    qtest_system_reset(old_qts);
+    qtest_clock_step(new_qts, NANOSECONDS_PER_SECOND);
+    qtest_clock_step(old_qts, NANOSECONDS_PER_SECOND);
+
+    g_assert_cmpuint(rtc_read_counter(new_qts), ==, new_before + 1);
+    g_assert_cmphex(old_before, ==, 0x05);
+    g_assert_cmphex(rtc_read_byte(old_qts, 0x20), ==, 0x06);
+
+    qtest_quit(new_qts);
+    qtest_quit(old_qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -830,5 +919,13 @@ int main(int argc, char **argv)
                    test_old_stopped_calendar_migration);
     qtest_add_func("/next-cube/rtc/chip-migration-mismatch",
                    test_rtc_chip_migration_mismatch);
+    qtest_add_func("/next-cube/rtc/mcs1850-retains-clock-state-"
+                   "across-system-reset",
+                   test_mcs1850_retains_clock_state_across_system_reset);
+    qtest_add_func("/next-cube/rtc/old-retains-clock-state-across-system-reset",
+                   test_old_rtc_retains_clock_state_across_system_reset);
+    qtest_add_func("/next-cube/rtc/running-remains-monotonic-"
+                   "across-system-reset",
+                   test_running_rtcs_remain_monotonic_across_system_reset);
     return g_test_run();
 }

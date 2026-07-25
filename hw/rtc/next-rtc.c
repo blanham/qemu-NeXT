@@ -467,12 +467,17 @@ static void next_rtc_cmd_reset_irq(void *opaque, int n, int level)
 static void next_rtc_reset_hold(Object *obj, ResetType type)
 {
     NeXTRTC *rtc = NEXT_RTC(obj);
-    struct tm tm;
 
     rtc->phase = 0;
     rtc->command = 0;
     rtc->value = 0;
     rtc->retval = 0;
+}
+
+static void next_rtc_initialize_clock(NeXTRTC *rtc)
+{
+    struct tm tm;
+
     rtc->status = rtc->chip == NEXT_RTC_CHIP_MCS1850 ?
                   NEXT_RTC_STATUS_NEW_CLOCK : 0;
     rtc->control = rtc->chip == NEXT_RTC_CHIP_MCS1850 ?
@@ -554,8 +559,10 @@ static void next_rtc_realize(DeviceState *dev, Error **errp)
 {
     NeXTRTC *rtc = NEXT_RTC(dev);
 
-    next_nvram_realize(&rtc->nvram, errp);
-    next_rtc_old_calendar_snapshot(rtc);
+    if (!next_nvram_realize(&rtc->nvram, errp)) {
+        return;
+    }
+    next_rtc_initialize_clock(rtc);
 }
 
 static void next_rtc_unrealize(DeviceState *dev)
