@@ -39,7 +39,8 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_cube_rtc_start_with_args(const char *args)
+static QTestState *next_cube_rtc_start_full(const char *machine_options,
+                                            const char *args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -57,9 +58,14 @@ static QTestState *next_cube_rtc_start_with_args(const char *args)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    qts = qtest_initf("-machine next-cube -bios %s %s",
-                      quoted_rom_path, args ?: "");
+    qts = qtest_initf("-machine next-cube%s -bios %s %s",
+                      machine_options ?: "", quoted_rom_path, args ?: "");
     return qts;
+}
+
+static QTestState *next_cube_rtc_start_with_args(const char *args)
+{
+    return next_cube_rtc_start_full(NULL, args);
 }
 
 static QTestState *next_cube_rtc_start(void)
@@ -214,6 +220,51 @@ static void test_nvram_survives_system_reset(void)
     qtest_quit(qts);
 }
 
+static void test_nvram_file_relaunch(void)
+{
+    static const uint8_t replacement[32] = {
+        0xf1, 0xe2, 0xd3, 0xc4, 0xb5, 0xa6, 0x97, 0x88,
+        0x79, 0x6a, 0x5b, 0x4c, 0x3d, 0x2e, 0x1f, 0x00,
+        0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
+        0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
+    };
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *machine_options = NULL;
+    g_autofree char *contents = NULL;
+    g_autoptr(GError) err = NULL;
+    gsize length;
+    uint8_t actual[32];
+    QTestState *qts;
+
+    tmpdir = g_dir_make_tmp("next-nvram-qtest-XXXXXX", &err);
+    g_assert_no_error(err);
+    g_assert_nonnull(tmpdir);
+    path = g_build_filename(tmpdir, "next.nvram", NULL);
+    quoted_path = g_shell_quote(path);
+    machine_options = g_strdup_printf(",nvram-file=%s", quoted_path);
+
+    qts = next_cube_rtc_start_full(machine_options, NULL);
+    rtc_block_write(qts, 0x80, replacement, sizeof(replacement));
+    qtest_quit(qts);
+
+    g_assert_true(g_file_get_contents(path, &contents, &length, &err));
+    g_assert_no_error(err);
+    g_assert_cmpuint(length, ==, sizeof(replacement));
+    g_assert_cmpmem(contents, length, replacement, sizeof(replacement));
+    g_clear_pointer(&contents, g_free);
+
+    qts = next_cube_rtc_start_full(machine_options, NULL);
+    rtc_block_read(qts, 0x00, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual),
+                    replacement, sizeof(replacement));
+    qtest_quit(qts);
+
+    g_unlink(path);
+    g_rmdir(tmpdir);
+}
+
 static uint32_t rtc_read_counter(QTestState *qts)
 {
     uint8_t bytes[4];
@@ -285,6 +336,8 @@ int main(int argc, char **argv)
                    test_nvram_block_transfer);
     qtest_add_func("/next-cube/rtc/nvram-survives-system-reset",
                    test_nvram_survives_system_reset);
+    qtest_add_func("/next-cube/rtc/nvram-file-relaunch",
+                   test_nvram_file_relaunch);
     qtest_add_func("/next-cube/rtc/mcs1850-counter",
                    test_mcs1850_counter);
     return g_test_run();

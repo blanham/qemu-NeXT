@@ -34,6 +34,150 @@
 #include "hw/nvram/next-nvram.h"
 #include "qemu/bitops.h"
 #include "qemu/bswap.h"
+#include "qemu/error-report.h"
+
+static bool next_nvram_pread_full(int fd, void *buf, size_t count,
+                                  off_t offset, const char *filename,
+                                  Error **errp)
+{
+    size_t done = 0;
+
+    while (done < count) {
+#ifdef _WIN32
+        HANDLE handle = (HANDLE)_get_osfhandle(fd);
+        LARGE_INTEGER position = { .QuadPart = offset + done };
+        DWORD transferred;
+
+        if (handle == INVALID_HANDLE_VALUE) {
+            error_setg_errno(errp, EBADF, "Could not read NVRAM file '%s'",
+                             filename);
+            return false;
+        }
+        if (!SetFilePointerEx(handle, position, NULL, FILE_BEGIN)) {
+            error_setg_win32(errp, GetLastError(),
+                             "Could not seek NVRAM file '%s'", filename);
+            return false;
+        }
+        if (!ReadFile(handle, (uint8_t *)buf + done, count - done,
+                      &transferred, NULL)) {
+            error_setg_win32(errp, GetLastError(),
+                             "Could not read NVRAM file '%s'", filename);
+            return false;
+        }
+#else
+        ssize_t transferred = pread(fd, (uint8_t *)buf + done,
+                                    count - done, offset + done);
+
+        if (transferred < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error_setg_errno(errp, errno, "Could not read NVRAM file '%s'",
+                             filename);
+            return false;
+        }
+#endif
+        if (transferred == 0) {
+            error_setg(errp, "Unexpected end of NVRAM file '%s'", filename);
+            return false;
+        }
+        done += transferred;
+    }
+
+    return true;
+}
+
+static bool next_nvram_pwrite_full(int fd, const void *buf, size_t count,
+                                   off_t offset, const char *filename,
+                                   Error **errp)
+{
+    size_t done = 0;
+
+    while (done < count) {
+#ifdef _WIN32
+        HANDLE handle = (HANDLE)_get_osfhandle(fd);
+        LARGE_INTEGER position = { .QuadPart = offset + done };
+        DWORD transferred;
+
+        if (handle == INVALID_HANDLE_VALUE) {
+            error_setg_errno(errp, EBADF, "Could not write NVRAM file '%s'",
+                             filename);
+            return false;
+        }
+        if (!SetFilePointerEx(handle, position, NULL, FILE_BEGIN)) {
+            error_setg_win32(errp, GetLastError(),
+                             "Could not seek NVRAM file '%s'", filename);
+            return false;
+        }
+        if (!WriteFile(handle, (uint8_t *)buf + done, count - done,
+                       &transferred, NULL)) {
+            error_setg_win32(errp, GetLastError(),
+                             "Could not write NVRAM file '%s'", filename);
+            return false;
+        }
+#else
+        ssize_t transferred = pwrite(fd, (const uint8_t *)buf + done,
+                                     count - done, offset + done);
+
+        if (transferred < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            error_setg_errno(errp, errno, "Could not write NVRAM file '%s'",
+                             filename);
+            return false;
+        }
+#endif
+        if (transferred == 0) {
+            error_setg(errp, "Short write to NVRAM file '%s'", filename);
+            return false;
+        }
+        done += transferred;
+    }
+
+    return true;
+}
+
+static bool next_nvram_lock(int fd, const char *filename, Error **errp)
+{
+#ifdef _WIN32
+    HANDLE handle = (HANDLE)_get_osfhandle(fd);
+    OVERLAPPED overlap = { 0 };
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        error_setg_errno(errp, EBADF, "Could not lock NVRAM file '%s'",
+                         filename);
+        return false;
+    }
+    if (!LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK |
+                    LOCKFILE_FAIL_IMMEDIATELY, 0,
+                    NEXT_NVRAM_SIZE, 0, &overlap)) {
+        error_setg_win32(errp, GetLastError(),
+                         "Could not lock NVRAM file '%s'", filename);
+        return false;
+    }
+#else
+    int ret = qemu_lock_fd(fd, 0, 0, true);
+
+    if (ret < 0) {
+        error_setg_errno(errp, -ret, "Could not lock NVRAM file '%s'",
+                         filename);
+        return false;
+    }
+#endif
+
+    return true;
+}
+
+static void next_nvram_report_write_error(NextNVRAMState *s, Error *err)
+{
+    if (!s->write_error_reported) {
+        s->write_error_reported = true;
+        error_report_err(err);
+    } else {
+        error_free(err);
+    }
+}
 
 void next_nvram_init(NextNVRAMState *s)
 {
@@ -68,11 +212,26 @@ uint8_t next_nvram_read(const NextNVRAMState *s, unsigned address)
 
 void next_nvram_write(NextNVRAMState *s, unsigned address, uint8_t value)
 {
+    Error *local_err = NULL;
+
     if (address >= NEXT_NVRAM_SIZE) {
         return;
     }
 
     s->data[address] = value;
+    if (s->fd < 0) {
+        return;
+    }
+
+    if (s->dirty) {
+        if (!next_nvram_flush(s, &local_err)) {
+            next_nvram_report_write_error(s, local_err);
+        }
+    } else if (!next_nvram_pwrite_full(s->fd, &s->data[address], 1, address,
+                                       s->filename, &local_err)) {
+        s->dirty = true;
+        next_nvram_report_write_error(s, local_err);
+    }
 }
 
 void next_nvram_decode_settings(const NextNVRAMState *s,
@@ -177,4 +336,108 @@ void next_nvram_update_checksum(NextNVRAMState *s)
 {
     stw_be_p(&s->data[NEXT_NVRAM_CHECKSUM],
              next_nvram_compute_checksum(s));
+}
+
+bool next_nvram_realize(NextNVRAMState *s, Error **errp)
+{
+    Error *local_err = NULL;
+    struct stat st;
+    bool created = false;
+    int open_errno;
+
+    if (!s->filename || !s->filename[0]) {
+        return true;
+    }
+
+    s->fd = qemu_open(s->filename, O_RDWR | O_BINARY, &local_err);
+    open_errno = errno;
+    if (s->fd < 0) {
+        if (open_errno != ENOENT) {
+            error_propagate(errp, local_err);
+            return false;
+        }
+
+        error_free(local_err);
+        local_err = NULL;
+        s->fd = qemu_create(s->filename, O_RDWR | O_BINARY | O_EXCL,
+                            0600, &local_err);
+        if (s->fd < 0) {
+            error_propagate(errp, local_err);
+            return false;
+        }
+        created = true;
+    }
+
+    if (!next_nvram_lock(s->fd, s->filename, &local_err)) {
+        goto fail;
+    }
+
+    if (created) {
+        if (!next_nvram_pwrite_full(s->fd, s->data, NEXT_NVRAM_SIZE, 0,
+                                    s->filename, &local_err)) {
+            goto fail;
+        }
+    } else {
+        if (fstat(s->fd, &st) < 0) {
+            error_setg_errno(&local_err, errno,
+                             "Could not stat NVRAM file '%s'", s->filename);
+            goto fail;
+        }
+        if (st.st_size != NEXT_NVRAM_SIZE) {
+            error_setg(&local_err,
+                       "NVRAM file '%s' must be exactly %u bytes, not %"
+                       PRId64,
+                       s->filename, NEXT_NVRAM_SIZE, (int64_t)st.st_size);
+            goto fail;
+        }
+        if (!next_nvram_pread_full(s->fd, s->data, NEXT_NVRAM_SIZE, 0,
+                                   s->filename, &local_err)) {
+            goto fail;
+        }
+    }
+
+    s->dirty = false;
+    s->write_error_reported = false;
+    return true;
+
+fail:
+    qemu_close(s->fd);
+    s->fd = -1;
+    if (created) {
+        qemu_unlink(s->filename);
+    }
+    error_propagate(errp, local_err);
+    return false;
+}
+
+bool next_nvram_flush(NextNVRAMState *s, Error **errp)
+{
+    if (s->fd < 0) {
+        return true;
+    }
+
+    if (!next_nvram_pwrite_full(s->fd, s->data, NEXT_NVRAM_SIZE, 0,
+                                s->filename, errp)) {
+        s->dirty = true;
+        return false;
+    }
+
+    s->dirty = false;
+    s->write_error_reported = false;
+    return true;
+}
+
+void next_nvram_unrealize(NextNVRAMState *s)
+{
+    Error *local_err = NULL;
+
+    if (s->fd < 0) {
+        return;
+    }
+
+    if (!next_nvram_flush(s, &local_err)) {
+        next_nvram_report_write_error(s, local_err);
+    }
+    qemu_close(s->fd);
+    s->fd = -1;
 }

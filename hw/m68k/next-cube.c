@@ -167,6 +167,7 @@ struct NeXTState {
     NextDMAState *dma;
     NextSoundState *sound;
     NextMB8795State *mb8795;
+    char *nvram_file;
 };
 
 #define SCR2_RTCLK 0x2
@@ -1203,6 +1204,10 @@ static void next_cube_init(MachineState *machine)
     object_property_set_link(OBJECT(pcdev), "cpu", OBJECT(cpu), &error_abort);
     object_property_set_link(OBJECT(pcdev), "dma", OBJECT(m->dma),
                              &error_abort);
+    if (m->nvram_file && m->nvram_file[0]) {
+        qdev_prop_set_string(DEVICE(&NEXT_PC(pcdev)->rtc), "nvram-file",
+                             m->nvram_file);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcdev), &error_fatal);
 
     sysbus_mmio_map(SYS_BUS_DEVICE(m->dma), 0, NEXT_DMA_BASE);
@@ -1352,6 +1357,27 @@ static void next_cube_init(MachineState *machine)
     }
 }
 
+static char *next_machine_get_nvram_file(Object *obj, Error **errp)
+{
+    return g_strdup(NEXT_MACHINE(obj)->nvram_file);
+}
+
+static void next_machine_set_nvram_file(Object *obj, const char *value,
+                                        Error **errp)
+{
+    NeXTState *s = NEXT_MACHINE(obj);
+
+    g_free(s->nvram_file);
+    s->nvram_file = g_strdup(value);
+}
+
+static void next_machine_finalize(Object *obj)
+{
+    NeXTState *s = NEXT_MACHINE(obj);
+
+    g_free(s->nvram_file);
+}
+
 static void next_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1365,6 +1391,11 @@ static void next_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_nic = TYPE_NEXT_MB8795;
     mc->no_cdrom = true;
     machine_add_audiodev_property(mc);
+    object_class_property_add_str(oc, "nvram-file",
+                                  next_machine_get_nvram_file,
+                                  next_machine_set_nvram_file);
+    object_class_property_set_description(
+        oc, "nvram-file", "Path to the persistent 32-byte NeXT NVRAM image");
 }
 
 static const TypeInfo next_typeinfo = {
@@ -1372,6 +1403,7 @@ static const TypeInfo next_typeinfo = {
     .parent = TYPE_MACHINE,
     .class_init = next_machine_class_init,
     .instance_size = sizeof(NeXTState),
+    .instance_finalize = next_machine_finalize,
 };
 
 static void next_register_type(void)

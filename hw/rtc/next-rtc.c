@@ -33,6 +33,7 @@
 #include "qemu/osdep.h"
 #include "hw/rtc/next-rtc.h"
 #include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
@@ -265,6 +266,20 @@ static void next_rtc_init(Object *obj)
                              "rtc-power-out", 1);
 }
 
+static void next_rtc_realize(DeviceState *dev, Error **errp)
+{
+    NeXTRTC *rtc = NEXT_RTC(dev);
+
+    next_nvram_realize(&rtc->nvram, errp);
+}
+
+static void next_rtc_unrealize(DeviceState *dev)
+{
+    NeXTRTC *rtc = NEXT_RTC(dev);
+
+    next_nvram_unrealize(&rtc->nvram);
+}
+
 static const VMStateDescription next_rtc_vmstate = {
     .name = "next-rtc",
     .version_id = 4,
@@ -286,6 +301,10 @@ static const VMStateDescription next_rtc_vmstate = {
     },
 };
 
+static const Property next_rtc_properties[] = {
+    DEFINE_PROP_STRING("nvram-file", NeXTRTC, nvram.filename),
+};
+
 static void next_rtc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -293,6 +312,9 @@ static void next_rtc_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "NeXT RTC";
     dc->vmsd = &next_rtc_vmstate;
+    dc->realize = next_rtc_realize;
+    dc->unrealize = next_rtc_unrealize;
+    device_class_set_props(dc, next_rtc_properties);
     rc->phases.hold = next_rtc_reset_hold;
     rc->phases.exit = next_rtc_reset_exit;
 }
