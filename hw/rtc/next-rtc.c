@@ -39,6 +39,7 @@
 #include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qapi/util.h"
 #include "system/rtc.h"
 #include "system/system.h"
 
@@ -54,6 +55,19 @@
                                     NEXT_RTC_CONTROL_AUTO_PON | \
                                     NEXT_RTC_CONTROL_ALARM_EN | \
                                     NEXT_RTC_CONTROL_LOW_BATT)
+#define NEXT_RTC_OLD_CONTROL_XTAL  0x30
+#define NEXT_RTC_OLD_CONTROL_STORED (NEXT_RTC_CONTROL_START | \
+                                     NEXT_RTC_OLD_CONTROL_XTAL)
+#define NEXT_RTC_OLD_HOUR_12       0x80
+#define NEXT_RTC_OLD_HOUR_PM       0x20
+
+static const QEnumLookup next_rtc_chip_lookup = {
+    .array = (const char *const[]) {
+        [NEXT_RTC_CHIP_MCS1850] = "mcs1850",
+        [NEXT_RTC_CHIP_MC68HC68T1] = "mc68hc68t1",
+    },
+    .size = NEXT_RTC_CHIP__MAX,
+};
 
 static bool next_rtc_cmd_is_write(uint8_t cmd)
 {
@@ -72,6 +86,112 @@ static uint32_t next_rtc_counter_value(NeXTRTC *rtc)
     return rtc->counter + elapsed_ns / NANOSECONDS_PER_SECOND;
 }
 
+static uint8_t next_rtc_to_bcd(unsigned int value)
+{
+    return ((value / 10) << 4) | (value % 10);
+}
+
+static unsigned int next_rtc_from_bcd(uint8_t value)
+{
+    return ((value >> 4) * 10) + (value & 0x0f);
+}
+
+static void next_rtc_old_get_tm(NeXTRTC *rtc, struct tm *tm)
+{
+    time_t now = next_rtc_counter_value(rtc);
+
+    gmtime_r(&now, tm);
+}
+
+static void next_rtc_old_set_tm(NeXTRTC *rtc, const struct tm *tm)
+{
+    struct tm new_tm = *tm;
+
+    rtc->counter = mktimegm(&new_tm);
+    rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+}
+
+static uint8_t next_rtc_old_calendar_read(NeXTRTC *rtc, uint8_t addr)
+{
+    struct tm tm;
+
+    next_rtc_old_get_tm(rtc, &tm);
+    switch (addr) {
+    case 0x20:
+        return next_rtc_to_bcd(tm.tm_sec) & 0x7f;
+    case 0x21:
+        return next_rtc_to_bcd(tm.tm_min) & 0x7f;
+    case 0x22:
+        if (rtc->old_hour_12) {
+            unsigned int hour = tm.tm_hour % 12;
+
+            return NEXT_RTC_OLD_HOUR_12 |
+                   (tm.tm_hour >= 12 ? NEXT_RTC_OLD_HOUR_PM : 0) |
+                   next_rtc_to_bcd(hour ? hour : 12);
+        }
+        return next_rtc_to_bcd(tm.tm_hour) & 0x3f;
+    case 0x23:
+        return next_rtc_to_bcd(tm.tm_wday) & 0x07;
+    case 0x24:
+        return next_rtc_to_bcd(tm.tm_mday) & 0x3f;
+    case 0x25:
+        return next_rtc_to_bcd(tm.tm_mon + 1) & 0x1f;
+    case 0x26:
+        return next_rtc_to_bcd((tm.tm_year + 1900) % 100);
+    default:
+        return 0;
+    }
+}
+
+static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
+                                         uint8_t value)
+{
+    struct tm tm;
+
+    next_rtc_old_get_tm(rtc, &tm);
+    switch (addr) {
+    case 0x20:
+        tm.tm_sec = next_rtc_from_bcd(value & 0x7f);
+        break;
+    case 0x21:
+        tm.tm_min = next_rtc_from_bcd(value & 0x7f);
+        break;
+    case 0x22:
+        if (value & NEXT_RTC_OLD_HOUR_12) {
+            unsigned int hour = next_rtc_from_bcd(value & 0x1f);
+
+            rtc->old_hour_12 = true;
+            if (value & NEXT_RTC_OLD_HOUR_PM) {
+                tm.tm_hour = hour == 12 ? 12 : hour + 12;
+            } else {
+                tm.tm_hour = hour == 12 ? 0 : hour;
+            }
+        } else {
+            rtc->old_hour_12 = false;
+            tm.tm_hour = next_rtc_from_bcd(value & 0x3f);
+        }
+        break;
+    case 0x23:
+        return;
+    case 0x24:
+        tm.tm_mday = next_rtc_from_bcd(value & 0x3f);
+        break;
+    case 0x25:
+        tm.tm_mon = next_rtc_from_bcd(value & 0x1f) - 1;
+        break;
+    case 0x26: {
+        unsigned int year = next_rtc_from_bcd(value);
+
+        tm.tm_year = year >= 69 ? year : year + 100;
+        break;
+    }
+    default:
+        return;
+    }
+
+    next_rtc_old_set_tm(rtc, &tm);
+}
+
 static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
 {
     bool was_running = rtc->control & NEXT_RTC_CONTROL_START;
@@ -82,6 +202,11 @@ static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
         rtc->counter = next_rtc_counter_value(rtc);
     } else if (!was_running && now_running) {
         rtc->counter_ref_ns = now;
+    }
+
+    if (rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
+        rtc->control = value & NEXT_RTC_OLD_CONTROL_STORED;
+        return;
     }
 
     rtc->control = value & NEXT_RTC_CONTROL_STORED;
@@ -104,6 +229,18 @@ static void next_rtc_load_read_value(NeXTRTC *rtc, bool new_command)
     rtc->retval = 0;
     if (addr <= 0x1f) {
         rtc->retval = next_nvram_read(&rtc->nvram, addr);
+    } else if (rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
+        if (addr <= 0x26) {
+            rtc->retval = next_rtc_old_calendar_read(rtc, addr);
+        } else if (addr >= 0x28 && addr <= 0x2a) {
+            rtc->retval = rtc->old_alarm[addr - 0x28];
+        } else if (addr == 0x30) {
+            rtc->retval = rtc->status & ~NEXT_RTC_STATUS_NEW_CLOCK;
+        } else if (addr == 0x31) {
+            rtc->retval = rtc->control;
+        } else if (addr == 0x32) {
+            rtc->retval = rtc->old_intctl;
+        }
     } else if (addr <= 0x23) {
         unsigned int shift = (0x23 - addr) * 8;
 
@@ -128,6 +265,16 @@ static void next_rtc_store_write_value(NeXTRTC *rtc)
 
     if (addr <= 0x1f) {
         next_nvram_write(&rtc->nvram, addr, rtc->value);
+    } else if (rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
+        if (addr <= 0x26) {
+            next_rtc_old_calendar_write(rtc, addr, rtc->value);
+        } else if (addr >= 0x28 && addr <= 0x2a) {
+            rtc->old_alarm[addr - 0x28] = rtc->value;
+        } else if (addr == 0x31) {
+            next_rtc_set_control(rtc, rtc->value);
+        } else if (addr == 0x32) {
+            rtc->old_intctl = rtc->value;
+        }
     } else if (addr <= 0x23) {
         unsigned int shift = (0x23 - addr) * 8;
 
@@ -207,13 +354,19 @@ static void next_rtc_reset_hold(Object *obj, ResetType type)
     rtc->command = 0;
     rtc->value = 0;
     rtc->retval = 0;
-    rtc->status = NEXT_RTC_STATUS_NEW_CLOCK;
-    rtc->control = NEXT_RTC_CONTROL_START;
+    rtc->status = rtc->chip == NEXT_RTC_CHIP_MCS1850 ?
+                  NEXT_RTC_STATUS_NEW_CLOCK : 0;
+    rtc->control = rtc->chip == NEXT_RTC_CHIP_MCS1850 ?
+                   NEXT_RTC_CONTROL_START :
+                   NEXT_RTC_CONTROL_START | NEXT_RTC_OLD_CONTROL_XTAL;
     qemu_get_timedate(&tm, 0);
     rtc->counter = mktimegm(&tm);
     rtc->counter_latch = rtc->counter;
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
     rtc->alarm = 0;
+    memset(rtc->old_alarm, 0, sizeof(rtc->old_alarm));
+    rtc->old_intctl = 0;
+    rtc->old_hour_12 = false;
 }
 
 static void next_rtc_reset_exit(Object *obj, ResetType type)
@@ -305,6 +458,26 @@ static const Property next_rtc_properties[] = {
     DEFINE_PROP_STRING("nvram-file", NeXTRTC, nvram.filename),
 };
 
+static int next_rtc_get_chip(Object *obj, Error **errp G_GNUC_UNUSED)
+{
+    return NEXT_RTC(obj)->chip;
+}
+
+static void next_rtc_set_chip(Object *obj, int value, Error **errp)
+{
+    NeXTRTC *rtc = NEXT_RTC(obj);
+
+    if (DEVICE(rtc)->realized) {
+        error_setg(errp, "rtc-chip cannot be changed after realize");
+        return;
+    }
+    if (value < 0 || value >= NEXT_RTC_CHIP__MAX) {
+        error_setg(errp, "invalid rtc-chip value %d", value);
+        return;
+    }
+    rtc->chip = value;
+}
+
 static void next_rtc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -315,6 +488,9 @@ static void next_rtc_class_init(ObjectClass *klass, const void *data)
     dc->realize = next_rtc_realize;
     dc->unrealize = next_rtc_unrealize;
     device_class_set_props(dc, next_rtc_properties);
+    object_class_property_add_enum(klass, "rtc-chip", "NextRTCChip",
+                                   &next_rtc_chip_lookup,
+                                   next_rtc_get_chip, next_rtc_set_chip);
     rc->phases.hold = next_rtc_reset_hold;
     rc->phases.exit = next_rtc_reset_exit;
 }

@@ -39,9 +39,16 @@
 #define TYPE_NEXT_RTC "next-rtc"
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTRTC, NEXT_RTC)
 
+typedef enum NextRTCChip {
+    NEXT_RTC_CHIP_MCS1850,
+    NEXT_RTC_CHIP_MC68HC68T1,
+    NEXT_RTC_CHIP__MAX,
+} NextRTCChip;
+
 struct NeXTRTC {
     SysBusDevice parent_obj;
 
+    NextRTCChip chip;
     int8_t phase;
     NextNVRAMState nvram;
     uint8_t command;
@@ -52,6 +59,9 @@ struct NeXTRTC {
     uint32_t counter;
     uint32_t counter_latch;
     uint32_t alarm;
+    uint8_t old_alarm[3];
+    uint8_t old_intctl;
+    bool old_hour_12;
     int64_t counter_ref_ns;
 
     qemu_irq data_out_irq;

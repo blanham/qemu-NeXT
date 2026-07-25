@@ -37,6 +37,7 @@
 #include "hw/misc/empty_slot.h"
 #include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
+#include "qapi/util.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
@@ -168,6 +169,15 @@ struct NeXTState {
     NextSoundState *sound;
     NextMB8795State *mb8795;
     char *nvram_file;
+    NextRTCChip rtc_chip;
+};
+
+static const QEnumLookup next_machine_rtc_chip_lookup = {
+    .array = (const char *const[]) {
+        [NEXT_RTC_CHIP_MCS1850] = "mcs1850",
+        [NEXT_RTC_CHIP_MC68HC68T1] = "mc68hc68t1",
+    },
+    .size = NEXT_RTC_CHIP__MAX,
 };
 
 #define SCR2_RTCLK 0x2
@@ -1208,6 +1218,10 @@ static void next_cube_init(MachineState *machine)
         qdev_prop_set_string(DEVICE(&NEXT_PC(pcdev)->rtc), "nvram-file",
                              m->nvram_file);
     }
+    object_property_set_str(OBJECT(&NEXT_PC(pcdev)->rtc), "rtc-chip",
+                            qapi_enum_lookup(&next_machine_rtc_chip_lookup,
+                                             m->rtc_chip),
+                            &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcdev), &error_fatal);
 
     sysbus_mmio_map(SYS_BUS_DEVICE(m->dma), 0, NEXT_DMA_BASE);
@@ -1371,6 +1385,20 @@ static void next_machine_set_nvram_file(Object *obj, const char *value,
     s->nvram_file = g_strdup(value);
 }
 
+static int next_machine_get_rtc_chip(Object *obj, Error **errp G_GNUC_UNUSED)
+{
+    return NEXT_MACHINE(obj)->rtc_chip;
+}
+
+static void next_machine_set_rtc_chip(Object *obj, int value, Error **errp)
+{
+    if (value < 0 || value >= NEXT_RTC_CHIP__MAX) {
+        error_setg(errp, "invalid rtc-chip value %d", value);
+        return;
+    }
+    NEXT_MACHINE(obj)->rtc_chip = value;
+}
+
 static void next_machine_finalize(Object *obj)
 {
     NeXTState *s = NEXT_MACHINE(obj);
@@ -1381,6 +1409,7 @@ static void next_machine_finalize(Object *obj)
 static void next_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+    ObjectProperty *prop;
 
     mc->desc = "NeXT Cube";
     mc->init = next_cube_init;
@@ -1396,6 +1425,13 @@ static void next_machine_class_init(ObjectClass *oc, const void *data)
                                   next_machine_set_nvram_file);
     object_class_property_set_description(
         oc, "nvram-file", "Path to the persistent 32-byte NeXT NVRAM image");
+    prop = object_class_property_add_enum(oc, "rtc-chip", "NextRTCChip",
+                                          &next_machine_rtc_chip_lookup,
+                                          next_machine_get_rtc_chip,
+                                          next_machine_set_rtc_chip);
+    object_property_set_default_str(prop, "mcs1850");
+    object_class_property_set_description(
+        oc, "rtc-chip", "NeXT RTC chip model (mcs1850 or mc68hc68t1)");
 }
 
 static const TypeInfo next_typeinfo = {

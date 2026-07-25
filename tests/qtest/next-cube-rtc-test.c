@@ -11,6 +11,7 @@
 #define NEXT_ROM_SIZE      (128 * 1024)
 #define NEXT_RTC_START     0x80
 #define NEXT_RTC_NEW_CLOCK 0x80
+#define NEXT_RTC_XTAL      0x30
 
 typedef struct TestROM {
     int fd;
@@ -404,6 +405,106 @@ static uint8_t rtc_read_counter_lsb(QTestState *qts)
     return value;
 }
 
+static uint8_t rtc_read_byte(QTestState *qts, uint8_t addr)
+{
+    uint8_t value;
+
+    rtc_block_read(qts, addr, &value, 1);
+    return value;
+}
+
+static void rtc_write_byte(QTestState *qts, uint8_t addr, uint8_t value)
+{
+    rtc_block_write(qts, addr | 0x80, &value, 1);
+}
+
+static void test_rtc_chip_selection_and_calendar_reads(void)
+{
+    static const uint8_t old_calendar[] = {
+        0x05, 0x04, 0x03, 0x00, 0x02, 0x01, 0x00,
+    };
+    QTestState *new_qts = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    QTestState *old_qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint8_t old_actual[G_N_ELEMENTS(old_calendar)];
+
+    g_assert_cmphex(rtc_read_byte(new_qts, 0x30), ==, NEXT_RTC_NEW_CLOCK);
+    g_assert_cmphex(rtc_read_byte(new_qts, 0x23), ==, 0x25);
+
+    g_assert_cmphex(rtc_read_byte(old_qts, 0x30), ==, 0x00);
+    rtc_block_read(old_qts, 0x20, old_actual, sizeof(old_actual));
+    g_assert_cmpmem(old_actual, sizeof(old_actual),
+                    old_calendar, sizeof(old_calendar));
+
+    qtest_clock_step(old_qts, NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(old_qts, 0x20), ==, 0x06);
+
+    qtest_quit(new_qts);
+    qtest_quit(old_qts);
+}
+
+static void test_old_calendar_stop_program_and_rollover(void)
+{
+    static const uint8_t leap_day[] = {
+        0x59, 0x59, 0x23, 0x02, 0x29, 0x02, 0x00,
+    };
+    QTestState *qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-01T00:00:00,clock=vm");
+    uint8_t actual[G_N_ELEMENTS(leap_day)];
+
+    rtc_write_byte(qts, 0x31, NEXT_RTC_XTAL);
+    rtc_block_write(qts, 0xa0, leap_day, sizeof(leap_day));
+    rtc_block_read(qts, 0x20, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), leap_day, sizeof(leap_day));
+
+    rtc_write_byte(qts, 0x31, NEXT_RTC_START | NEXT_RTC_XTAL);
+    qtest_clock_step(qts, NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(qts, 0x20), ==, 0x00);
+    g_assert_cmphex(rtc_read_byte(qts, 0x21), ==, 0x00);
+    g_assert_cmphex(rtc_read_byte(qts, 0x22), ==, 0x00);
+    g_assert_cmphex(rtc_read_byte(qts, 0x23), ==, 0x03);
+    g_assert_cmphex(rtc_read_byte(qts, 0x24), ==, 0x01);
+    g_assert_cmphex(rtc_read_byte(qts, 0x25), ==, 0x03);
+    g_assert_cmphex(rtc_read_byte(qts, 0x26), ==, 0x00);
+
+    qtest_quit(qts);
+}
+
+static void test_old_hour_format_and_private_registers(void)
+{
+    static const uint8_t alarm[] = { 0x12, 0x34, 0x56 };
+    QTestState *qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T00:00:00,clock=vm");
+    uint8_t actual[G_N_ELEMENTS(alarm)];
+
+    rtc_write_byte(qts, 0x31, NEXT_RTC_XTAL);
+    rtc_write_byte(qts, 0x20, 0x59);
+    rtc_write_byte(qts, 0x21, 0x59);
+    rtc_write_byte(qts, 0x22, 0xb1);
+    rtc_write_byte(qts, 0x23, 0x00);
+    rtc_write_byte(qts, 0x24, 0x02);
+    rtc_write_byte(qts, 0x25, 0x01);
+    rtc_write_byte(qts, 0x26, 0x00);
+    rtc_write_byte(qts, 0x31, NEXT_RTC_START | NEXT_RTC_XTAL);
+    qtest_clock_step(qts, NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(qts, 0x22), ==, 0x92);
+    g_assert_cmphex(rtc_read_byte(qts, 0x24), ==, 0x03);
+
+    rtc_block_write(qts, 0xa8, alarm, sizeof(alarm));
+    rtc_block_read(qts, 0x28, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), alarm, sizeof(alarm));
+    rtc_write_byte(qts, 0x32, 0x3f);
+    g_assert_cmphex(rtc_read_byte(qts, 0x32), ==, 0x3f);
+    rtc_write_byte(qts, 0x27, 0xff);
+    g_assert_cmphex(rtc_read_byte(qts, 0x27), ==, 0x00);
+
+    qtest_quit(qts);
+}
+
 static uint32_t rtc_read_counter_with_step(QTestState *qts, int64_t step)
 {
     uint32_t scr2 = rtc_begin(qts);
@@ -528,5 +629,11 @@ int main(int argc, char **argv)
                    test_mcs1850_counter);
     qtest_add_func("/next-cube/rtc/mcs1850-counter-lsb",
                    test_mcs1850_counter_lsb);
+    qtest_add_func("/next-cube/rtc/chip-selection-and-calendar-reads",
+                   test_rtc_chip_selection_and_calendar_reads);
+    qtest_add_func("/next-cube/rtc/old-calendar-stop-program-and-rollover",
+                   test_old_calendar_stop_program_and_rollover);
+    qtest_add_func("/next-cube/rtc/old-hour-format-and-private-registers",
+                   test_old_hour_format_and_private_registers);
     return g_test_run();
 }
