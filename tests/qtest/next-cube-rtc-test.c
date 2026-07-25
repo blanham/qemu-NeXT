@@ -102,17 +102,21 @@ static void rtc_send_byte(QTestState *qts, uint32_t scr2, uint8_t value)
     }
 }
 
+static bool rtc_receive_bit(QTestState *qts, uint32_t scr2)
+{
+    scr2 &= ~NEXT_SCR2_RTDATA;
+    qtest_writel(qts, NEXT_SCR2, scr2 | NEXT_SCR2_RTCLK);
+    qtest_writel(qts, NEXT_SCR2, scr2);
+    return qtest_readl(qts, NEXT_SCR2) & NEXT_SCR2_RTDATA;
+}
+
 static uint8_t rtc_receive_byte(QTestState *qts, uint32_t scr2)
 {
     uint8_t value = 0;
     int bit;
 
-    scr2 &= ~NEXT_SCR2_RTDATA;
     for (bit = 0; bit < 8; bit++) {
-        qtest_writel(qts, NEXT_SCR2, scr2 | NEXT_SCR2_RTCLK);
-        qtest_writel(qts, NEXT_SCR2, scr2);
-        value = (value << 1) |
-                !!(qtest_readl(qts, NEXT_SCR2) & NEXT_SCR2_RTDATA);
+        value = (value << 1) | rtc_receive_bit(qts, scr2);
     }
     return value;
 }
@@ -176,12 +180,36 @@ static void test_nvram_survives_system_reset(void)
     };
     QTestState *qts = next_cube_rtc_start();
     uint8_t actual[32];
+    uint32_t scr2;
+    bool data_out_low;
+    size_t i;
 
     rtc_block_write(qts, 0x80, replacement, sizeof(replacement));
+
+    scr2 = rtc_begin(qts);
+    rtc_send_byte(qts, scr2, 0x01);
+    g_assert_true(rtc_receive_bit(qts, scr2));
+
     qtest_system_reset(qts);
-    rtc_block_read(qts, 0x00, actual, sizeof(actual));
+    data_out_low = !(qtest_readl(qts, NEXT_SCR2) & NEXT_SCR2_RTDATA);
+
+    /*
+     * Start a new transaction without pulsing command reset.  The system
+     * reset itself must have discarded the interrupted transaction.
+     */
+    scr2 = qtest_readl(qts, NEXT_SCR2);
+    scr2 &= ~(NEXT_SCR2_RTCLK | NEXT_SCR2_RTDATA);
+    scr2 |= NEXT_SCR2_RTCE;
+    qtest_writel(qts, NEXT_SCR2, scr2);
+    rtc_send_byte(qts, scr2, 0x00);
+    for (i = 0; i < sizeof(actual); i++) {
+        actual[i] = rtc_receive_byte(qts, scr2);
+    }
+    rtc_end(qts, scr2);
+
     g_assert_cmpmem(actual, sizeof(actual),
                     replacement, sizeof(replacement));
+    g_assert_true(data_out_low);
 
     qtest_quit(qts);
 }

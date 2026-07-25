@@ -202,6 +202,10 @@ static void next_rtc_reset_hold(Object *obj, ResetType type)
     NeXTRTC *rtc = NEXT_RTC(obj);
     struct tm tm;
 
+    rtc->phase = 0;
+    rtc->command = 0;
+    rtc->value = 0;
+    rtc->retval = 0;
     rtc->status = NEXT_RTC_STATUS_NEW_CLOCK;
     rtc->control = NEXT_RTC_CONTROL_START;
     qemu_get_timedate(&tm, 0);
@@ -209,6 +213,14 @@ static void next_rtc_reset_hold(Object *obj, ResetType type)
     rtc->counter_latch = rtc->counter;
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
     rtc->alarm = 0;
+}
+
+static void next_rtc_reset_exit(Object *obj, ResetType type)
+{
+    NeXTRTC *rtc = NEXT_RTC(obj);
+
+    qemu_irq_lower(rtc->data_out_irq);
+    qemu_irq_lower(rtc->power_irq);
 }
 
 static int next_rtc_pre_save(void *opaque)
@@ -282,6 +294,7 @@ static void next_rtc_class_init(ObjectClass *klass, const void *data)
     dc->desc = "NeXT RTC";
     dc->vmsd = &next_rtc_vmstate;
     rc->phases.hold = next_rtc_reset_hold;
+    rc->phases.exit = next_rtc_reset_exit;
 }
 
 static const TypeInfo next_rtc_info = {
