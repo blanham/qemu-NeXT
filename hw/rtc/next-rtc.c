@@ -60,6 +60,8 @@
                                      NEXT_RTC_OLD_CONTROL_XTAL)
 #define NEXT_RTC_OLD_HOUR_12       0x80
 #define NEXT_RTC_OLD_HOUR_PM       0x20
+#define NEXT_RTC_OLD_CALENDAR_START 0x20
+#define NEXT_RTC_OLD_CALENDAR_SIZE  7
 #define NEXT_RTC_SECONDS_PER_DAY    (24 * 60 * 60)
 
 static const QEnumLookup next_rtc_chip_lookup = {
@@ -126,9 +128,87 @@ static void next_rtc_old_set_tm(NeXTRTC *rtc, const struct tm *tm)
     rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
 }
 
+static uint8_t next_rtc_old_calendar_mask(uint8_t addr, uint8_t value)
+{
+    switch (addr) {
+    case 0x20:
+    case 0x21:
+        return value & 0x7f;
+    case 0x22:
+        return value & (NEXT_RTC_OLD_HOUR_12 | NEXT_RTC_OLD_HOUR_PM | 0x1f);
+    case 0x23:
+        return value & 0x07;
+    case 0x24:
+        return value & 0x3f;
+    case 0x25:
+        return value & 0x1f;
+    case 0x26:
+        return value;
+    default:
+        return 0;
+    }
+}
+
+static void next_rtc_old_calendar_snapshot(NeXTRTC *rtc)
+{
+    struct tm tm;
+
+    next_rtc_old_update_weekday(rtc);
+    next_rtc_old_get_tm(rtc, &tm);
+    rtc->old_calendar[0] = next_rtc_to_bcd(tm.tm_sec) & 0x7f;
+    rtc->old_calendar[1] = next_rtc_to_bcd(tm.tm_min) & 0x7f;
+    if (rtc->old_hour_12) {
+        unsigned int hour = tm.tm_hour % 12;
+
+        rtc->old_calendar[2] = NEXT_RTC_OLD_HOUR_12 |
+            (tm.tm_hour >= 12 ? NEXT_RTC_OLD_HOUR_PM : 0) |
+            next_rtc_to_bcd(hour ? hour : 12);
+    } else {
+        rtc->old_calendar[2] = next_rtc_to_bcd(tm.tm_hour) & 0x3f;
+    }
+    rtc->old_calendar[3] = next_rtc_to_bcd(rtc->old_weekday) & 0x07;
+    rtc->old_calendar[4] = next_rtc_to_bcd(tm.tm_mday) & 0x3f;
+    rtc->old_calendar[5] = next_rtc_to_bcd(tm.tm_mon + 1) & 0x1f;
+    rtc->old_calendar[6] = next_rtc_to_bcd((tm.tm_year + 1900) % 100);
+}
+
+static void next_rtc_old_calendar_apply(NeXTRTC *rtc)
+{
+    struct tm tm;
+    uint8_t hour = rtc->old_calendar[2];
+
+    next_rtc_old_get_tm(rtc, &tm);
+    tm.tm_sec = next_rtc_from_bcd(rtc->old_calendar[0]);
+    tm.tm_min = next_rtc_from_bcd(rtc->old_calendar[1]);
+    if (hour & NEXT_RTC_OLD_HOUR_12) {
+        unsigned int value = next_rtc_from_bcd(hour & 0x1f);
+
+        rtc->old_hour_12 = true;
+        if (hour & NEXT_RTC_OLD_HOUR_PM) {
+            tm.tm_hour = value == 12 ? 12 : value + 12;
+        } else {
+            tm.tm_hour = value == 12 ? 0 : value;
+        }
+    } else {
+        rtc->old_hour_12 = false;
+        tm.tm_hour = next_rtc_from_bcd(hour & 0x3f);
+    }
+    tm.tm_mday = next_rtc_from_bcd(rtc->old_calendar[4]);
+    tm.tm_mon = next_rtc_from_bcd(rtc->old_calendar[5]) - 1;
+    tm.tm_year = next_rtc_from_bcd(rtc->old_calendar[6]);
+    tm.tm_year = tm.tm_year >= 69 ? tm.tm_year : tm.tm_year + 100;
+    next_rtc_old_set_tm(rtc, &tm);
+    rtc->old_weekday = next_rtc_from_bcd(rtc->old_calendar[3]) % 7;
+    rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
+}
+
 static uint8_t next_rtc_old_calendar_read(NeXTRTC *rtc, uint8_t addr)
 {
     struct tm tm;
+
+    if (!(rtc->control & NEXT_RTC_CONTROL_START)) {
+        return rtc->old_calendar[addr - NEXT_RTC_OLD_CALENDAR_START];
+    }
 
     next_rtc_old_get_tm(rtc, &tm);
     switch (addr) {
@@ -164,6 +244,12 @@ static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
 {
     struct tm tm;
 
+    if (!(rtc->control & NEXT_RTC_CONTROL_START)) {
+        rtc->old_calendar[addr - NEXT_RTC_OLD_CALENDAR_START] =
+            next_rtc_old_calendar_mask(addr, value);
+        return;
+    }
+
     next_rtc_old_update_weekday(rtc);
     next_rtc_old_get_tm(rtc, &tm);
     switch (addr) {
@@ -191,6 +277,7 @@ static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
     case 0x23:
         rtc->old_weekday = next_rtc_from_bcd(value & 0x07) % 7;
         rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
+        next_rtc_old_calendar_snapshot(rtc);
         return;
     case 0x24:
         tm.tm_mday = next_rtc_from_bcd(value & 0x3f);
@@ -209,6 +296,7 @@ static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
     }
 
     next_rtc_old_set_tm(rtc, &tm);
+    next_rtc_old_calendar_snapshot(rtc);
 }
 
 static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
@@ -217,15 +305,26 @@ static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
     bool now_running = value & NEXT_RTC_CONTROL_START;
     int64_t now = qemu_clock_get_ns(rtc_clock);
 
+    if (rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
+        if (was_running && !now_running) {
+            rtc->counter = next_rtc_counter_value(rtc);
+            rtc->counter_ref_ns = now;
+            rtc->control = value & NEXT_RTC_OLD_CONTROL_STORED;
+            next_rtc_old_calendar_snapshot(rtc);
+        } else if (!was_running && now_running) {
+            next_rtc_old_calendar_apply(rtc);
+            rtc->counter_ref_ns = now;
+            rtc->control = value & NEXT_RTC_OLD_CONTROL_STORED;
+        } else {
+            rtc->control = value & NEXT_RTC_OLD_CONTROL_STORED;
+        }
+        return;
+    }
+
     if (was_running && !now_running) {
         rtc->counter = next_rtc_counter_value(rtc);
     } else if (!was_running && now_running) {
         rtc->counter_ref_ns = now;
-    }
-
-    if (rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
-        rtc->control = value & NEXT_RTC_OLD_CONTROL_STORED;
-        return;
     }
 
     rtc->control = value & NEXT_RTC_CONTROL_STORED;
@@ -389,6 +488,7 @@ static void next_rtc_reset_hold(Object *obj, ResetType type)
     next_rtc_old_get_tm(rtc, &tm);
     rtc->old_weekday = tm.tm_wday;
     rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
+    next_rtc_old_calendar_snapshot(rtc);
 }
 
 static void next_rtc_reset_exit(Object *obj, ResetType type)
@@ -428,6 +528,9 @@ static bool next_rtc_post_load_errp(void *opaque, int version_id, Error **errp)
         return false;
     }
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    if (version_id < 6 && rtc->chip == NEXT_RTC_CHIP_MC68HC68T1) {
+        next_rtc_old_calendar_snapshot(rtc);
+    }
     return next_nvram_flush(&rtc->nvram, errp);
 }
 
@@ -451,6 +554,7 @@ static void next_rtc_realize(DeviceState *dev, Error **errp)
     NeXTRTC *rtc = NEXT_RTC(dev);
 
     next_nvram_realize(&rtc->nvram, errp);
+    next_rtc_old_calendar_snapshot(rtc);
 }
 
 static void next_rtc_unrealize(DeviceState *dev)
@@ -462,7 +566,7 @@ static void next_rtc_unrealize(DeviceState *dev)
 
 static const VMStateDescription next_rtc_vmstate = {
     .name = "next-rtc",
-    .version_id = 5,
+    .version_id = 6,
     .minimum_version_id = 3,
     .pre_save = next_rtc_pre_save,
     .post_load_errp = next_rtc_post_load_errp,
@@ -483,6 +587,8 @@ static const VMStateDescription next_rtc_vmstate = {
         VMSTATE_BOOL_V(old_hour_12, NeXTRTC, 5),
         VMSTATE_UINT8_V(old_weekday, NeXTRTC, 5),
         VMSTATE_UINT32_V(old_weekday_day, NeXTRTC, 5),
+        VMSTATE_UINT8_ARRAY_V(old_calendar, NeXTRTC,
+                              NEXT_RTC_OLD_CALENDAR_SIZE, 6),
         VMSTATE_END_OF_LIST()
     },
 };

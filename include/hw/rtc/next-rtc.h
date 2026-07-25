@@ -60,6 +60,7 @@ struct NeXTRTC {
     uint32_t counter_latch;
     uint32_t alarm;
     uint8_t old_alarm[3];
+    uint8_t old_calendar[7];
     uint8_t old_intctl;
     bool old_hour_12;
     uint8_t old_weekday;
