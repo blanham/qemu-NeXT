@@ -37,6 +37,7 @@
 #include "migration/vmstate.h"
 #include "qemu/bitops.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "system/rtc.h"
@@ -238,6 +239,7 @@ static int next_rtc_pre_save(void *opaque)
 static int next_rtc_post_load(void *opaque, int version_id)
 {
     NeXTRTC *rtc = opaque;
+    Error *local_err = NULL;
 
     if (version_id < 4) {
         struct tm tm;
@@ -248,6 +250,10 @@ static int next_rtc_post_load(void *opaque, int version_id)
         rtc->alarm = 0;
     }
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    if (!next_nvram_flush(&rtc->nvram, &local_err)) {
+        error_report_err(local_err);
+        return -1;
+    }
     return 0;
 }
 

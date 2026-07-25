@@ -23,6 +23,19 @@ The AN5206 emulation includes the following devices:
 NeXT Cube system emulator
 -------------------------
 
+The RTC contains 32 bytes of NeXT nonvolatile configuration.  The bytes
+survive ``system_reset``.  They are process-local by default; use
+``-M next-cube,nvram-file=PATH`` to retain them across QEMU runs.  The file is
+an exact 32-byte raw NVRAM image, is created with mode 0600 when absent, and is
+held under an exclusive lock.  QEMU preserves invalid checksums for firmware
+diagnosis rather than repairing them.
+
+ROM preference “serial port A is alternate console” is stored in this NVRAM.
+With ``serial0`` attached, save the preference and reset to move the ROM
+console to SCC channel A.  Channel A is ``serial0`` and channel B is
+``serial1``; the current Mach driver uses interrupt-driven PIO rather than SCC
+DMA.
+
 The ``next-cube`` machine has one shared DMA controller covering all twelve
 physical channels.  Machine reset clears every channel register, pending
 initial-pointer latch, staged SCSI byte, and DMA interrupt.  Migration saves

@@ -17,6 +17,13 @@ typedef struct TestROM {
     char *path;
 } TestROM;
 
+typedef struct TestMigrationFiles {
+    char *tmpdir;
+    char *ephemeral_socket;
+    char *backed_socket;
+    char *destination_nvram;
+} TestMigrationFiles;
+
 static const uint8_t initial_nvram[32] = {
     0x94, 0x0f, 0x40, 0x03, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0xfb, 0x6d, 0x00, 0x00, 0x4b, 0x00,
@@ -37,6 +44,30 @@ static void cleanup_test_rom(void *opaque)
         g_free(rom->path);
     }
     g_free(rom);
+}
+
+static void cleanup_test_migration_files(void *opaque)
+{
+    TestMigrationFiles *files = opaque;
+
+    qtest_remove_abrt_handler(files);
+    if (files->ephemeral_socket) {
+        g_unlink(files->ephemeral_socket);
+    }
+    if (files->backed_socket) {
+        g_unlink(files->backed_socket);
+    }
+    if (files->destination_nvram) {
+        g_unlink(files->destination_nvram);
+    }
+    if (files->tmpdir) {
+        g_rmdir(files->tmpdir);
+    }
+    g_free(files->ephemeral_socket);
+    g_free(files->backed_socket);
+    g_free(files->destination_nvram);
+    g_free(files->tmpdir);
+    g_free(files);
 }
 
 static QTestState *next_cube_rtc_start_full(const char *machine_options,
@@ -153,6 +184,16 @@ static void rtc_block_write(QTestState *qts, uint8_t command,
     rtc_end(qts, scr2);
 }
 
+static void migrate_wait(QTestState *source, QTestState *destination,
+                         const char *uri)
+{
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
+}
+
 static void test_nvram_block_transfer(void)
 {
     static const uint8_t replacement[32] = {
@@ -265,6 +306,85 @@ static void test_nvram_file_relaunch(void)
     g_rmdir(tmpdir);
 }
 
+static void migrate_nvram_to_destination(const uint8_t replacement[32],
+                                         const char *socket_path,
+                                         const char *destination_nvram)
+{
+    g_autofree char *uri = g_strdup_printf("unix:%s", socket_path);
+    g_autofree char *quoted_uri = g_shell_quote(uri);
+    g_autofree char *incoming_args =
+        g_strdup_printf("-incoming %s", quoted_uri);
+    g_autofree char *quoted_nvram = destination_nvram ?
+        g_shell_quote(destination_nvram) : NULL;
+    g_autofree char *machine_options = destination_nvram ?
+        g_strdup_printf(",nvram-file=%s", quoted_nvram) : NULL;
+    QTestState *destination =
+        next_cube_rtc_start_full(machine_options, incoming_args);
+    QTestState *source = next_cube_rtc_start();
+    g_autoptr(GError) err = NULL;
+    g_autofree char *contents = NULL;
+    gsize length;
+    uint8_t actual[32];
+
+    if (destination_nvram) {
+        g_assert_true(g_file_get_contents(destination_nvram, &contents,
+                                         &length, &err));
+        g_assert_no_error(err);
+        g_assert_cmpuint(length, ==, sizeof(initial_nvram));
+        g_assert_cmpmem(contents, length,
+                        initial_nvram, sizeof(initial_nvram));
+    }
+
+    rtc_block_write(source, 0x80, replacement, 32);
+    migrate_wait(source, destination, uri);
+
+    rtc_block_read(destination, 0x00, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), replacement, 32);
+
+    if (destination_nvram) {
+        g_clear_pointer(&contents, g_free);
+        g_assert_true(g_file_get_contents(destination_nvram, &contents,
+                                         &length, &err));
+        g_assert_no_error(err);
+        g_assert_cmpuint(length, ==, 32);
+        g_assert_cmpmem(contents, length, replacement, 32);
+    }
+
+    qtest_quit(source);
+    qtest_quit(destination);
+}
+
+static void test_nvram_migration(void)
+{
+    static const uint8_t replacement[32] = {
+        0x5a, 0xc3, 0x19, 0xe7, 0x84, 0x2d, 0xb6, 0x40,
+        0xfe, 0x73, 0x08, 0x91, 0x4c, 0xd5, 0x2a, 0xbf,
+        0x61, 0x0d, 0xf8, 0x34, 0xa7, 0x52, 0xcb, 0x16,
+        0x89, 0xe0, 0x47, 0xbc, 0x25, 0x9e, 0x73, 0x0a,
+    };
+    g_autoptr(GError) err = NULL;
+    TestMigrationFiles *files = g_new0(TestMigrationFiles, 1);
+
+    qtest_add_abrt_handler(cleanup_test_migration_files, files);
+    g_test_queue_destroy(cleanup_test_migration_files, files);
+    files->tmpdir = g_dir_make_tmp("next-nvram-migration-XXXXXX", &err);
+    g_assert_no_error(err);
+    g_assert_nonnull(files->tmpdir);
+    files->ephemeral_socket =
+        g_build_filename(files->tmpdir, "ephemeral.sock", NULL);
+    files->backed_socket =
+        g_build_filename(files->tmpdir, "backed.sock", NULL);
+    files->destination_nvram =
+        g_build_filename(files->tmpdir, "destination.nvram", NULL);
+
+    migrate_nvram_to_destination(replacement, files->ephemeral_socket, NULL);
+    g_unlink(files->ephemeral_socket);
+
+    migrate_nvram_to_destination(replacement, files->backed_socket,
+                                 files->destination_nvram);
+    g_unlink(files->backed_socket);
+}
+
 static uint32_t rtc_read_counter(QTestState *qts)
 {
     uint8_t bytes[4];
@@ -338,6 +458,8 @@ int main(int argc, char **argv)
                    test_nvram_survives_system_reset);
     qtest_add_func("/next-cube/rtc/nvram-file-relaunch",
                    test_nvram_file_relaunch);
+    qtest_add_func("/next-cube/rtc/migration",
+                   test_nvram_migration);
     qtest_add_func("/next-cube/rtc/mcs1850-counter",
                    test_mcs1850_counter);
     return g_test_run();
