@@ -396,6 +396,14 @@ static uint32_t rtc_read_counter(QTestState *qts)
            bytes[3];
 }
 
+static uint8_t rtc_read_counter_lsb(QTestState *qts)
+{
+    uint8_t value;
+
+    rtc_block_read(qts, 0x23, &value, 1);
+    return value;
+}
+
 static uint32_t rtc_read_counter_with_step(QTestState *qts, int64_t step)
 {
     uint32_t scr2 = rtc_begin(qts);
@@ -487,6 +495,22 @@ static void test_mcs1850_counter(void)
     qtest_quit(qts);
 }
 
+static void test_mcs1850_counter_lsb(void)
+{
+    QTestState *qts = next_cube_rtc_start_with_args(
+        "-rtc base=2000-01-02T03:04:05,clock=vm");
+    uint8_t before;
+    uint8_t after;
+
+    before = rtc_read_counter_lsb(qts);
+    qtest_clock_step(qts, NANOSECONDS_PER_SECOND);
+    after = rtc_read_counter_lsb(qts);
+
+    g_assert_cmphex(after, ==, (uint8_t)(before + 1));
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -502,5 +526,7 @@ int main(int argc, char **argv)
                    test_mcs1850_alarm_registers);
     qtest_add_func("/next-cube/rtc/mcs1850-counter",
                    test_mcs1850_counter);
+    qtest_add_func("/next-cube/rtc/mcs1850-counter-lsb",
+                   test_mcs1850_counter_lsb);
     return g_test_run();
 }

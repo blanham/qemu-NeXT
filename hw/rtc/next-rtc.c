@@ -97,7 +97,7 @@ static void next_rtc_set_control(NeXTRTC *rtc, uint8_t value)
     }
 }
 
-static void next_rtc_load_read_value(NeXTRTC *rtc)
+static void next_rtc_load_read_value(NeXTRTC *rtc, bool new_command)
 {
     uint8_t addr = rtc->command & 0x3f;
 
@@ -107,7 +107,7 @@ static void next_rtc_load_read_value(NeXTRTC *rtc)
     } else if (addr <= 0x23) {
         unsigned int shift = (0x23 - addr) * 8;
 
-        if (addr == 0x20) {
+        if (new_command) {
             rtc->counter_latch = next_rtc_counter_value(rtc);
         }
         rtc->retval = rtc->counter_latch >> shift;
@@ -149,7 +149,7 @@ static void next_rtc_advance_byte(NeXTRTC *rtc)
     rtc->phase = 8;
     rtc->value = 0;
     if (!next_rtc_cmd_is_write(rtc->command)) {
-        next_rtc_load_read_value(rtc);
+        next_rtc_load_read_value(rtc, false);
     }
 }
 
@@ -161,7 +161,7 @@ static void next_rtc_data_in_irq(void *opaque, int n, int level)
         rtc->command = (rtc->command << 1) | level;
         rtc->phase++;
         if (rtc->phase == 8 && !next_rtc_cmd_is_write(rtc->command)) {
-            next_rtc_load_read_value(rtc);
+            next_rtc_load_read_value(rtc, true);
         }
         return;
     }
