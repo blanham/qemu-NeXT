@@ -1131,7 +1131,7 @@ NextDMAResult next_dma_sound_out_read(NextDMAState *s, uint8_t *samples,
     }
 
     start = c->next_initbuf_valid ? c->next_initbuf : c->next;
-    if ((start & 3) || (c->limit & 15) || c->limit <= start) {
+    if ((start & 3) || (c->limit & 3) || c->limit <= start) {
         return next_dma_sound_out_error(s);
     }
 
