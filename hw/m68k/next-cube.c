@@ -873,12 +873,13 @@ static void next_eventc_write(void *opaque, hwaddr addr, uint64_t val,
 static uint64_t next_eventc_read(void *opaque, hwaddr addr, unsigned size)
 {
     NeXTPC *s = opaque;
+    int64_t now;
 
     switch (addr) {
     case 0:
-        s->eventc_latched =
-            (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / NEXT_TIMER_TICK_NS) &
-            NEXT_EVENTC_MASK;
+        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->eventc_latched = (now / NEXT_TIMER_TICK_NS) & NEXT_EVENTC_MASK;
+        trace_next_eventc_latch(s->eventc_latched, now);
         return 0;
     case 1:
         return extract32(s->eventc_latched, 16, 4);

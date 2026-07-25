@@ -43,6 +43,7 @@
 #include "system/rtc.h"
 #include "system/runstate.h"
 #include "system/system.h"
+#include "trace.h"
 
 #define NEXT_RTC_STATUS_NEW_CLOCK  0x80
 #define NEXT_RTC_STATUS_FTU        0x10
@@ -462,6 +463,15 @@ static void next_rtc_load_read_value(NeXTRTC *rtc, bool new_command)
         rtc->retval = rtc->status;
     } else if (addr == 0x31) {
         rtc->retval = rtc->control;
+    }
+
+    if (trace_event_get_state_backends(TRACE_NEXT_RTC_READ)) {
+        uint32_t live = next_rtc_counter_value(rtc);
+        int64_t now = qemu_clock_get_ns(rtc_clock);
+
+        trace_next_rtc_read(addr, rtc->retval, live, rtc->counter_latch,
+                            rtc->status, rtc->control, now,
+                            rtc->counter_ref_ns, new_command);
     }
 }
 
