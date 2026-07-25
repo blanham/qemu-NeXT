@@ -56,6 +56,7 @@
 #define NEXT_MB8795_ADDR_SIZE 6
 
 #define NEXT_MB8795_TXSTAT_READY 0x80
+#define NEXT_MB8795_TXSTAT_TXRECV 0x20
 #define NEXT_MB8795_TXSTAT_UNDERFLOW 0x08
 #define NEXT_MB8795_TXMODE_NO_LBC 0x02
 #define NEXT_MB8795_RXSTAT_OK 0x80
@@ -286,17 +287,16 @@ static bool next_mb8795_accept(NextMB8795State *s,
     }
 }
 
-static ssize_t next_mb8795_receive(NetClientState *nc,
-                                   const uint8_t *buf, size_t size)
+static bool next_mb8795_receive_frame(NextMB8795State *s,
+                                      const uint8_t *buf, size_t size)
 {
-    NextMB8795State *s = qemu_get_nic_opaque(nc);
     uint8_t frame_fcs[NEXT_MB8795_MAX_FRAME + NEXT_MB8795_FCS_SIZE];
     NextDMAResult result;
     uint32_t fcs;
 
     if (!next_mb8795_accept(s, buf, size)) {
         trace_next_mb8795_rx_filtered(size, s->rx_mode);
-        return size;
+        return false;
     }
 
     if (size > NEXT_MB8795_MAX_FRAME ||
@@ -325,6 +325,15 @@ static ssize_t next_mb8795_receive(NetClientState *nc,
     }
     next_mb8795_update_rx_irq(s);
     trace_next_mb8795_rx_complete(result, size, s->rx_status);
+    return result == NEXT_DMA_OK;
+}
+
+static ssize_t next_mb8795_receive(NetClientState *nc,
+                                   const uint8_t *buf, size_t size)
+{
+    NextMB8795State *s = qemu_get_nic_opaque(nc);
+
+    next_mb8795_receive_frame(s, buf, size);
     return size;
 }
 
@@ -341,15 +350,19 @@ static void next_mb8795_tx_timer(void *opaque)
     uint8_t frame[NEXT_MB8795_MAX_FRAME];
     size_t length;
     NextDMAResult result;
+    bool loopback_received = false;
 
     result = next_dma_enet_tx_read(s->dma, frame, sizeof(frame), &length);
     if (result == NEXT_DMA_OK) {
         if (s->tx_mode & NEXT_MB8795_TXMODE_NO_LBC) {
             qemu_send_packet(qemu_get_queue(s->nic), frame, length);
         } else {
-            next_mb8795_receive(qemu_get_queue(s->nic), frame, length);
+            loopback_received = next_mb8795_receive_frame(s, frame, length);
         }
         s->tx_status |= NEXT_MB8795_TXSTAT_READY;
+        if (loopback_received) {
+            s->tx_status |= NEXT_MB8795_TXSTAT_TXRECV;
+        }
     } else {
         s->tx_status |= NEXT_MB8795_TXSTAT_UNDERFLOW;
     }
@@ -363,6 +376,8 @@ static void next_mb8795_tx_kick(void *opaque)
     NextMB8795State *s = NEXT_MB8795(opaque);
 
     if (!s->reset) {
+        s->tx_status &= ~NEXT_MB8795_TXSTAT_TXRECV;
+        next_mb8795_update_tx_irq(s);
         timer_mod(&s->tx_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
         trace_next_mb8795_tx_kick();

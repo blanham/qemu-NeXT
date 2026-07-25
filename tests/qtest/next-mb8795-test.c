@@ -89,7 +89,9 @@ enum {
 };
 
 #define EN_TXSTAT_READY     0x80
+#define EN_TXSTAT_TXRECV    0x20
 #define EN_TXSTAT_UNDERFLOW 0x08
+#define EN_TXMASK_TXRXIE    0x20
 #define EN_TXMODE_NO_LBC    0x02
 #define EN_RXSTAT_OK        0x80
 #define EN_RXSTAT_OVERFLOW  0x01
@@ -724,6 +726,7 @@ static void test_tx_internal_loopback(void)
     rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0,
                false);
     tx_prepare_controller(qts);
+    en_writeb(qts, EN_TXMASK, EN_TXMASK_TXRXIE);
     en_writeb(qts, EN_TXMODE, 0);
 
     qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
@@ -741,13 +744,79 @@ static void test_tx_internal_loopback(void)
                     (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
                     ==, DMA_COMPLETE);
     g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
-    g_assert_cmphex(en_readb(qts, EN_TXSTAT), ==, EN_TXSTAT_READY);
+    g_assert_cmphex(en_readb(qts, EN_TXSTAT), ==,
+                    EN_TXSTAT_READY | EN_TXSTAT_TXRECV);
+    g_assert_cmphex(controller_irqs(qts), ==, NEXT_ENTX_IRQ);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
                     (NEXT_ENRX_DMA_IRQ | NEXT_ENTX_DMA_IRQ),
                     ==, NEXT_ENRX_DMA_IRQ | NEXT_ENTX_DMA_IRQ);
     socket_assert_empty(harness.backend_fd);
 
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_CLRCOMPLETE);
+    qtest_writel(qts, NEXT_ENTX_NEXT, NEXT_TX_BUFFER);
+    qtest_writel(qts, NEXT_ENTX_LIMIT,
+                 ENTX_EOP | (NEXT_TX_BUFFER + sizeof(rx_frame) +
+                             ENTX_END_BIAS));
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
+    g_assert_cmphex(en_readb(qts, EN_TXSTAT), ==, EN_TXSTAT_READY);
+    g_assert_cmphex(controller_irqs(qts), ==, 0);
+
     tx_harness_stop(&harness);
+}
+
+static void tx_internal_loopback_failure(uint8_t rx_mode,
+                                         uint32_t rx_window,
+                                         uint8_t expected_rx_status,
+                                         uint32_t expected_rx_csr)
+{
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
+    uint8_t after[sizeof(before)];
+    size_t i;
+
+    memset(before, 0xa5, sizeof(before));
+    qtest_memwrite(qts, NEXT_TX_BUFFER, rx_frame, sizeof(rx_frame));
+    qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+    qtest_writel(qts, NEXT_ENTX_NEXT, NEXT_TX_BUFFER);
+    qtest_writel(qts, NEXT_ENTX_LIMIT,
+                 ENTX_EOP | (NEXT_TX_BUFFER + sizeof(rx_frame) +
+                             ENTX_END_BIAS));
+    for (i = 0; i < 6; i++) {
+        en_writeb(qts, EN_ADDR + i, rx_frame[i]);
+    }
+    rx_prepare_controller(qts, rx_mode);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + rx_window, 0, 0,
+               false);
+    tx_prepare_controller(qts);
+    en_writeb(qts, EN_TXMASK, EN_TXMASK_TXRXIE);
+    en_writeb(qts, EN_TXMODE, 0);
+
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+
+    g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+    g_assert_cmphex(en_readb(qts, EN_TXSTAT), ==, EN_TXSTAT_READY);
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, expected_rx_status);
+    g_assert_cmphex(controller_irqs(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, expected_rx_csr);
+    socket_assert_empty(harness.backend_fd);
+
+    tx_harness_stop(&harness);
+}
+
+static void test_tx_internal_loopback_filtered(void)
+{
+    tx_internal_loopback_failure(0, 0x1000, 0, DMA_ENABLE);
+}
+
+static void test_tx_internal_loopback_rx_failure(void)
+{
+    tx_internal_loopback_failure(1, 32, EN_RXSTAT_OVERFLOW,
+                                 DMA_COMPLETE | DMA_BUSEXC);
 }
 
 static void test_tx_two_segment(void)
@@ -1541,6 +1610,10 @@ int main(int argc, char **argv)
                    test_tx_single_buffer);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback",
                    test_tx_internal_loopback);
+    qtest_add_func("/next-cube/mb8795/tx-internal-loopback-filtered",
+                   test_tx_internal_loopback_filtered);
+    qtest_add_func("/next-cube/mb8795/tx-internal-loopback-rx-failure",
+                   test_tx_internal_loopback_rx_failure);
     qtest_add_func("/next-cube/mb8795/tx-two-segment",
                    test_tx_two_segment);
     qtest_add_func("/next-cube/mb8795/tx-range-rejection",
@@ -1569,6 +1642,10 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/mb8795/tx-single-buffer",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/tx-internal-loopback-filtered",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/tx-internal-loopback-rx-failure",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/tx-two-segment",
                    test_tx_transport_unavailable);
