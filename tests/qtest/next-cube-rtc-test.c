@@ -166,6 +166,26 @@ static void test_nvram_block_transfer(void)
     qtest_quit(qts);
 }
 
+static void test_nvram_survives_system_reset(void)
+{
+    static const uint8_t replacement[32] = {
+        0x1b, 0xad, 0xc0, 0xde, 0x10, 0x20, 0x30, 0x40,
+        0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+        0xd0, 0xe0, 0xf0, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b,
+        0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xbc, 0xcd,
+    };
+    QTestState *qts = next_cube_rtc_start();
+    uint8_t actual[32];
+
+    rtc_block_write(qts, 0x80, replacement, sizeof(replacement));
+    qtest_system_reset(qts);
+    rtc_block_read(qts, 0x00, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual),
+                    replacement, sizeof(replacement));
+
+    qtest_quit(qts);
+}
+
 static uint32_t rtc_read_counter(QTestState *qts)
 {
     uint8_t bytes[4];
@@ -235,6 +255,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/next-cube/rtc/nvram-block-transfer",
                    test_nvram_block_transfer);
+    qtest_add_func("/next-cube/rtc/nvram-survives-system-reset",
+                   test_nvram_survives_system_reset);
     qtest_add_func("/next-cube/rtc/mcs1850-counter",
                    test_mcs1850_counter);
     return g_test_run();
