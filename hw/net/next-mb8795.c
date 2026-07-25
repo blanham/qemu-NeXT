@@ -57,6 +57,7 @@
 
 #define NEXT_MB8795_TXSTAT_READY 0x80
 #define NEXT_MB8795_TXSTAT_UNDERFLOW 0x08
+#define NEXT_MB8795_TXMODE_NO_LBC 0x02
 #define NEXT_MB8795_RXSTAT_OK 0x80
 #define NEXT_MB8795_RXSTAT_OVERFLOW 0x01
 #define NEXT_MB8795_RESET_MODE   0x80
@@ -343,7 +344,11 @@ static void next_mb8795_tx_timer(void *opaque)
 
     result = next_dma_enet_tx_read(s->dma, frame, sizeof(frame), &length);
     if (result == NEXT_DMA_OK) {
-        qemu_send_packet(qemu_get_queue(s->nic), frame, length);
+        if (s->tx_mode & NEXT_MB8795_TXMODE_NO_LBC) {
+            qemu_send_packet(qemu_get_queue(s->nic), frame, length);
+        } else {
+            next_mb8795_receive(qemu_get_queue(s->nic), frame, length);
+        }
         s->tx_status |= NEXT_MB8795_TXSTAT_READY;
     } else {
         s->tx_status |= NEXT_MB8795_TXSTAT_UNDERFLOW;
