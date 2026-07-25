@@ -422,6 +422,7 @@ static bool next_rtc_post_load_errp(void *opaque, int version_id, Error **errp)
         rtc->counter_latch = rtc->counter;
         rtc->alarm = 0;
     }
+    /* Versions up to 4 were released with only the MCS1850 RTC. */
     if (version_id < 5 && rtc->chip != NEXT_RTC_CHIP_MCS1850) {
         error_setg(errp, "cannot load pre-v5 state into an old RTC chip");
         return false;

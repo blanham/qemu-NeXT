@@ -584,6 +584,41 @@ static void test_old_rtc_migration(void)
     qtest_quit(destination);
 }
 
+static void test_rtc_chip_migration_mismatch(void)
+{
+    g_autoptr(GError) err = NULL;
+    TestMigrationFiles *files = g_new0(TestMigrationFiles, 1);
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    QTestState *source;
+    QTestState *destination;
+
+    qtest_add_abrt_handler(cleanup_test_migration_files, files);
+    g_test_queue_destroy(cleanup_test_migration_files, files);
+    files->tmpdir = g_dir_make_tmp("next-rtc-mismatch-migration-XXXXXX", &err);
+    g_assert_no_error(err);
+    g_assert_nonnull(files->tmpdir);
+    files->ephemeral_socket =
+        g_build_filename(files->tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", files->ephemeral_socket);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_rtc_start_full(NULL, incoming_args);
+    source = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T00:00:00,clock=vm");
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_set_expected_status(destination, 1);
+    qtest_wait_qemu(destination);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+}
+
 static uint32_t rtc_read_counter_with_step(QTestState *qts, int64_t step)
 {
     uint32_t scr2 = rtc_begin(qts);
@@ -717,5 +752,7 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/rtc/old-weekday-write-and-rollover",
                    test_old_weekday_write_and_rollover);
     qtest_add_func("/next-cube/rtc/old-migration", test_old_rtc_migration);
+    qtest_add_func("/next-cube/rtc/chip-migration-mismatch",
+                   test_rtc_chip_migration_mismatch);
     return g_test_run();
 }
