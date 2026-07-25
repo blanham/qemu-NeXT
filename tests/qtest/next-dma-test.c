@@ -625,6 +625,43 @@ static void test_sound_output_final_segment(void)
     qtest_quit(qts);
 }
 
+static void test_sound_output_frame_aligned_window(void)
+{
+    static const uint8_t samples[16] = {
+        0x10, 0x00, 0xf0, 0x00,
+        0x20, 0x00, 0xe0, 0x00,
+        0x30, 0x00, 0xd0, 0x00,
+        0x40, 0x00, 0xc0, 0x00,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint32_t window = NEXT_TEST_RAM_BASE + 12;
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+    uint64_t next_init = channel_address(sound, 0x4200);
+
+    intercept_next_pc_inputs(qts);
+    qtest_memwrite(qts, window, samples, sizeof(samples));
+    qtest_writel(qts, next_init, window);
+    qtest_writel(qts, limit, window + sizeof(samples));
+    qtest_writel(qts, csr, DMA_SETENABLE);
+
+    enable_sound_output(qts);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    window + sizeof(samples));
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_true(qtest_get_irq(qts,
+                                dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SOUND_DMA_IRQ,
+                    ==, NEXT_SOUND_DMA_IRQ);
+
+    qtest_quit(qts);
+}
+
 static void test_sound_output_direct_kickstart(void)
 {
     static const uint8_t samples[16] = {
@@ -1419,6 +1456,8 @@ int main(int argc, char **argv)
                    test_video_retrace_interrupt);
     qtest_add_func("/next-cube/dma/sound-output-final-segment",
                    test_sound_output_final_segment);
+    qtest_add_func("/next-cube/dma/sound-output-frame-aligned-window",
+                   test_sound_output_frame_aligned_window);
     qtest_add_func("/next-cube/dma/sound-output-direct-kickstart",
                    test_sound_output_direct_kickstart);
     qtest_add_func("/next-cube/dma/sound-output-direct-kickstart-backpressure",
