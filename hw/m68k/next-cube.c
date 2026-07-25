@@ -170,6 +170,7 @@ struct NeXTState {
     NextMB8795State *mb8795;
     char *nvram_file;
     NextRTCChip rtc_chip;
+    bool rtc_chip_locked;
 };
 
 static const QEnumLookup next_machine_rtc_chip_lookup = {
@@ -1223,6 +1224,7 @@ static void next_cube_init(MachineState *machine)
                                              m->rtc_chip),
                             &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcdev), &error_fatal);
+    m->rtc_chip_locked = true;
 
     sysbus_mmio_map(SYS_BUS_DEVICE(m->dma), 0, NEXT_DMA_BASE);
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
@@ -1392,11 +1394,17 @@ static int next_machine_get_rtc_chip(Object *obj, Error **errp G_GNUC_UNUSED)
 
 static void next_machine_set_rtc_chip(Object *obj, int value, Error **errp)
 {
+    NeXTState *s = NEXT_MACHINE(obj);
+
+    if (s->rtc_chip_locked) {
+        error_setg(errp, "rtc-chip cannot be changed after machine init");
+        return;
+    }
     if (value < 0 || value >= NEXT_RTC_CHIP__MAX) {
         error_setg(errp, "invalid rtc-chip value %d", value);
         return;
     }
-    NEXT_MACHINE(obj)->rtc_chip = value;
+    s->rtc_chip = value;
 }
 
 static void next_machine_finalize(Object *obj)

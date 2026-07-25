@@ -48,7 +48,7 @@ typedef enum NextRTCChip {
 struct NeXTRTC {
     SysBusDevice parent_obj;
 
-    NextRTCChip chip;
+    uint32_t chip;
     int8_t phase;
     NextNVRAMState nvram;
     uint8_t command;
@@ -62,6 +62,8 @@ struct NeXTRTC {
     uint8_t old_alarm[3];
     uint8_t old_intctl;
     bool old_hour_12;
+    uint8_t old_weekday;
+    uint32_t old_weekday_day;
     int64_t counter_ref_ns;
 
     qemu_irq data_out_irq;

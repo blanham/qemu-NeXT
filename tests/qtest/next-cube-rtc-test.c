@@ -428,6 +428,7 @@ static void test_rtc_chip_selection_and_calendar_reads(void)
     QTestState *old_qts = next_cube_rtc_start_full(
         ",rtc-chip=mc68hc68t1",
         "-rtc base=2000-01-02T03:04:05,clock=vm");
+    QDict *response;
     uint8_t old_actual[G_N_ELEMENTS(old_calendar)];
 
     g_assert_cmphex(rtc_read_byte(new_qts, 0x30), ==, NEXT_RTC_NEW_CLOCK);
@@ -440,6 +441,13 @@ static void test_rtc_chip_selection_and_calendar_reads(void)
 
     qtest_clock_step(old_qts, NANOSECONDS_PER_SECOND);
     g_assert_cmphex(rtc_read_byte(old_qts, 0x20), ==, 0x06);
+
+    response = qtest_qmp_assert_failure_ref(
+        new_qts,
+        "{ 'execute': 'qom-set', 'arguments': { "
+        "'path': '/machine', 'property': 'rtc-chip', "
+        "'value': 'mc68hc68t1' } }");
+    qobject_unref(response);
 
     qtest_quit(new_qts);
     qtest_quit(old_qts);
@@ -503,6 +511,77 @@ static void test_old_hour_format_and_private_registers(void)
     g_assert_cmphex(rtc_read_byte(qts, 0x27), ==, 0x00);
 
     qtest_quit(qts);
+}
+
+static void test_old_weekday_write_and_rollover(void)
+{
+    QTestState *qts = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T00:00:00,clock=vm");
+
+    rtc_write_byte(qts, 0x31, NEXT_RTC_XTAL);
+    rtc_write_byte(qts, 0x23, 0x06);
+    g_assert_cmphex(rtc_read_byte(qts, 0x23), ==, 0x06);
+    rtc_write_byte(qts, 0x24, 0x03);
+    g_assert_cmphex(rtc_read_byte(qts, 0x23), ==, 0x06);
+    rtc_write_byte(qts, 0x31, NEXT_RTC_START | NEXT_RTC_XTAL);
+    qtest_clock_step(qts, 24 * 60 * 60 * NANOSECONDS_PER_SECOND);
+    g_assert_cmphex(rtc_read_byte(qts, 0x23), ==, 0x00);
+
+    qtest_quit(qts);
+}
+
+static void test_old_rtc_migration(void)
+{
+    static const uint8_t alarm[] = { 0x12, 0x34, 0x56 };
+    g_autoptr(GError) err = NULL;
+    TestMigrationFiles *files = g_new0(TestMigrationFiles, 1);
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    QTestState *source;
+    QTestState *destination;
+    uint8_t actual[G_N_ELEMENTS(alarm)];
+
+    qtest_add_abrt_handler(cleanup_test_migration_files, files);
+    g_test_queue_destroy(cleanup_test_migration_files, files);
+    files->tmpdir = g_dir_make_tmp("next-old-rtc-migration-XXXXXX", &err);
+    g_assert_no_error(err);
+    g_assert_nonnull(files->tmpdir);
+    files->ephemeral_socket =
+        g_build_filename(files->tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", files->ephemeral_socket);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1", incoming_args);
+    source = next_cube_rtc_start_full(
+        ",rtc-chip=mc68hc68t1",
+        "-rtc base=2000-01-02T00:00:00,clock=vm");
+    rtc_write_byte(source, 0x31, NEXT_RTC_XTAL);
+    rtc_write_byte(source, 0x20, 0x59);
+    rtc_write_byte(source, 0x21, 0x59);
+    rtc_write_byte(source, 0x22, 0xb1);
+    rtc_write_byte(source, 0x23, 0x06);
+    rtc_write_byte(source, 0x24, 0x02);
+    rtc_write_byte(source, 0x25, 0x01);
+    rtc_write_byte(source, 0x26, 0x00);
+    rtc_block_write(source, 0xa8, alarm, sizeof(alarm));
+    rtc_write_byte(source, 0x32, 0x3f);
+    migrate_wait(source, destination, uri);
+
+    g_assert_cmphex(rtc_read_byte(destination, 0x31), ==, NEXT_RTC_XTAL);
+    g_assert_cmphex(rtc_read_byte(destination, 0x20), ==, 0x59);
+    g_assert_cmphex(rtc_read_byte(destination, 0x21), ==, 0x59);
+    g_assert_cmphex(rtc_read_byte(destination, 0x22), ==, 0xb1);
+    g_assert_cmphex(rtc_read_byte(destination, 0x23), ==, 0x06);
+    rtc_block_read(destination, 0x28, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), alarm, sizeof(alarm));
+    g_assert_cmphex(rtc_read_byte(destination, 0x32), ==, 0x3f);
+
+    qtest_quit(source);
+    qtest_quit(destination);
 }
 
 static uint32_t rtc_read_counter_with_step(QTestState *qts, int64_t step)
@@ -635,5 +714,8 @@ int main(int argc, char **argv)
                    test_old_calendar_stop_program_and_rollover);
     qtest_add_func("/next-cube/rtc/old-hour-format-and-private-registers",
                    test_old_hour_format_and_private_registers);
+    qtest_add_func("/next-cube/rtc/old-weekday-write-and-rollover",
+                   test_old_weekday_write_and_rollover);
+    qtest_add_func("/next-cube/rtc/old-migration", test_old_rtc_migration);
     return g_test_run();
 }

@@ -60,6 +60,7 @@
                                      NEXT_RTC_OLD_CONTROL_XTAL)
 #define NEXT_RTC_OLD_HOUR_12       0x80
 #define NEXT_RTC_OLD_HOUR_PM       0x20
+#define NEXT_RTC_SECONDS_PER_DAY    (24 * 60 * 60)
 
 static const QEnumLookup next_rtc_chip_lookup = {
     .array = (const char *const[]) {
@@ -103,12 +104,26 @@ static void next_rtc_old_get_tm(NeXTRTC *rtc, struct tm *tm)
     gmtime_r(&now, tm);
 }
 
+static void next_rtc_old_update_weekday(NeXTRTC *rtc)
+{
+    uint32_t day = next_rtc_counter_value(rtc) / NEXT_RTC_SECONDS_PER_DAY;
+    int64_t elapsed_days = (int64_t)day - rtc->old_weekday_day;
+
+    if (elapsed_days) {
+        int64_t weekday = (rtc->old_weekday + elapsed_days) % 7;
+
+        rtc->old_weekday = weekday < 0 ? weekday + 7 : weekday;
+        rtc->old_weekday_day = day;
+    }
+}
+
 static void next_rtc_old_set_tm(NeXTRTC *rtc, const struct tm *tm)
 {
     struct tm new_tm = *tm;
 
     rtc->counter = mktimegm(&new_tm);
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
+    rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
 }
 
 static uint8_t next_rtc_old_calendar_read(NeXTRTC *rtc, uint8_t addr)
@@ -131,7 +146,8 @@ static uint8_t next_rtc_old_calendar_read(NeXTRTC *rtc, uint8_t addr)
         }
         return next_rtc_to_bcd(tm.tm_hour) & 0x3f;
     case 0x23:
-        return next_rtc_to_bcd(tm.tm_wday) & 0x07;
+        next_rtc_old_update_weekday(rtc);
+        return next_rtc_to_bcd(rtc->old_weekday) & 0x07;
     case 0x24:
         return next_rtc_to_bcd(tm.tm_mday) & 0x3f;
     case 0x25:
@@ -148,6 +164,7 @@ static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
 {
     struct tm tm;
 
+    next_rtc_old_update_weekday(rtc);
     next_rtc_old_get_tm(rtc, &tm);
     switch (addr) {
     case 0x20:
@@ -172,6 +189,8 @@ static void next_rtc_old_calendar_write(NeXTRTC *rtc, uint8_t addr,
         }
         break;
     case 0x23:
+        rtc->old_weekday = next_rtc_from_bcd(value & 0x07) % 7;
+        rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
         return;
     case 0x24:
         tm.tm_mday = next_rtc_from_bcd(value & 0x3f);
@@ -367,6 +386,9 @@ static void next_rtc_reset_hold(Object *obj, ResetType type)
     memset(rtc->old_alarm, 0, sizeof(rtc->old_alarm));
     rtc->old_intctl = 0;
     rtc->old_hour_12 = false;
+    next_rtc_old_get_tm(rtc, &tm);
+    rtc->old_weekday = tm.tm_wday;
+    rtc->old_weekday_day = rtc->counter / NEXT_RTC_SECONDS_PER_DAY;
 }
 
 static void next_rtc_reset_exit(Object *obj, ResetType type)
@@ -399,6 +421,10 @@ static bool next_rtc_post_load_errp(void *opaque, int version_id, Error **errp)
         rtc->counter = mktimegm(&tm);
         rtc->counter_latch = rtc->counter;
         rtc->alarm = 0;
+    }
+    if (version_id < 5 && rtc->chip != NEXT_RTC_CHIP_MCS1850) {
+        error_setg(errp, "cannot load pre-v5 state into an old RTC chip");
+        return false;
     }
     rtc->counter_ref_ns = qemu_clock_get_ns(rtc_clock);
     return next_nvram_flush(&rtc->nvram, errp);
@@ -435,7 +461,7 @@ static void next_rtc_unrealize(DeviceState *dev)
 
 static const VMStateDescription next_rtc_vmstate = {
     .name = "next-rtc",
-    .version_id = 4,
+    .version_id = 5,
     .minimum_version_id = 3,
     .pre_save = next_rtc_pre_save,
     .post_load_errp = next_rtc_post_load_errp,
@@ -450,6 +476,12 @@ static const VMStateDescription next_rtc_vmstate = {
         VMSTATE_UINT32_V(counter, NeXTRTC, 4),
         VMSTATE_UINT32_V(counter_latch, NeXTRTC, 4),
         VMSTATE_UINT32_V(alarm, NeXTRTC, 4),
+        VMSTATE_UINT32_EQUAL_V(chip, NeXTRTC, 5),
+        VMSTATE_UINT8_ARRAY_V(old_alarm, NeXTRTC, 3, 5),
+        VMSTATE_UINT8_V(old_intctl, NeXTRTC, 5),
+        VMSTATE_BOOL_V(old_hour_12, NeXTRTC, 5),
+        VMSTATE_UINT8_V(old_weekday, NeXTRTC, 5),
+        VMSTATE_UINT32_V(old_weekday_day, NeXTRTC, 5),
         VMSTATE_END_OF_LIST()
     },
 };
