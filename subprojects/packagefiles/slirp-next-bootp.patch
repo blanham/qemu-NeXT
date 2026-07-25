@@ -17,6 +17,333 @@ index 7e7d8189..1d71b272 100644
  if install_devel
    install_headers(['src/libslirp.h'], subdir : 'slirp')
  
+diff --git a/src/bootp.c b/src/bootp.c
+index 147955fc..f247879f 100644
+--- a/src/bootp.c
++++ b/src/bootp.c
+@@ -38,6 +38,39 @@
+ 
+ static const uint8_t rfc1533_cookie[] = { RFC1533_COOKIE };
+ 
++#define NEXT_BOOTP_VENDOR_VERSION 1
++#define NEXT_BOOTP_OPCODE_OK 0
++
++static const uint8_t next_bootp_vendor_magic[] = {
++    'N', 'e', 'X', 'T',
++};
++
++static bool is_next_bootp_request(const struct bootp_t *bp,
++                                  const uint8_t *bp_end)
++{
++    const uint8_t *vendor = bp->bp_vend;
++
++    return bp_end >= vendor &&
++           (size_t)(bp_end - vendor) >= BOOTP_VENDOR_LEN &&
++           memcmp(vendor, next_bootp_vendor_magic,
++                  sizeof(next_bootp_vendor_magic)) == 0 &&
++           vendor[4] == NEXT_BOOTP_VENDOR_VERSION;
++}
++
++static uint8_t *encode_next_bootp_reply(const struct bootp_t *request,
++                                        struct bootp_t *reply)
++{
++    uint8_t *vendor = reply->bp_vend;
++
++    memset(vendor, 0, BOOTP_VENDOR_LEN);
++    memcpy(vendor, next_bootp_vendor_magic,
++           sizeof(next_bootp_vendor_magic));
++    vendor[4] = NEXT_BOOTP_VENDOR_VERSION;
++    vendor[5] = NEXT_BOOTP_OPCODE_OK;
++    vendor[6] = request->bp_vend[6];
++    return vendor + BOOTP_VENDOR_LEN;
++}
++
+ #define DPRINTF(...) DEBUG_RAW_CALL(__VA_ARGS__)
+ 
+ static BOOTPClient *get_new_addr(Slirp *slirp, struct in_addr *paddr,
+@@ -160,6 +193,7 @@ static void bootp_reply(Slirp *slirp,
+     uint8_t *q;
+     uint8_t *end;
+     uint8_t client_ethaddr[ETH_ALEN];
++    bool next_bootp = is_next_bootp_request(bp, bp_end);
+ 
+     /* extract exact DHCP msg type */
+     dhcp_decode(bp, bp_end, &dhcp_msg_type, &preq_addr);
+@@ -240,151 +274,157 @@ static void bootp_reply(Slirp *slirp,
+     rbp->bp_yiaddr = daddr.sin_addr; /* Client IP address */
+     rbp->bp_siaddr = saddr.sin_addr; /* Server IP address */
+ 
+-    q = rbp->bp_vend;
+-    end = rbp->bp_vend + DHCP_OPT_LEN;
+-    memcpy(q, rfc1533_cookie, 4);
+-    q += 4;
+-
+-    if (bc) {
+-        DPRINTF("%s addr=%08" PRIx32 "\n",
+-                (dhcp_msg_type == DHCPDISCOVER) ? "offered" : "ack'ed",
+-                ntohl(daddr.sin_addr.s_addr));
+-
+-        if (dhcp_msg_type == DHCPDISCOVER) {
+-            *q++ = RFC2132_MSG_TYPE;
+-            *q++ = 1;
+-            *q++ = DHCPOFFER;
+-        } else /* DHCPREQUEST */ {
+-            *q++ = RFC2132_MSG_TYPE;
+-            *q++ = 1;
+-            *q++ = DHCPACK;
+-        }
+-
+-        if (slirp->bootp_filename) {
+-            g_assert(strlen(slirp->bootp_filename) < sizeof(rbp->bp_file));
+-            strcpy(rbp->bp_file, slirp->bootp_filename);
+-        }
++    if (bc && slirp->bootp_filename) {
++        g_assert(strlen(slirp->bootp_filename) < sizeof(rbp->bp_file));
++        strcpy(rbp->bp_file, slirp->bootp_filename);
++    }
+ 
+-        *q++ = RFC2132_SRV_ID;
+-        *q++ = 4;
+-        memcpy(q, &saddr.sin_addr, 4);
+-        q += 4;
++    q = rbp->bp_vend;
++    if (next_bootp) {
++        end = rbp->bp_vend + BOOTP_VENDOR_LEN;
++        q = encode_next_bootp_reply(bp, rbp);
++    } else {
++        end = rbp->bp_vend + DHCP_OPT_LEN;
++        memcpy(q, rfc1533_cookie, sizeof(rfc1533_cookie));
++        q += sizeof(rfc1533_cookie);
+ 
+-        *q++ = RFC1533_NETMASK;
+-        *q++ = 4;
+-        memcpy(q, &slirp->vnetwork_mask, 4);
+-        q += 4;
++        if (bc) {
++            DPRINTF("%s addr=%08" PRIx32 "\n",
++                    (dhcp_msg_type == DHCPDISCOVER) ? "offered" : "ack'ed",
++                    ntohl(daddr.sin_addr.s_addr));
++
++            if (dhcp_msg_type == DHCPDISCOVER) {
++                *q++ = RFC2132_MSG_TYPE;
++                *q++ = 1;
++                *q++ = DHCPOFFER;
++            } else /* DHCPREQUEST */ {
++                *q++ = RFC2132_MSG_TYPE;
++                *q++ = 1;
++                *q++ = DHCPACK;
++            }
+ 
+-        if (!slirp->restricted) {
+-            *q++ = RFC1533_GATEWAY;
++            *q++ = RFC2132_SRV_ID;
+             *q++ = 4;
+             memcpy(q, &saddr.sin_addr, 4);
+             q += 4;
+ 
+-            *q++ = RFC1533_DNS;
++            *q++ = RFC1533_NETMASK;
+             *q++ = 4;
+-            memcpy(q, &slirp->vnameserver_addr, 4);
++            memcpy(q, &slirp->vnetwork_mask, 4);
+             q += 4;
+-        }
+ 
+-        *q++ = RFC2132_LEASE_TIME;
+-        *q++ = 4;
+-        val = htonl(LEASE_TIME);
+-        memcpy(q, &val, 4);
+-        q += 4;
+-
+-        if (*slirp->client_hostname) {
+-            val = strlen(slirp->client_hostname);
+-            if (q + val + 2 >= end) {
+-                g_warning("DHCP packet size exceeded, "
+-                          "omitting host name option.");
+-            } else {
+-                *q++ = RFC1533_HOSTNAME;
+-                *q++ = val;
+-                memcpy(q, slirp->client_hostname, val);
+-                q += val;
++            if (!slirp->restricted) {
++                *q++ = RFC1533_GATEWAY;
++                *q++ = 4;
++                memcpy(q, &saddr.sin_addr, 4);
++                q += 4;
++
++                *q++ = RFC1533_DNS;
++                *q++ = 4;
++                memcpy(q, &slirp->vnameserver_addr, 4);
++                q += 4;
+             }
+-        }
+ 
+-        if (slirp->vdomainname) {
+-            val = strlen(slirp->vdomainname);
+-            if (q + val + 2 >= end) {
+-                g_warning("DHCP packet size exceeded, "
+-                          "omitting domain name option.");
+-            } else {
+-                *q++ = RFC1533_DOMAINNAME;
+-                *q++ = val;
+-                memcpy(q, slirp->vdomainname, val);
+-                q += val;
++            *q++ = RFC2132_LEASE_TIME;
++            *q++ = 4;
++            val = htonl(LEASE_TIME);
++            memcpy(q, &val, 4);
++            q += 4;
++
++            if (*slirp->client_hostname) {
++                val = strlen(slirp->client_hostname);
++                if (q + val + 2 >= end) {
++                    g_warning("DHCP packet size exceeded, "
++                              "omitting host name option.");
++                } else {
++                    *q++ = RFC1533_HOSTNAME;
++                    *q++ = val;
++                    memcpy(q, slirp->client_hostname, val);
++                    q += val;
++                }
+             }
+-        }
+ 
+-        if (slirp->tftp_server_name) {
+-            val = strlen(slirp->tftp_server_name);
+-            if (q + val + 2 >= end) {
+-                g_warning("DHCP packet size exceeded, "
+-                          "omitting tftp-server-name option.");
+-            } else {
+-                *q++ = RFC2132_TFTP_SERVER_NAME;
+-                *q++ = val;
+-                memcpy(q, slirp->tftp_server_name, val);
+-                q += val;
++            if (slirp->vdomainname) {
++                val = strlen(slirp->vdomainname);
++                if (q + val + 2 >= end) {
++                    g_warning("DHCP packet size exceeded, "
++                              "omitting domain name option.");
++                } else {
++                    *q++ = RFC1533_DOMAINNAME;
++                    *q++ = val;
++                    memcpy(q, slirp->vdomainname, val);
++                    q += val;
++                }
+             }
+-        }
+ 
+-        if (slirp->vdnssearch) {
+-            val = slirp->vdnssearch_len;
+-            if (q + val >= end) {
+-                g_warning("DHCP packet size exceeded, "
+-                          "omitting domain-search option.");
+-            } else {
+-                memcpy(q, slirp->vdnssearch, val);
+-                q += val;
++            if (slirp->tftp_server_name) {
++                val = strlen(slirp->tftp_server_name);
++                if (q + val + 2 >= end) {
++                    g_warning("DHCP packet size exceeded, "
++                              "omitting tftp-server-name option.");
++                } else {
++                    *q++ = RFC2132_TFTP_SERVER_NAME;
++                    *q++ = val;
++                    memcpy(q, slirp->tftp_server_name, val);
++                    q += val;
++                }
+             }
+-        }
+ 
+-        /* this allows to support UEFI HTTP boot: according to the UEFI
+-           specification, DHCP server must send vendor class identifier option
+-           set to "HTTPClient" string, when responding to DHCP requests as part
+-           of the UEFI HTTP boot
+-
+-           we assume that, if the bootfile parameter was configured as an http
+-           URL, the user intends to perform UEFI HTTP boot, so send this option
+-           automatically */
+-        if (slirp->bootp_filename && g_str_has_prefix(slirp->bootp_filename, "http://")) {
+-            val = strlen(UEFI_HTTP_VENDOR_CLASS_ID);
+-            if (q + val + 2 >= end) {
+-                g_warning("DHCP packet size exceeded, "
+-                          "omitting vendor class id option.");
+-            } else {
+-                *q++ = RFC2132_VENDOR_CLASS_ID;
+-                *q++ = val;
+-                memcpy(q, UEFI_HTTP_VENDOR_CLASS_ID, val);
+-                q += val;
++            if (slirp->vdnssearch) {
++                val = slirp->vdnssearch_len;
++                if (q + val >= end) {
++                    g_warning("DHCP packet size exceeded, "
++                              "omitting domain-search option.");
++                } else {
++                    memcpy(q, slirp->vdnssearch, val);
++                    q += val;
++                }
+             }
+-        }
+-    } else {
+-        static const char nak_msg[] = "requested address not available";
+ 
+-        DPRINTF("nak'ed addr=%08" PRIx32 "\n", ntohl(preq_addr.s_addr));
++            /* this allows to support UEFI HTTP boot: according to the UEFI
++               specification, DHCP server must send vendor class identifier option
++               set to "HTTPClient" string, when responding to DHCP requests as part
++               of the UEFI HTTP boot
++
++               we assume that, if the bootfile parameter was configured as an http
++               URL, the user intends to perform UEFI HTTP boot, so send this option
++               automatically */
++            if (slirp->bootp_filename && g_str_has_prefix(slirp->bootp_filename, "http://")) {
++                val = strlen(UEFI_HTTP_VENDOR_CLASS_ID);
++                if (q + val + 2 >= end) {
++                    g_warning("DHCP packet size exceeded, "
++                              "omitting vendor class id option.");
++                } else {
++                    *q++ = RFC2132_VENDOR_CLASS_ID;
++                    *q++ = val;
++                    memcpy(q, UEFI_HTTP_VENDOR_CLASS_ID, val);
++                    q += val;
++                }
++            }
++        } else {
++            static const char nak_msg[] = "requested address not available";
+ 
+-        *q++ = RFC2132_MSG_TYPE;
+-        *q++ = 1;
+-        *q++ = DHCPNAK;
++            DPRINTF("nak'ed addr=%08" PRIx32 "\n", ntohl(preq_addr.s_addr));
+ 
+-        *q++ = RFC2132_MESSAGE;
+-        *q++ = sizeof(nak_msg) - 1;
+-        memcpy(q, nak_msg, sizeof(nak_msg) - 1);
+-        q += sizeof(nak_msg) - 1;
++            *q++ = RFC2132_MSG_TYPE;
++            *q++ = 1;
++            *q++ = DHCPNAK;
++
++            *q++ = RFC2132_MESSAGE;
++            *q++ = sizeof(nak_msg) - 1;
++            memcpy(q, nak_msg, sizeof(nak_msg) - 1);
++            q += sizeof(nak_msg) - 1;
++        }
++        assert(q < end);
++        *q++ = RFC1533_END;
+     }
+-    assert(q < end);
+-    *q++ = RFC1533_END;
+ 
+     daddr.sin_addr.s_addr = 0xffffffffu;
+ 
+     assert(q <= end);
+ 
+-    m->m_len = sizeof(struct bootp_t) + (end - rbp->bp_vend) - sizeof(struct ip) - sizeof(struct udphdr);
++    m->m_len = sizeof(struct bootp_t) + (end - rbp->bp_vend) -
++               sizeof(struct ip) - sizeof(struct udphdr);
+     udp_output(NULL, m, &saddr, &daddr, IPTOS_LOWDELAY);
+ }
+ 
 diff --git a/test/bootptest.c b/test/bootptest.c
 new file mode 100644
 index 00000000..713e6fc3
