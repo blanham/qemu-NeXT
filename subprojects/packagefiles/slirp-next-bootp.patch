@@ -19,7 +19,7 @@ index 7e7d8189..1d71b272 100644
  
 diff --git a/test/bootptest.c b/test/bootptest.c
 new file mode 100644
-index 00000000..331e9f24
+index 00000000..713e6fc3
 --- /dev/null
 +++ b/test/bootptest.c
 @@ -0,0 +1,232 @@
@@ -210,7 +210,7 @@ index 00000000..331e9f24
 +                  "sdmach", strlen("sdmach")) == 0);
 +}
 +
-+static void test_next_v1(void)
++static void test_next_v1_reply(void)
 +{
 +    const uint8_t expected_vendor[BOOTP_VENDOR_LEN] = {
 +        'N', 'e', 'X', 'T', 1, 0, 0x5a,
@@ -223,18 +223,18 @@ index 00000000..331e9f24
 +                  expected_vendor, sizeof(expected_vendor)) == 0);
 +}
 +
-+static void test_next_v2(void)
++static void test_next_unknown_version_falls_back(void)
 +{
-+    const uint8_t rfc1533_cookie[] = { 0x63, 0x82, 0x53, 0x63 };
++    const uint8_t dhcp_ack[] = { 99, 130, 83, 99, 53, 1, 5 };
 +    Capture capture = run_request(REQUEST_NEXT_V2);
 +
 +    check_common_reply(&capture);
 +    assert(capture.length == DHCP_RESPONSE_LENGTH);
 +    assert(memcmp(capture.packet + BOOTP_OFFSET + BOOTP_VENDOR_OFFSET,
-+                  rfc1533_cookie, sizeof(rfc1533_cookie)) == 0);
++                  dhcp_ack, sizeof(dhcp_ack)) == 0);
 +}
 +
-+static void test_rfc1533(void)
++static void test_rfc1533_reply_unchanged(void)
 +{
 +    const uint8_t dhcp_offer[] = {
 +        0x63, 0x82, 0x53, 0x63,
@@ -250,8 +250,8 @@ index 00000000..331e9f24
 +
 +int main(void)
 +{
-+    test_next_v1();
-+    test_next_v2();
-+    test_rfc1533();
++    test_next_unknown_version_falls_back();
++    test_rfc1533_reply_unchanged();
++    test_next_v1_reply();
 +    return 0;
 +}
