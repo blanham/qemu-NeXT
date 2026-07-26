@@ -1398,24 +1398,34 @@ F: hw/net/mcf_fec.c
 F: include/hw/m68k/mcf*.h
 F: tests/functional/m68k/test_mcf5208evb.py
 
-NeXTcube
+NeXT system emulators
 M: Thomas Huth <th.huth+qemu@posteo.eu>
 S: Odd Fixes
+F: docs/system/target-m68k.rst
 F: hw/audio/next-sound.c
+F: hw/block/next-floppy.c
+F: hw/char/next-serial.c
+F: hw/display/next-*.c
+F: hw/dma/next-dma.c
 F: hw/m68k/next-*.c
 F: hw/m68k/trace-events
 F: hw/m68k/trace.h
-F: hw/display/next-fb.c
-F: hw/dma/next-dma.c
+F: hw/misc/next-*.c
 F: hw/net/next-mb8795.c
+F: hw/nvram/next-nvram.c
+F: hw/rtc/next-rtc.c
 F: include/hw/audio/next-sound.h
+F: include/hw/block/next-floppy.h
+F: include/hw/char/next-serial.h
+F: include/hw/display/next-*.h
 F: include/hw/dma/next-dma.h
 F: include/hw/m68k/next-cube.h
+F: include/hw/misc/next-*.h
 F: include/hw/net/next-mb8795.h
+F: include/hw/nvram/next-nvram.h
+F: include/hw/rtc/next-rtc.h
 F: tests/functional/m68k/test_nextcube.py
-F: tests/qtest/next-dma-test.c
-F: tests/qtest/next-mb8795-test.c
-F: tests/qtest/next-cube-*.c
+F: tests/qtest/next-*.c
 
 q800
 M: Laurent Vivier <laurent@vivier.eu>
