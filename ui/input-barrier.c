@@ -439,9 +439,6 @@ static gboolean writecmd(InputBarrier *ib, struct barrierMsg *msg)
         for (i = 0; i < msg->repeat.repeat; i++) {
             qemu_input_event_send_key_linux(NULL,
                   input_barrier_to_linux(msg->repeat.keyid, msg->repeat.button),
-                                            false);
-            qemu_input_event_send_key_linux(NULL,
-                  input_barrier_to_linux(msg->repeat.keyid, msg->repeat.button),
                                             true);
         }
         break;

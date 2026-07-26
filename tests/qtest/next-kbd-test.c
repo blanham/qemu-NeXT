@@ -59,6 +59,7 @@
 #define NEXT_ROM_SIZE     (128 * 1024)
 #define NEXT_POLL_LIMIT   10000
 #define NEXT_SOUND_TIMER_NS INT64_C(3000000)
+#define BARRIER_XORG_KEY_A 38
 
 #define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
 #define SOUT_ENAB                  0x01
@@ -142,6 +143,68 @@ static void send_key(QTestState *qts, const char *qcode, bool down)
         "{ 'type': 'key', 'data': { 'down': %i, "
         "'key': { 'type': 'qcode', 'data': %s } } } ] } }",
         down, qcode);
+}
+
+static int barrier_listen(uint16_t *port)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t addrlen = sizeof(addr);
+    int fd;
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(bind(fd, (struct sockaddr *)&addr, sizeof(addr)), ==, 0);
+    g_assert_cmpint(getsockname(fd, (struct sockaddr *)&addr, &addrlen), ==, 0);
+    g_assert_cmpint(listen(fd, 1), ==, 0);
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+static void barrier_write_all(int fd, const void *data, size_t size)
+{
+    const uint8_t *p = data;
+
+    while (size) {
+        ssize_t written = send(fd, p, size, 0);
+
+        g_assert_cmpint(written, >, 0);
+        p += written;
+        size -= written;
+    }
+}
+
+static void barrier_send_key(int fd, const char command[4], uint16_t repeat)
+{
+    uint8_t packet[16] = { 0 };
+    uint32_t payload_size = repeat ? 12 : 10;
+    uint32_t net_payload_size = htonl(payload_size);
+    uint16_t net_repeat = htons(repeat);
+    uint16_t net_button = htons(BARRIER_XORG_KEY_A);
+
+    memcpy(packet, &net_payload_size, sizeof(net_payload_size));
+    memcpy(packet + 4, command, 4);
+    if (repeat) {
+        memcpy(packet + 12, &net_repeat, sizeof(net_repeat));
+        memcpy(packet + 14, &net_button, sizeof(net_button));
+    } else {
+        memcpy(packet + 12, &net_button, sizeof(net_button));
+    }
+    barrier_write_all(fd, packet, payload_size + sizeof(net_payload_size));
+}
+
+static void wait_for_keyboard_data(QTestState *qts)
+{
+    for (unsigned int i = 0; i < NEXT_POLL_LIMIT; i++) {
+        if (qtest_readl(qts, NEXT_KBD_CSR) & NEXT_KBD_DAV) {
+            return;
+        }
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for NeXT keyboard data");
 }
 
 static void send_mouse_motion(QTestState *qts, int x, int y)
@@ -321,6 +384,74 @@ static void test_key_state_cleared_by_reset(void)
     assert_mouse_queue_empty(qts);
 
     qtest_quit(qts);
+}
+
+static void test_barrier_repeat_is_key_down(void)
+{
+    static const bool expected_down[] = {
+        true, true, true, true, false,
+    };
+    g_autofree char *args = NULL;
+    g_autofree char *trace_contents = NULL;
+    g_autofree char *trace_path = NULL;
+    g_autofree char *quoted_trace_path = NULL;
+    g_auto(GStrv) trace_lines = NULL;
+    QTestState *qts;
+    unsigned int event_count = 0;
+    uint16_t port;
+    int trace_fd;
+    int listener;
+    int client;
+
+    listener = barrier_listen(&port);
+    trace_fd = g_file_open_tmp("next-kbd-barrier-trace-XXXXXX",
+                               &trace_path, NULL);
+    g_assert_cmpint(trace_fd, >=, 0);
+    close(trace_fd);
+    quoted_trace_path = g_shell_quote(trace_path);
+    args = g_strdup_printf("-object input-barrier,id=barrier0,name=test,"
+                           "server=127.0.0.1,port=%u "
+                           "-D %s -trace enable=input_event_key_qcode",
+                           port, quoted_trace_path);
+    qts = next_cube_kbd_start_with_args(args);
+    client = accept(listener, NULL, NULL);
+    g_assert_cmpint(client, >=, 0);
+
+    barrier_send_key(client, "DKDN", 0);
+    wait_for_keyboard_data(qts);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    assert_mouse_queue_empty(qts);
+
+    barrier_send_key(client, "DKRP", 3);
+    barrier_send_key(client, "DKUP", 0);
+    wait_for_keyboard_data(qts);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    assert_mouse_queue_empty(qts);
+
+    qtest_quit(qts);
+    close(client);
+    close(listener);
+
+    g_assert_true(g_file_get_contents(trace_path, &trace_contents,
+                                      NULL, NULL));
+    trace_lines = g_strsplit(trace_contents, "\n", -1);
+    for (unsigned int i = 0; trace_lines[i]; i++) {
+        if (!strstr(trace_lines[i], "input_event_key_qcode")) {
+            continue;
+        }
+
+        g_assert_cmpuint(event_count, <, ARRAY_SIZE(expected_down));
+        g_assert_nonnull(strstr(trace_lines[i], "key qcode a"));
+        g_assert_nonnull(strstr(trace_lines[i],
+                                expected_down[event_count] ?
+                                "down 1" : "down 0"));
+        event_count++;
+    }
+    g_assert_cmpuint(event_count, ==, ARRAY_SIZE(expected_down));
+    g_assert_cmpint(g_unlink(trace_path), ==, 0);
 }
 
 static void test_key_dequeue_modifiers(void)
@@ -585,6 +716,8 @@ int main(int argc, char **argv)
                    test_duplicate_key_state_ignored);
     qtest_add_func("/next-cube/kbd/key-state-cleared-by-reset",
                    test_key_state_cleared_by_reset);
+    qtest_add_func("/next-cube/kbd/barrier-repeat-is-key-down",
+                   test_barrier_repeat_is_key_down);
     qtest_add_func("/next-cube/kbd/key-dequeue-modifiers",
                    test_key_dequeue_modifiers);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
