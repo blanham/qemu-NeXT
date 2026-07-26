@@ -53,6 +53,8 @@
 #define NEXT_OPTICAL_DEVICE_IRQ (1U << 13)
 #define NEXT_OPTICAL_MTREE      \
     "0000000002112000-000000000211201f (prio 0, i/o): next-optical"
+#define NEXT_P_DISK_COMPAT_MTREE \
+    "0000000002112000-000000000211201f (prio -10000, i/o): empty-slot"
 
 typedef struct TestROM {
     int fd;
@@ -288,23 +290,30 @@ static void test_machine_mapping(void)
 {
     QTestState *cube = next_machine_start("next-cube", NULL);
     g_autofree char *cube_mtree = qtest_hmp(cube, "info mtree -f");
-    QTestState *station;
-    QTestState *color;
-    g_autofree char *station_mtree = NULL;
-    g_autofree char *color_mtree = NULL;
+    const char *absent_formatter_machines[] = {
+        "next-station",
+        "next-station-color",
+    };
+    size_t i;
 
     g_assert_nonnull(strstr(cube_mtree, NEXT_OPTICAL_MTREE));
     qtest_quit(cube);
 
-    station = next_machine_start("next-station", NULL);
-    station_mtree = qtest_hmp(station, "info mtree -f");
-    g_assert_null(strstr(station_mtree, "next-optical"));
-    qtest_quit(station);
+    for (i = 0; i < ARRAY_SIZE(absent_formatter_machines); i++) {
+        QTestState *qts =
+            next_machine_start(absent_formatter_machines[i], NULL);
+        g_autofree char *mtree = qtest_hmp(qts, "info mtree -f");
 
-    color = next_machine_start("next-station-color", NULL);
-    color_mtree = qtest_hmp(color, "info mtree -f");
-    g_assert_null(strstr(color_mtree, "next-optical"));
-    qtest_quit(color);
+        g_assert_null(strstr(mtree, "next-optical"));
+        g_assert_nonnull(strstr(mtree, NEXT_P_DISK_COMPAT_MTREE));
+        qtest_writeb(qts, NEXT_DISR, 1);
+        qtest_writeb(qts, NEXT_DIMR, 0xff);
+        qtest_writeb(qts, NEXT_CONTROL1, 0xff);
+        g_assert_cmphex(qtest_readb(qts, NEXT_DISR), ==, 0);
+        g_assert_cmphex(qtest_readb(qts, NEXT_DIMR), ==, 0);
+        g_assert_cmphex(qtest_readb(qts, NEXT_CONTROL1), ==, 0);
+        qtest_quit(qts);
+    }
 }
 
 static void test_registers_and_reset(void)

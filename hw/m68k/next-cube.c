@@ -66,6 +66,7 @@
 #define NEXT_DMA_BASE        0x02000000
 #define NEXT_NBIC_BASE       0x02020000
 #define NEXT_OPTICAL_BASE    0x02112000
+#define NEXT_OPTICAL_SIZE    0x20
 #define NEXT_SCSI_ROM_CSR_BASE 0x02014020
 #define NEXT_SCSI_BASE       0x02114000
 #define NEXT_SCSI_CSR_OFFSET 0x20
@@ -1388,6 +1389,13 @@ static void next_machine_init(MachineState *machine)
                                  OBJECT(m->dma), &error_abort);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(optical_dev), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(optical_dev), 0, NEXT_OPTICAL_BASE);
+    } else {
+        /*
+         * The ROM resets P_DISK before mon_setup identifies the machine,
+         * then accesses offsets 4, 5, and 7 unconditionally.
+         */
+        empty_slot_init("next.p-disk-compat",
+                        NEXT_OPTICAL_BASE, NEXT_OPTICAL_SIZE);
     }
 
     /* Serial ports and clock select */
