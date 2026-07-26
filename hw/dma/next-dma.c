@@ -183,6 +183,8 @@ struct NextDMAState {
     void *enet_opaque;
     const NextDMAOpticalNotify *optical_notify;
     void *optical_opaque;
+    const NextDMASoundOutNotify *sound_out_notify;
+    void *sound_out_opaque;
     bool rx_ready;
     bool rx_keep_enabled;
     QEMUTimer video_retrace_timer;
@@ -603,6 +605,10 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         (c->csr & NEXT_DMA_CSR_ENABLE) &&
         s->optical_notify && s->optical_notify->enabled) {
         s->optical_notify->enabled(s->optical_opaque);
+    }
+    if (channel == NEXT_DMA_SOUND_OUT && s->sound_out_notify &&
+        s->sound_out_notify->state_changed) {
+        s->sound_out_notify->state_changed(s->sound_out_opaque);
     }
 }
 
@@ -1251,6 +1257,22 @@ NextDMAResult next_dma_sound_out_read(NextDMAState *s, uint8_t *samples,
     next_dma_advance(s, NEXT_DMA_SOUND_OUT, chunk);
     *length = chunk;
     return NEXT_DMA_OK;
+}
+
+bool next_dma_sound_out_complete(NextDMAState *s)
+{
+    return s->channel[NEXT_DMA_SOUND_OUT].csr & NEXT_DMA_CSR_COMPLETE;
+}
+
+void next_dma_set_sound_out_notify(NextDMAState *s,
+                                   const NextDMASoundOutNotify *notify,
+                                   void *opaque)
+{
+    s->sound_out_notify = notify;
+    s->sound_out_opaque = opaque;
+    if (notify && notify->state_changed) {
+        notify->state_changed(opaque);
+    }
 }
 
 typedef struct NextDMAEnetTxRange {

@@ -52,6 +52,7 @@
 #define NEXT_SOUND_DMA_IRQ  (1U << 23)
 #define NEXT_VIDEO_IRQ      (1U << 5)
 #define NEXT_VIDEO_RETRACE_NS (INT64_C(1000000000) / 68)
+#define NEXT_SOUND_POST_WAIT_NS INT64_C(200000000)
 #define NEXT_VIDEO_LIMIT    0xea
 #define NEXT_SOUND_OUT_CHANNEL 1
 
@@ -82,6 +83,7 @@
 #define NEXT_DMAOUT_DMAEN          0x80000000
 #define NEXT_DMAOUT_OVR            0x20000000
 #define SOUT_ENAB                  0x01
+#define SOUT_DOUB                  0x02
 
 typedef struct TestChannel {
     const char *name;
@@ -606,6 +608,7 @@ static void test_sound_output_final_segment(void)
     qtest_writel(qts, csr, DMA_SETENABLE);
 
     enable_sound_output(qts);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, next), ==,
                     NEXT_TEST_RAM_BASE + sizeof(samples));
@@ -648,6 +651,7 @@ static void test_sound_output_frame_aligned_window(void)
     qtest_writel(qts, csr, DMA_SETENABLE);
 
     enable_sound_output(qts);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, next), ==,
                     window + sizeof(samples));
@@ -684,6 +688,7 @@ static void test_sound_output_direct_kickstart(void)
      * first latch underrun, then arm DMA, and finally send the direct frame.
      */
     enable_sound_output(qts);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
     g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) &
                     (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR),
                     ==, NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR);
@@ -704,6 +709,11 @@ static void test_sound_output_direct_kickstart(void)
 
     qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SOUND_OUT);
     qtest_writel(qts, NEXT_MON_DATA, 0);
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + 4);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
+                    ==, 0);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, next), ==,
                     NEXT_TEST_RAM_BASE + sizeof(samples));
@@ -716,7 +726,6 @@ static void test_sound_output_direct_kickstart(void)
                     ==, NEXT_SOUND_DMA_IRQ);
     g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
                     ==, 0);
-
     qtest_quit(qts);
 }
 
@@ -757,6 +766,11 @@ static void test_sound_output_direct_kickstart_backpressure(void)
 
     qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SOUND_OUT);
     qtest_writel(qts, NEXT_MON_DATA, 0);
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + 4);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
+                    ==, 0);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, next), ==,
                     NEXT_TEST_RAM_BASE + sizeof(samples));
@@ -769,6 +783,135 @@ static void test_sound_output_direct_kickstart_backpressure(void)
                     ==, NEXT_SOUND_DMA_IRQ);
     g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
                     ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_sound_output_host_stall_virtual_clock(void)
+{
+    enum {
+        DMA_LENGTH = 8192,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    g_autofree uint8_t *samples = g_malloc0(DMA_LENGTH);
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+
+    intercept_next_pc_inputs(qts);
+    enable_sound_output(qts);
+    qtest_writeb(qts, NEXT_MON_CSR,
+                 (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR) >> 24);
+
+    /*
+     * Saturate qtest's 1024-frame noaudio ring and leave presentation data
+     * pending.  Guest DMA timing must not depend on a host callback making
+     * room in that ring.
+     */
+    for (size_t i = 0; i <= 1024; i++) {
+        qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SOUND_OUT);
+        qtest_writel(qts, NEXT_MON_DATA, i);
+    }
+
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, DMA_LENGTH);
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    qtest_writel(qts, csr, DMA_SETENABLE);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==, NEXT_TEST_RAM_BASE);
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
+                    ==, 0);
+
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_true(qtest_get_irq(qts,
+                                dma_board_inputs[NEXT_SOUND_OUT_CHANNEL]));
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
+                    NEXT_SOUND_DMA_IRQ, ==, NEXT_SOUND_DMA_IRQ);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
+                    ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_output_double_rate_virtual_clock(void)
+{
+    enum {
+        DMA_LENGTH = 8192,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    g_autofree uint8_t *samples = g_malloc0(DMA_LENGTH);
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+    uint32_t position;
+
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, DMA_LENGTH);
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    qtest_writel(qts, csr, DMA_SETENABLE);
+    qtest_writeb(qts, NEXT_MON_CSR, NEXT_DMAOUT_DMAEN >> 24);
+    qtest_writeb(qts, NEXT_MON_CSR + 3,
+                 MON_SNDOUT_CTRL(SOUT_ENAB | SOUT_DOUB));
+    qtest_writel(qts, NEXT_MON_DATA, 0);
+
+    qtest_clock_step(qts, INT64_C(80000000));
+    position = qtest_readl(qts, next);
+    g_assert_cmphex(position, >, NEXT_TEST_RAM_BASE);
+    g_assert_cmphex(position, <, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE);
+
+    qtest_clock_step(qts, INT64_C(40000000));
+    g_assert_cmphex(qtest_readl(qts, next), ==,
+                    NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+
+    qtest_quit(qts);
+}
+
+static void test_sound_output_timer_reset(void)
+{
+    enum {
+        DMA_LENGTH = 8192,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    g_autofree uint8_t *samples = g_malloc0(DMA_LENGTH);
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, DMA_LENGTH);
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    qtest_writel(qts, csr, DMA_SETENABLE);
+    enable_sound_output(qts);
+    qtest_clock_step(qts, INT64_C(20000000));
+    g_assert_cmphex(qtest_readl(qts, next), >, NEXT_TEST_RAM_BASE);
+    g_assert_cmphex(qtest_readl(qts, next),
+                    <, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, csr), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) &
+                    (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR), ==, 0);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
+    g_assert_cmphex(qtest_readl(qts, csr), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) &
+                    (NEXT_DMAOUT_DMAEN | NEXT_DMAOUT_OVR), ==, 0);
 
     qtest_quit(qts);
 }
@@ -797,6 +940,7 @@ static void test_sound_output_chained_segments(void)
     qtest_writel(qts, csr, DMA_SETENABLE | DMA_SETSUPDATE);
 
     enable_sound_output(qts);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, next), ==, NEXT_TEST_RAM_BASE + 16);
     g_assert_cmphex(qtest_readl(qts, limit), ==,
@@ -808,6 +952,7 @@ static void test_sound_output_chained_segments(void)
     qtest_writel(qts, csr, DMA_CLRCOMPLETE);
     qtest_writeb(qts, NEXT_MON_CSR + 3, MON_SNDOUT_CTRL(SOUT_ENAB));
     qtest_writel(qts, NEXT_MON_DATA, 0);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, next), ==,
                     NEXT_TEST_RAM_BASE + sizeof(samples));
@@ -831,6 +976,7 @@ static void test_sound_output_range_error_and_reset(void)
     qtest_writel(qts, csr, DMA_SETENABLE);
 
     enable_sound_output(qts);
+    qtest_clock_step(qts, NEXT_SOUND_POST_WAIT_NS);
 
     g_assert_cmphex(qtest_readl(qts, csr) &
                     (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
@@ -1437,6 +1583,65 @@ static void test_migration_partial_scsi_stage(void)
     g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
 }
 
+static void test_sound_output_active_migration(void)
+{
+    enum {
+        DMA_LENGTH = 8192,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    g_autofree uint8_t *samples = g_malloc0(DMA_LENGTH);
+    QTestState *source;
+    QTestState *destination;
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+    uint32_t position;
+
+    tmpdir = g_dir_make_tmp("next-sound-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_dma_start_with_args(false, incoming_args);
+    source = next_dma_start_with_args(false, NULL);
+    qtest_memwrite(source, NEXT_TEST_RAM_BASE, samples, DMA_LENGTH);
+    qtest_writel(source, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(source, limit, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    qtest_writel(source, csr, DMA_SETENABLE);
+    enable_sound_output(source);
+    qtest_clock_step(source, INT64_C(20000000));
+    position = qtest_readl(source, next);
+    g_assert_cmphex(position, >, NEXT_TEST_RAM_BASE);
+    g_assert_cmphex(position, <, NEXT_TEST_RAM_BASE + DMA_LENGTH);
+
+    migrate_wait(source, destination, uri);
+    g_assert_cmphex(qtest_readl(destination, next), ==, position);
+    g_assert_cmphex(qtest_readl(destination, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE);
+
+    qtest_clock_step(destination, NEXT_SOUND_POST_WAIT_NS);
+    g_assert_cmphex(qtest_readl(destination, next), ==,
+                    NEXT_TEST_RAM_BASE + DMA_LENGTH);
+    g_assert_cmphex(qtest_readl(destination, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1462,6 +1667,12 @@ int main(int argc, char **argv)
                    test_sound_output_direct_kickstart);
     qtest_add_func("/next-cube/dma/sound-output-direct-kickstart-backpressure",
                    test_sound_output_direct_kickstart_backpressure);
+    qtest_add_func("/next-cube/dma/sound-output-host-stall-virtual-clock",
+                   test_sound_output_host_stall_virtual_clock);
+    qtest_add_func("/next-cube/dma/sound-output-double-rate-virtual-clock",
+                   test_sound_output_double_rate_virtual_clock);
+    qtest_add_func("/next-cube/dma/sound-output-timer-reset",
+                   test_sound_output_timer_reset);
     qtest_add_func("/next-cube/dma/sound-output-chained-segments",
                    test_sound_output_chained_segments);
     qtest_add_func("/next-cube/dma/sound-output-range-error-and-reset",
@@ -1478,5 +1689,7 @@ int main(int argc, char **argv)
                    test_migration_idle_all_channels);
     qtest_add_func("/next-cube/dma/migration-partial-scsi-stage",
                    test_migration_partial_scsi_stage);
+    qtest_add_func("/next-cube/dma/sound-output-active-migration",
+                   test_sound_output_active_migration);
     return g_test_run();
 }

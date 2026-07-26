@@ -58,6 +58,7 @@
 #define NEXT_KEY_UP       0x80
 #define NEXT_ROM_SIZE     (128 * 1024)
 #define NEXT_POLL_LIMIT   10000
+#define NEXT_SOUND_TIMER_NS INT64_C(3000000)
 
 #define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
 #define SOUT_ENAB                  0x01
@@ -223,6 +224,10 @@ static void test_sound_monitor_handshake_and_overrun(void)
     csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_MON_CTX_PEND | NEXT_KBD_CTX | NEXT_MON_DTX),
                     ==, 0);
+    g_assert_cmphex(csr & NEXT_DMAOUT_OVR, ==, 0);
+
+    qtest_clock_step(qts, NEXT_SOUND_TIMER_NS);
+    csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & NEXT_DMAOUT_OVR, ==, NEXT_DMAOUT_OVR);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_SND_OVR,
                     ==, NEXT_INTR_SND_OVR);
