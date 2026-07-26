@@ -34,6 +34,7 @@
 #include "hw/display/next-color-video.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
+#include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
@@ -43,6 +44,12 @@
 #define NEXT_C16_WIDTH 1120
 #define NEXT_C16_HEIGHT 832
 #define NEXT_C16_STRIDE (1152 * 2)
+#define NEXT_BT463_ENTRIES 0x400
+#define NEXT_COLOR_RETRACE_NS (NANOSECONDS_PER_SECOND / 68)
+
+#define NEXT_COLOR_COMMAND_CLRINTR 0x01
+#define NEXT_COLOR_COMMAND_INTRENA 0x02
+#define NEXT_COLOR_COMMAND_UNBLANK 0x04
 
 struct NextColorVideoState {
     SysBusDevice parent_obj;
@@ -56,6 +63,10 @@ struct NextColorVideoState {
     QemuConsole *console;
     qemu_irq irq;
     QEMUTimer retrace_timer;
+    uint16_t dac_address;
+    uint8_t dac_component;
+    uint8_t palette[NEXT_BT463_ENTRIES][3];
+    uint8_t general[NEXT_BT463_ENTRIES][3];
     uint8_t command;
     uint8_t dram_timing;
     uint8_t vram_timing;
@@ -63,25 +74,120 @@ struct NextColorVideoState {
     bool invalidate;
 };
 
+static uint8_t next_color_dac_data_read(NextColorVideoState *s,
+                                        uint8_t table[][3])
+{
+    uint8_t value = table[s->dac_address & 0x3ff][s->dac_component];
+
+    s->dac_component++;
+    if (s->dac_component == 3) {
+        s->dac_component = 0;
+        s->dac_address = (s->dac_address + 1) & 0x3ff;
+    }
+
+    return value;
+}
+
+static void next_color_dac_data_write(NextColorVideoState *s,
+                                      uint8_t table[][3], uint8_t value)
+{
+    table[s->dac_address & 0x3ff][s->dac_component] = value;
+
+    s->dac_component++;
+    if (s->dac_component == 3) {
+        s->dac_component = 0;
+        s->dac_address = (s->dac_address + 1) & 0x3ff;
+    }
+}
+
 static uint64_t next_color_dac_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return 0;
+    NextColorVideoState *s = opaque;
+
+    switch (addr) {
+    case 0:
+        return s->dac_address & 0xff;
+    case 1:
+        return s->dac_address >> 8;
+    case 2:
+        return next_color_dac_data_read(s, s->general);
+    case 3:
+        return next_color_dac_data_read(s, s->palette);
+    default:
+        return 0;
+    }
 }
 
 static void next_color_dac_write(void *opaque, hwaddr addr, uint64_t value,
                                  unsigned size)
 {
+    NextColorVideoState *s = opaque;
+
+    switch (addr) {
+    case 0:
+        s->dac_address = (s->dac_address & 0xff00) | (value & 0xff);
+        s->dac_component = 0;
+        break;
+    case 1:
+        s->dac_address = (s->dac_address & 0x00ff) |
+            ((value & 0xff) << 8);
+        s->dac_component = 0;
+        break;
+    case 2:
+        next_color_dac_data_write(s, s->general, value);
+        break;
+    case 3:
+        next_color_dac_data_write(s, s->palette, value);
+        break;
+    }
 }
 
 static uint64_t next_color_command_read(void *opaque, hwaddr addr,
                                         unsigned size)
 {
-    return 0;
+    NextColorVideoState *s = opaque;
+
+    return s->command;
+}
+
+static void next_color_set_irq(NextColorVideoState *s, bool level)
+{
+    s->irq_level = level;
+    qemu_set_irq(s->irq, level);
+}
+
+static void next_color_retrace(void *opaque)
+{
+    NextColorVideoState *s = opaque;
+
+    if (s->command & NEXT_COLOR_COMMAND_INTRENA) {
+        next_color_set_irq(s, true);
+    }
+}
+
+static void next_color_schedule_retrace(NextColorVideoState *s)
+{
+    timer_mod(&s->retrace_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              NEXT_COLOR_RETRACE_NS);
 }
 
 static void next_color_command_write(void *opaque, hwaddr addr,
                                      uint64_t value, unsigned size)
 {
+    NextColorVideoState *s = opaque;
+
+    if (value & NEXT_COLOR_COMMAND_CLRINTR) {
+        next_color_set_irq(s, false);
+    }
+
+    s->command = value &
+        (NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK);
+    timer_del(&s->retrace_timer);
+    if (s->command & NEXT_COLOR_COMMAND_INTRENA) {
+        next_color_schedule_retrace(s);
+    }
+    s->invalidate = true;
 }
 
 static uint64_t next_color_dram_timing_read(void *opaque, hwaddr addr,
@@ -122,11 +228,11 @@ static const MemoryRegionOps next_color_dac_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 1,
     },
     .impl = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 1,
     },
 };
 
@@ -176,13 +282,54 @@ static void next_color_video_reset_hold(Object *obj, ResetType type)
 {
     NextColorVideoState *s = NEXT_COLOR_VIDEO(obj);
 
+    timer_del(&s->retrace_timer);
+    next_color_set_irq(s, false);
+    s->dac_address = 0;
+    s->dac_component = 0;
+    memset(s->palette, 0, sizeof(s->palette));
+    memset(s->general, 0, sizeof(s->general));
     s->command = 0;
     s->dram_timing = 0;
     s->vram_timing = 0;
-    s->irq_level = false;
     s->invalidate = false;
-    qemu_set_irq(s->irq, 0);
 }
+
+static int next_color_video_post_load(void *opaque, int version_id)
+{
+    NextColorVideoState *s = opaque;
+
+    s->dac_address &= 0x3ff;
+    s->dac_component %= 3;
+    s->command &=
+        NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
+    qemu_set_irq(s->irq, s->irq_level);
+    if (!(s->command & NEXT_COLOR_COMMAND_INTRENA)) {
+        timer_del(&s->retrace_timer);
+    }
+
+    return 0;
+}
+
+static const VMStateDescription vmstate_next_color_video = {
+    .name = TYPE_NEXT_COLOR_VIDEO,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = next_color_video_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(dac_address, NextColorVideoState),
+        VMSTATE_UINT8(dac_component, NextColorVideoState),
+        VMSTATE_UINT8_2DARRAY(palette, NextColorVideoState,
+                             NEXT_BT463_ENTRIES, 3),
+        VMSTATE_UINT8_2DARRAY(general, NextColorVideoState,
+                             NEXT_BT463_ENTRIES, 3),
+        VMSTATE_UINT8(command, NextColorVideoState),
+        VMSTATE_UINT8(dram_timing, NextColorVideoState),
+        VMSTATE_UINT8(vram_timing, NextColorVideoState),
+        VMSTATE_BOOL(irq_level, NextColorVideoState),
+        VMSTATE_TIMER(retrace_timer, NextColorVideoState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static void next_color_video_realize(DeviceState *dev, Error **errp)
 {
@@ -221,13 +368,23 @@ static void next_color_video_class_init(ObjectClass *oc, const void *data)
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = next_color_video_realize;
+    dc->vmsd = &vmstate_next_color_video;
     rc->phases.hold = next_color_video_reset_hold;
+}
+
+static void next_color_video_init(Object *obj)
+{
+    NextColorVideoState *s = NEXT_COLOR_VIDEO(obj);
+
+    timer_init_ns(&s->retrace_timer, QEMU_CLOCK_VIRTUAL,
+                  next_color_retrace, s);
 }
 
 static const TypeInfo next_color_video_info = {
     .name = TYPE_NEXT_COLOR_VIDEO,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(NextColorVideoState),
+    .instance_init = next_color_video_init,
     .class_init = next_color_video_class_init,
 };
 
