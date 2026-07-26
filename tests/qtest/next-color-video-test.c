@@ -20,6 +20,13 @@
 #define NEXT_COLOR_COMMAND_INTRENA   0x02
 #define NEXT_COLOR_COMMAND_UNBLANK   0x04
 #define NEXT_COLOR_RETRACE_NS        (NANOSECONDS_PER_SECOND / 68)
+#define NEXT_COLOR_WIDTH             1120
+#define NEXT_COLOR_HEIGHT            832
+#define NEXT_COLOR_STRIDE            2304
+#define NEXT_COLOR_PPM_HEADER        "P6\n1120 832\n255\n"
+#define NEXT_COLOR_PPM_HEADER_SIZE   (sizeof(NEXT_COLOR_PPM_HEADER) - 1)
+#define NEXT_COLOR_PPM_RASTER_SIZE \
+    ((size_t)NEXT_COLOR_WIDTH * NEXT_COLOR_HEIGHT * 3)
 
 #define NEXT_COLOR_VRAM_MTREE \
     "000000002c000000-000000002c1fffff (prio 0, ram): next-color-vram"
@@ -44,6 +51,11 @@ typedef struct TestMigration {
     char *tmpdir;
     char *socket_path;
 } TestMigration;
+
+typedef struct TestPPM {
+    char *tmpdir;
+    char *path;
+} TestPPM;
 
 static void cleanup_test_rom(void *opaque)
 {
@@ -123,6 +135,119 @@ static TestMigration *create_test_migration(void)
         g_build_filename(migration->tmpdir, "migration.sock", NULL);
 
     return migration;
+}
+
+static void cleanup_test_ppm(void *opaque)
+{
+    TestPPM *ppm = opaque;
+
+    qtest_remove_abrt_handler(ppm);
+    if (ppm->path) {
+        g_unlink(ppm->path);
+    }
+    if (ppm->tmpdir) {
+        g_rmdir(ppm->tmpdir);
+    }
+    g_free(ppm->path);
+    g_free(ppm->tmpdir);
+    g_free(ppm);
+}
+
+static TestPPM *create_test_ppm(void)
+{
+    g_autoptr(GError) error = NULL;
+    TestPPM *ppm = g_new0(TestPPM, 1);
+
+    qtest_add_abrt_handler(cleanup_test_ppm, ppm);
+    g_test_queue_destroy(cleanup_test_ppm, ppm);
+    ppm->tmpdir = g_dir_make_tmp("next-color-video-ppm-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(ppm->tmpdir);
+    ppm->path = g_build_filename(ppm->tmpdir, "screendump.ppm", NULL);
+
+    return ppm;
+}
+
+static bool qmp_command_available(QTestState *qts, const char *name)
+{
+    g_autoptr(QDict) response =
+        qtest_qmp(qts, "{ 'execute': 'query-commands' }");
+    QList *commands;
+    QListEntry *entry;
+
+    g_assert_nonnull(response);
+    g_assert_true(qdict_haskey(response, "return"));
+    commands = qdict_get_qlist(response, "return");
+    g_assert_nonnull(commands);
+
+    QLIST_FOREACH_ENTRY(commands, entry) {
+        QDict *command = qobject_to(QDict, qlist_entry_obj(entry));
+
+        g_assert_nonnull(command);
+        if (!strcmp(qdict_get_str(command, "name"), name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool require_screendump(QTestState *qts)
+{
+    if (qmp_command_available(qts, "screendump")) {
+        return true;
+    }
+
+    g_test_skip("QMP screendump is unavailable");
+    return false;
+}
+
+static void take_screendump(QTestState *qts, const TestPPM *ppm)
+{
+    qtest_qmp_assert_success(
+        qts,
+        "{ 'execute': 'screendump', 'arguments': { 'filename': %s } }",
+        ppm->path);
+}
+
+static char *load_test_ppm(const TestPPM *ppm)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *actual_header = NULL;
+    char *contents = NULL;
+    const char *cursor;
+    const char *end;
+    gsize length;
+
+    g_assert_true(g_file_get_contents(ppm->path, &contents, &length, &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(length, >=, NEXT_COLOR_PPM_HEADER_SIZE);
+    cursor = contents;
+    end = contents + length;
+    for (unsigned i = 0; i < 3; i++) {
+        cursor = memchr(cursor, '\n', end - cursor);
+        g_assert_nonnull(cursor);
+        cursor++;
+    }
+    actual_header = g_strndup(contents, cursor - contents);
+    g_assert_cmpstr(actual_header, ==, NEXT_COLOR_PPM_HEADER);
+    g_assert_cmpuint(length, ==,
+                     NEXT_COLOR_PPM_HEADER_SIZE +
+                     NEXT_COLOR_PPM_RASTER_SIZE);
+
+    return contents;
+}
+
+static void assert_screendump_pixel(QTestState *qts, const TestPPM *ppm,
+                                    size_t pixel, const uint8_t expected[3])
+{
+    g_autofree char *contents = NULL;
+    const uint8_t *rgb;
+
+    take_screendump(qts, ppm);
+    contents = load_test_ppm(ppm);
+    rgb = (const uint8_t *)contents + NEXT_COLOR_PPM_HEADER_SIZE + pixel * 3;
+    g_assert_cmpmem(rgb, 3, expected, 3);
 }
 
 static void dac_set_address(QTestState *qts, uint16_t address)
@@ -433,6 +558,92 @@ static void test_registers_and_reset(void)
     qtest_quit(qts);
 }
 
+static void test_rgb444_scanout(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *ppm;
+    static const uint8_t row0[] = {
+        0xf0, 0x00,
+        0x0f, 0x00,
+        0x00, 0xf0,
+        0x00, 0x00,
+    };
+    static const uint8_t white[] = { 0xff, 0xf0 };
+    static const uint8_t expected_row0[] = {
+        0xff, 0x00, 0x00,
+        0x00, 0xff, 0x00,
+        0x00, 0x00, 0xff,
+        0x00, 0x00, 0x00,
+    };
+    static const uint8_t expected_white[] = { 0xff, 0xff, 0xff };
+    g_autofree char *contents = NULL;
+    const uint8_t *raster;
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, row0, sizeof(row0));
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM + NEXT_COLOR_STRIDE,
+                   white, sizeof(white));
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+
+    take_screendump(qts, ppm);
+    contents = load_test_ppm(ppm);
+    raster = (const uint8_t *)contents + NEXT_COLOR_PPM_HEADER_SIZE;
+    g_assert_cmpmem(raster, sizeof(expected_row0),
+                    expected_row0, sizeof(expected_row0));
+    g_assert_cmpmem(raster + NEXT_COLOR_WIDTH * 3, sizeof(expected_white),
+                    expected_white, sizeof(expected_white));
+
+    qtest_quit(qts);
+}
+
+static void test_blanking(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *initial_blank;
+    TestPPM *still_blank;
+    TestPPM *unblanked;
+    TestPPM *reblanked;
+    TestPPM *unblanked_again;
+    TestPPM *reset_blank;
+    static const uint8_t red444[] = { 0xf0, 0x00 };
+    static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+    static const uint8_t red[] = { 0xff, 0x00, 0x00 };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    initial_blank = create_test_ppm();
+    still_blank = create_test_ppm();
+    unblanked = create_test_ppm();
+    reblanked = create_test_ppm();
+    unblanked_again = create_test_ppm();
+    reset_blank = create_test_ppm();
+
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, red444, sizeof(red444));
+    assert_screendump_pixel(qts, initial_blank, 0, black);
+    assert_screendump_pixel(qts, still_blank, 0, black);
+
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+    assert_screendump_pixel(qts, unblanked, 0, red);
+
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, 0);
+    assert_screendump_pixel(qts, reblanked, 0, black);
+
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+    assert_screendump_pixel(qts, unblanked_again, 0, red);
+
+    qtest_system_reset(qts);
+    assert_screendump_pixel(qts, reset_blank, 0, black);
+
+    qtest_quit(qts);
+}
+
 static void test_migration(void)
 {
     TestMigration *migration = create_test_migration();
@@ -558,6 +769,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-color-video/migration", test_migration);
     qtest_add_func("/next-color-video/migration-active-timer-and-dac-phase",
                    test_migration_active_timer_and_dac_phase);
+    qtest_add_func("/next-color-video/rgb444-scanout", test_rgb444_scanout);
+    qtest_add_func("/next-color-video/blanking", test_blanking);
 
     return g_test_run();
 }

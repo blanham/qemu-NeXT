@@ -35,10 +35,13 @@
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
+#include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "ui/console.h"
+#include "hw/display/framebuffer.h"
+#include "ui/pixel_ops.h"
 
 #define NEXT_C16_VRAM_SIZE (2 * MiB)
 #define NEXT_C16_WIDTH 1120
@@ -72,6 +75,73 @@ struct NextColorVideoState {
     uint8_t vram_timing;
     bool irq_level;
     bool invalidate;
+};
+
+static void next_color_video_draw_line(void *opaque, uint8_t *dst,
+                                       const uint8_t *src, int width,
+                                       int pitch)
+{
+    uint32_t *out = (uint32_t *)dst;
+
+    for (int x = 0; x < width; x++) {
+        uint16_t pixel = lduw_be_p(src + x * 2);
+        uint8_t r = ((pixel >> 12) & 0xf) * 0x11;
+        uint8_t g = ((pixel >> 8) & 0xf) * 0x11;
+        uint8_t b = ((pixel >> 4) & 0xf) * 0x11;
+
+        out[x] = rgb_to_pixel32(r, g, b);
+    }
+}
+
+static bool next_color_video_update(void *opaque)
+{
+    NextColorVideoState *s = opaque;
+    DisplaySurface *surface = qemu_console_surface(s->console);
+    int first = 0;
+    int last = 0;
+
+    if (!(s->command & NEXT_COLOR_COMMAND_UNBLANK)) {
+        if (!s->invalidate) {
+            return true;
+        }
+        memset(surface_data(surface), 0,
+               (size_t)surface_stride(surface) * surface_height(surface));
+        qemu_console_update(s->console, 0, 0, surface_width(surface),
+                            surface_height(surface));
+        s->invalidate = false;
+        return true;
+    }
+
+    if (s->invalidate) {
+        framebuffer_update_memory_section(&s->vram_section, &s->vram, 0,
+                                          NEXT_C16_HEIGHT,
+                                          NEXT_C16_STRIDE);
+    }
+
+    framebuffer_update_display(surface, &s->vram_section,
+                               NEXT_C16_WIDTH, NEXT_C16_HEIGHT,
+                               NEXT_C16_STRIDE, NEXT_C16_WIDTH * 4, 0,
+                               s->invalidate, next_color_video_draw_line,
+                               s, &first, &last);
+    if (first >= 0) {
+        qemu_console_update(s->console, 0, first, NEXT_C16_WIDTH,
+                            last - first + 1);
+    }
+    s->invalidate = false;
+
+    return true;
+}
+
+static void next_color_video_invalidate(void *opaque)
+{
+    NextColorVideoState *s = opaque;
+
+    s->invalidate = true;
+}
+
+static const GraphicHwOps next_color_video_ops = {
+    .invalidate = next_color_video_invalidate,
+    .gfx_update = next_color_video_update,
 };
 
 static uint8_t next_color_dac_data_read(NextColorVideoState *s,
@@ -291,7 +361,7 @@ static void next_color_video_reset_hold(Object *obj, ResetType type)
     s->command = 0;
     s->dram_timing = 0;
     s->vram_timing = 0;
-    s->invalidate = false;
+    s->invalidate = true;
 }
 
 static int next_color_video_post_load(void *opaque, int version_id)
@@ -306,6 +376,7 @@ static int next_color_video_post_load(void *opaque, int version_id)
     if (!(s->command & NEXT_COLOR_COMMAND_INTRENA)) {
         timer_del(&s->retrace_timer);
     }
+    s->invalidate = true;
 
     return 0;
 }
@@ -359,6 +430,27 @@ static void next_color_video_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->vram_timing_mmio);
 
     sysbus_init_irq(sbd, &s->irq);
+
+    s->invalidate = true;
+    s->console =
+        qemu_graphic_console_create(dev, 0, &next_color_video_ops, s);
+    qemu_console_resize(s->console, NEXT_C16_WIDTH, NEXT_C16_HEIGHT);
+}
+
+static void next_color_video_unrealize(DeviceState *dev)
+{
+    NextColorVideoState *s = NEXT_COLOR_VIDEO(dev);
+
+    timer_del(&s->retrace_timer);
+    if (s->vram_section.mr) {
+        memory_region_set_log(s->vram_section.mr, false, DIRTY_MEMORY_VGA);
+        memory_region_unref(s->vram_section.mr);
+        s->vram_section.mr = NULL;
+    }
+    if (s->console) {
+        qemu_graphic_console_close(s->console);
+        s->console = NULL;
+    }
 }
 
 static void next_color_video_class_init(ObjectClass *oc, const void *data)
@@ -368,6 +460,7 @@ static void next_color_video_class_init(ObjectClass *oc, const void *data)
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = next_color_video_realize;
+    dc->unrealize = next_color_video_unrealize;
     dc->vmsd = &vmstate_next_color_video;
     rc->phases.hold = next_color_video_reset_hold;
 }
