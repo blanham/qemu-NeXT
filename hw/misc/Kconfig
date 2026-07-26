@@ -89,6 +89,9 @@ config IVSHMEM_FLAT_DEVICE
 config ECCMEMCTL
     bool
 
+config NEXT_OPTICAL
+    bool
+
 config IMX
     bool
     select PTIMER

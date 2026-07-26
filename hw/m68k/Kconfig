@@ -21,6 +21,7 @@ config NEXTCUBE
     select ISA_BUS
     select ESCC
     select EMPTY_SLOT
+    select NEXT_OPTICAL
 
 config Q800
     bool

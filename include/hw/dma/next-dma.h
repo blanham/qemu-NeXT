@@ -66,6 +66,10 @@ typedef struct NextDMAEthernetNotify {
     void (*rx_ready_changed)(void *opaque, bool ready);
 } NextDMAEthernetNotify;
 
+typedef struct NextDMAOpticalNotify {
+    void (*enabled)(void *opaque);
+} NextDMAOpticalNotify;
+
 void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len);
 void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len);
 void next_dma_scsi_fifo_reset(NextDMAState *s);
@@ -87,5 +91,14 @@ void next_dma_enet_rx_complete(NextDMAState *s, NextDMAResult result);
 void next_dma_set_ethernet_notify(NextDMAState *s,
                                   const NextDMAEthernetNotify *notify,
                                   void *opaque);
+NextDMAResult next_dma_optical_read(NextDMAState *s, uint8_t *buffer,
+                                    size_t length);
+NextDMAResult next_dma_optical_write(NextDMAState *s,
+                                     const uint8_t *buffer,
+                                     size_t length);
+NextDMAResult next_dma_optical_abort(NextDMAState *s);
+void next_dma_set_optical_notify(NextDMAState *s,
+                                 const NextDMAOpticalNotify *notify,
+                                 void *opaque);
 
 #endif /* HW_DMA_NEXT_DMA_H */

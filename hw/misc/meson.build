@@ -11,6 +11,7 @@ system_ss.add(when: 'CONFIG_LED', if_true: files('led.c'))
 system_ss.add(when: 'CONFIG_PVPANIC_COMMON', if_true: files('pvpanic.c'))
 system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-memctl.c'))
 system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-nbic.c'))
+system_ss.add(when: 'CONFIG_NEXT_OPTICAL', if_true: files('next-optical.c'))
 
 # ARM devices
 system_ss.add(when: 'CONFIG_PL310', if_true: files('arm_l2x0.c'))

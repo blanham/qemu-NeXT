@@ -181,6 +181,8 @@ struct NextDMAState {
     qemu_irq irq[NEXT_DMA_CHANNEL_COUNT];
     const NextDMAEthernetNotify *enet_notify;
     void *enet_opaque;
+    const NextDMAOpticalNotify *optical_notify;
+    void *optical_opaque;
     bool rx_ready;
     bool rx_keep_enabled;
     QEMUTimer video_retrace_timer;
@@ -595,6 +597,12 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         (c->csr & NEXT_DMA_CSR_ENABLE) &&
         s->enet_notify && s->enet_notify->tx_kick) {
         s->enet_notify->tx_kick(s->enet_opaque);
+    }
+    if (channel == NEXT_DMA_OPTICAL &&
+        (value & NEXT_DMA_CMD_SETENABLE) &&
+        (c->csr & NEXT_DMA_CSR_ENABLE) &&
+        s->optical_notify && s->optical_notify->enabled) {
+        s->optical_notify->enabled(s->optical_opaque);
     }
 }
 
@@ -1101,6 +1109,97 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
     trace_next_scsi_dma_transfer(
         "flush", staged, sizeof(beat), base, c->csr, c->next,
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
+}
+
+static NextDMAResult next_dma_optical_error(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_OPTICAL];
+
+    c->csr |= NEXT_DMA_CSR_BUSEXC | NEXT_DMA_CSR_COMPLETE;
+    c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+    next_dma_update_irq(s, NEXT_DMA_OPTICAL);
+    return NEXT_DMA_RANGE_ERROR;
+}
+
+static NextDMAResult next_dma_optical_transfer(NextDMAState *s,
+                                               uint8_t *buffer,
+                                               size_t length,
+                                               bool to_guest)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_OPTICAL];
+    g_autofree uint8_t *staged = NULL;
+    uint32_t start;
+    MemTxResult result;
+
+    if (!(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE)) {
+        return NEXT_DMA_NOT_READY;
+    }
+
+    start = c->next_initbuf_valid ? c->next_initbuf : c->next;
+    if (!buffer || !length || (c->csr & NEXT_DMA_CSR_SUPDATE) ||
+        (!!(c->csr & NEXT_DMA_CSR_READ) != to_guest) ||
+        c->limit <= start || c->limit - start != length ||
+        !address_space_access_valid(s->as, start, length, to_guest,
+                                    MEMTXATTRS_UNSPECIFIED)) {
+        return next_dma_optical_error(s);
+    }
+
+    if (to_guest) {
+        result = address_space_write(s->as, start, MEMTXATTRS_UNSPECIFIED,
+                                     buffer, length);
+    } else {
+        staged = g_malloc(length);
+        result = address_space_read(s->as, start, MEMTXATTRS_UNSPECIFIED,
+                                    staged, length);
+    }
+    if (result != MEMTX_OK) {
+        return next_dma_optical_error(s);
+    }
+    if (!to_guest) {
+        memcpy(buffer, staged, length);
+    }
+
+    c->next = start + length;
+    c->next_initbuf_valid = false;
+    next_dma_complete_segment(s, NEXT_DMA_OPTICAL);
+    return NEXT_DMA_OK;
+}
+
+NextDMAResult next_dma_optical_read(NextDMAState *s, uint8_t *buffer,
+                                    size_t length)
+{
+    return next_dma_optical_transfer(s, buffer, length, false);
+}
+
+NextDMAResult next_dma_optical_write(NextDMAState *s,
+                                     const uint8_t *buffer,
+                                     size_t length)
+{
+    return next_dma_optical_transfer(s, (uint8_t *)buffer, length, true);
+}
+
+NextDMAResult next_dma_optical_abort(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_OPTICAL];
+
+    if (!(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE)) {
+        return NEXT_DMA_NOT_READY;
+    }
+    return next_dma_optical_error(s);
+}
+
+void next_dma_set_optical_notify(NextDMAState *s,
+                                 const NextDMAOpticalNotify *notify,
+                                 void *opaque)
+{
+    s->optical_notify = notify;
+    s->optical_opaque = opaque;
+    if (notify && notify->enabled &&
+        (s->channel[NEXT_DMA_OPTICAL].csr & NEXT_DMA_CSR_ENABLE)) {
+        notify->enabled(opaque);
+    }
 }
 
 static NextDMAResult next_dma_sound_out_error(NextDMAState *s)

@@ -27,6 +27,7 @@
 #include "hw/display/next-fb.h"
 #include "hw/misc/next-memctl.h"
 #include "hw/misc/next-nbic.h"
+#include "hw/misc/next-optical.h"
 #include "hw/net/next-mb8795.h"
 #include "hw/rtc/next-rtc.h"
 #include "hw/scsi/esp.h"
@@ -64,6 +65,7 @@
 
 #define NEXT_DMA_BASE        0x02000000
 #define NEXT_NBIC_BASE       0x02020000
+#define NEXT_OPTICAL_BASE    0x02112000
 #define NEXT_SCSI_ROM_CSR_BASE 0x02014020
 #define NEXT_SCSI_BASE       0x02114000
 #define NEXT_SCSI_CSR_OFFSET 0x20
@@ -189,6 +191,7 @@ typedef struct NeXTBoardProfile {
     NeXTVideoKind video_kind;
     NeXTDiskMuxKind disk_mux_kind;
     bool has_nextbus;
+    bool has_optical_formatter;
 } NeXTBoardProfile;
 
 typedef struct NeXTMachineClass {
@@ -227,6 +230,7 @@ static const NeXTBoardProfile next_cube_profile = {
     .video_kind = NEXT_VIDEO_MONO,
     .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
     .has_nextbus = true,
+    .has_optical_formatter = true,
 };
 
 static const NeXTBoardProfile next_station_profile = {
@@ -1310,6 +1314,7 @@ static void next_machine_init(MachineState *machine)
     DeviceState *mbdev;
     DeviceState *memctl_dev;
     DeviceState *nbic_dev;
+    DeviceState *optical_dev;
     DeviceState *pcdev;
     DeviceState *serial_dev;
     DeviceState *sound_dev;
@@ -1373,6 +1378,16 @@ static void next_machine_init(MachineState *machine)
     case NEXT_DISK_MUX_CUBE_OD:
     default:
         g_assert_not_reached();
+    }
+
+    if (profile->has_optical_formatter) {
+        optical_dev = qdev_new(TYPE_NEXT_OPTICAL);
+        object_property_add_child(OBJECT(machine), "next-optical",
+                                  OBJECT(optical_dev));
+        object_property_set_link(OBJECT(optical_dev), "dma",
+                                 OBJECT(m->dma), &error_abort);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(optical_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(optical_dev), 0, NEXT_OPTICAL_BASE);
     }
 
     /* Serial ports and clock select */
@@ -1458,8 +1473,6 @@ static void next_machine_init(MachineState *machine)
 
     /* unknown: Brightness control register? */
     empty_slot_init("next.unknown.0", 0x02110000, 0x10);
-    /* unknown: Magneto-Optical drive controller? */
-    empty_slot_init("next.unknown.1", 0x02112000, 0x10);
 
     /* SCSI */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, NEXT_SCSI_BASE);
