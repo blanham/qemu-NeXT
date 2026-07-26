@@ -33,6 +33,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/audio/next-sound-clock.h"
 #include "hw/audio/next-sound.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
@@ -239,10 +240,9 @@ static void next_sound_schedule(NextSoundState *s)
 static void next_sound_dma_timer(void *opaque)
 {
     NextSoundState *s = opaque;
-    uint64_t scaled;
     uint64_t frames;
+    uint64_t next_fraction;
     uint32_t rate;
-    int64_t elapsed;
     int64_t now;
 
     if (!next_sound_dma_enabled(s) ||
@@ -251,21 +251,18 @@ static void next_sound_dma_timer(void *opaque)
     }
 
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    elapsed = now - s->dma_clock_ns;
-    if (elapsed < 0 ||
-        (uint64_t)elapsed > (UINT64_MAX - s->dma_fraction) /
-                            NEXT_SOUND_SAMPLE_RATE) {
+    rate = (s->control & SOUT_DOUB) ? NEXT_SOUND_SAMPLE_RATE / 2
+                                    : NEXT_SOUND_SAMPLE_RATE;
+    if (!next_sound_clock_elapsed_frames(now, s->dma_clock_ns,
+                                         s->dma_fraction, rate, &frames,
+                                         &next_fraction)) {
         s->dma_clock_ns = now;
         s->dma_fraction = 0;
         timer_mod(&s->dma_timer, now + NEXT_SOUND_TIMER_NS);
         return;
     }
 
-    rate = (s->control & SOUT_DOUB) ? NEXT_SOUND_SAMPLE_RATE / 2
-                                    : NEXT_SOUND_SAMPLE_RATE;
-    scaled = (uint64_t)elapsed * rate + s->dma_fraction;
-    frames = scaled / INT64_C(1000000000);
-    s->dma_fraction = scaled % INT64_C(1000000000);
+    s->dma_fraction = next_fraction;
     s->dma_clock_ns = now;
 
     if (frames) {
@@ -401,7 +398,9 @@ static int next_sound_post_load(void *opaque, int version_id)
         (NEXT_SOUND_FRAME_BYTES - 1)) {
         return -EINVAL;
     }
-    if (version_id >= 2 && s->dma_fraction >= INT64_C(1000000000)) {
+    if (version_id >= 2 &&
+        (s->dma_clock_ns < 0 ||
+         s->dma_fraction >= NANOSECONDS_PER_SECOND)) {
         return -EINVAL;
     }
     if (version_id < 2) {

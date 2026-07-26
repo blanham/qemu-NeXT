@@ -31,6 +31,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/audio/next-sound-clock.h"
 #include "libqtest.h"
 
 #define NEXT_DMA_BASE       0x02000000
@@ -92,6 +93,33 @@ typedef struct TestChannel {
     unsigned saved_words;
     bool functional;
 } TestChannel;
+
+static void test_sound_output_clock_boundaries(void)
+{
+    uint64_t frames;
+    uint64_t fraction;
+
+    g_assert_false(next_sound_clock_elapsed_frames(
+        0, INT64_MIN, 0, 44100, &frames, &fraction));
+    g_assert_false(next_sound_clock_elapsed_frames(
+        0, -1, 0, 44100, &frames, &fraction));
+    g_assert_false(next_sound_clock_elapsed_frames(
+        10, 11, 0, 44100, &frames, &fraction));
+    g_assert_false(next_sound_clock_elapsed_frames(
+        INT64_MAX, 0, 0, 44100, &frames, &fraction));
+    g_assert_false(next_sound_clock_elapsed_frames(
+        0, 0, NANOSECONDS_PER_SECOND, 44100, &frames, &fraction));
+
+    g_assert_true(next_sound_clock_elapsed_frames(
+        NANOSECONDS_PER_SECOND, 0, 0, 44100, &frames, &fraction));
+    g_assert_cmpuint(frames, ==, 44100);
+    g_assert_cmpuint(fraction, ==, 0);
+
+    g_assert_true(next_sound_clock_elapsed_frames(
+        1, 0, NANOSECONDS_PER_SECOND - 1, 1, &frames, &fraction));
+    g_assert_cmpuint(frames, ==, 1);
+    g_assert_cmpuint(fraction, ==, 0);
+}
 
 static const TestChannel channels[] = {
     { "scsi",     0x010, 26, 0, true  },
@@ -1691,5 +1719,7 @@ int main(int argc, char **argv)
                    test_migration_partial_scsi_stage);
     qtest_add_func("/next-cube/dma/sound-output-active-migration",
                    test_sound_output_active_migration);
+    qtest_add_func("/next-cube/dma/sound-output-clock-boundaries",
+                   test_sound_output_clock_boundaries);
     return g_test_run();
 }
