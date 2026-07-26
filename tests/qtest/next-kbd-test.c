@@ -280,6 +280,49 @@ static void test_key_irq_and_data(void)
     qtest_quit(qts);
 }
 
+static void test_duplicate_key_state_ignored(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_key(qts, "a", true);
+    send_key(qts, "a", true);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
+                    (NEXT_KBD_INT | NEXT_KBD_DAV), ==, 0);
+
+    send_key(qts, "a", false);
+    send_key(qts, "a", false);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
+                    (NEXT_KBD_INT | NEXT_KBD_DAV), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_key_state_cleared_by_reset(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_key(qts, "a", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    assert_mouse_queue_empty(qts);
+
+    qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+
+    send_key(qts, "a", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    assert_mouse_queue_empty(qts);
+
+    qtest_quit(qts);
+}
+
 static void test_key_dequeue_modifiers(void)
 {
     QTestState *qts = next_cube_kbd_start();
@@ -453,6 +496,7 @@ static void test_migrate_queued_input(void)
     send_key(source, "a", true);
     send_mouse_motion_and_button(source, 3, -3, "left", true);
     send_key(source, "a", false);
+    send_key(source, "a", true);
 
     /*
      * Preserve a signed sub-packet remainder across migration.  These first
@@ -507,6 +551,16 @@ static void test_migrate_queued_input(void)
     g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
                     NEXT_KEY_UP | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    assert_mouse_queue_empty(destination);
+
+    send_key(destination, "a", true);
+    assert_mouse_queue_empty(destination);
+    send_key(destination, "a", false);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
     assert_mouse_queue_empty(destination);
 
     /*
@@ -527,6 +581,10 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/kbd/key-irq-and-data",
                    test_key_irq_and_data);
+    qtest_add_func("/next-cube/kbd/duplicate-key-state-ignored",
+                   test_duplicate_key_state_ignored);
+    qtest_add_func("/next-cube/kbd/key-state-cleared-by-reset",
+                   test_key_state_cleared_by_reset);
     qtest_add_func("/next-cube/kbd/key-dequeue-modifiers",
                    test_key_dequeue_modifiers);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",

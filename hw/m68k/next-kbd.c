@@ -66,6 +66,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 #define KD_MODS       0x4f00
 
 #define KBD_QUEUE_SIZE 256
+#define NEXTKBD_KEY_COUNT 128
 
 typedef struct {
     uint32_t data;
@@ -88,6 +89,7 @@ struct NextKBDState {
     uint8_t command;
     uint32_t monitor_data;
     uint16_t shift;
+    bool key_down[NEXTKBD_KEY_COUNT];
     bool overrun;
     int64_t mouse_dx;
     int64_t mouse_dy;
@@ -364,6 +366,11 @@ static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
         return;
     }
 
+    if (s->key_down[keycode] == evt->key.down) {
+        return;
+    }
+    s->key_down[keycode] = evt->key.down;
+
     /* If key release event, create keyboard break code */
     if (!evt->key.down) {
         keycode |= 0x80;
@@ -489,6 +496,7 @@ static void nextkbd_reset(DeviceState *dev)
 
     memset(&nks->queue, 0, sizeof(KBDQueue));
     nks->shift = 0;
+    memset(nks->key_down, 0, sizeof(nks->key_down));
     nks->overrun = false;
     nks->command = 0;
     nks->monitor_data = 0;
@@ -548,7 +556,7 @@ static int nextkbd_post_load(void *opaque, int version_id)
 
 static const VMStateDescription nextkbd_vmstate = {
     .name = TYPE_NEXTKBD,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = nextkbd_post_load,
     .fields = (const VMStateField[]) {
@@ -560,6 +568,7 @@ static const VMStateDescription nextkbd_vmstate = {
         VMSTATE_UINT8(command, NextKBDState),
         VMSTATE_UINT32(monitor_data, NextKBDState),
         VMSTATE_UINT16(shift, NextKBDState),
+        VMSTATE_BOOL_ARRAY_V(key_down, NextKBDState, NEXTKBD_KEY_COUNT, 2),
         VMSTATE_BOOL(overrun, NextKBDState),
         VMSTATE_INT64(mouse_dx, NextKBDState),
         VMSTATE_INT64(mouse_dy, NextKBDState),
