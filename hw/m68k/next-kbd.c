@@ -103,6 +103,10 @@ struct NextKBDState {
     int32_t absolute_anchor_y;
     int64_t absolute_pending_x;
     int64_t absolute_pending_y;
+    bool absolute_delivered_left;
+    bool absolute_delivered_right;
+    bool absolute_button_waiting;
+    bool absolute_motion_before_button;
     QEMUTimer absolute_timer;
     KBDQueue queue;
     uint8_t command;
@@ -516,6 +520,21 @@ static bool nextkbd_put_mouse_packet(NextKBDState *s, int raw_dx, int raw_dy,
     return nextkbd_put_packet(s, packet, false);
 }
 
+static bool nextkbd_absolute_deliver_button(NextKBDState *s)
+{
+    if (!nextkbd_put_mouse_packet(s, 0, 0,
+                                  s->mouse_left, s->mouse_right)) {
+        return false;
+    }
+
+    s->absolute_delivered_left = s->mouse_left;
+    s->absolute_delivered_right = s->mouse_right;
+    s->mouse_button_pending = false;
+    s->absolute_button_waiting = false;
+    s->absolute_motion_before_button = false;
+    return true;
+}
+
 static int nextkbd_nextstep_factor(int raw_x, int raw_y)
 {
     int distance = ABS(raw_x) + ABS(raw_y);
@@ -629,11 +648,18 @@ static void nextkbd_absolute_sync(NextKBDState *s)
         int new_y = nextkbd_absolute_pixel(s->absolute_y,
                                             NEXT_POINTER_HEIGHT - 1);
 
-        s->absolute_dirty = false;
         if (!s->absolute_anchor_valid) {
             s->absolute_anchor_x = new_x;
             s->absolute_anchor_y = new_y;
             s->absolute_anchor_valid = true;
+        } else if (ABS(new_x - s->absolute_anchor_x) >
+                       NEXT_POINTER_WIDTH / 2 ||
+                   ABS(new_y - s->absolute_anchor_y) >
+                       NEXT_POINTER_HEIGHT / 2) {
+            s->absolute_anchor_x = new_x;
+            s->absolute_anchor_y = new_y;
+            s->absolute_pending_x = 0;
+            s->absolute_pending_y = 0;
         } else {
             s->absolute_pending_x =
                 nextkbd_pending_add(s->absolute_pending_x,
@@ -644,12 +670,32 @@ static void nextkbd_absolute_sync(NextKBDState *s)
             s->absolute_anchor_x = new_x;
             s->absolute_anchor_y = new_y;
         }
+        s->absolute_dirty = false;
     }
 
+    /*
+     * mouse_button_pending marks desired state not yet reported;
+     * absolute_button_waiting means absolute mode owns timer delivery;
+     * absolute_motion_before_button means no motion prerequisite remains.
+     * It is true after motion succeeds, motion is cancelled or discarded,
+     * or a button-only enqueue found the queue full.
+     */
     if (s->mouse_button_pending) {
-        nextkbd_put_mouse_packet(s, 0, 0,
-                                 s->mouse_left, s->mouse_right);
-        s->mouse_button_pending = false;
+        if (s->absolute_button_waiting) {
+            if (s->absolute_pending_x || s->absolute_pending_y) {
+                s->absolute_motion_before_button = false;
+            } else {
+                s->absolute_motion_before_button = true;
+            }
+        } else if (!s->absolute_pending_x && !s->absolute_pending_y) {
+            if (!nextkbd_absolute_deliver_button(s)) {
+                s->absolute_button_waiting = true;
+                s->absolute_motion_before_button = true;
+            }
+        } else {
+            s->absolute_button_waiting = true;
+            s->absolute_motion_before_button = false;
+        }
     }
 }
 
@@ -661,10 +707,19 @@ static void nextkbd_absolute_tick(void *opaque)
 
     if (candidate.raw_x || candidate.raw_y) {
         if (nextkbd_put_mouse_packet(s, candidate.raw_x, candidate.raw_y,
-                                     s->mouse_left, s->mouse_right)) {
+                                     s->absolute_delivered_left,
+                                     s->absolute_delivered_right)) {
             s->absolute_pending_x -= candidate.guest_x;
             s->absolute_pending_y -= candidate.guest_y;
+            if (s->absolute_button_waiting) {
+                s->absolute_motion_before_button = true;
+            }
         }
+    } else if (s->absolute_button_waiting &&
+               s->absolute_motion_before_button &&
+               ABS(s->absolute_pending_x) <= 1 &&
+               ABS(s->absolute_pending_y) <= 1) {
+        nextkbd_absolute_deliver_button(s);
     }
     timer_mod(&s->absolute_timer, now + NEXT_POINTER_TICK_NS);
 }
@@ -721,6 +776,10 @@ static void nextkbd_reset(DeviceState *dev)
     nks->absolute_anchor_y = 0;
     nks->absolute_pending_x = 0;
     nks->absolute_pending_y = 0;
+    nks->absolute_delivered_left = false;
+    nks->absolute_delivered_right = false;
+    nks->absolute_button_waiting = false;
+    nks->absolute_motion_before_button = false;
     timer_del(&nks->absolute_timer);
     if (nks->absolute_pointer) {
         timer_mod(&nks->absolute_timer,
