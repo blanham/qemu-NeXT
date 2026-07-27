@@ -62,6 +62,16 @@ interrupt on the destination.  A channel's DMA interrupt is asserted exactly
 when its ``COMPLETE`` status bit is set; register programming alone does not
 complete a transfer.
 
+The NeXT keyboard/mouse device accepts absolute host pointer coordinates by
+default and translates them into original-format relative NeXT mouse packets.
+This compatibility mode compensates for NeXTSTEP's default nonlinear mouse
+acceleration and works with unmodified guest software.  GTK with
+``grab-on-hover=off`` is the recommended capture-free display backend.
+
+Plan 9 and hardware-oriented diagnostics can retain the literal relative
+input path with ``-global next-kbd.absolute-pointer=off``.  That mode preserves
+the fixed divide-by-three translation used for Plan 9's mouse policy.
+
 The RTC contains 32 bytes of NeXT nonvolatile configuration.  The bytes
 survive ``system_reset``.  They are process-local by default; for example, use
 ``-M next-cube,nvram-file=PATH`` to retain them across QEMU runs.  The file is
