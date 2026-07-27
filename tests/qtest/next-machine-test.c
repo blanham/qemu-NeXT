@@ -196,6 +196,7 @@ static void test_missing_firmware(void)
             qemu_binary,
             "-machine", "next-cube",
             "-display", "none",
+            "-audio", "none",
             "-bios", "/definitely/missing/next.rom",
             NULL
         };
