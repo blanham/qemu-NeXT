@@ -35,6 +35,8 @@
 #include "qemu/osdep.h"
 #include "qemu/host-utils.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/units.h"
 #include "hw/audio/next-sound.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
@@ -67,6 +69,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 
 #define KBD_QUEUE_SIZE 256
 #define NEXTKBD_KEY_COUNT 128
+#define NEXT_POINTER_WIDTH       1120
+#define NEXT_POINTER_HEIGHT      832
+#define NEXT_POINTER_TICK_NS \
+    (NANOSECONDS_PER_SECOND / 68)
+#define NEXT_POINTER_PENDING_LIMIT INT64_C(1048576)
 
 typedef struct {
     uint32_t data;
@@ -94,6 +101,9 @@ struct NextKBDState {
     bool absolute_anchor_valid;
     int32_t absolute_anchor_x;
     int32_t absolute_anchor_y;
+    int64_t absolute_pending_x;
+    int64_t absolute_pending_y;
+    QEMUTimer absolute_timer;
     KBDQueue queue;
     uint8_t command;
     uint32_t monitor_data;
@@ -439,6 +449,22 @@ static void nextkbd_absolute_event(NextKBDState *s, QemuInputEvent *evt)
     }
 }
 
+static int nextkbd_absolute_pixel(int value, int maximum_pixel)
+{
+    return qemu_input_scale_axis(value,
+                                 INPUT_EVENT_ABS_MIN,
+                                 INPUT_EVENT_ABS_MAX,
+                                 0, maximum_pixel);
+}
+
+static int64_t nextkbd_pending_add(int64_t current, int delta)
+{
+    int64_t result = current + delta;
+
+    return MAX(-NEXT_POINTER_PENDING_LIMIT,
+               MIN(NEXT_POINTER_PENDING_LIMIT, result));
+}
+
 static void nextkbd_event(DeviceState *dev, QemuConsole *src,
                           QemuInputEvent *evt)
 {
@@ -490,6 +516,87 @@ static bool nextkbd_put_mouse_packet(NextKBDState *s, int raw_dx, int raw_dy,
     return nextkbd_put_packet(s, packet, false);
 }
 
+static int nextkbd_nextstep_factor(int raw_x, int raw_y)
+{
+    int distance = ABS(raw_x) + ABS(raw_y);
+
+    if (distance <= 2) {
+        return 1;
+    }
+    if (distance == 3) {
+        return 2;
+    }
+    if (distance == 4) {
+        return 4;
+    }
+    if (distance == 5) {
+        return 6;
+    }
+    if (distance == 6) {
+        return 8;
+    }
+    return 10;
+}
+
+typedef struct NextPointerCandidate {
+    int raw_x;
+    int raw_y;
+    int guest_x;
+    int guest_y;
+    int64_t score;
+    int raw_distance;
+} NextPointerCandidate;
+
+static NextPointerCandidate nextkbd_choose_pointer_packet(NextKBDState *s)
+{
+    NextPointerCandidate best = {
+        .score = INT64_MAX,
+        .raw_distance = INT_MAX,
+    };
+
+    if (!s->absolute_pending_x && !s->absolute_pending_y) {
+        return (NextPointerCandidate) { 0 };
+    }
+
+    for (int raw_x = -64; raw_x <= 63; raw_x++) {
+        for (int raw_y = -64; raw_y <= 63; raw_y++) {
+            int factor = nextkbd_nextstep_factor(raw_x, raw_y);
+            int guest_x = -raw_x * factor;
+            int guest_y = -raw_y * factor;
+            int64_t error_x = s->absolute_pending_x - guest_x;
+            int64_t error_y = s->absolute_pending_y - guest_y;
+            int64_t score = error_x * error_x + error_y * error_y;
+            int raw_distance = ABS(raw_x) + ABS(raw_y);
+
+            if (score < best.score ||
+                (score == best.score && raw_distance < best.raw_distance) ||
+                (score == best.score && raw_distance == best.raw_distance &&
+                 ABS(raw_x) < ABS(best.raw_x)) ||
+                (score == best.score && raw_distance == best.raw_distance &&
+                 ABS(raw_x) == ABS(best.raw_x) &&
+                 ABS(raw_y) < ABS(best.raw_y)) ||
+                (score == best.score && raw_distance == best.raw_distance &&
+                 ABS(raw_x) == ABS(best.raw_x) &&
+                 ABS(raw_y) == ABS(best.raw_y) && raw_x < best.raw_x) ||
+                (score == best.score && raw_distance == best.raw_distance &&
+                 ABS(raw_x) == ABS(best.raw_x) &&
+                 ABS(raw_y) == ABS(best.raw_y) && raw_x == best.raw_x &&
+                 raw_y < best.raw_y)) {
+                best = (NextPointerCandidate) {
+                    .raw_x = raw_x,
+                    .raw_y = raw_y,
+                    .guest_x = guest_x,
+                    .guest_y = guest_y,
+                    .score = score,
+                    .raw_distance = raw_distance,
+                };
+            }
+        }
+    }
+
+    return best;
+}
+
 static void nextkbd_relative_sync(NextKBDState *s)
 {
     int64_t scaled_dx = s->mouse_dx / 3;
@@ -517,17 +624,49 @@ static void nextkbd_absolute_sync(NextKBDState *s)
 {
     if (s->absolute_dirty &&
         s->absolute_x_valid && s->absolute_y_valid) {
-        s->absolute_anchor_x = s->absolute_x;
-        s->absolute_anchor_y = s->absolute_y;
-        s->absolute_anchor_valid = true;
+        int new_x = nextkbd_absolute_pixel(s->absolute_x,
+                                            NEXT_POINTER_WIDTH - 1);
+        int new_y = nextkbd_absolute_pixel(s->absolute_y,
+                                            NEXT_POINTER_HEIGHT - 1);
+
+        s->absolute_dirty = false;
+        if (!s->absolute_anchor_valid) {
+            s->absolute_anchor_x = new_x;
+            s->absolute_anchor_y = new_y;
+            s->absolute_anchor_valid = true;
+        } else {
+            s->absolute_pending_x =
+                nextkbd_pending_add(s->absolute_pending_x,
+                                    new_x - s->absolute_anchor_x);
+            s->absolute_pending_y =
+                nextkbd_pending_add(s->absolute_pending_y,
+                                    new_y - s->absolute_anchor_y);
+            s->absolute_anchor_x = new_x;
+            s->absolute_anchor_y = new_y;
+        }
     }
-    s->absolute_dirty = false;
 
     if (s->mouse_button_pending) {
         nextkbd_put_mouse_packet(s, 0, 0,
                                  s->mouse_left, s->mouse_right);
         s->mouse_button_pending = false;
     }
+}
+
+static void nextkbd_absolute_tick(void *opaque)
+{
+    NextKBDState *s = opaque;
+    NextPointerCandidate candidate = nextkbd_choose_pointer_packet(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (candidate.raw_x || candidate.raw_y) {
+        if (nextkbd_put_mouse_packet(s, candidate.raw_x, candidate.raw_y,
+                                     s->mouse_left, s->mouse_right)) {
+            s->absolute_pending_x -= candidate.guest_x;
+            s->absolute_pending_y -= candidate.guest_y;
+        }
+    }
+    timer_mod(&s->absolute_timer, now + NEXT_POINTER_TICK_NS);
 }
 
 static void nextkbd_sync(DeviceState *dev)
@@ -572,6 +711,22 @@ static void nextkbd_reset(DeviceState *dev)
     nks->mouse_left = false;
     nks->mouse_right = false;
     nks->mouse_button_pending = false;
+    nks->absolute_x = 0;
+    nks->absolute_y = 0;
+    nks->absolute_x_valid = false;
+    nks->absolute_y_valid = false;
+    nks->absolute_dirty = false;
+    nks->absolute_anchor_valid = false;
+    nks->absolute_anchor_x = 0;
+    nks->absolute_anchor_y = 0;
+    nks->absolute_pending_x = 0;
+    nks->absolute_pending_y = 0;
+    timer_del(&nks->absolute_timer);
+    if (nks->absolute_pointer) {
+        timer_mod(&nks->absolute_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NEXT_POINTER_TICK_NS);
+    }
     qemu_irq_lower(nks->irq);
 }
 
@@ -582,6 +737,8 @@ static void nextkbd_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->mr, OBJECT(dev), &kbd_ops, s, "next.kbd", 0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mr);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    timer_init_ns(&s->absolute_timer, QEMU_CLOCK_VIRTUAL,
+                  nextkbd_absolute_tick, s);
 
     s->hs = qemu_input_handler_register(
         dev, s->absolute_pointer
@@ -592,6 +749,7 @@ static void nextkbd_unrealize(DeviceState *dev)
 {
     NextKBDState *s = NEXTKBD(dev);
 
+    timer_del(&s->absolute_timer);
     g_clear_pointer(&s->hs, qemu_input_handler_unregister);
 }
 

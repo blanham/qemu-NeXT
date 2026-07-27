@@ -31,6 +31,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/timer.h"
+#include "qemu/units.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
 #include "qobject/qlist.h"
@@ -60,6 +62,11 @@
 #define NEXT_ROM_SIZE     (128 * 1024)
 #define NEXT_POLL_LIMIT   10000
 #define NEXT_SOUND_TIMER_NS INT64_C(3000000)
+#define NEXT_POINTER_WIDTH       1120
+#define NEXT_POINTER_HEIGHT      832
+#define NEXT_INPUT_ABS_MAX       0x7fff
+#define NEXT_POINTER_TICK_NS \
+    (NANOSECONDS_PER_SECOND / 68)
 #define BARRIER_XORG_KEY_A 38
 
 #define MON_SNDOUT_CTRL(options) (0x07 | ((options) << 3))
@@ -117,6 +124,11 @@ static QTestState *next_cube_kbd_start_with_args(const char *extra_args)
 static QTestState *next_cube_kbd_start(void)
 {
     return next_cube_kbd_start_with_args(NULL);
+}
+
+static QTestState *next_cube_absolute_kbd_start(void)
+{
+    return next_kbd_start("next-cube", false, NULL);
 }
 
 static bool query_next_mouse_absolute(QTestState *qts)
@@ -260,6 +272,25 @@ static void send_mouse_motion(QTestState *qts, int x, int y)
         x, y);
 }
 
+static int pixel_to_absolute(int pixel, int maximum_pixel)
+{
+    return ((int64_t)pixel * NEXT_INPUT_ABS_MAX +
+            maximum_pixel - 1) / maximum_pixel;
+}
+
+static void send_absolute_pointer(QTestState *qts, int x, int y)
+{
+    int abs_x = pixel_to_absolute(x, NEXT_POINTER_WIDTH - 1);
+    int abs_y = pixel_to_absolute(y, NEXT_POINTER_HEIGHT - 1);
+
+    qtest_qmp_assert_success(
+        qts,
+        "{ 'execute': 'input-send-event', 'arguments': { 'events': ["
+        "{ 'type': 'abs', 'data': { 'axis': 'x', 'value': %d } },"
+        "{ 'type': 'abs', 'data': { 'axis': 'y', 'value': %d } } ] } }",
+        abs_x, abs_y);
+}
+
 static void send_mouse_button(QTestState *qts, const char *button, bool down)
 {
     qtest_qmp_assert_success(
@@ -287,6 +318,38 @@ static int decode_mouse_delta(uint32_t field)
 {
     field &= 0x7f;
     return field & 0x40 ? (int)field - 0x80 : (int)field;
+}
+
+static int nextstep_factor(int raw_x, int raw_y)
+{
+    int distance = ABS(raw_x) + ABS(raw_y);
+
+    if (distance <= 2) {
+        return 1;
+    }
+    if (distance == 3) {
+        return 2;
+    }
+    if (distance == 4) {
+        return 4;
+    }
+    if (distance == 5) {
+        return 6;
+    }
+    if (distance == 6) {
+        return 8;
+    }
+    return 10;
+}
+
+static void accelerated_packet_motion(uint32_t packet, int *x, int *y)
+{
+    int raw_x = decode_mouse_delta(packet >> 1);
+    int raw_y = decode_mouse_delta(packet >> 9);
+    int factor = nextstep_factor(raw_x, raw_y);
+
+    *x = -raw_x * factor;
+    *y = -raw_y * factor;
 }
 
 static void assert_mouse_queue_empty(QTestState *qts)
@@ -656,6 +719,178 @@ static void test_mouse_large_motion(void)
     qtest_quit(qts);
 }
 
+static void test_absolute_acceleration_inverse(void)
+{
+    const int movements[] = { 1, 6, 16, 30, 48, 70, 100 };
+    QTestState *qts = next_cube_absolute_kbd_start();
+    int x = 100;
+
+    send_absolute_pointer(qts, x, 100);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    assert_mouse_queue_empty(qts);
+
+    for (size_t i = 0; i < ARRAY_SIZE(movements); i++) {
+        uint32_t packet;
+        int motion_x;
+        int motion_y;
+
+        x += movements[i];
+        send_absolute_pointer(qts, x, 100);
+        qtest_clock_step(qts, NEXT_POINTER_TICK_NS - 1);
+        assert_mouse_queue_empty(qts);
+        qtest_clock_step(qts, 1);
+        packet = qtest_readl(qts, NEXT_KBD_DATA);
+        accelerated_packet_motion(packet, &motion_x, &motion_y);
+        g_assert_cmpint(motion_x, ==, movements[i]);
+        g_assert_cmpint(motion_y, ==, 0);
+        assert_mouse_queue_empty(qts);
+    }
+
+    qtest_quit(qts);
+}
+
+static void test_absolute_diagonal_and_residual(void)
+{
+    const int residual_x[] = { 6, 2, 2 };
+    QTestState *qts = next_cube_absolute_kbd_start();
+    int motion_x = 0;
+    int motion_y = 0;
+
+    send_absolute_pointer(qts, 200, 200);
+    send_absolute_pointer(qts, 208, 208);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    accelerated_packet_motion(qtest_readl(qts, NEXT_KBD_DATA),
+                              &motion_x, &motion_y);
+    g_assert_cmpint(motion_x, ==, 8);
+    g_assert_cmpint(motion_y, ==, 8);
+    assert_mouse_queue_empty(qts);
+
+    send_absolute_pointer(qts, 218, 208);
+    for (unsigned int i = 0; i < 3; i++) {
+        int packet_x;
+        int packet_y;
+
+        qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+        accelerated_packet_motion(qtest_readl(qts, NEXT_KBD_DATA),
+                                  &packet_x, &packet_y);
+        g_assert_cmpint(packet_x, ==, residual_x[i]);
+        g_assert_cmpint(packet_y, ==, 0);
+        motion_x += packet_x;
+        motion_y += packet_y;
+        assert_mouse_queue_empty(qts);
+    }
+    g_assert_cmpint(motion_x, ==, 18);
+    g_assert_cmpint(motion_y, ==, 8);
+
+    qtest_quit(qts);
+}
+
+static void test_absolute_surface_endpoints(void)
+{
+    QTestState *qts = next_cube_absolute_kbd_start();
+    int motion_x;
+    int motion_y;
+
+    send_absolute_pointer(qts, 1, 1);
+    send_absolute_pointer(qts, 0, 0);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    accelerated_packet_motion(qtest_readl(qts, NEXT_KBD_DATA),
+                              &motion_x, &motion_y);
+    g_assert_cmpint(motion_x, ==, -1);
+    g_assert_cmpint(motion_y, ==, -1);
+    assert_mouse_queue_empty(qts);
+    qtest_quit(qts);
+
+    qts = next_cube_absolute_kbd_start();
+    send_absolute_pointer(qts, 1118, 830);
+    send_absolute_pointer(qts, 1119, 831);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    accelerated_packet_motion(qtest_readl(qts, NEXT_KBD_DATA),
+                              &motion_x, &motion_y);
+    g_assert_cmpint(motion_x, ==, 1);
+    g_assert_cmpint(motion_y, ==, 1);
+    assert_mouse_queue_empty(qts);
+    qtest_quit(qts);
+}
+
+static void test_absolute_large_motion_converges(void)
+{
+    QTestState *qts = next_cube_absolute_kbd_start();
+    int motion_x = 0;
+    int motion_y = 0;
+
+    send_absolute_pointer(qts, 0, 100);
+    send_absolute_pointer(qts, 500, 100);
+    send_absolute_pointer(qts, 1000, 100);
+    for (unsigned int i = 0; i < 2; i++) {
+        int packet_x;
+        int packet_y;
+
+        qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+        accelerated_packet_motion(qtest_readl(qts, NEXT_KBD_DATA),
+                                  &packet_x, &packet_y);
+        motion_x += packet_x;
+        motion_y += packet_y;
+        assert_mouse_queue_empty(qts);
+    }
+    g_assert_cmpint(motion_x, ==, 1000);
+    g_assert_cmpint(motion_y, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_absolute_reset_discards_pending_and_anchor(void)
+{
+    QTestState *qts = next_cube_absolute_kbd_start();
+
+    send_absolute_pointer(qts, 0, 100);
+    send_absolute_pointer(qts, 500, 100);
+    send_absolute_pointer(qts, 1000, 100);
+    qtest_system_reset(qts);
+
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    assert_mouse_queue_empty(qts);
+
+    send_absolute_pointer(qts, 600, 400);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    assert_mouse_queue_empty(qts);
+
+    qtest_quit(qts);
+}
+
+static void test_absolute_queue_full_retries_motion(void)
+{
+    QTestState *qts = next_cube_absolute_kbd_start();
+    int motion_x;
+    int motion_y;
+
+    send_absolute_pointer(qts, 100, 100);
+    for (unsigned int i = 0; i < 256; i++) {
+        send_key(qts, "a", !(i & 1));
+    }
+    send_absolute_pointer(qts, 106, 100);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) & NEXT_KBD_OVR,
+                    ==, NEXT_KBD_OVR);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    qtest_writeb(qts, NEXT_KBD_CSR + 1, NEXT_KBD_OVR >> 16);
+    qtest_clock_step(qts, NEXT_POINTER_TICK_NS);
+    for (unsigned int i = 0; i < 255; i++) {
+        uint32_t packet = qtest_readl(qts, NEXT_KBD_DATA);
+
+        g_assert_cmphex(packet & 0xf0000000, ==, NEXT_KBD_DEVICE_1);
+    }
+    accelerated_packet_motion(qtest_readl(qts, NEXT_KBD_DATA),
+                              &motion_x, &motion_y);
+    g_assert_cmpint(motion_x, ==, 6);
+    g_assert_cmpint(motion_y, ==, 0);
+    assert_mouse_queue_empty(qts);
+
+    qtest_quit(qts);
+}
+
 static void test_migrate_queued_input(void)
 {
     g_autofree char *migration_path = NULL;
@@ -781,10 +1016,23 @@ int main(int argc, char **argv)
                          "next-cube", test_default_pointer_is_absolute);
     g_test_add_data_func("/next-station/mouse/default-pointer-is-absolute",
                          "next-station", test_default_pointer_is_absolute);
-    g_test_add_data_func("/next-station-color/mouse/default-pointer-is-absolute",
-                         "next-station-color", test_default_pointer_is_absolute);
+    g_test_add_data_func(
+        "/next-station-color/mouse/default-pointer-is-absolute",
+        "next-station-color", test_default_pointer_is_absolute);
     qtest_add_func("/next-cube/mouse/relative-pointer-opt-out",
                    test_relative_pointer_opt_out);
+    qtest_add_func("/next-cube/mouse/absolute/acceleration-inverse",
+                   test_absolute_acceleration_inverse);
+    qtest_add_func("/next-cube/mouse/absolute/diagonal-and-residual",
+                   test_absolute_diagonal_and_residual);
+    qtest_add_func("/next-cube/mouse/absolute/surface-endpoints",
+                   test_absolute_surface_endpoints);
+    qtest_add_func("/next-cube/mouse/absolute/large-motion-converges",
+                   test_absolute_large_motion_converges);
+    qtest_add_func("/next-cube/mouse/absolute/reset-discards-pending-and-anchor",
+                   test_absolute_reset_discards_pending_and_anchor);
+    qtest_add_func("/next-cube/mouse/absolute/queue-full-retries-motion",
+                   test_absolute_queue_full_retries_motion);
     qtest_add_func("/next-cube/kbd/migrate-queued-input",
                    test_migrate_queued_input);
     return g_test_run();
