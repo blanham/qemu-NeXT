@@ -85,6 +85,15 @@ struct NextKBDState {
     QemuInputHandlerState *hs;
     qemu_irq irq;
     NextSoundState *sound;
+    bool absolute_pointer;
+    int32_t absolute_x;
+    int32_t absolute_y;
+    bool absolute_x_valid;
+    bool absolute_y_valid;
+    bool absolute_dirty;
+    bool absolute_anchor_valid;
+    int32_t absolute_anchor_x;
+    int32_t absolute_anchor_y;
     KBDQueue queue;
     uint8_t command;
     uint32_t monitor_data;
@@ -417,6 +426,19 @@ static void nextkbd_relative_event(NextKBDState *s, QemuInputEvent *evt)
     }
 }
 
+static void nextkbd_absolute_event(NextKBDState *s, QemuInputEvent *evt)
+{
+    if (evt->abs.axis == INPUT_AXIS_X) {
+        s->absolute_x = evt->abs.value;
+        s->absolute_x_valid = true;
+        s->absolute_dirty = true;
+    } else if (evt->abs.axis == INPUT_AXIS_Y) {
+        s->absolute_y = evt->abs.value;
+        s->absolute_y_valid = true;
+        s->absolute_dirty = true;
+    }
+}
+
 static void nextkbd_event(DeviceState *dev, QemuConsole *src,
                           QemuInputEvent *evt)
 {
@@ -431,6 +453,9 @@ static void nextkbd_event(DeviceState *dev, QemuConsole *src,
         break;
     case INPUT_EVENT_KIND_REL:
         nextkbd_relative_event(s, evt);
+        break;
+    case INPUT_EVENT_KIND_ABS:
+        nextkbd_absolute_event(s, evt);
         break;
     default:
         break;
@@ -453,9 +478,20 @@ static int nextkbd_mouse_delta(int64_t *delta)
     return raw;
 }
 
-static void nextkbd_sync(DeviceState *dev)
+static bool nextkbd_put_mouse_packet(NextKBDState *s, int raw_dx, int raw_dy,
+                                     bool left, bool right)
 {
-    NextKBDState *s = NEXTKBD(dev);
+    uint32_t packet = 0x11000000 |
+        ((raw_dy & 0x7f) << 9) |
+        ((right ? 0 : 1) << 8) |
+        ((raw_dx & 0x7f) << 1) |
+        (left ? 0 : 1);
+
+    return nextkbd_put_packet(s, packet, false);
+}
+
+static void nextkbd_relative_sync(NextKBDState *s)
+{
     int64_t scaled_dx = s->mouse_dx / 3;
     int64_t scaled_dy = s->mouse_dy / 3;
 
@@ -465,14 +501,9 @@ static void nextkbd_sync(DeviceState *dev)
     while (scaled_dx || scaled_dy || s->mouse_button_pending) {
         int raw_dx = nextkbd_mouse_delta(&scaled_dx);
         int raw_dy = nextkbd_mouse_delta(&scaled_dy);
-        uint32_t packet;
 
-        packet = 0x11000000 |
-                 ((raw_dy & 0x7f) << 9) |
-                 ((s->mouse_right ? 0 : 1) << 8) |
-                 ((raw_dx & 0x7f) << 1) |
-                 (s->mouse_left ? 0 : 1);
-        if (!nextkbd_put_packet(s, packet, false)) {
+        if (!nextkbd_put_mouse_packet(s, raw_dx, raw_dy,
+                                      s->mouse_left, s->mouse_right)) {
             scaled_dx = 0;
             scaled_dy = 0;
             s->mouse_dx = 0;
@@ -482,12 +513,48 @@ static void nextkbd_sync(DeviceState *dev)
     }
 }
 
-static const QemuInputHandler nextkbd_handler = {
-    .name  = "QEMU NeXT Keyboard/Mouse",
-    .mask  = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN |
-             INPUT_EVENT_MASK_REL,
+static void nextkbd_absolute_sync(NextKBDState *s)
+{
+    if (s->absolute_dirty &&
+        s->absolute_x_valid && s->absolute_y_valid) {
+        s->absolute_anchor_x = s->absolute_x;
+        s->absolute_anchor_y = s->absolute_y;
+        s->absolute_anchor_valid = true;
+    }
+    s->absolute_dirty = false;
+
+    if (s->mouse_button_pending) {
+        nextkbd_put_mouse_packet(s, 0, 0,
+                                 s->mouse_left, s->mouse_right);
+        s->mouse_button_pending = false;
+    }
+}
+
+static void nextkbd_sync(DeviceState *dev)
+{
+    NextKBDState *s = NEXTKBD(dev);
+
+    if (s->absolute_pointer) {
+        nextkbd_absolute_sync(s);
+    } else {
+        nextkbd_relative_sync(s);
+    }
+}
+
+static const QemuInputHandler nextkbd_absolute_handler = {
+    .name = "QEMU NeXT Keyboard/Mouse",
+    .mask = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN |
+            INPUT_EVENT_MASK_ABS,
     .event = nextkbd_event,
-    .sync  = nextkbd_sync,
+    .sync = nextkbd_sync,
+};
+
+static const QemuInputHandler nextkbd_relative_handler = {
+    .name = "QEMU NeXT Keyboard/Mouse",
+    .mask = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN |
+            INPUT_EVENT_MASK_REL,
+    .event = nextkbd_event,
+    .sync = nextkbd_sync,
 };
 
 static void nextkbd_reset(DeviceState *dev)
@@ -516,7 +583,9 @@ static void nextkbd_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mr);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 
-    s->hs = qemu_input_handler_register(dev, &nextkbd_handler);
+    s->hs = qemu_input_handler_register(
+        dev, s->absolute_pointer
+        ? &nextkbd_absolute_handler : &nextkbd_relative_handler);
 }
 
 static void nextkbd_unrealize(DeviceState *dev)
@@ -580,6 +649,8 @@ static const VMStateDescription nextkbd_vmstate = {
 };
 
 static const Property nextkbd_properties[] = {
+    DEFINE_PROP_BOOL("absolute-pointer", NextKBDState,
+                     absolute_pointer, true),
     DEFINE_PROP_LINK("sound", NextKBDState, sound, TYPE_NEXT_SOUND,
                      NextSoundState *),
 };

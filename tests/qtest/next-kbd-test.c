@@ -33,6 +33,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qobject/qdict.h"
+#include "qobject/qlist.h"
 
 #define NEXT_INTR_STATUS  0x02007000
 #define NEXT_KBD_CSR      0x0200e000
@@ -84,11 +85,13 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_cube_kbd_start_with_args(const char *extra_args)
+static QTestState *next_kbd_start(const char *machine, bool relative_pointer,
+                                  const char *extra_args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
-    QTestState *qts;
+    const char *pointer_arg = relative_pointer
+        ? "-global next-kbd.absolute-pointer=off" : "";
 
     rom->fd = -1;
     qtest_add_abrt_handler(cleanup_test_rom, rom);
@@ -101,14 +104,54 @@ static QTestState *next_cube_kbd_start_with_args(const char *extra_args)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    qts = qtest_initf("-machine next-cube -bios %s %s",
-                      quoted_rom_path, extra_args);
-    return qts;
+    return qtest_initf("-machine %s -bios %s %s %s",
+                       machine, quoted_rom_path, pointer_arg,
+                       extra_args ?: "");
+}
+
+static QTestState *next_cube_kbd_start_with_args(const char *extra_args)
+{
+    return next_kbd_start("next-cube", true, extra_args);
 }
 
 static QTestState *next_cube_kbd_start(void)
 {
-    return next_cube_kbd_start_with_args("");
+    return next_cube_kbd_start_with_args(NULL);
+}
+
+static bool query_next_mouse_absolute(QTestState *qts)
+{
+    g_autoptr(QDict) response =
+        qtest_qmp(qts, "{ 'execute': 'query-mice' }");
+    QList *mice = qdict_get_qlist(response, "return");
+    QListEntry *entry;
+
+    QLIST_FOREACH_ENTRY(mice, entry) {
+        QDict *mouse = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(mouse, "name"),
+                    "QEMU NeXT Keyboard/Mouse")) {
+            return qdict_get_bool(mouse, "absolute");
+        }
+    }
+    g_error("NeXT mouse missing from query-mice");
+}
+
+static void test_default_pointer_is_absolute(gconstpointer opaque)
+{
+    const char *machine = opaque;
+    QTestState *qts = next_kbd_start(machine, false, NULL);
+
+    g_assert_true(query_next_mouse_absolute(qts));
+    qtest_quit(qts);
+}
+
+static void test_relative_pointer_opt_out(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    g_assert_false(query_next_mouse_absolute(qts));
+    qtest_quit(qts);
 }
 
 static void wait_migration_complete(QTestState *qts, const char *operation)
@@ -734,6 +777,14 @@ int main(int argc, char **argv)
                    test_mouse_scaled_signed_remainder);
     qtest_add_func("/next-cube/mouse/large-motion",
                    test_mouse_large_motion);
+    g_test_add_data_func("/next-cube/mouse/default-pointer-is-absolute",
+                         "next-cube", test_default_pointer_is_absolute);
+    g_test_add_data_func("/next-station/mouse/default-pointer-is-absolute",
+                         "next-station", test_default_pointer_is_absolute);
+    g_test_add_data_func("/next-station-color/mouse/default-pointer-is-absolute",
+                         "next-station-color", test_default_pointer_is_absolute);
+    qtest_add_func("/next-cube/mouse/relative-pointer-opt-out",
+                   test_relative_pointer_opt_out);
     qtest_add_func("/next-cube/kbd/migrate-queued-input",
                    test_migrate_queued_input);
     return g_test_run();
