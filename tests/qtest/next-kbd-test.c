@@ -190,6 +190,93 @@ static void wait_migration_complete(QTestState *qts, const char *operation)
     g_error("timed out waiting for %s migration", operation);
 }
 
+static void wait_migration_failed(QTestState *qts, const char *operation)
+{
+    unsigned int i;
+
+    for (i = 0; i < NEXT_POLL_LIMIT; i++) {
+        QDict *response = qtest_qmp_assert_success_ref(
+            qts, "{ 'execute': 'query-migrate' }");
+        const char *status = qdict_get_str(response, "status");
+
+        if (!strcmp(status, "failed")) {
+            const char *error_desc =
+                qdict_get_try_str(response, "error-desc");
+
+            g_assert_nonnull(error_desc);
+            g_assert_nonnull(strstr(error_desc, "next-kbd"));
+            g_test_message("incoming migration failure: %s", error_desc);
+            qobject_unref(response);
+            return;
+        }
+        if (!strcmp(status, "completed") || !strcmp(status, "cancelled")) {
+            g_error("%s migration entered unexpected terminal state '%s'",
+                    operation, status);
+        }
+        qobject_unref(response);
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for failed %s migration", operation);
+}
+
+static void save_next_kbd_migration(QTestState *source,
+                                    char **migration_path)
+{
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *outgoing_uri = NULL;
+    int migration_fd;
+
+    migration_fd = g_file_open_tmp("next-kbd-migration-XXXXXX",
+                                   &path, NULL);
+    g_assert_cmpint(migration_fd, >=, 0);
+    close(migration_fd);
+    quoted_path = g_shell_quote(path);
+    outgoing_uri = g_strdup_printf("exec: cat > %s", quoted_path);
+    qtest_qmp_assert_success(
+        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }",
+        outgoing_uri);
+    wait_migration_complete(source, "outgoing");
+    qtest_quit(source);
+    *migration_path = g_steal_pointer(&path);
+}
+
+static QTestState *start_next_kbd_incoming(const char *migration_path,
+                                           bool relative_pointer,
+                                           bool expect_failure)
+{
+    g_autofree char *quoted_path = g_shell_quote(migration_path);
+    g_autofree char *incoming_uri =
+        g_strdup_printf("exec: cat %s", quoted_path);
+    QTestState *destination =
+        next_kbd_start("next-cube", relative_pointer, "-incoming defer");
+
+    if (expect_failure) {
+        qtest_qmp_assert_success(
+            destination,
+            "{ 'execute': 'migrate-incoming', 'arguments': { "
+            "'uri': %s, 'exit-on-error': false } }",
+            incoming_uri);
+    } else {
+        qtest_qmp_assert_success(
+            destination,
+            "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+            incoming_uri);
+    }
+    return destination;
+}
+
+static QTestState *load_next_kbd_migration(const char *migration_path,
+                                           bool relative_pointer)
+{
+    QTestState *destination =
+        start_next_kbd_incoming(migration_path, relative_pointer, false);
+
+    wait_migration_complete(destination, "incoming");
+    return destination;
+}
+
 static void send_key(QTestState *qts, const char *qcode, bool down)
 {
     qtest_qmp_assert_success(
@@ -1104,13 +1191,9 @@ static void test_absolute_queue_full_retries_motion(void)
 static void test_migrate_queued_input(void)
 {
     g_autofree char *migration_path = NULL;
-    g_autofree char *quoted_migration_path = NULL;
-    g_autofree char *outgoing_uri = NULL;
-    g_autofree char *incoming_uri = NULL;
     QTestState *source = next_cube_kbd_start();
     QTestState *destination;
     uint32_t csr;
-    int migration_fd;
 
     send_key(source, "a", true);
     send_mouse_motion_and_button(source, 3, -3, "left", true);
@@ -1132,26 +1215,8 @@ static void test_migrate_queued_input(void)
     g_assert_cmphex(qtest_readl(source, NEXT_INTR_STATUS) & NEXT_INTR_KBD,
                     ==, NEXT_INTR_KBD);
 
-    migration_fd = g_file_open_tmp("next-kbd-migration-XXXXXX",
-                                   &migration_path, NULL);
-    g_assert_cmpint(migration_fd, >=, 0);
-    close(migration_fd);
-    quoted_migration_path = g_shell_quote(migration_path);
-    outgoing_uri = g_strdup_printf("exec: cat > %s",
-                                   quoted_migration_path);
-    qtest_qmp_assert_success(
-        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }",
-        outgoing_uri);
-    wait_migration_complete(source, "outgoing");
-    qtest_quit(source);
-
-    destination = next_cube_kbd_start_with_args("-incoming defer");
-    incoming_uri = g_strdup_printf("exec: cat %s", quoted_migration_path);
-    qtest_qmp_assert_success(
-        destination,
-        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
-        incoming_uri);
-    wait_migration_complete(destination, "incoming");
+    save_next_kbd_migration(source, &migration_path);
+    destination = load_next_kbd_migration(migration_path, true);
 
     csr = qtest_readl(destination, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV),
@@ -1189,6 +1254,106 @@ static void test_migrate_queued_input(void)
     send_mouse_motion(destination, 1, -1);
     g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==, 0x110003fe);
     assert_mouse_queue_empty(destination);
+
+    qtest_quit(destination);
+    g_assert_cmpint(g_unlink(migration_path), ==, 0);
+}
+
+static void test_migrate_absolute_pending_timer(void)
+{
+    g_autofree char *migration_path = NULL;
+    QTestState *source = next_cube_absolute_kbd_start();
+    QTestState *destination;
+    uint32_t packet;
+    int motion_x;
+    int motion_y;
+    int64_t source_clock;
+
+    send_absolute_pointer(source, 100, 100);
+    send_absolute_pointer(source, 106, 100);
+    source_clock = qtest_clock_step(source, NEXT_POINTER_TICK_NS / 2);
+
+    save_next_kbd_migration(source, &migration_path);
+    destination = load_next_kbd_migration(migration_path, false);
+    qtest_clock_set(destination, source_clock);
+
+    qtest_clock_step(destination, NEXT_POINTER_TICK_NS / 2 - 1);
+    assert_mouse_queue_empty(destination);
+    qtest_clock_step(destination, 1);
+    packet = qtest_readl(destination, NEXT_KBD_DATA);
+    accelerated_packet_motion(packet, &motion_x, &motion_y);
+    g_assert_cmpint(motion_x, ==, 6);
+    g_assert_cmpint(motion_y, ==, 0);
+    assert_mouse_queue_empty(destination);
+
+    send_absolute_pointer(destination, 900, 700);
+    qtest_clock_step(destination, NEXT_POINTER_TICK_NS);
+    assert_mouse_queue_empty(destination);
+
+    qtest_quit(destination);
+    g_assert_cmpint(g_unlink(migration_path), ==, 0);
+}
+
+static void test_migrate_absolute_deferred_button(void)
+{
+    g_autofree char *migration_path = NULL;
+    QTestState *source = next_cube_absolute_kbd_start();
+    QTestState *destination;
+    uint32_t packet;
+    int motion_x;
+    int motion_y;
+    int64_t source_clock;
+
+    send_absolute_pointer(source, 100, 100);
+    qtest_clock_step(source, NEXT_POINTER_TICK_NS);
+    assert_mouse_queue_empty(source);
+
+    send_mouse_button(source, "left", true);
+    g_assert_cmphex(qtest_readl(source, NEXT_KBD_DATA), ==,
+                    NEXT_MOUSE_PACKET | NEXT_MOUSE_RIGHT_RELEASED);
+    assert_mouse_queue_empty(source);
+
+    send_absolute_pointer_and_button(source, 106, 100, "left", false);
+    qtest_clock_step(source, NEXT_POINTER_TICK_NS);
+    packet = qtest_readl(source, NEXT_KBD_DATA);
+    accelerated_packet_motion(packet, &motion_x, &motion_y);
+    g_assert_cmpint(motion_x, ==, 6);
+    g_assert_cmpint(motion_y, ==, 0);
+    g_assert_cmphex(packet & (NEXT_MOUSE_RIGHT_RELEASED |
+                              NEXT_MOUSE_LEFT_RELEASED),
+                    ==, NEXT_MOUSE_RIGHT_RELEASED);
+    assert_mouse_queue_empty(source);
+
+    source_clock = qtest_clock_step(source, NEXT_POINTER_TICK_NS / 2);
+    save_next_kbd_migration(source, &migration_path);
+    destination = load_next_kbd_migration(migration_path, false);
+    qtest_clock_set(destination, source_clock);
+
+    qtest_clock_step(destination, NEXT_POINTER_TICK_NS / 2 - 1);
+    assert_mouse_queue_empty(destination);
+    qtest_clock_step(destination, 1);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_MOUSE_PACKET | NEXT_MOUSE_RIGHT_RELEASED |
+                    NEXT_MOUSE_LEFT_RELEASED);
+    assert_mouse_queue_empty(destination);
+
+    send_absolute_pointer(destination, 900, 700);
+    qtest_clock_step(destination, NEXT_POINTER_TICK_NS);
+    assert_mouse_queue_empty(destination);
+
+    qtest_quit(destination);
+    g_assert_cmpint(g_unlink(migration_path), ==, 0);
+}
+
+static void test_migrate_pointer_mode_mismatch_rejected(void)
+{
+    g_autofree char *migration_path = NULL;
+    QTestState *source = next_cube_absolute_kbd_start();
+    QTestState *destination;
+
+    save_next_kbd_migration(source, &migration_path);
+    destination = start_next_kbd_incoming(migration_path, true, true);
+    wait_migration_failed(destination, "incoming");
 
     qtest_quit(destination);
     g_assert_cmpint(g_unlink(migration_path), ==, 0);
@@ -1258,5 +1423,11 @@ int main(int argc, char **argv)
                    test_absolute_queue_full_retries_motion);
     qtest_add_func("/next-cube/kbd/migrate-queued-input",
                    test_migrate_queued_input);
+    qtest_add_func("/next-cube/kbd/migrate-absolute-pending-timer",
+                   test_migrate_absolute_pending_timer);
+    qtest_add_func("/next-cube/kbd/migrate-absolute-deferred-button",
+                   test_migrate_absolute_deferred_button);
+    qtest_add_func("/next-cube/kbd/migrate-pointer-mode-mismatch-rejected",
+                   test_migrate_pointer_mode_mismatch_rejected);
     return g_test_run();
 }

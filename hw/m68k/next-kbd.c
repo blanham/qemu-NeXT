@@ -108,6 +108,7 @@ struct NextKBDState {
     bool absolute_button_waiting;
     bool absolute_motion_before_button;
     QEMUTimer absolute_timer;
+    bool migration_absolute_pointer;
     KBDQueue queue;
     uint8_t command;
     uint32_t monitor_data;
@@ -823,6 +824,44 @@ static const VMStateDescription nextkbd_queue_entry_vmstate = {
     },
 };
 
+static int nextkbd_pre_save(void *opaque)
+{
+    NextKBDState *s = opaque;
+
+    s->migration_absolute_pointer = s->absolute_pointer;
+    return 0;
+}
+
+static bool nextkbd_v3_state_valid(const NextKBDState *s)
+{
+    if (s->migration_absolute_pointer != s->absolute_pointer ||
+        s->absolute_pending_x < -NEXT_POINTER_PENDING_LIMIT ||
+        s->absolute_pending_x > NEXT_POINTER_PENDING_LIMIT ||
+        s->absolute_pending_y < -NEXT_POINTER_PENDING_LIMIT ||
+        s->absolute_pending_y > NEXT_POINTER_PENDING_LIMIT ||
+        (s->absolute_button_waiting && !s->mouse_button_pending) ||
+        (s->absolute_motion_before_button &&
+         !s->absolute_button_waiting)) {
+        return false;
+    }
+
+    if (!s->absolute_pointer) {
+        return true;
+    }
+
+    if ((s->mouse_button_pending && !s->absolute_button_waiting) ||
+        (s->absolute_button_waiting &&
+         !s->absolute_pending_x && !s->absolute_pending_y &&
+         !s->absolute_motion_before_button) ||
+        (!s->mouse_button_pending &&
+         (s->absolute_delivered_left != s->mouse_left ||
+          s->absolute_delivered_right != s->mouse_right))) {
+        return false;
+    }
+
+    return true;
+}
+
 static int nextkbd_post_load(void *opaque, int version_id)
 {
     NextKBDState *s = opaque;
@@ -836,14 +875,60 @@ static int nextkbd_post_load(void *opaque, int version_id)
         return -EINVAL;
     }
 
+    if (version_id >= 3) {
+        if (!nextkbd_v3_state_valid(s)) {
+            return -EINVAL;
+        }
+    } else {
+        s->absolute_pending_x = 0;
+        s->absolute_pending_y = 0;
+        s->absolute_delivered_left = s->mouse_left;
+        s->absolute_delivered_right = s->mouse_right;
+        /*
+         * Legacy streams did not migrate absolute delivery state.  Make a
+         * pending desired button state timer-eligible so it cannot get stuck.
+         */
+        s->absolute_button_waiting =
+            s->absolute_pointer && s->mouse_button_pending;
+        s->absolute_motion_before_button = s->absolute_button_waiting;
+    }
+
+    /*
+     * Frontend coordinates are destination-local.  The first absolute
+     * sample after migration establishes a new anchor without guest motion.
+     */
+    s->absolute_x = 0;
+    s->absolute_y = 0;
+    s->absolute_x_valid = false;
+    s->absolute_y_valid = false;
+    s->absolute_dirty = false;
+    s->absolute_anchor_valid = false;
+    s->absolute_anchor_x = 0;
+    s->absolute_anchor_y = 0;
+
+    if (s->absolute_pointer) {
+        if (version_id < 3 || !timer_pending(&s->absolute_timer)) {
+            timer_mod(&s->absolute_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NEXT_POINTER_TICK_NS);
+        }
+    } else {
+        s->absolute_pending_x = 0;
+        s->absolute_pending_y = 0;
+        s->absolute_button_waiting = false;
+        s->absolute_motion_before_button = false;
+        timer_del(&s->absolute_timer);
+    }
+
     qemu_set_irq(s->irq, s->queue.count || s->overrun);
     return 0;
 }
 
 static const VMStateDescription nextkbd_vmstate = {
     .name = TYPE_NEXTKBD,
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
+    .pre_save = nextkbd_pre_save,
     .post_load = nextkbd_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(queue.entries, NextKBDState, KBD_QUEUE_SIZE, 1,
@@ -861,6 +946,14 @@ static const VMStateDescription nextkbd_vmstate = {
         VMSTATE_BOOL(mouse_left, NextKBDState),
         VMSTATE_BOOL(mouse_right, NextKBDState),
         VMSTATE_BOOL(mouse_button_pending, NextKBDState),
+        VMSTATE_INT64_V(absolute_pending_x, NextKBDState, 3),
+        VMSTATE_INT64_V(absolute_pending_y, NextKBDState, 3),
+        VMSTATE_BOOL_V(absolute_delivered_left, NextKBDState, 3),
+        VMSTATE_BOOL_V(absolute_delivered_right, NextKBDState, 3),
+        VMSTATE_BOOL_V(absolute_button_waiting, NextKBDState, 3),
+        VMSTATE_BOOL_V(absolute_motion_before_button, NextKBDState, 3),
+        VMSTATE_TIMER_V(absolute_timer, NextKBDState, 3),
+        VMSTATE_BOOL_V(migration_absolute_pointer, NextKBDState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
