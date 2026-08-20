@@ -18,7 +18,7 @@ index 7e7d8189..1d71b272 100644
    install_headers(['src/libslirp.h'], subdir : 'slirp')
  
 diff --git a/src/bootp.c b/src/bootp.c
-index 147955fc..f247879f 100644
+index 147955fc..b61956d7 100644
 --- a/src/bootp.c
 +++ b/src/bootp.c
 @@ -38,6 +38,39 @@
@@ -69,7 +69,7 @@ index 147955fc..f247879f 100644
  
      /* extract exact DHCP msg type */
      dhcp_decode(bp, bp_end, &dhcp_msg_type, &preq_addr);
-@@ -240,151 +274,157 @@ static void bootp_reply(Slirp *slirp,
+@@ -240,151 +274,159 @@ static void bootp_reply(Slirp *slirp,
      rbp->bp_yiaddr = daddr.sin_addr; /* Client IP address */
      rbp->bp_siaddr = saddr.sin_addr; /* Server IP address */
  
@@ -334,7 +334,10 @@ index 147955fc..f247879f 100644
 -    assert(q < end);
 -    *q++ = RFC1533_END;
  
-     daddr.sin_addr.s_addr = 0xffffffffu;
+-    daddr.sin_addr.s_addr = 0xffffffffu;
++    if (!next_bootp) {
++        daddr.sin_addr.s_addr = 0xffffffffu;
++    }
  
      assert(q <= end);
  
@@ -346,10 +349,10 @@ index 147955fc..f247879f 100644
  
 diff --git a/test/bootptest.c b/test/bootptest.c
 new file mode 100644
-index 00000000..713e6fc3
+index 00000000..5f43cf51
 --- /dev/null
 +++ b/test/bootptest.c
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,258 @@
 +/* SPDX-License-Identifier: BSD-3-Clause */
 +/*
 + * Copyright (c) 2026 Bryce Lanham
@@ -367,6 +370,8 @@ index 00000000..713e6fc3
 +#define BOOTP_FIXED_LEN 236
 +#define BOOTP_VENDOR_LEN 64
 +#define DHCP_OPTION_CAPACITY 312
++#define IPV4_DESTINATION_OFFSET 16
++#define IPV4_ADDRESS_LEN 4
 +
 +#define BOOTP_OFFSET (ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN)
 +#define BOOTP_XID_OFFSET 4
@@ -537,6 +542,27 @@ index 00000000..713e6fc3
 +                  "sdmach", strlen("sdmach")) == 0);
 +}
 +
++static void check_unicast_destination(const Capture *capture)
++{
++    assert(memcmp(capture->packet, client_mac, sizeof(client_mac)) == 0);
++    assert(memcmp(capture->packet + ETHERNET_HEADER_LEN +
++                      IPV4_DESTINATION_OFFSET,
++                  capture->packet + BOOTP_OFFSET + BOOTP_YIADDR_OFFSET,
++                  IPV4_ADDRESS_LEN) == 0);
++}
++
++static void check_broadcast_destination(const Capture *capture)
++{
++    static const uint8_t broadcast[6] = {
++        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    };
++
++    assert(memcmp(capture->packet, broadcast, sizeof(broadcast)) == 0);
++    assert(memcmp(capture->packet + ETHERNET_HEADER_LEN +
++                      IPV4_DESTINATION_OFFSET,
++                  broadcast, IPV4_ADDRESS_LEN) == 0);
++}
++
 +static void test_next_v1_reply(void)
 +{
 +    const uint8_t expected_vendor[BOOTP_VENDOR_LEN] = {
@@ -545,6 +571,7 @@ index 00000000..713e6fc3
 +    Capture capture = run_request(REQUEST_NEXT_V1);
 +
 +    check_common_reply(&capture);
++    check_unicast_destination(&capture);
 +    assert(capture.length == REQUEST_LENGTH);
 +    assert(memcmp(capture.packet + BOOTP_OFFSET + BOOTP_VENDOR_OFFSET,
 +                  expected_vendor, sizeof(expected_vendor)) == 0);
@@ -556,6 +583,7 @@ index 00000000..713e6fc3
 +    Capture capture = run_request(REQUEST_NEXT_V2);
 +
 +    check_common_reply(&capture);
++    check_broadcast_destination(&capture);
 +    assert(capture.length == DHCP_RESPONSE_LENGTH);
 +    assert(memcmp(capture.packet + BOOTP_OFFSET + BOOTP_VENDOR_OFFSET,
 +                  dhcp_ack, sizeof(dhcp_ack)) == 0);
@@ -570,6 +598,7 @@ index 00000000..713e6fc3
 +    Capture capture = run_request(REQUEST_RFC1533);
 +
 +    check_common_reply(&capture);
++    check_broadcast_destination(&capture);
 +    assert(capture.length == DHCP_RESPONSE_LENGTH);
 +    assert(memcmp(capture.packet + BOOTP_OFFSET + BOOTP_VENDOR_OFFSET,
 +                  dhcp_offer, sizeof(dhcp_offer)) == 0);
