@@ -1,7 +1,6 @@
 [wrap-git]
-url = https://gitlab.freedesktop.org/slirp/libslirp.git
-revision = 26be815b86e8d49add8c9a8b320239b9594ff03d
-diff_files = slirp-next-bootp.patch
+url = https://github.com/blanham/libslirp.git
+revision = 248600520cafba0e3704c353924de4def9cb7c6f
 
 [provide]
 slirp = libslirp_dep
