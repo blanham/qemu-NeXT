@@ -1,34 +1,49 @@
-/*
- * NeXT Cube/Station Framebuffer Emulation
+/* SPDX-License-Identifier: NCSA
  *
- * Copyright (c) 2011 Bryce Lanham
+ * Copyright (c) 2011-2026 Bryce Lanham
  *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute,
+ * sublicense, and/or sell copies of the Software, and to permit persons to
+ * whom the Software is furnished to do so, subject to the following
+ * conditions:
  *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
+ * Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimers.
+ *
+ * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimers in the
+ * documentation and/or other materials provided with the distribution.
+ *
+ * Neither the names of the University of Illinois/NCSA nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * Software without specific prior written permission.
  *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * IMPLIED, INCLUDING, BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS WITH THE SOFTWARE.
  */
 #include "qemu/osdep.h"
-#include "qapi/error.h"
-#include "ui/console.h"
+#include "hw/core/irq.h"
 #include "hw/core/loader.h"
-#include "framebuffer.h"
-#include "ui/pixel_ops.h"
 #include "hw/display/next-fb.h"
+#include "migration/vmstate.h"
+#include "qapi/error.h"
+#include "qemu/timer.h"
+#include "qemu/units.h"
 #include "qom/object.h"
+#include "ui/console.h"
+#include "hw/display/framebuffer.h"
+#include "ui/pixel_ops.h"
+
+#define NEXT_FB_RETRACE_HZ 68
+#define NEXT_FB_RETRACE_NS (NANOSECONDS_PER_SECOND / NEXT_FB_RETRACE_HZ)
 
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTFbState, NEXTFB)
 
@@ -38,11 +53,27 @@ struct NeXTFbState {
     MemoryRegion fb_mr;
     MemoryRegionSection fbsection;
     QemuConsole *con;
+    qemu_irq retrace_irq;
+    QEMUTimer retrace_timer;
 
     uint32_t cols;
     uint32_t rows;
     int invalidate;
 };
+
+static void nextfb_schedule_retrace(NeXTFbState *s)
+{
+    timer_mod(&s->retrace_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + NEXT_FB_RETRACE_NS);
+}
+
+static void nextfb_retrace(void *opaque)
+{
+    NeXTFbState *s = opaque;
+
+    qemu_irq_pulse(s->retrace_irq);
+    nextfb_schedule_retrace(s);
+}
 
 static void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
                              int width, int pitch)
@@ -105,6 +136,25 @@ static const GraphicHwOps nextfb_ops = {
     .gfx_update  = nextfb_update,
 };
 
+static void nextfb_reset_hold(Object *obj, ResetType type)
+{
+    NeXTFbState *s = NEXTFB(obj);
+
+    timer_del(&s->retrace_timer);
+    s->invalidate = 1;
+    nextfb_schedule_retrace(s);
+}
+
+static const VMStateDescription vmstate_nextfb = {
+    .name = TYPE_NEXTFB,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER(retrace_timer, NeXTFbState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static void nextfb_realize(DeviceState *dev, Error **errp)
 {
     NeXTFbState *s = NEXTFB(dev);
@@ -112,6 +162,7 @@ static void nextfb_realize(DeviceState *dev, Error **errp)
     memory_region_init_ram(&s->fb_mr, OBJECT(dev), "next-video", 0x1CB100,
                            &error_fatal);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->fb_mr);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->retrace_irq);
 
     s->invalidate = 1;
     s->cols = 1120;
@@ -121,20 +172,46 @@ static void nextfb_realize(DeviceState *dev, Error **errp)
     qemu_console_resize(s->con, s->cols, s->rows);
 }
 
+static void nextfb_unrealize(DeviceState *dev)
+{
+    NeXTFbState *s = NEXTFB(dev);
+
+    timer_del(&s->retrace_timer);
+    if (s->fbsection.mr) {
+        memory_region_set_log(s->fbsection.mr, false, DIRTY_MEMORY_VGA);
+        memory_region_unref(s->fbsection.mr);
+        s->fbsection.mr = NULL;
+    }
+    if (s->con) {
+        qemu_graphic_console_close(s->con);
+        s->con = NULL;
+    }
+}
+
 static void nextfb_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = nextfb_realize;
+    dc->unrealize = nextfb_unrealize;
+    dc->vmsd = &vmstate_nextfb;
+    rc->phases.hold = nextfb_reset_hold;
+}
 
-    /* Note: This device does not have any state that we have to reset or migrate */
+static void nextfb_init(Object *obj)
+{
+    NeXTFbState *s = NEXTFB(obj);
+
+    timer_init_ns(&s->retrace_timer, QEMU_CLOCK_VIRTUAL, nextfb_retrace, s);
 }
 
 static const TypeInfo nextfb_info = {
     .name          = TYPE_NEXTFB,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(NeXTFbState),
+    .instance_init = nextfb_init,
     .class_init    = nextfb_class_init,
 };
 

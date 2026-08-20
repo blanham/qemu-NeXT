@@ -1455,7 +1455,16 @@ static void next_machine_init(MachineState *machine)
 
     /* Framebuffer */
     if (profile->video_kind == NEXT_VIDEO_MONO) {
-        sysbus_create_simple(TYPE_NEXTFB, 0x0B000000, NULL);
+        DeviceState *mono_video_dev = qdev_new(TYPE_NEXTFB);
+        SysBusDevice *mono_video_sbd = SYS_BUS_DEVICE(mono_video_dev);
+
+        object_property_add_child(OBJECT(machine), "next-fb",
+                                  OBJECT(mono_video_dev));
+        sysbus_realize_and_unref(mono_video_sbd, &error_fatal);
+        sysbus_mmio_map(mono_video_sbd, 0, 0x0B000000);
+        sysbus_connect_irq(mono_video_sbd, 0,
+                           qdev_get_gpio_in_named(
+                               dma_dev, NEXT_DMA_VIDEO_RETRACE_GPIO, 0));
     } else {
         DeviceState *color_video_dev = qdev_new(TYPE_NEXT_COLOR_VIDEO);
         SysBusDevice *color_video_sbd = SYS_BUS_DEVICE(color_video_dev);
