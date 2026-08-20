@@ -36,6 +36,7 @@
 #include "qom/object.h"
 
 #define TYPE_NEXT_DMA "next-dma"
+#define NEXT_DMA_VIDEO_RETRACE_GPIO "video-retrace"
 OBJECT_DECLARE_SIMPLE_TYPE(NextDMAState, NEXT_DMA)
 
 typedef enum NextDMAChannel {

@@ -83,10 +83,6 @@
 #define NEXT_DMA_ENRX_EOP         0x80000000
 #define NEXT_DMA_ENRX_MAX_FRAME   1518
 
-#define NEXT_DMA_VIDEO_RETRACE_HZ 68
-#define NEXT_DMA_VIDEO_RETRACE_NS \
-    (NANOSECONDS_PER_SECOND / NEXT_DMA_VIDEO_RETRACE_HZ)
-
 typedef enum NextDMASavedCapability {
     NEXT_DMA_SAVED_NONE,
     NEXT_DMA_SAVED_TWO,
@@ -235,38 +231,21 @@ static void next_dma_update_irq(NextDMAState *s, NextDMAChannel channel)
     }
 }
 
-static bool next_dma_video_retrace_enabled(const NextDMAState *s)
-{
-    return s->channel[NEXT_DMA_VIDEO].limit != 0;
-}
-
-static void next_dma_video_retrace_schedule(NextDMAState *s)
-{
-    if (!next_dma_video_retrace_enabled(s)) {
-        timer_del(&s->video_retrace_timer);
-        return;
-    }
-    if (!timer_pending(&s->video_retrace_timer)) {
-        timer_mod(&s->video_retrace_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                  NEXT_DMA_VIDEO_RETRACE_NS);
-    }
-}
-
-static void next_dma_video_retrace(void *opaque)
+static void next_dma_video_retrace_in(void *opaque, int n, int level)
 {
     NextDMAState *s = opaque;
-    NextDMAChannelState *video = &s->channel[NEXT_DMA_VIDEO];
 
-    if (!next_dma_video_retrace_enabled(s)) {
+    if (!level) {
         return;
     }
 
-    video->csr |= NEXT_DMA_CSR_COMPLETE;
+    s->channel[NEXT_DMA_VIDEO].csr |= NEXT_DMA_CSR_COMPLETE;
     next_dma_update_irq(s, NEXT_DMA_VIDEO);
-    timer_mod(&s->video_retrace_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NEXT_DMA_VIDEO_RETRACE_NS);
+}
+
+static void next_dma_legacy_video_retrace(void *opaque)
+{
+    /* Retained only as the callback for the version-2 migration timer. */
 }
 
 typedef struct NextDMAEnetRxRange {
@@ -638,10 +617,6 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
         *resolved.value = value;
         if (resolved.reg == NEXT_DMA_REGISTER_NEXT_INIT) {
             s->channel[resolved.channel].next_initbuf_valid = true;
-        }
-        if (resolved.channel == NEXT_DMA_VIDEO &&
-            resolved.reg == NEXT_DMA_REGISTER_LIMIT) {
-            next_dma_video_retrace_schedule(s);
         }
     }
 
@@ -1567,12 +1542,7 @@ static int next_dma_post_load(void *opaque, int version_id)
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
         next_dma_update_irq(s, channel);
     }
-    if (next_dma_video_retrace_enabled(s) &&
-        !timer_pending(&s->video_retrace_timer)) {
-        next_dma_video_retrace_schedule(s);
-    } else if (!next_dma_video_retrace_enabled(s)) {
-        timer_del(&s->video_retrace_timer);
-    }
+    timer_del(&s->video_retrace_timer);
 
     /* Host callbacks and their opaque are deliberately not VMState. */
     s->rx_ready = false;
@@ -1645,7 +1615,9 @@ static void next_dma_init(Object *obj)
                           "next.dma", NEXT_DMA_MMIO_SIZE);
     sysbus_init_mmio(sbd, &s->mmio);
     timer_init_ns(&s->video_retrace_timer, QEMU_CLOCK_VIRTUAL,
-                  next_dma_video_retrace, s);
+                  next_dma_legacy_video_retrace, s);
+    qdev_init_gpio_in_named(DEVICE(obj), next_dma_video_retrace_in,
+                            NEXT_DMA_VIDEO_RETRACE_GPIO, 1);
     s->floppy_bh = qemu_bh_new(next_dma_floppy_run, s);
 
     for (i = 0; i < NEXT_DMA_CHANNEL_COUNT; i++) {
