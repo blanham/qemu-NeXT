@@ -105,8 +105,10 @@ the selected QEMU fsdev security model. The initial launcher uses
 
 Filesystem work that may block runs through QEMU's coroutine/cofile machinery;
 the SLiRP receive callback only frames requests and schedules service work.
-Replies respect libslirp backpressure and remain ordered on the single 9P1
-connection.
+Each queued operation holds a QOM reference to its server until its completion
+callback has retired the operation. Replies remain ordered on the single 9P1
+connection; a partially delivered reply retains its byte offset and resumes
+only after the SLiRP adapter reports fresh receive capacity.
 
 ### Plan 9 BOOTP support in libslirp
 
@@ -147,16 +149,20 @@ through authenticated QMP after the prompt is visibly confirmed.
 - QEMU startup fails with a precise error if the fsdev is missing, the netdev
   is not SLiRP, the guest address is outside the virtual network, or the
   address/port is already registered.
-- Unknown message types, impossible lengths, payloads larger than 8192 bytes,
-  and invalid fid transitions produce an old-protocol `Rerror` when a tag can
-  be recovered. Unrecoverable framing errors reset the stream session.
+- Unknown message types are fatal framing errors, matching the historical
+  stream module, and reset the stream session. Impossible lengths and payloads
+  larger than 8192 bytes produce an old-protocol `Rerror` when a valid known
+  type and tag can be recovered, then reset the stream. Invalid fid
+  transitions produce `Rerror` without resetting the connection.
 - A new `Tsession` discards stale fids and pending connection-local state, so a
   reconnect starts cleanly even though libslirp's legacy callback API has no
   explicit connection-open notification.
 - Path traversal and symlink handling remain confined by the selected QEMU
   fsdev backend. The 9P1 layer never constructs an unchecked host path.
-- Object finalization cancels pending coroutine work, clunks open fids, and
-  unregisters the guest forward before freeing buffers.
+- Every pending coroutine holds a server reference, so object memory and the
+  backend remain live until its completion retires. Explicit object deletion
+  is refused while work is pending. Once idle, teardown unregisters the guest
+  forward, clunks open fids, and frees buffers/backend state in that order.
 - Live 9P1 TCP connections are not migrated in the first version. After
   migration or reconnect, the guest must establish a new session. Starting a
   VM with the same object configuration recreates the service endpoint.

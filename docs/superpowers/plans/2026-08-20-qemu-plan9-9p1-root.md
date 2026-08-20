@@ -4,7 +4,7 @@
 
 **Goal:** Let the archived Plan 9 Second Edition NeXT kernel obtain its network configuration through BOOTP, mount a writable matching release tree over native 9P1/TCP inside QEMU user networking, and execute `/68020/init` without an external file server or host listener.
 
-**Architecture:** A user-creatable QEMU `plan9-9p1-server` object binds a named `-fsdev` to a callback-backed guest-only endpoint on a named SLiRP `-netdev`. A standalone old-protocol codec frames the Second Edition wire format, a server layer translates 16-bit fid operations through QEMU's existing filesystem backend, and a public libslirp extension supplies Plan 9 BOOTP vendor data plus safe callback-forward teardown. The lab controller stages a private writable root tree and performs the final GTK-visible acceptance through authenticated QMP.
+**Architecture:** A user-creatable QEMU `plan9-9p1-server` object binds a named `-fsdev` to a callback-backed guest-only endpoint on a named SLiRP `-netdev`. A standalone old-protocol codec frames the Second Edition wire format, a server layer translates 16-bit fid operations through QEMU's existing filesystem backend, and a public libslirp extension supplies Plan 9 BOOTP vendor data plus safe callback-forward teardown. Pending filesystem operations hold server references, and reply offsets survive SLiRP backpressure. The lab controller stages a private writable root tree and performs the final GTK-visible acceptance through authenticated QMP.
 
 **Tech Stack:** QEMU QOM/QAPI, QEMU fsdev/FileOperations and coroutines, libslirp callback guest forwarding and BOOTP, GLib unit tests, QTest, Meson/Ninja, Python unittest, authenticated QMP, Plan 9 Second Edition 9P1/TCP.
 
@@ -66,7 +66,7 @@ Tclwalk 80/35   Rclwalk 81/13
 Tsession 84/11  Rsession 85/87  Tattach 86/146   Rattach 87/26
 ```
 
-`Rread` stores count at byte 5 and includes one zero pad byte before data. `Twrite` stores count at byte 13 and includes one zero pad byte before data. Reject payloads above 8192 bytes. Unknown types are fatal framing errors. A `Tsession` resets fids and returns zero challenge/authid/authdom, which disables the archived boot program's authentication exchange.
+`Rread` stores count at byte 5 and includes one zero pad byte before data. `Twrite` stores count at byte 13 and includes one zero pad byte before data. Reject payloads above 8192 bytes. Unknown types are fatal framing errors and reset the stream. A malformed known request with a recoverable tag receives `Rerror` before reset. A `Tsession` resets fids and returns zero challenge/authid/authdom, which disables the archived boot program's authentication exchange.
 
 ### Task 1: Make callback guest-forward removal safe in public libslirp
 
@@ -92,7 +92,7 @@ Expected: the new active-removal case exposes the current stale `so->guestfwd` r
 
 - [ ] **Step 2: Add owner-safe removal**
 
-Keep `slirp_remove_guestfwd(Slirp *, struct in_addr, int)` source-compatible, but before freeing the matching rule iterate the active TCP sockets and close every socket whose `so->guestfwd` points at that rule. Clear the pointer as part of the close path. Return `false` when no rule matches and `true` only after all owners are detached.
+Keep `slirp_remove_guestfwd(Slirp *, struct in_addr, int)` source-compatible, but before freeing the matching rule walk the circular TCP socket list with a saved `so_next`, clear `so->guestfwd`, and invoke the normal TCP close/discard path for every socket that referenced the rule. The helper must also cover sockets already marked for close and must leave no socket in the poll list with that rule pointer. Return false when no rule matches and true only after all owners are detached. Reorder `slirp_cleanup()` so TCP/IP socket cleanup happens before callback-forward rules are freed.
 
 If the current socket list cannot be traversed from `misc.c`, add a private helper in `tcp_subr.c`:
 
@@ -100,7 +100,10 @@ If the current socket list cannot be traversed from `misc.c`, add a private help
 void tcp_remove_guestfwd_sockets(Slirp *slirp, SlirpGuestFwd *guestfwd);
 ```
 
-The helper is private; do not expose `SlirpGuestFwd` publicly.
+The helper is private; do not expose `SlirpGuestFwd` publicly. Also make
+`slirp_send()` propagate the callback's exact return value instead of always
+returning `len`, so a short or failed owner write follows the existing socket
+error/short-write handling rather than silently dropping bytes.
 
 - [ ] **Step 3: Verify callback-forward compatibility**
 
@@ -205,7 +208,8 @@ Use these public-to-QEMU-internal signatures:
 typedef struct QemuSlirpGuestFwd QemuSlirpGuestFwd;
 
 typedef struct QemuSlirpGuestFwdOps {
-    ssize_t (*write)(const uint8_t *buf, size_t len, void *opaque);
+    ssize_t (*write)(const void *buf, size_t len, void *opaque);
+    void (*can_send)(void *opaque);
 } QemuSlirpGuestFwdOps;
 
 int qemu_slirp_guestfwd_add(const char *netdev_id,
@@ -225,11 +229,14 @@ bool qemu_slirp_guestfwd_set_plan9_bootp(
 void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle);
 ```
 
-The header must not expose `SlirpState` or `Slirp *`.
+The header must not expose `SlirpState` or `Slirp *`. `net/slirp.c` supplies a
+`SlirpWriteCb` wrapper; an owner callback must consume the complete input and
+return `len`, while a negative or short result is propagated as a failed/short
+socket write.
 
 - [ ] **Step 3: Implement lookup, validation, transport, and idempotent teardown**
 
-Resolve `qemu_find_netdev(netdev_id)` and require `NET_CLIENT_DRIVER_USER`. Store the opaque rule handle in QEMU's `SlirpState` forwarding list so global cleanup and object cleanup share one idempotent path. Use only `slirp_add_guestfwd`, `slirp_socket_can_recv`, `slirp_socket_recv`, `slirp_set_plan9_bootp`, and the now-safe `slirp_remove_guestfwd`; never call a host-forward API.
+Resolve `qemu_find_netdev(netdev_id)` and require `NET_CLIENT_DRIVER_USER`. Store the opaque rule handle in QEMU's `SlirpState` forwarding list so global cleanup and object cleanup share one idempotent path. Use only `slirp_add_guestfwd`, `slirp_socket_can_recv`, `slirp_socket_recv`, `slirp_set_plan9_bootp`, and the now-safe `slirp_remove_guestfwd`; never call a host-forward API. After each SLiRP poll, scan live callback handles and invoke `ops->can_send` only when `slirp_socket_can_recv()` is nonzero. This is the retry edge for queued server replies after the guest drains SLiRP's socket buffer.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -334,6 +341,13 @@ void v9fs_backend_cleanup(V9fsBackend *backend);
 
 Move only lookup, copied export configuration, backend `ops->init`, root stat/type validation, device-map ownership, throttle ownership, and cleanup. Keep PDU pools, negotiated protocol, transport callbacks, and request state in `V9fsState`.
 
+`V9fsBackend` does not own open-fid unions. The 9P1 server and existing 9P2000
+server both use the shared `V9fsFidOpenState` definition from `hw/9pfs/9p.h`;
+if include ordering prevents that reuse, move `V9fsDir`, `V9fsXattr`, and
+`V9fsFidOpenState` together into a neutral `hw/9pfs/9p-open-state.h` included
+by both servers and `file-op-9p.h`. Do not duplicate the backend open-state
+ABI.
+
 - [ ] **Step 3: Convert current 9P2000 realization to the shared lifecycle**
 
 Embed `V9fsBackend` in `V9fsState` and update call sites without changing command-line or migration-visible behavior. Change `get_fsdev_fsentry` to accept `const char *` while retaining the process-lifetime pointer semantics.
@@ -386,7 +400,7 @@ The fid table key is the full 16-bit fid. Each fid owns a confined `V9fsPath`, o
 
 - [ ] **Step 3: Implement session, identity, qids, and read-only operations**
 
-Run blocking backend work with QEMU's coroutine worker machinery. Preserve reply order with a single request queue. `Tsession` discards fids and returns zeroed legacy auth fields. `Tattach` accepts the supplied Plan 9 user but leaves host credential policy to the fsdev. Map qid paths as directory bit 31, seven device-map bits, and 24 inode bits; reject device-map exhaustion. Derive `qid.vers` from modification time.
+Run blocking backend work with QEMU's coroutine worker machinery. Each queued operation increments `pending` and takes `object_ref(OBJECT(owner))` before scheduling; its sole completion path decrements `pending` and releases that reference after retiring or queuing the reply. Preserve reply order with a single request queue. Store an encoded reply plus a delivered-byte offset, send no more than `can_send()`, and retain the remainder until the adapter's `can_send` callback fires. A failed transport send marks the connection closing and discards unsent replies. Add tests for multiple capacity windows, zero capacity, a short input callback, and deletion while backend work is queued. `Tsession` discards fids and returns zeroed legacy auth fields. `Tattach` accepts the supplied Plan 9 user but leaves host credential policy to the fsdev. Map qid paths as directory bit 31, seven device-map bits, and 24 inode bits; reject device-map exhaustion. Derive `qid.vers` from modification time.
 
 - [ ] **Step 4: Verify and commit the boot subset**
 
@@ -442,7 +456,7 @@ git commit -m "9pfs: complete writable Plan 9 9P1 service"
 
 - [ ] **Step 1: Add failing QOM/QMP lifecycle tests**
 
-Cover command-line creation after `-fsdev`/`-netdev`, QMP `object-add`/`object-del`, default `guest-address=10.0.2.100`, default `port=564`, missing properties, missing fsdev, missing/non-user netdev, invalid/out-of-subnet/reserved address, duplicate endpoint, backend-init unwind, active-connection delete safety, and recreation after delete.
+Cover command-line creation after `-fsdev`/`-netdev`, QMP `object-add`/`object-del`, default `guest-address=10.0.2.100`, default `port=564`, missing properties, missing fsdev, missing/non-user netdev, invalid/out-of-subnet/reserved address, duplicate endpoint, backend-init unwind, active-connection delete safety, deletion refused while a backend coroutine is queued, eventual deletion after it retires, and recreation after delete.
 
 - [ ] **Step 2: Add the generated QAPI branch**
 
@@ -458,7 +472,7 @@ and the `'plan9-9p1-server': 'Plan9P1ServerProperties'` branch to `ObjectOptions
 
 - [ ] **Step 3: Implement `UserCreatable` completion and teardown**
 
-Create the QOM type with `fsdev`, `netdev`, `guest-address`, and `port` properties. In `complete()`, validate properties, initialize `V9fsBackend`, register the callback endpoint, configure Plan 9 BOOTP, then create the protocol server. Unwind in reverse order on failure. In `prepare_delete()`, reject only while coroutine work is genuinely pending; otherwise stop acceptance of new bytes, safely remove the SLiRP endpoint, clunk fids, and clean the backend. Make `finalize()` idempotent.
+Create the QOM type with `fsdev`, `netdev`, `guest-address`, and `port` properties. In `complete()`, validate properties, initialize `V9fsBackend`, register the callback endpoint, configure Plan 9 BOOTP, then create the protocol server. Unwind in reverse order on failure. In `prepare_delete()`, first reject without side effects when `pending` is nonzero. Once idle, mark closing, stop acceptance of new bytes, safely remove the SLiRP endpoint, clunk fids, and clean the backend. Every queued coroutine's object reference prevents finalization during global unparent cleanup; `finalize()` performs the same ordered teardown idempotently once the final reference is released.
 
 - [ ] **Step 4: Pin the exact public libslirp commit and document usage**
 
@@ -606,7 +620,7 @@ After confirmation, inject the exact one-shot ROM boot command. Capture TFTP pac
 
 - [ ] **Step 3: Mount root and reach userspace**
 
-After confirmation, inject `tcp`. Capture the `p9  ` BOOTP exchange, guest TCP connection to `10.0.2.100:564`, 9P1 request/response activity, successful root mount, execution of `/68020/init`, and the desktop or normal first-login screen.
+After confirmation, inject `tcp` to select the root transport. The subsequent network configuration itself is automatic: capture the `p9  ` BOOTP exchange, guest TCP connection to `10.0.2.100:564`, 9P1 request/response activity, successful root mount, execution of `/68020/init`, and the desktop or normal first-login screen.
 
 - [ ] **Step 4: Shut down only through authenticated ownership**
 
