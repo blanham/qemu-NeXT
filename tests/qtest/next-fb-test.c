@@ -20,6 +20,11 @@ typedef struct TestROM {
     char *path;
 } TestROM;
 
+typedef struct TestMigration {
+    char *tmpdir;
+    char *socket_path;
+} TestMigration;
+
 static void cleanup_test_rom(void *opaque)
 {
     TestROM *rom = opaque;
@@ -33,6 +38,38 @@ static void cleanup_test_rom(void *opaque)
         g_free(rom->path);
     }
     g_free(rom);
+}
+
+static void cleanup_test_migration(void *opaque)
+{
+    TestMigration *migration = opaque;
+
+    qtest_remove_abrt_handler(migration);
+    if (migration->socket_path) {
+        g_unlink(migration->socket_path);
+    }
+    if (migration->tmpdir) {
+        g_rmdir(migration->tmpdir);
+    }
+    g_free(migration->socket_path);
+    g_free(migration->tmpdir);
+    g_free(migration);
+}
+
+static TestMigration *create_test_migration(void)
+{
+    g_autoptr(GError) error = NULL;
+    TestMigration *migration = g_new0(TestMigration, 1);
+
+    qtest_add_abrt_handler(cleanup_test_migration, migration);
+    g_test_queue_destroy(cleanup_test_migration, migration);
+    migration->tmpdir = g_dir_make_tmp("next-fb-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(migration->tmpdir);
+    migration->socket_path =
+        g_build_filename(migration->tmpdir, "migration.sock", NULL);
+
+    return migration;
 }
 
 static QTestState *next_fb_start(const char *machine, const char *extra_args)
@@ -58,6 +95,16 @@ static QTestState *next_fb_start(const char *machine, const char *extra_args)
 static uint32_t mono_irq_status(QTestState *qts)
 {
     return qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_MONO_VIDEO_IRQ;
+}
+
+static void migrate_wait(QTestState *source, QTestState *destination,
+                         const char *uri)
+{
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
 }
 
 static void test_free_running_retrace(void)
@@ -94,6 +141,55 @@ static void test_color_has_no_mono_retrace(void)
     qtest_quit(qts);
 }
 
+static void test_retrace_migration(void)
+{
+    TestMigration *migration = create_test_migration();
+    g_autofree char *uri =
+        g_strdup_printf("unix:%s", migration->socket_path);
+    QTestState *destination = next_fb_start("next-cube", "-incoming defer");
+    QTestState *source = next_fb_start("next-cube", NULL);
+    const int64_t source_phase = NEXT_RETRACE_NS / 2;
+    const int64_t source_fraction = NEXT_RETRACE_NS / 3;
+    const int64_t remaining = NEXT_RETRACE_NS - source_fraction;
+    const int64_t source_elapsed = 5 * NEXT_RETRACE_NS + source_fraction;
+    const int64_t destination_elapsed =
+        3 * NEXT_RETRACE_NS + NEXT_RETRACE_NS / 5;
+    int64_t source_clock;
+
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        uri);
+
+    qtest_clock_step(destination, destination_elapsed);
+    qtest_writel(destination, NEXT_VIDEO_CSR, NEXT_DMA_RESET);
+
+    qtest_clock_step(source, source_phase);
+    qtest_system_reset(source);
+    source_clock = qtest_clock_step(source, source_elapsed);
+    qtest_writel(source, NEXT_VIDEO_CSR, NEXT_DMA_RESET);
+    g_assert_cmphex(mono_irq_status(source), ==, 0);
+
+    migrate_wait(source, destination, uri);
+    g_assert_cmpint(qtest_clock_set(destination, source_clock), ==,
+                   source_clock);
+    g_assert_cmphex(mono_irq_status(destination), ==, 0);
+
+    qtest_clock_step(destination, remaining - 1);
+    g_assert_cmphex(mono_irq_status(destination), ==, 0);
+    qtest_clock_step(destination, 1);
+    g_assert_cmphex(mono_irq_status(destination), ==, NEXT_MONO_VIDEO_IRQ);
+    g_assert_cmphex(qtest_readl(destination, NEXT_VIDEO_CSR) & NEXT_DMA_COMPLETE,
+                    ==, NEXT_DMA_COMPLETE);
+    qtest_writel(destination, NEXT_VIDEO_CSR, NEXT_DMA_RESET);
+    g_assert_cmphex(mono_irq_status(destination), ==, 0);
+    g_assert_cmphex(qtest_readl(destination, NEXT_VIDEO_CSR) & NEXT_DMA_COMPLETE,
+                    ==, 0);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -101,5 +197,6 @@ int main(int argc, char **argv)
                    test_free_running_retrace);
     qtest_add_func("/next-fb/color-has-no-mono-retrace",
                    test_color_has_no_mono_retrace);
+    qtest_add_func("/next-fb/retrace-migration", test_retrace_migration);
     return g_test_run();
 }

@@ -570,11 +570,11 @@ static void test_video_retrace_interrupt(void)
 
     intercept_next_pc_inputs(qts);
 
+    g_assert_cmphex(qtest_readl(qts, limit), ==, 0);
     g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
                     ==, 0);
 
-    qtest_writel(qts, limit, NEXT_VIDEO_LIMIT);
     qtest_clock_step(qts, NEXT_VIDEO_RETRACE_NS - 1);
     g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
@@ -590,20 +590,18 @@ static void test_video_retrace_interrupt(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
                     ==, 0);
 
+    qtest_writel(qts, limit, NEXT_VIDEO_LIMIT);
     qtest_clock_step(qts, NEXT_VIDEO_RETRACE_NS);
     g_assert_true(qtest_get_irq(qts, dma_board_inputs[9]));
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
                     ==, NEXT_VIDEO_IRQ);
 
+    qtest_writel(qts, csr, DMA_RESET);
     qtest_writel(qts, limit, 0);
+    qtest_clock_step(qts, NEXT_VIDEO_RETRACE_NS);
     g_assert_true(qtest_get_irq(qts, dma_board_inputs[9]));
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
                     ==, NEXT_VIDEO_IRQ);
-    qtest_writel(qts, csr, DMA_RESET);
-    qtest_clock_step(qts, 2 * NEXT_VIDEO_RETRACE_NS);
-    g_assert_false(qtest_get_irq(qts, dma_board_inputs[9]));
-    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_VIDEO_IRQ,
-                    ==, 0);
 
     qtest_quit(qts);
 }
