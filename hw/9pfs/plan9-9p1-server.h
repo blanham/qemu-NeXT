@@ -92,6 +92,13 @@ void plan9p1_server_reset(Plan9P1Server *server);
 bool plan9p1_server_busy(const Plan9P1Server *server);
 
 /*
+ * Stop accepting transport input and start asynchronous fid cleanup without
+ * consuming a caller reference.  This is idempotent and is used by QOM
+ * unparent as well as the consuming free() API.
+ */
+void plan9p1_server_begin_close(Plan9P1Server *server);
+
+/*
  * Consumes the caller's QOM reference.  Each queued worker holds its own QOM
  * reference, so this is safe while backend work is pending.  A transport
  * callback may consume the caller reference this way; no later API use through

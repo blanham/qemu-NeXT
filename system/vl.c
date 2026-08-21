@@ -1983,6 +1983,11 @@ static bool object_create_early(const char *type)
         return false;
     }
 
+    /* Reason: properties "fsdev" and "netdev". */
+    if (g_str_equal(type, "plan9-9p1-server")) {
+        return false;
+    }
+
 #if defined(CONFIG_VHOST_USER) && defined(CONFIG_LINUX)
     /* Reason: cryptodev-vhost-user property "chardev" */
     if (g_str_equal(type, "cryptodev-vhost-user")) {

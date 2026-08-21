@@ -156,6 +156,7 @@ if have_system
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
+        files('plan9-9p1-slirp-stub.c'),
         testblock,
       ],
       'test-plan9-9p1-server-local': [
@@ -166,6 +167,7 @@ if have_system
         meson.project_source_root() / 'hw/9pfs/9p-xattr-user.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
+        files('plan9-9p1-slirp-stub.c'),
         plan9p1_local_test_sources,
         testblock,
       ],

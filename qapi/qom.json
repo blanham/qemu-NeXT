@@ -1247,6 +1247,26 @@
             '*close-action': 'MonitorQMPCloseAction' } }
 
 ##
+# @Plan9P1ServerProperties:
+#
+# @fsdev: ID of the filesystem export to serve.
+#
+# @netdev: ID of the user-mode network stack that owns the guest
+#     endpoint.
+#
+# @guest-address: Guest-only file-server address (default:
+#     10.0.2.100).
+#
+# @port: Guest-only TCP port (default: 564).
+#
+# Since: 11.1
+##
+{ 'struct': 'Plan9P1ServerProperties',
+  'data': { 'fsdev': 'str', 'netdev': 'str',
+            '*guest-address': 'str', '*port': 'uint16' },
+  'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } }
+
+##
 # @ObjectType:
 #
 # Features:
@@ -1298,6 +1318,8 @@
       'if': 'CONFIG_POSIX' },
     'monitor-hmp',
     'monitor-qmp',
+    { 'name': 'plan9-9p1-server',
+      'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } },
     'pef-guest',
     { 'name': 'pr-manager-helper',
       'if': 'CONFIG_LINUX' },
@@ -1378,6 +1400,9 @@
                                       'if': 'CONFIG_POSIX' },
       'monitor-hmp':                'MonitorHMPProperties',
       'monitor-qmp':                'MonitorQMPProperties',
+      'plan9-9p1-server':           {
+          'type': 'Plan9P1ServerProperties',
+          'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } },
       'pr-manager-helper':          { 'type': 'PrManagerHelperProperties',
                                       'if': 'CONFIG_LINUX' },
       'qtest':                      'QtestProperties',

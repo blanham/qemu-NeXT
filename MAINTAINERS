@@ -2527,9 +2527,12 @@ W: https://wiki.qemu.org/Documentation/9p
 F: hw/9pfs/
 X: hw/9pfs/xen-9p*
 F: fsdev/
+F: docs/system/devices/9p.rst
+F: tests/qtest/plan9-9p1-object-test.c
 F: tests/qtest/virtio-9p-test.c
 F: tests/qtest/libqos/virtio-9p*
 F: tests/unit/test-9p-backend.c
+F: tests/unit/test-plan9-9p1-*
 T: git https://github.com/cschoenebeck/qemu.git 9p.next
 
 virtio-blk

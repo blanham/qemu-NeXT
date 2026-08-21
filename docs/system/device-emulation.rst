@@ -84,6 +84,7 @@ Emulated Devices
 
    devices/virtio/index.rst
 
+   devices/9p.rst
    devices/can.rst
    devices/canokey.rst
    devices/ccid.rst

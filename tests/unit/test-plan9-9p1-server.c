@@ -9,6 +9,7 @@
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qom/object_interfaces.h"
 
 typedef struct ServerFixture ServerFixture;
 
@@ -952,6 +953,52 @@ static void test_free_while_queued(ServerFixture *f, gconstpointer opaque)
     g_assert_cmpuint(f->cleanup_calls, ==, 1);
 }
 
+static void test_prepare_delete_pending(ServerFixture *f,
+                                        gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    Error *err = NULL;
+    unsigned int iterations = 0;
+
+    attach(f, 31, 1);
+    g_assert_cmpuint(walk(f, 31, 2, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 31,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+
+    f->gate_read = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 4, .fid = 31, .count = 1,
+    };
+    send_call(f, &call, false);
+    aio_poll(qemu_get_aio_context(), false);
+    qemu_event_wait(&f->read_started);
+    g_assert_true(plan9p1_server_busy(f->server));
+    g_assert_false(user_creatable_prepare_delete(USER_CREATABLE(f->server),
+                                                  &err));
+    g_assert_nonnull(err);
+    error_free(err);
+
+    /* A rejected deletion must not close the transport or cancel the read. */
+    qemu_event_set(&f->read_release);
+    pump_server(f->server);
+    reply = take_reply(f);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    call = (Plan9P1Fcall) { .type = PLAN9P1_TNOP, .tag = 5 };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RNOP);
+
+    g_assert_true(user_creatable_prepare_delete(USER_CREATABLE(f->server),
+                                                 &error_abort));
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (!f->cleanup_calls) {
+        g_assert_cmpuint(iterations++, <, 10000);
+        aio_poll(qemu_get_aio_context(), true);
+    }
+}
+
 static void test_qid_guards(ServerFixture *f, gconstpointer opaque)
 {
     Plan9P1Fcall reply;
@@ -1827,6 +1874,9 @@ int main(int argc, char **argv)
                fixture_setup, test_clunk_error_invalidates, fixture_teardown);
     g_test_add("/plan9-9p1-server/free-queued", ServerFixture, NULL,
                fixture_setup, test_free_while_queued, fixture_teardown);
+    g_test_add("/plan9-9p1-server/prepare-delete-pending", ServerFixture,
+               NULL, fixture_setup, test_prepare_delete_pending,
+               fixture_teardown);
     g_test_add("/plan9-9p1-server/qid-guards", ServerFixture, &one_device,
                fixture_setup, test_qid_guards, fixture_teardown);
     g_test_add("/plan9-9p1-server/qid-collision", ServerFixture, NULL,

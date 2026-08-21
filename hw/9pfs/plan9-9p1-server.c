@@ -41,9 +41,15 @@
 #include "fsdev/qemu-fsdev-throttle.h"
 #include "block/thread-pool.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/aio.h"
 #include "qemu/coroutine.h"
 #include "qemu/main-loop.h"
+#include "qom/object_interfaces.h"
+
+#ifdef CONFIG_SLIRP
+#include "net/slirp-guestfwd.h"
+#endif
 
 #define PLAN9P1_DEFAULT_QUEUE_BYTES (1024 * 1024)
 #define PLAN9P1_MAX_REQUESTS 128
@@ -170,6 +176,14 @@ struct Plan9P1Server {
     bool deferred_close;
     bool deferred_connection_failure;
     bool flushing;
+#ifdef CONFIG_SLIRP
+    QemuSlirpGuestFwd *guestfwd;
+#endif
+    char *fsdev_id;
+    char *netdev_id;
+    char *guest_address;
+    uint16_t port;
+    bool completed;
 };
 
 static void server_kick(Plan9P1Server *server);
@@ -469,15 +483,29 @@ static void plan9p1_server_instance_finalize(Object *obj)
 {
     Plan9P1Server *server = PLAN9P1_SERVER(obj);
 
+    /* Finalization must never launch asynchronous cleanup work. */
     assert(server->pending == 0);
     assert(!server->active);
     assert(g_queue_is_empty(&server->requests));
     assert(g_queue_is_empty(&server->replies));
     assert(g_queue_is_empty(&server->deferred_inputs));
     assert(g_hash_table_size(server->fids) == 0);
+#ifdef CONFIG_SLIRP
+    if (server->guestfwd) {
+        QemuSlirpGuestFwd *guestfwd = server->guestfwd;
+
+        server->guestfwd = NULL;
+        qemu_slirp_guestfwd_remove(guestfwd);
+    }
+#endif
+    server->closing = true;
     g_hash_table_unref(server->fids);
     g_hash_table_unref(server->qid_paths);
     v9fs_backend_cleanup(&server->backend_storage);
+    server->backend = NULL;
+    g_free(server->fsdev_id);
+    g_free(server->netdev_id);
+    g_free(server->guest_address);
 }
 
 static void owner_ref(Plan9P1Server *server)
@@ -1627,6 +1655,8 @@ static void plan9p1_server_instance_init(Object *obj)
     server->max_queued_bytes = PLAN9P1_DEFAULT_QUEUE_BYTES;
     server->max_dir_cache_bytes = PLAN9P1_DEFAULT_DIR_CACHE_BYTES;
     server->max_qid_entries = PLAN9P1_DEFAULT_QID_ENTRIES;
+    server->guest_address = g_strdup("10.0.2.100");
+    server->port = 564;
 }
 
 int plan9p1_server_backend_init(Plan9P1Server *server,
@@ -1830,29 +1860,286 @@ bool plan9p1_server_busy(const Plan9P1Server *server)
     return server && (server->pending || server->requests.length != 0);
 }
 
+void plan9p1_server_begin_close(Plan9P1Server *server)
+{
+    if (!server) {
+        return;
+    }
+    if (server->closing) {
+        return;
+    }
+
+    server->closing = true;
+#ifdef CONFIG_SLIRP
+    if (server->guestfwd) {
+        QemuSlirpGuestFwd *guestfwd = server->guestfwd;
+
+        server->guestfwd = NULL;
+        qemu_slirp_guestfwd_remove(guestfwd);
+    }
+#endif
+    if (server->callback_depth) {
+        server->deferred_close = true;
+        return;
+    }
+    plan9p1_stream_reset(&server->stream);
+    clear_deferred_inputs(server);
+    clear_requests(server);
+    clear_replies(server);
+    if (server->active) {
+        server->active->cancelled = true;
+    } else if (g_hash_table_size(server->fids)) {
+        server_start_cleanup(server);
+    }
+}
+
 void plan9p1_server_free(Plan9P1Server *server)
 {
     if (!server) {
         return;
     }
-    if (!server->closing) {
-        server->closing = true;
-        if (server->callback_depth) {
-            server->deferred_close = true;
-            object_unref(OBJECT(server));
-            return;
-        }
-        plan9p1_stream_reset(&server->stream);
-        clear_requests(server);
-        clear_replies(server);
-        if (server->active) {
-            server->active->cancelled = true;
-        } else if (g_hash_table_size(server->fids)) {
-            server_start_cleanup(server);
-        }
-    }
+    plan9p1_server_begin_close(server);
     object_unref(OBJECT(server));
 }
+
+#ifdef CONFIG_SLIRP
+static bool plan9p1_server_properties_mutable(Plan9P1Server *server,
+                                               Error **errp)
+{
+    if (server->completed || server->backend || server->started ||
+        server->closing) {
+        error_setg(errp, "9P1 server properties cannot change after "
+                   "completion");
+        return false;
+    }
+    return true;
+}
+
+static char *plan9p1_server_get_fsdev(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->fsdev_id);
+}
+
+static void plan9p1_server_set_fsdev(Object *obj, const char *value,
+                                     Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    g_free(server->fsdev_id);
+    server->fsdev_id = g_strdup(value);
+}
+
+static char *plan9p1_server_get_netdev(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->netdev_id);
+}
+
+static void plan9p1_server_set_netdev(Object *obj, const char *value,
+                                      Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    g_free(server->netdev_id);
+    server->netdev_id = g_strdup(value);
+}
+
+static char *plan9p1_server_get_guest_address(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->guest_address);
+}
+
+static void plan9p1_server_set_guest_address(Object *obj, const char *value,
+                                              Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    g_free(server->guest_address);
+    server->guest_address = g_strdup(value);
+}
+
+static void plan9p1_server_get_port(Object *obj, Visitor *visitor,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    uint16_t value = PLAN9P1_SERVER(obj)->port;
+
+    visit_type_uint16(visitor, name, &value, errp);
+}
+
+static void plan9p1_server_set_port(Object *obj, Visitor *visitor,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+    uint16_t value;
+
+    if (!visit_type_uint16(visitor, name, &value, errp) ||
+        !plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    if (!value) {
+        error_setg(errp, "9P1 server port must not be zero");
+        return;
+    }
+    server->port = value;
+}
+
+static ssize_t plan9p1_server_guest_write(const void *buf, size_t len,
+                                           void *opaque)
+{
+    Plan9P1Server *server = opaque;
+    Error *local_err = NULL;
+
+    if (plan9p1_server_receive(server, buf, len, &local_err) < 0) {
+        error_free(local_err);
+        return -EIO;
+    }
+    return len;
+}
+
+static void plan9p1_server_guest_can_send(void *opaque)
+{
+    plan9p1_server_can_send(opaque);
+}
+
+static size_t plan9p1_server_transport_can_send(void *opaque)
+{
+    Plan9P1Server *server = opaque;
+
+    return qemu_slirp_guestfwd_can_send(server->guestfwd);
+}
+
+static int plan9p1_server_transport_send(const uint8_t *buf, size_t len,
+                                         void *opaque)
+{
+    Plan9P1Server *server = opaque;
+
+    return qemu_slirp_guestfwd_send(server->guestfwd, buf, len);
+}
+
+static const QemuSlirpGuestFwdOps plan9p1_server_guestfwd_ops = {
+    .write = plan9p1_server_guest_write,
+    .can_send = plan9p1_server_guest_can_send,
+};
+
+static const Plan9P1TransportOps plan9p1_server_transport_ops = {
+    .can_send = plan9p1_server_transport_can_send,
+    .send = plan9p1_server_transport_send,
+};
+
+static void plan9p1_server_complete(UserCreatable *uc, Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(uc);
+    QemuSlirpPlan9BootpConfig bootp = { 0 };
+    QemuSlirpIPv4Config ipv4;
+    struct in_addr guest_address;
+
+    if (server->completed) {
+        error_setg(errp, "9P1 server is already complete");
+        return;
+    }
+    if (!server->fsdev_id || !server->fsdev_id[0]) {
+        error_setg(errp, "9P1 server requires an fsdev property");
+        return;
+    }
+    if (!server->netdev_id || !server->netdev_id[0]) {
+        error_setg(errp, "9P1 server requires a netdev property");
+        return;
+    }
+    if (!server->guest_address ||
+        inet_pton(AF_INET, server->guest_address, &guest_address) != 1) {
+        error_setg(errp, "Invalid 9P1 guest address '%s'",
+                   server->guest_address ?: "");
+        return;
+    }
+    if (!server->port) {
+        error_setg(errp, "9P1 server port must not be zero");
+        return;
+    }
+
+    if (plan9p1_server_backend_init(server, server->fsdev_id, NULL, errp) < 0) {
+        return;
+    }
+    if (qemu_slirp_guestfwd_add(server->netdev_id, guest_address,
+                                server->port, &plan9p1_server_guestfwd_ops,
+                                server, &server->guestfwd, errp) < 0) {
+        goto fail_backend;
+    }
+    if (!qemu_slirp_guestfwd_get_ipv4_config(server->guestfwd, &ipv4, errp)) {
+        goto fail_guestfwd;
+    }
+    bootp.netmask = ipv4.netmask;
+    bootp.file_server = guest_address;
+    bootp.gateway = ipv4.host;
+    if (!qemu_slirp_guestfwd_set_plan9_bootp(server->guestfwd, &bootp,
+                                             errp)) {
+        goto fail_guestfwd;
+    }
+    if (plan9p1_server_start(server, &plan9p1_server_transport_ops,
+                             server, errp) < 0) {
+        goto fail_guestfwd;
+    }
+    server->completed = true;
+    return;
+
+fail_guestfwd:
+    qemu_slirp_guestfwd_remove(server->guestfwd);
+    server->guestfwd = NULL;
+fail_backend:
+    v9fs_backend_cleanup(&server->backend_storage);
+    server->backend = NULL;
+}
+
+static bool plan9p1_server_prepare_delete(UserCreatable *uc, Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(uc);
+
+    if (plan9p1_server_busy(server)) {
+        error_setg(errp, "9P1 server has pending filesystem work");
+        return false;
+    }
+    plan9p1_server_begin_close(server);
+    return true;
+}
+
+static void plan9p1_server_unparent(Object *obj)
+{
+    plan9p1_server_begin_close(PLAN9P1_SERVER(obj));
+}
+
+static void plan9p1_server_class_init(ObjectClass *oc, const void *data)
+{
+    UserCreatableClass *ucc = USER_CREATABLE_CLASS(oc);
+    ObjectProperty *property;
+
+    ucc->complete = plan9p1_server_complete;
+    ucc->prepare_delete = plan9p1_server_prepare_delete;
+    oc->unparent = plan9p1_server_unparent;
+
+    object_class_property_add_str(oc, "fsdev", plan9p1_server_get_fsdev,
+                                  plan9p1_server_set_fsdev);
+    object_class_property_add_str(oc, "netdev", plan9p1_server_get_netdev,
+                                  plan9p1_server_set_netdev);
+    property = object_class_property_add_str(
+        oc, "guest-address", plan9p1_server_get_guest_address,
+        plan9p1_server_set_guest_address);
+    object_property_set_default_str(property, "10.0.2.100");
+    property = object_class_property_add(oc, "port", "uint16",
+                                         plan9p1_server_get_port,
+                                         plan9p1_server_set_port,
+                                         NULL, NULL);
+    object_property_set_default_uint(property, 564);
+}
+#endif
 
 static const TypeInfo plan9p1_server_type_info = {
     .name = TYPE_PLAN9P1_SERVER,
@@ -1860,6 +2147,13 @@ static const TypeInfo plan9p1_server_type_info = {
     .instance_size = sizeof(Plan9P1Server),
     .instance_init = plan9p1_server_instance_init,
     .instance_finalize = plan9p1_server_instance_finalize,
+#ifdef CONFIG_SLIRP
+    .class_init = plan9p1_server_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { TYPE_USER_CREATABLE },
+        { }
+    },
+#endif
 };
 
 static void plan9p1_server_register_types(void)
