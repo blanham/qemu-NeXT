@@ -41,6 +41,7 @@
 #include "ui/console.h"
 #include "hw/display/framebuffer.h"
 #include "ui/pixel_ops.h"
+#include "trace.h"
 
 #define NEXT_FB_RETRACE_HZ 68
 #define NEXT_FB_RETRACE_NS (NANOSECONDS_PER_SECOND / NEXT_FB_RETRACE_HZ)
@@ -101,6 +102,7 @@ static void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
 static bool nextfb_update(void *opaque)
 {
     NeXTFbState *s = NEXTFB(opaque);
+    bool invalidate = s->invalidate;
     int dest_width = 4;
     int src_width;
     int first = 0;
@@ -113,14 +115,17 @@ static bool nextfb_update(void *opaque)
     if (s->invalidate) {
         framebuffer_update_memory_section(&s->fbsection, &s->fb_mr, 0,
                                           s->cols, src_width);
-        s->invalidate = 0;
     }
 
     framebuffer_update_display(surface, &s->fbsection, s->cols, s->rows,
-                               src_width, dest_width, 0, 1, nextfb_draw_line,
-                               s, &first, &last);
+                               src_width, dest_width, 0, invalidate,
+                               nextfb_draw_line, s, &first, &last);
+    trace_nextfb_update(first, last, invalidate);
 
-    qemu_console_update(s->con, 0, 0, s->cols, s->rows);
+    if (first >= 0) {
+        qemu_console_update(s->con, 0, first, s->cols, last - first + 1);
+    }
+    s->invalidate = 0;
 
     return true;
 }

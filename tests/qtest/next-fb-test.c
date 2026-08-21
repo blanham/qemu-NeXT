@@ -12,6 +12,11 @@
 #define NEXT_MONO_VIDEO_IRQ (1U << 5)
 #define NEXT_DMA_RESET      0x00100000
 #define NEXT_DMA_COMPLETE   0x08000000
+#define NEXT_FB_BASE        0x0b000000
+#define NEXT_FB_WIDTH       1120
+#define NEXT_FB_HEIGHT      832
+#define NEXT_FB_STRIDE      (NEXT_FB_WIDTH / 4 + 8)
+#define NEXT_FB_DIRTY_ROW   400
 #define NEXT_ROM_SIZE       (128 * KiB)
 #define NEXT_RETRACE_NS     (NANOSECONDS_PER_SECOND / 68)
 
@@ -24,6 +29,18 @@ typedef struct TestMigration {
     char *tmpdir;
     char *socket_path;
 } TestMigration;
+
+typedef struct TestRefreshTrace {
+    char *tmpdir;
+    char *trace_path;
+    char *ppm_path;
+} TestRefreshTrace;
+
+typedef struct RefreshEvent {
+    int first;
+    int last;
+    int invalidate;
+} RefreshEvent;
 
 static void cleanup_test_rom(void *opaque)
 {
@@ -72,6 +89,42 @@ static TestMigration *create_test_migration(void)
     return migration;
 }
 
+static void cleanup_refresh_trace(void *opaque)
+{
+    TestRefreshTrace *trace = opaque;
+
+    qtest_remove_abrt_handler(trace);
+    if (trace->trace_path) {
+        g_unlink(trace->trace_path);
+    }
+    if (trace->ppm_path) {
+        g_unlink(trace->ppm_path);
+    }
+    if (trace->tmpdir) {
+        g_rmdir(trace->tmpdir);
+    }
+    g_free(trace->trace_path);
+    g_free(trace->ppm_path);
+    g_free(trace->tmpdir);
+    g_free(trace);
+}
+
+static TestRefreshTrace *create_refresh_trace(void)
+{
+    g_autoptr(GError) error = NULL;
+    TestRefreshTrace *trace = g_new0(TestRefreshTrace, 1);
+
+    qtest_add_abrt_handler(cleanup_refresh_trace, trace);
+    g_test_queue_destroy(cleanup_refresh_trace, trace);
+    trace->tmpdir = g_dir_make_tmp("next-fb-refresh-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(trace->tmpdir);
+    trace->trace_path = g_build_filename(trace->tmpdir, "updates.log", NULL);
+    trace->ppm_path = g_build_filename(trace->tmpdir, "screen.ppm", NULL);
+
+    return trace;
+}
+
 static QTestState *next_fb_start(const char *machine, const char *extra_args)
 {
     TestROM *rom = g_new0(TestROM, 1);
@@ -95,6 +148,42 @@ static QTestState *next_fb_start(const char *machine, const char *extra_args)
 static uint32_t mono_irq_status(QTestState *qts)
 {
     return qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_MONO_VIDEO_IRQ;
+}
+
+static void take_screendump(QTestState *qts, const char *path)
+{
+    qtest_qmp_assert_success(
+        qts,
+        "{ 'execute': 'screendump', 'arguments': { 'filename': %s } }",
+        path);
+}
+
+static GArray *load_refresh_events(const char *path)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *contents = NULL;
+    g_auto(GStrv) lines = NULL;
+    gsize length;
+    GArray *events = g_array_new(false, false, sizeof(RefreshEvent));
+
+    g_assert_true(g_file_get_contents(path, &contents, &length, &error));
+    g_assert_no_error(error);
+    lines = g_strsplit(contents, "\n", -1);
+    for (char **line = lines; *line; line++) {
+        const char *record = strstr(*line, "nextfb_update ");
+        RefreshEvent event;
+
+        if (!record) {
+            continue;
+        }
+        if (sscanf(record,
+                   "nextfb_update first=%d last=%d invalidate=%d",
+                   &event.first, &event.last, &event.invalidate) == 3) {
+            g_array_append_val(events, event);
+        }
+    }
+
+    return events;
 }
 
 static void migrate_wait(QTestState *source, QTestState *destination,
@@ -190,6 +279,56 @@ static void test_retrace_migration(void)
     qtest_quit(destination);
 }
 
+static void test_dirty_row_refresh(void)
+{
+    TestRefreshTrace *trace = create_refresh_trace();
+    g_autofree char *quoted_trace_path = g_shell_quote(trace->trace_path);
+    g_autofree char *args =
+        g_strdup_printf("-trace enable=nextfb_update,file=%s",
+                        quoted_trace_path);
+    QTestState *qts = next_fb_start("next-cube", args);
+    g_autoptr(GArray) events = NULL;
+    bool saw_clean = false;
+    bool saw_partial = false;
+    bool saw_reset_full = false;
+
+    take_screendump(qts, trace->ppm_path);
+    take_screendump(qts, trace->ppm_path);
+    qtest_writeb(qts, NEXT_FB_BASE + NEXT_FB_DIRTY_ROW * NEXT_FB_STRIDE,
+                 0xff);
+    take_screendump(qts, trace->ppm_path);
+    qtest_system_reset(qts);
+    take_screendump(qts, trace->ppm_path);
+    qtest_quit(qts);
+
+    events = load_refresh_events(trace->trace_path);
+    g_assert_cmpuint(events->len, >=, 4);
+    for (guint i = 0; i < events->len; i++) {
+        const RefreshEvent *event = &g_array_index(events, RefreshEvent, i);
+
+        if (!saw_clean && event->invalidate == 0 && event->first == -1) {
+            saw_clean = true;
+            continue;
+        }
+        if (saw_clean && !saw_partial && event->invalidate == 0 &&
+            event->first >= 0 && event->last < NEXT_FB_HEIGHT &&
+            event->first <= NEXT_FB_DIRTY_ROW &&
+            event->last >= NEXT_FB_DIRTY_ROW) {
+            saw_partial = true;
+            continue;
+        }
+        if (saw_partial && event->invalidate == 1 && event->first == 0 &&
+            event->last == NEXT_FB_HEIGHT - 1) {
+            saw_reset_full = true;
+            break;
+        }
+    }
+
+    g_assert_true(saw_clean);
+    g_assert_true(saw_partial);
+    g_assert_true(saw_reset_full);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -198,5 +337,6 @@ int main(int argc, char **argv)
     qtest_add_func("/next-fb/color-has-no-mono-retrace",
                    test_color_has_no_mono_retrace);
     qtest_add_func("/next-fb/retrace-migration", test_retrace_migration);
+    qtest_add_func("/next-fb/dirty-row-refresh", test_dirty_row_refresh);
     return g_test_run();
 }
