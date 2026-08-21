@@ -138,9 +138,36 @@ endif
 
 if have_system
   if have_virtfs
+    plan9p1_local_test_sources = [
+      meson.project_source_root() / 'hw/9pfs/9p-util-generic.c',
+    ]
+    if host_os == 'darwin'
+      plan9p1_local_test_sources += meson.project_source_root() / 'hw/9pfs/9p-util-darwin.c'
+    elif host_os == 'freebsd'
+      plan9p1_local_test_sources += meson.project_source_root() / 'hw/9pfs/9p-util-freebsd.c'
+    elif host_os == 'linux'
+      plan9p1_local_test_sources += meson.project_source_root() / 'hw/9pfs/9p-util-linux.c'
+    endif
     tests += {
       'test-9p-backend': [
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+      ],
+      'test-plan9-9p1-server': [
+        meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
+        testblock,
+      ],
+      'test-plan9-9p1-server-local': [
+        meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/9p-local.c',
+        meson.project_source_root() / 'hw/9pfs/9p-posix-acl.c',
+        meson.project_source_root() / 'hw/9pfs/9p-xattr.c',
+        meson.project_source_root() / 'hw/9pfs/9p-xattr-user.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
+        plan9p1_local_test_sources,
+        testblock,
       ],
     }
   endif

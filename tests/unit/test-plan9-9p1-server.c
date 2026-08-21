@@ -1,0 +1,1428 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#include "qemu/osdep.h"
+
+#include "fsdev/qemu-fsdev.h"
+#include "hw/9pfs/9p.h"
+#include "hw/9pfs/plan9-9p1-codec.h"
+#include "hw/9pfs/plan9-9p1-server.h"
+#include "qapi/error.h"
+#include "qemu/main-loop.h"
+#include "qemu/module.h"
+
+typedef struct TestTransport {
+    GByteArray *output;
+    size_t capacity;
+    size_t max_chunk;
+    bool fail;
+} TestTransport;
+
+typedef struct ServerFixture {
+    FsDriverEntry fse;
+    Plan9P1Server *server;
+    TestTransport transport;
+    char *root;
+    GThread *main_thread;
+    bool track_worker;
+    bool backend_on_main;
+    bool device_exhaustion;
+    bool inode_collision;
+    bool fail_close;
+    bool fail_read;
+    bool literal_stats;
+    unsigned int fail_dir_lstat_after;
+    unsigned int dir_lstat_count;
+    bool variant_dir_inodes;
+    unsigned int backend_calls;
+    unsigned int cleanup_calls;
+    bool gate_read;
+    QemuEvent read_started;
+    QemuEvent read_release;
+} ServerFixture;
+
+static ServerFixture *fixture;
+
+static void note_backend_thread(ServerFixture *f)
+{
+    f->backend_calls++;
+    if (f->track_worker && g_thread_self() == f->main_thread) {
+        f->backend_on_main = true;
+    }
+}
+
+FsDriverEntry *get_fsdev_fsentry(const char *id)
+{
+    if (fixture && !g_strcmp0(id, fixture->fse.fsdev_id)) {
+        return &fixture->fse;
+    }
+    return NULL;
+}
+
+void fsdev_throttle_init(FsThrottle *fst)
+{
+}
+
+void fsdev_throttle_cleanup(FsThrottle *fst)
+{
+}
+
+static int test_init(FsContext *ctx, Error **errp)
+{
+    ctx->private = fixture;
+    return 0;
+}
+
+static void test_cleanup(FsContext *ctx)
+{
+    ServerFixture *f = ctx->private;
+
+    f->cleanup_calls++;
+    ctx->private = NULL;
+}
+
+static int set_path(V9fsPath *path, const char *value)
+{
+    g_free(path->data);
+    path->data = g_strdup(value);
+    path->size = strlen(value) + 1;
+    return 0;
+}
+
+static int test_name_to_path(FsContext *ctx, V9fsPath *dirpath,
+                             const char *name, V9fsPath *path)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *parent = NULL;
+    g_autofree char *joined = NULL;
+
+    note_backend_thread(f);
+    if (!dirpath) {
+        if (strcmp(name, "/") && strcmp(name, ".") && strcmp(name, "..")) {
+            errno = EINVAL;
+            return -1;
+        }
+        return set_path(path, ".");
+    }
+    if (!strcmp(name, ".")) {
+        return set_path(path, dirpath->data);
+    }
+    if (!strcmp(name, "..")) {
+        if (!strcmp(dirpath->data, ".")) {
+            return set_path(path, ".");
+        }
+        parent = g_path_get_dirname(dirpath->data);
+        return set_path(path, parent);
+    }
+    if (!name[0] || strchr(name, '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    joined = !strcmp(dirpath->data, ".") ? g_strdup_printf("./%s", name) :
+        g_strdup_printf("%s/%s", dirpath->data, name);
+    return set_path(path, joined);
+}
+
+static char *host_path(FsContext *ctx, V9fsPath *path)
+{
+    ServerFixture *f = ctx->private;
+
+    g_assert_true(!strcmp(path->data, ".") ||
+                  g_str_has_prefix(path->data, "./"));
+    return !strcmp(path->data, ".") ? g_strdup(f->root) :
+        g_build_filename(f->root, path->data + 2, NULL);
+}
+
+static int test_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *host = host_path(ctx, path);
+    int ret;
+
+    note_backend_thread(f);
+    if (g_str_has_prefix(path->data, "./dir/")) {
+        f->dir_lstat_count++;
+        if (f->fail_dir_lstat_after &&
+            f->dir_lstat_count > f->fail_dir_lstat_after) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    ret = lstat(host, st);
+    if (!ret && f->variant_dir_inodes &&
+        g_str_has_prefix(path->data, "./dir/")) {
+        st->st_ino += UINT64_C(1) << 20;
+    }
+    if (!ret && f->literal_stats) {
+        memset(st, 0, sizeof(*st));
+        st->st_dev = 42;
+        st->st_uid = 42;
+        st->st_gid = 43;
+        if (!strcmp(path->data, ".")) {
+            st->st_ino = 0x100;
+            st->st_mode = S_IFDIR | 0755;
+            st->st_atime = 1000;
+            st->st_mtime = 2000;
+        } else if (!strcmp(path->data, "./68020")) {
+            st->st_ino = 0x101;
+            st->st_mode = S_IFDIR | 0755;
+            st->st_atime = 1001;
+            st->st_mtime = 2001;
+        } else if (!strcmp(path->data, "./68020/init")) {
+            st->st_ino = 0x102;
+            st->st_mode = S_IFREG | 0644;
+            st->st_atime = 1002;
+            st->st_mtime = 2002;
+            st->st_size = 10;
+        }
+    }
+    if (!ret && f->device_exhaustion && strcmp(path->data, ".")) {
+        st->st_dev++;
+    }
+    if (!ret && f->inode_collision && g_str_has_suffix(path->data, "/plain")) {
+        st->st_ino = 7;
+    } else if (!ret && f->inode_collision &&
+               g_str_has_suffix(path->data, "/denied")) {
+        st->st_ino = (UINT64_C(1) << 24) | 7;
+    }
+    return ret;
+}
+
+static int test_open(FsContext *ctx, V9fsPath *path, int flags,
+                     V9fsFidOpenState *fs)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *host = host_path(ctx, path);
+
+    note_backend_thread(f);
+    if (g_str_has_suffix(path->data, "/denied")) {
+        errno = EACCES;
+        return -1;
+    }
+    fs->fd = open(host, flags);
+    return fs->fd;
+}
+
+static int test_close(FsContext *ctx, V9fsFidOpenState *fs)
+{
+    ServerFixture *f = ctx->private;
+
+    note_backend_thread(f);
+    if (f->fail_close) {
+        close(fs->fd);
+        errno = EIO;
+        return -1;
+    }
+    return close(fs->fd);
+}
+
+static int test_opendir(FsContext *ctx, V9fsPath *path,
+                        V9fsFidOpenState *fs)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *host = host_path(ctx, path);
+
+    note_backend_thread(f);
+    fs->dir.stream = opendir(host);
+    return fs->dir.stream ? 0 : -1;
+}
+
+static int test_closedir(FsContext *ctx, V9fsFidOpenState *fs)
+{
+    note_backend_thread(ctx->private);
+    return closedir(fs->dir.stream);
+}
+
+static void test_rewinddir(FsContext *ctx, V9fsFidOpenState *fs)
+{
+    note_backend_thread(ctx->private);
+    rewinddir(fs->dir.stream);
+}
+
+static struct dirent *test_readdir(FsContext *ctx, V9fsFidOpenState *fs)
+{
+    note_backend_thread(ctx->private);
+    return readdir(fs->dir.stream);
+}
+
+static ssize_t test_preadv(FsContext *ctx, V9fsFidOpenState *fs,
+                           const struct iovec *iov, int iovcnt, off_t offset)
+{
+    ServerFixture *f = ctx->private;
+
+    note_backend_thread(f);
+    if (f->gate_read) {
+        qemu_event_set(&f->read_started);
+        qemu_event_wait(&f->read_release);
+    }
+    if (f->fail_read) {
+        errno = EIO;
+        return -1;
+    }
+    return preadv(fs->fd, iov, iovcnt, offset);
+}
+
+static FileOperations test_ops = {
+    .init = test_init,
+    .cleanup = test_cleanup,
+    .name_to_path = test_name_to_path,
+    .lstat = test_lstat,
+    .open = test_open,
+    .close = test_close,
+    .opendir = test_opendir,
+    .closedir = test_closedir,
+    .rewinddir = test_rewinddir,
+    .readdir = test_readdir,
+    .preadv = test_preadv,
+};
+
+static size_t transport_can_send(void *opaque)
+{
+    TestTransport *transport = opaque;
+
+    return transport->capacity;
+}
+
+static int transport_send(const uint8_t *buf, size_t len, void *opaque)
+{
+    TestTransport *transport = opaque;
+    size_t sent;
+
+    if (transport->fail) {
+        return -1;
+    }
+    sent = transport->max_chunk ? MIN(len, transport->max_chunk) : len;
+    g_byte_array_append(transport->output, buf, sent);
+    if (transport->capacity != SIZE_MAX) {
+        transport->capacity -= MIN(transport->capacity, sent);
+    }
+    return sent;
+}
+
+static const Plan9P1TransportOps transport_ops = {
+    .can_send = transport_can_send,
+    .send = transport_send,
+};
+
+static void write_file(const char *path, const void *data, size_t len)
+{
+    GError *err = NULL;
+
+    g_assert_true(g_file_set_contents(path, data, len, &err));
+    g_assert_no_error(err);
+}
+
+static void fixture_setup(ServerFixture *f, gconstpointer opaque)
+{
+    g_autofree char *cpu = NULL;
+    g_autofree char *dir = NULL;
+    g_autofree char *nested = NULL;
+    g_autofree char *path = NULL;
+    g_autofree uint8_t *big = g_malloc0(PLAN9P1_MAX_DATA);
+    GError *gerr = NULL;
+    int fd;
+
+    fixture = f;
+    qemu_event_init(&f->read_started, false);
+    qemu_event_init(&f->read_release, false);
+    f->main_thread = g_thread_self();
+    f->root = g_dir_make_tmp("qemu-9p1-server-XXXXXX", &gerr);
+    g_assert_no_error(gerr);
+    cpu = g_build_filename(f->root, "68020", NULL);
+    dir = g_build_filename(f->root, "dir", NULL);
+    nested = g_build_filename(f->root, "a", NULL);
+    g_assert_cmpint(g_mkdir(cpu, 0700), ==, 0);
+    g_assert_cmpint(g_mkdir(dir, 0700), ==, 0);
+    g_assert_cmpint(g_mkdir(nested, 0700), ==, 0);
+    g_free(nested);
+    nested = g_build_filename(f->root, "a", "b", NULL);
+    g_assert_cmpint(g_mkdir(nested, 0700), ==, 0);
+    path = g_build_filename(cpu, "init", NULL);
+    write_file(path, "boot-init\n", 10);
+    g_free(path);
+    path = g_build_filename(dir, "entry", NULL);
+    write_file(path, "directory-entry\n", 16);
+    g_free(path);
+    path = g_build_filename(dir, "second", NULL);
+    write_file(path, "directory-second\n", 17);
+    g_free(path);
+    path = g_build_filename(f->root, "plain", NULL);
+    write_file(path, "plain-file\n", 11);
+    g_free(path);
+    path = g_build_filename(f->root, "denied", NULL);
+    write_file(path, "denied\n", 7);
+    g_free(path);
+    path = g_build_filename(f->root, "big", NULL);
+    write_file(path, big, PLAN9P1_MAX_DATA);
+    g_free(path);
+    path = g_build_filename(f->root, "large", NULL);
+    fd = open(path, O_CREAT | O_RDWR, 0600);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(ftruncate(fd, (off_t)UINT32_MAX + 123), ==, 0);
+    g_assert_cmpint(close(fd), ==, 0);
+
+    f->fse = (FsDriverEntry) {
+        .fsdev_id = (char *)"testfs",
+        .path = f->root,
+        .ops = &test_ops,
+        .export_flags = V9FS_SM_NONE,
+    };
+    f->transport.output = g_byte_array_new();
+    f->transport.capacity = SIZE_MAX;
+    f->server = plan9p1_server_new("testfs", &transport_ops,
+                                   &f->transport, opaque, &error_abort);
+    f->track_worker = true;
+}
+
+static void pump_server(Plan9P1Server *server)
+{
+    unsigned int iterations = 0;
+
+    while (plan9p1_server_busy(server)) {
+        g_assert_cmpuint(iterations++, <, 10000);
+        aio_poll(qemu_get_aio_context(), true);
+    }
+}
+
+static void fixture_teardown(ServerFixture *f, gconstpointer opaque)
+{
+    g_autofree char *path = NULL;
+
+    if (f->server) {
+        plan9p1_server_free(f->server);
+        f->server = NULL;
+        while (f->cleanup_calls == 0) {
+            aio_poll(qemu_get_aio_context(), true);
+        }
+    }
+    g_byte_array_unref(f->transport.output);
+    path = g_build_filename(f->root, "68020", "init", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "dir", "entry", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "dir", "second", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "plain", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "denied", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "big", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "large", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "68020", NULL);
+    g_assert_cmpint(g_rmdir(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "dir", NULL);
+    g_assert_cmpint(g_rmdir(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "a", "b", NULL);
+    g_assert_cmpint(g_rmdir(path), ==, 0);
+    g_free(path);
+    path = g_build_filename(f->root, "a", NULL);
+    g_assert_cmpint(g_rmdir(path), ==, 0);
+    g_assert_cmpint(g_rmdir(f->root), ==, 0);
+    g_free(f->root);
+    qemu_event_set(&f->read_release);
+    qemu_event_destroy(&f->read_release);
+    qemu_event_destroy(&f->read_started);
+    fixture = NULL;
+}
+
+static void set_name(uint8_t dst[PLAN9P1_NAMELEN], const char *name)
+{
+    memset(dst, 0, PLAN9P1_NAMELEN);
+    memcpy(dst, name, MIN(strlen(name), (size_t)PLAN9P1_NAMELEN));
+}
+
+static void send_call(ServerFixture *f, Plan9P1Fcall *call, bool fragmented)
+{
+    uint8_t wire[PLAN9P1_MAX_FRAME];
+    Error *err = NULL;
+    ssize_t length;
+    size_t i;
+
+    length = plan9p1_encode(wire, sizeof(wire), call, &error_abort);
+    if (fragmented) {
+        for (i = 0; i < length; i++) {
+            g_assert_cmpint(plan9p1_server_receive(f->server, wire + i, 1,
+                                                   &err), ==, 0);
+            g_assert_null(err);
+        }
+    } else {
+        g_assert_cmpint(plan9p1_server_receive(f->server, wire, length, &err),
+                        ==, 0);
+        g_assert_null(err);
+    }
+}
+
+static Plan9P1Fcall take_reply(ServerFixture *f)
+{
+    Plan9P1Fcall reply;
+
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, >, 0);
+    g_assert_cmpint(plan9p1_decode(f->transport.output->data,
+                                  f->transport.output->len,
+                                  &reply, &error_abort), ==, 0);
+    g_byte_array_set_size(f->transport.output, 0);
+    return reply;
+}
+
+static Plan9P1Fcall transact(ServerFixture *f, Plan9P1Fcall *call)
+{
+    send_call(f, call, false);
+    return take_reply(f);
+}
+
+static void attach(ServerFixture *f, uint16_t fid, uint16_t tag)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH,
+        .tag = tag,
+        .fid = fid,
+    };
+    Plan9P1Fcall reply = transact(f, &call);
+
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RATTACH);
+    g_assert_cmpuint(reply.fid, ==, fid);
+}
+
+static Plan9P1Fcall walk(ServerFixture *f, uint16_t fid, uint16_t tag,
+                         const char *name)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TWALK,
+        .tag = tag,
+        .fid = fid,
+    };
+
+    set_name(call.name, name);
+    return transact(f, &call);
+}
+
+static void test_session_reply(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TSESSION,
+        .tag = 0x1234,
+    };
+    uint8_t expected[87] = { PLAN9P1_RSESSION, 0x34, 0x12 };
+
+    send_call(f, &call, true);
+    pump_server(f->server);
+    g_assert_cmpmem(f->transport.output->data, f->transport.output->len,
+                    expected, sizeof(expected));
+    g_assert_false(f->backend_on_main);
+}
+
+static void test_boot_sequence(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TSESSION, .tag = UINT16_MAX };
+    Plan9P1Fcall reply = transact(f, &call);
+
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RSESSION);
+    attach(f, 0, 2);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 3, .fid = 0, .newfid = UINT16_MAX,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCLONE);
+    g_assert_cmpuint(reply.fid, ==, 0);
+    reply = walk(f, UINT16_MAX, 4, "68020");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWALK);
+    reply = walk(f, UINT16_MAX, 5, "init");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 6, .fid = UINT16_MAX,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 7, .fid = UINT16_MAX, .count = 64,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, 10);
+    g_assert_cmpmem(reply.data, reply.count, "boot-init\n", 10);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 8, .fid = UINT16_MAX,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RSTAT);
+    g_assert_cmpuint(reply.dir.length, ==, 10);
+    g_assert_cmpmem(reply.dir.name, 4, "init", 4);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 9, .fid = UINT16_MAX,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCLUNK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TFLUSH, .tag = 10, .oldtag = 7,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RFLUSH);
+    g_assert_false(f->backend_on_main);
+    g_assert_cmpuint(f->backend_calls, >, 10);
+}
+
+static void test_fid_and_path_errors(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    Plan9P1Qid root_qid;
+
+    attach(f, 1, 1);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TATTACH, .tag = 2, .fid = 1,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 3, .fid = 65535,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    reply = walk(f, 1, 4, "missing");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 5, .fid = 1,
+    };
+    root_qid = transact(f, &call).dir.qid;
+    reply = walk(f, 1, 6, "..");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(reply.qid.path, ==, root_qid.path);
+    reply = walk(f, 1, 7, ".");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 8, .fid = 1, .newfid = 65000,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    call.tag = 9;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 2, 10);
+    reply = walk(f, 2, 11, "denied");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 12, .fid = 2,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    g_assert_true(g_str_has_prefix((char *)reply.ename, g_strerror(EACCES)));
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 13, .fid = 1,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+}
+
+static Plan9P1Dir decode_dir_record(const uint8_t *record)
+{
+    uint8_t wire[121] = { PLAN9P1_RSTAT, 1, 0, 0, 0 };
+    Plan9P1Fcall fcall;
+
+    memcpy(wire + 5, record, PLAN9P1_DIRLEN);
+    g_assert_cmpint(plan9p1_decode(wire, sizeof(wire), &fcall, &error_abort),
+                    ==, 0);
+    return fcall.dir;
+}
+
+static void test_clwalk_and_directory(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    Plan9P1Dir dir;
+
+    attach(f, 10, 1);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLWALK, .tag = 2, .fid = 10, .newfid = 11,
+    };
+    set_name(call.name, "dir");
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCLWALK);
+    g_assert_cmpuint(reply.fid, ==, 11);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 11,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 4, .fid = 11,
+        .count = PLAN9P1_DIRLEN,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, PLAN9P1_DIRLEN);
+    dir = decode_dir_record(reply.data);
+    g_assert_cmpmem(dir.name, 5, "entry", 5);
+    call.offset = PLAN9P1_DIRLEN;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, PLAN9P1_DIRLEN);
+    call.offset = 2 * PLAN9P1_DIRLEN;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, 0);
+    call.offset = 1;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    call.offset = 0;
+    call.count = PLAN9P1_DIRLEN + 1;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLWALK, .tag = 5, .fid = 10, .newfid = 12,
+    };
+    set_name(call.name, "missing");
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCLWALK);
+    g_assert_cmpuint(reply.fid, ==, 10);
+    g_assert_cmpuint(reply.qid.path, ==, 0);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 6, .fid = 12,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+}
+
+static void test_backpressure(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TSESSION, .tag = 1 };
+    size_t previous;
+
+    f->transport.capacity = 0;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+    f->transport.capacity = 10;
+    plan9p1_server_can_send(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 10);
+    previous = f->transport.output->len;
+    f->transport.max_chunk = 3;
+    while (f->transport.output->len < 87) {
+        f->transport.capacity = 20;
+        plan9p1_server_can_send(f->server);
+        g_assert_cmpuint(f->transport.output->len, >, previous);
+        previous = f->transport.output->len;
+    }
+    g_assert_cmpuint(f->transport.output->len, ==, 87);
+}
+
+typedef struct ReplyCollector {
+    GPtrArray *calls;
+} ReplyCollector;
+
+static int collect_reply(const uint8_t *frame, size_t len,
+                         void *opaque, Error **errp)
+{
+    ReplyCollector *collector = opaque;
+    Plan9P1Fcall *call = g_new(Plan9P1Fcall, 1);
+
+    if (plan9p1_decode(frame, len, call, errp) < 0) {
+        g_free(call);
+        return -1;
+    }
+    g_ptr_array_add(collector->calls, call);
+    return 0;
+}
+
+static void test_coalesced_order(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall session = { .type = PLAN9P1_TSESSION, .tag = 1 };
+    Plan9P1Fcall attach_call = {
+        .type = PLAN9P1_TATTACH, .tag = 2, .fid = 42,
+    };
+    uint8_t wire[200];
+    ssize_t first;
+    ssize_t second;
+    Plan9P1Stream stream;
+    ReplyCollector collector = {
+        .calls = g_ptr_array_new_with_free_func(g_free),
+    };
+
+    first = plan9p1_encode(wire, sizeof(wire), &session, &error_abort);
+    second = plan9p1_encode(wire + first, sizeof(wire) - first,
+                            &attach_call, &error_abort);
+    g_assert_cmpint(plan9p1_server_receive(f->server, wire, first + second,
+                                           &error_abort), ==, 0);
+    pump_server(f->server);
+    plan9p1_stream_init(&stream);
+    g_assert_cmpint(plan9p1_stream_feed(&stream, f->transport.output->data,
+                                        f->transport.output->len,
+                                        collect_reply, &collector,
+                                        &error_abort), ==, 0);
+    g_assert_cmpuint(collector.calls->len, ==, 2);
+    g_assert_cmpuint(((Plan9P1Fcall *)collector.calls->pdata[0])->type,
+                     ==, PLAN9P1_RSESSION);
+    g_assert_cmpuint(((Plan9P1Fcall *)collector.calls->pdata[1])->type,
+                     ==, PLAN9P1_RATTACH);
+    g_ptr_array_unref(collector.calls);
+}
+
+static void test_reset_while_queued(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH, .tag = 1, .fid = 4,
+    };
+
+    send_call(f, &call, false);
+    g_assert_true(plan9p1_server_busy(f->server));
+    plan9p1_server_reset(f->server);
+    pump_server(f->server);
+    g_byte_array_set_size(f->transport.output, 0);
+    attach(f, 4, 2);
+}
+
+static void test_session_reconnect(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall session = {
+        .type = PLAN9P1_TSESSION, .tag = UINT16_MAX,
+    };
+
+    attach(f, 4, 1);
+    g_assert_cmpuint(transact(f, &session).type, ==, PLAN9P1_RSESSION);
+    attach(f, 4, 2);
+}
+
+static void test_clunk_error_invalidates(ServerFixture *f,
+                                         gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 30, 1);
+    g_assert_cmpuint(walk(f, 30, 2, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 30,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    f->fail_close = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 4, .fid = 30,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    f->fail_close = false;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 5, .fid = 30,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+}
+
+static void test_free_while_queued(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH, .tag = 1, .fid = 4,
+    };
+    unsigned int iterations = 0;
+
+    send_call(f, &call, false);
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    g_assert_cmpuint(f->cleanup_calls, ==, 0);
+    while (!f->cleanup_calls) {
+        g_assert_cmpuint(iterations++, <, 10000);
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    g_assert_cmpuint(f->cleanup_calls, ==, 1);
+}
+
+static void test_qid_guards(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall reply;
+
+    f->device_exhaustion = true;
+    attach(f, 1, 1);
+    reply = walk(f, 1, 2, "plain");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+}
+
+static void test_qid_collision(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    f->inode_collision = true;
+    attach(f, 1, 1);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 2, .fid = 1, .newfid = 2,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    g_assert_cmpuint(walk(f, 1, 3, "plain").type, ==, PLAN9P1_RWALK);
+    reply = walk(f, 2, 4, "denied");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+}
+
+static void test_transport_failure(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TSESSION, .tag = 1 };
+    uint8_t byte = PLAN9P1_TNOP;
+    Error *err = NULL;
+
+    f->transport.fail = true;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+    g_assert_cmpint(plan9p1_server_receive(f->server, &byte, 1, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_flush_cancels_unsent(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall attach_call = {
+        .type = PLAN9P1_TATTACH, .tag = 11, .fid = 1,
+    };
+    Plan9P1Fcall flush = {
+        .type = PLAN9P1_TFLUSH, .tag = 12, .oldtag = 11,
+    };
+    Plan9P1Fcall reply;
+
+    f->transport.capacity = 0;
+    send_call(f, &attach_call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+    send_call(f, &flush, false);
+    pump_server(f->server);
+    f->transport.capacity = SIZE_MAX;
+    plan9p1_server_can_send(f->server);
+    reply = take_reply(f);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RFLUSH);
+    g_assert_cmpuint(reply.tag, ==, 12);
+}
+
+static void test_constructor_validation(ServerFixture *f,
+                                        gconstpointer opaque)
+{
+    Plan9P1ServerOptions too_many = { .max_devices = 128 };
+    Plan9P1TransportOps incomplete = { .can_send = transport_can_send };
+    Plan9P1Server *server;
+    Error *err = NULL;
+
+    server = plan9p1_server_new("missing", &transport_ops, &f->transport,
+                                NULL, &err);
+    g_assert_null(server);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    server = plan9p1_server_new("testfs", &transport_ops, &f->transport,
+                                &too_many, &err);
+    g_assert_null(server);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    server = plan9p1_server_new("testfs", &incomplete, &f->transport,
+                                NULL, &err);
+    g_assert_null(server);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_short_receive(ServerFixture *f, gconstpointer opaque)
+{
+    Error *err = NULL;
+
+    g_assert_cmpint(plan9p1_server_receive(f->server, NULL, 1, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_malformed_and_fatal(ServerFixture *f, gconstpointer opaque)
+{
+    uint8_t oversized[15] = {
+        PLAN9P1_TREAD, 1, 0, 1, 0,
+        [13] = 1, [14] = 32,
+    };
+    uint8_t unknown = 0xff;
+    Error *err = NULL;
+    Plan9P1Fcall reply;
+
+    g_assert_cmpint(plan9p1_server_receive(f->server, oversized,
+                                           sizeof(oversized), &err), ==, 0);
+    g_assert_null(err);
+    reply = take_reply(f);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(reply.tag, ==, 1);
+    g_assert_cmpint(plan9p1_server_receive(f->server, &unknown, 1, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_maximum_read(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 20, 1);
+    g_assert_cmpuint(walk(f, 20, 2, "big").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 20,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 4, .fid = 20,
+        .count = PLAN9P1_MAX_DATA,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, PLAN9P1_MAX_DATA);
+}
+
+static void test_read_error(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 21, 1);
+    g_assert_cmpuint(walk(f, 21, 2, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 21,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    f->fail_read = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 4, .fid = 21, .count = 1,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    g_assert_true(g_str_has_prefix((char *)reply.ename, g_strerror(EIO)));
+}
+
+static void test_stat_large_file(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 22, 1);
+    g_assert_cmpuint(walk(f, 22, 2, "large").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 3, .fid = 22,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RSTAT);
+    g_assert_cmpuint(reply.dir.length, ==, 122);
+}
+
+static void test_walk_parent_stat_name(ServerFixture *f,
+                                       gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 23, 1);
+    g_assert_cmpuint(walk(f, 23, 2, "a").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 23, 3, "b").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 23, 4, "..").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 23, 5, ".").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 6, .fid = 23,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RSTAT);
+    g_assert_cmpmem(reply.dir.name, 1, "a", 1);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 7, .fid = 23, .newfid = 24,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    g_assert_cmpuint(walk(f, 24, 8, "..").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 9, .fid = 24,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpmem(reply.dir.name, 1, "/", 1);
+    call.fid = 23;
+    call.tag = 10;
+    reply = transact(f, &call);
+    g_assert_cmpmem(reply.dir.name, 1, "a", 1);
+}
+
+static void test_directory_cache_retry(ServerFixture *f,
+                                       gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 25, 1);
+    g_assert_cmpuint(walk(f, 25, 2, "dir").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 25,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+
+    f->fail_dir_lstat_after = 1;
+    f->variant_dir_inodes = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 4, .fid = 25,
+        .count = 2 * PLAN9P1_DIRLEN,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+
+    f->fail_dir_lstat_after = 0;
+    f->variant_dir_inodes = false;
+    f->dir_lstat_count = 0;
+    call.tag = 5;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, 2 * PLAN9P1_DIRLEN);
+}
+
+static void open_directory(ServerFixture *f, uint16_t fid, uint16_t tag)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TOPEN, .tag = tag, .fid = fid,
+    };
+
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+}
+
+static void test_directory_cache_bound(ServerFixture *f,
+                                       gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 30, 1);
+    g_assert_cmpuint(walk(f, 30, 2, "dir").type, ==, PLAN9P1_RWALK);
+    open_directory(f, 30, 3);
+    attach(f, 31, 4);
+    g_assert_cmpuint(walk(f, 31, 5, "dir").type, ==, PLAN9P1_RWALK);
+    open_directory(f, 31, 6);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 7, .fid = 30,
+        .count = 2 * PLAN9P1_DIRLEN,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, 2 * PLAN9P1_DIRLEN);
+    call.tag = 8;
+    call.fid = 31;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 9, .fid = 30,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 10, .fid = 31,
+        .count = 2 * PLAN9P1_DIRLEN,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, 2 * PLAN9P1_DIRLEN);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSESSION, .tag = 11,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSESSION);
+    attach(f, 32, 12);
+    g_assert_cmpuint(walk(f, 32, 13, "dir").type, ==, PLAN9P1_RWALK);
+    open_directory(f, 32, 14);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 15, .fid = 32,
+        .count = 2 * PLAN9P1_DIRLEN,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREAD);
+
+    plan9p1_server_reset(f->server);
+    pump_server(f->server);
+    g_byte_array_set_size(f->transport.output, 0);
+    attach(f, 33, 16);
+    g_assert_cmpuint(walk(f, 33, 17, "dir").type, ==, PLAN9P1_RWALK);
+    open_directory(f, 33, 18);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 19, .fid = 33,
+        .count = 2 * PLAN9P1_DIRLEN,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREAD);
+}
+
+static void test_qid_entry_bound(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    f->inode_collision = true;
+    attach(f, 32, 1);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 2, .fid = 32, .newfid = 33,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    g_assert_cmpuint(walk(f, 32, 3, "plain").type, ==, PLAN9P1_RWALK);
+    reply = walk(f, 33, 4, "denied");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 5, .fid = 32,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    reply = walk(f, 33, 6, "denied");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+    reply = walk(f, 33, 7, "big");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RERROR);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSESSION, .tag = 8,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSESSION);
+    attach(f, 34, 9);
+    reply = walk(f, 34, 10, "denied");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWALK);
+}
+
+static void literal_exchange(ServerFixture *f,
+                             const uint8_t *request, size_t request_len,
+                             const uint8_t *expected, size_t expected_len)
+{
+    g_assert_cmpint(plan9p1_server_receive(f->server, request, request_len,
+                                           &error_abort), ==, 0);
+    pump_server(f->server);
+    g_assert_cmpmem(f->transport.output->data, f->transport.output->len,
+                    expected, expected_len);
+    g_byte_array_set_size(f->transport.output, 0);
+}
+
+static void test_literal_boot_wire(ServerFixture *f, gconstpointer opaque)
+{
+    static const uint8_t tsession[11] = {
+        [0] = 84, [1] = 0xff, [2] = 0xff,
+    };
+    static const uint8_t rsession[87] = {
+        [0] = 85, [1] = 0xff, [2] = 0xff,
+    };
+    static const uint8_t tattach[146] = {
+        [0] = 86, [1] = 1, [3] = 1,
+    };
+    static const uint8_t rattach[26] = {
+        [0] = 87, [1] = 1, [3] = 1,
+        [5] = 0x00, [6] = 0x01, [7] = 0x00, [8] = 0x81,
+        [9] = 0xd0, [10] = 0x07,
+    };
+    static const uint8_t tclone[7] = {
+        [0] = 60, [1] = 2, [3] = 1, [5] = 2,
+    };
+    static const uint8_t rclone[5] = {
+        [0] = 61, [1] = 2, [3] = 1,
+    };
+    static const uint8_t twalk_cpu[33] = {
+        [0] = 62, [1] = 3, [3] = 2,
+        [5] = '6', [6] = '8', [7] = '0', [8] = '2', [9] = '0',
+    };
+    static const uint8_t rwalk_cpu[13] = {
+        [0] = 63, [1] = 3, [3] = 2,
+        [5] = 0x01, [6] = 0x01, [7] = 0x00, [8] = 0x81,
+        [9] = 0xd1, [10] = 0x07,
+    };
+    static const uint8_t twalk_init[33] = {
+        [0] = 62, [1] = 4, [3] = 2,
+        [5] = 'i', [6] = 'n', [7] = 'i', [8] = 't',
+    };
+    static const uint8_t rwalk_init[13] = {
+        [0] = 63, [1] = 4, [3] = 2,
+        [5] = 0x02, [6] = 0x01, [7] = 0x00, [8] = 0x01,
+        [9] = 0xd2, [10] = 0x07,
+    };
+    static const uint8_t topen[6] = {
+        [0] = 64, [1] = 5, [3] = 2,
+    };
+    static const uint8_t ropen[13] = {
+        [0] = 65, [1] = 5, [3] = 2,
+        [5] = 0x02, [6] = 0x01, [7] = 0x00, [8] = 0x01,
+        [9] = 0xd2, [10] = 0x07,
+    };
+    static const uint8_t tread[15] = {
+        [0] = 68, [1] = 6, [3] = 2, [13] = 16,
+    };
+    static const uint8_t rread[18] = {
+        [0] = 69, [1] = 6, [3] = 2, [5] = 10,
+        [8] = 'b', [9] = 'o', [10] = 'o', [11] = 't', [12] = '-',
+        [13] = 'i', [14] = 'n', [15] = 'i', [16] = 't', [17] = '\n',
+    };
+    static const uint8_t tstat[5] = {
+        [0] = 76, [1] = 7, [3] = 2,
+    };
+    static const uint8_t rstat[121] = {
+        [0] = 77, [1] = 7, [3] = 2,
+        [5] = 'i', [6] = 'n', [7] = 'i', [8] = 't',
+        [33] = '4', [34] = '2', [61] = '4', [62] = '3',
+        [89] = 0x02, [90] = 0x01, [91] = 0x00, [92] = 0x01,
+        [93] = 0xd2, [94] = 0x07,
+        [97] = 0xa4, [98] = 0x01,
+        [101] = 0xea, [102] = 0x03,
+        [105] = 0xd2, [106] = 0x07,
+        [109] = 10, [119] = 1,
+    };
+    static const uint8_t tclwalk[35] = {
+        [0] = 80, [1] = 8, [3] = 1, [5] = 3,
+        [7] = '6', [8] = '8', [9] = '0', [10] = '2', [11] = '0',
+    };
+    static const uint8_t rclwalk[13] = {
+        [0] = 81, [1] = 8, [3] = 3,
+        [5] = 0x01, [6] = 0x01, [7] = 0x00, [8] = 0x81,
+        [9] = 0xd1, [10] = 0x07,
+    };
+    static const uint8_t tclunk[5] = {
+        [0] = 72, [1] = 9, [3] = 2,
+    };
+    static const uint8_t rclunk[5] = {
+        [0] = 73, [1] = 9, [3] = 2,
+    };
+    static const uint8_t tflush[5] = {
+        [0] = 56, [1] = 10, [3] = 6,
+    };
+    static const uint8_t rflush[3] = {
+        [0] = 57, [1] = 10,
+    };
+
+    f->literal_stats = true;
+    literal_exchange(f, tsession, sizeof(tsession),
+                     rsession, sizeof(rsession));
+    literal_exchange(f, tattach, sizeof(tattach), rattach, sizeof(rattach));
+    literal_exchange(f, tclone, sizeof(tclone), rclone, sizeof(rclone));
+    literal_exchange(f, twalk_cpu, sizeof(twalk_cpu),
+                     rwalk_cpu, sizeof(rwalk_cpu));
+    literal_exchange(f, twalk_init, sizeof(twalk_init),
+                     rwalk_init, sizeof(rwalk_init));
+    literal_exchange(f, topen, sizeof(topen), ropen, sizeof(ropen));
+    literal_exchange(f, tread, sizeof(tread), rread, sizeof(rread));
+    literal_exchange(f, tstat, sizeof(tstat), rstat, sizeof(rstat));
+    literal_exchange(f, tclwalk, sizeof(tclwalk),
+                     rclwalk, sizeof(rclwalk));
+    literal_exchange(f, tclunk, sizeof(tclunk), rclunk, sizeof(rclunk));
+    literal_exchange(f, tflush, sizeof(tflush), rflush, sizeof(rflush));
+}
+
+static void test_flush_active_and_queued(ServerFixture *f,
+                                         gconstpointer opaque)
+{
+    static const uint8_t tnop_old[] = { 50, 40, 0 };
+    static const uint8_t tread_old[15] = {
+        [0] = 68, [1] = 40, [3] = 40, [13] = 1,
+    };
+    static const uint8_t tstat_old[] = { 76, 40, 0, 40, 0 };
+    static const uint8_t tnop_after[] = { 50, 42, 0 };
+    static const uint8_t tflush[] = { 56, 41, 0, 40, 0 };
+    static const uint8_t expected[] = { 57, 41, 0, 51, 42, 0 };
+    Plan9P1Fcall call;
+
+    attach(f, 40, 1);
+    g_assert_cmpuint(walk(f, 40, 2, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 40,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+
+    f->transport.capacity = 0;
+    g_assert_cmpint(plan9p1_server_receive(f->server, tnop_old,
+                                           sizeof(tnop_old),
+                                           &error_abort), ==, 0);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+
+    f->gate_read = true;
+    g_assert_cmpint(plan9p1_server_receive(f->server, tread_old,
+                                           sizeof(tread_old),
+                                           &error_abort), ==, 0);
+    aio_poll(qemu_get_aio_context(), false);
+    qemu_event_wait(&f->read_started);
+    g_assert_cmpint(plan9p1_server_receive(f->server, tstat_old,
+                                           sizeof(tstat_old),
+                                           &error_abort), ==, 0);
+    g_assert_cmpint(plan9p1_server_receive(f->server, tnop_after,
+                                           sizeof(tnop_after),
+                                           &error_abort), ==, 0);
+    g_assert_cmpint(plan9p1_server_receive(f->server, tflush,
+                                           sizeof(tflush),
+                                           &error_abort), ==, 0);
+    f->transport.capacity = SIZE_MAX;
+    plan9p1_server_can_send(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+
+    qemu_event_set(&f->read_release);
+    pump_server(f->server);
+    g_assert_cmpmem(f->transport.output->data, f->transport.output->len,
+                    expected, sizeof(expected));
+    g_byte_array_set_size(f->transport.output, 0);
+    plan9p1_server_can_send(f->server);
+    aio_poll(qemu_get_aio_context(), false);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+}
+
+int main(int argc, char **argv)
+{
+    Plan9P1ServerOptions one_device = { .max_devices = 1 };
+    Plan9P1ServerOptions dir_bound = {
+        .max_dir_cache_bytes = 2 * PLAN9P1_DIRLEN,
+    };
+    Plan9P1ServerOptions qid_bound = { .max_qid_entries = 2 };
+    Plan9P1ServerOptions cache_retry_qids = { .max_qid_entries = 4 };
+
+    g_test_init(&argc, &argv, NULL);
+    module_call_init(MODULE_INIT_QOM);
+    qemu_init_main_loop(&error_abort);
+    g_test_add("/plan9-9p1-server/session", ServerFixture, NULL,
+               fixture_setup, test_session_reply, fixture_teardown);
+    g_test_add("/plan9-9p1-server/boot-sequence", ServerFixture, NULL,
+               fixture_setup, test_boot_sequence, fixture_teardown);
+    g_test_add("/plan9-9p1-server/fid-path-errors", ServerFixture, NULL,
+               fixture_setup, test_fid_and_path_errors, fixture_teardown);
+    g_test_add("/plan9-9p1-server/clwalk-directory", ServerFixture, NULL,
+               fixture_setup, test_clwalk_and_directory, fixture_teardown);
+    g_test_add("/plan9-9p1-server/backpressure", ServerFixture, NULL,
+               fixture_setup, test_backpressure, fixture_teardown);
+    g_test_add("/plan9-9p1-server/coalesced-order", ServerFixture, NULL,
+               fixture_setup, test_coalesced_order, fixture_teardown);
+    g_test_add("/plan9-9p1-server/reset-queued", ServerFixture, NULL,
+               fixture_setup, test_reset_while_queued, fixture_teardown);
+    g_test_add("/plan9-9p1-server/session-reconnect", ServerFixture, NULL,
+               fixture_setup, test_session_reconnect, fixture_teardown);
+    g_test_add("/plan9-9p1-server/clunk-error", ServerFixture, NULL,
+               fixture_setup, test_clunk_error_invalidates, fixture_teardown);
+    g_test_add("/plan9-9p1-server/free-queued", ServerFixture, NULL,
+               fixture_setup, test_free_while_queued, fixture_teardown);
+    g_test_add("/plan9-9p1-server/qid-guards", ServerFixture, &one_device,
+               fixture_setup, test_qid_guards, fixture_teardown);
+    g_test_add("/plan9-9p1-server/qid-collision", ServerFixture, NULL,
+               fixture_setup, test_qid_collision, fixture_teardown);
+    g_test_add("/plan9-9p1-server/transport-failure", ServerFixture, NULL,
+               fixture_setup, test_transport_failure, fixture_teardown);
+    g_test_add("/plan9-9p1-server/flush-cancels-unsent", ServerFixture, NULL,
+               fixture_setup, test_flush_cancels_unsent, fixture_teardown);
+    g_test_add("/plan9-9p1-server/constructor-validation", ServerFixture,
+               NULL, fixture_setup, test_constructor_validation,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/short-receive", ServerFixture, NULL,
+               fixture_setup, test_short_receive, fixture_teardown);
+    g_test_add("/plan9-9p1-server/malformed-fatal", ServerFixture, NULL,
+               fixture_setup, test_malformed_and_fatal, fixture_teardown);
+    g_test_add("/plan9-9p1-server/maximum-read", ServerFixture, NULL,
+               fixture_setup, test_maximum_read, fixture_teardown);
+    g_test_add("/plan9-9p1-server/read-error", ServerFixture, NULL,
+               fixture_setup, test_read_error, fixture_teardown);
+    g_test_add("/plan9-9p1-server/stat-large-file", ServerFixture, NULL,
+               fixture_setup, test_stat_large_file, fixture_teardown);
+    g_test_add("/plan9-9p1-server/walk-parent-stat-name", ServerFixture,
+               NULL, fixture_setup, test_walk_parent_stat_name,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/directory-cache-retry", ServerFixture,
+               &cache_retry_qids, fixture_setup, test_directory_cache_retry,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/directory-cache-bound", ServerFixture,
+               &dir_bound, fixture_setup, test_directory_cache_bound,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/qid-entry-bound", ServerFixture,
+               &qid_bound, fixture_setup, test_qid_entry_bound,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/literal-boot-wire", ServerFixture, NULL,
+               fixture_setup, test_literal_boot_wire, fixture_teardown);
+    g_test_add("/plan9-9p1-server/flush-active-queued", ServerFixture, NULL,
+               fixture_setup, test_flush_active_and_queued,
+               fixture_teardown);
+    return g_test_run();
+}
