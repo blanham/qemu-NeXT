@@ -84,7 +84,8 @@ QMP=/tmp/next-plan9.qmp
 
 The frequency override compensates for the historical kernel loading `0xffff`
 while configuring `HZ` as 68. It affects the system timer only; the event
-counter remains at its hardware rate.
+counter remains at its hardware rate. Use the same override on both ends of a
+migration; the frequency is machine configuration, not migrated guest state.
 
 At the ROM prompt enter `ben() 68020/9nextstation`. At the root source prompt
 enter `tcp`, then accept `none` at the Plan 9 `user[none]:` prompt. This archive

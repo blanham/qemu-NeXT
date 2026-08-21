@@ -404,11 +404,17 @@ static void test_scr2_soft_interrupts(void)
     qtest_quit(qts);
 }
 
-static void test_migration_pending_irq_and_active_timer(void)
+static void run_migration_pending_irq_and_active_timer(const char *extra_args,
+                                                       uint32_t frequency)
 {
     const int64_t timer_b_ticks = 1000;
     const int64_t elapsed_b_ticks = 400;
-    const int64_t remaining_b_ticks = timer_b_ticks - elapsed_b_ticks;
+    const int64_t first_tick_ns = timer_ticks_to_ns(1, frequency);
+    const int64_t elapsed_b_ns = timer_ticks_to_ns(elapsed_b_ticks,
+                                                   frequency);
+    const int64_t remaining_b_ns = timer_ticks_to_ns(timer_b_ticks,
+                                                     frequency) -
+                                   elapsed_b_ns;
     g_autoptr(GError) error = NULL;
     g_autofree char *tmpdir = NULL;
     g_autofree char *socket_path = NULL;
@@ -425,10 +431,11 @@ static void test_migration_pending_irq_and_active_timer(void)
     socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
     uri = g_strdup_printf("unix:%s", socket_path);
     quoted_uri = g_shell_quote(uri);
-    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+    incoming_args = g_strdup_printf("-incoming %s %s", quoted_uri,
+                                    extra_args ?: "");
 
     destination = next_cube_timer_start_with_args(incoming_args);
-    source = next_cube_timer_start();
+    source = next_cube_timer_start_with_args(extra_args);
 
     /*
      * The fixed next-kbd device has no VMState yet.  It is unrelated to
@@ -438,14 +445,14 @@ static void test_migration_pending_irq_and_active_timer(void)
     unrealize_next_kbd(destination);
 
     arm_timer(source, 1);
-    qtest_clock_step(source, NEXT_TIMER_TICK_NS);
+    qtest_clock_step(source, first_tick_ns);
     g_assert_cmphex(timer_status(source), ==, NEXT_INTR_TIMER);
 
     write_timer_latch(source, timer_b_ticks);
     qtest_writeb(source, NEXT_TIMER_CSR,
                  NEXT_TIMER_ENABLE | NEXT_TIMER_UPDATE);
     source_clock =
-        qtest_clock_step(source, elapsed_b_ticks * NEXT_TIMER_TICK_NS);
+        qtest_clock_step(source, elapsed_b_ns);
     g_assert_cmphex(timer_status(source), ==, NEXT_INTR_TIMER);
 
     qtest_qmp_assert_success(
@@ -465,8 +472,7 @@ static void test_migration_pending_irq_and_active_timer(void)
                     NEXT_TIMER_ENABLE);
     g_assert_cmphex(timer_status(destination), ==, 0);
 
-    qtest_clock_step(destination,
-                     remaining_b_ticks * NEXT_TIMER_TICK_NS - 1);
+    qtest_clock_step(destination, remaining_b_ns - 1);
     g_assert_cmphex(read_timer_count(destination), ==, 1);
     g_assert_cmphex(timer_status(destination), ==, 0);
     qtest_clock_step(destination, 1);
@@ -479,6 +485,18 @@ static void test_migration_pending_irq_and_active_timer(void)
     qtest_quit(destination);
     g_unlink(socket_path);
     g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_migration_pending_irq_and_active_timer(void)
+{
+    run_migration_pending_irq_and_active_timer(NULL, 1000000);
+}
+
+static void test_migration_frequency_override(void)
+{
+    run_migration_pending_irq_and_active_timer(
+        "-global next-pc.system-timer-frequency=4456448",
+        NEXT_PLAN9_TIMER_FREQUENCY);
 }
 
 int main(int argc, char **argv)
@@ -503,5 +521,7 @@ int main(int argc, char **argv)
                    test_scr2_soft_interrupts);
     qtest_add_func("/next-cube/timer/migration-pending-irq-and-active-timer",
                    test_migration_pending_irq_and_active_timer);
+    qtest_add_func("/next-cube/timer/migration-frequency-override",
+                   test_migration_frequency_override);
     return g_test_run();
 }
