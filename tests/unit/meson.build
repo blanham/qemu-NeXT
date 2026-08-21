@@ -134,6 +134,14 @@ if have_system and config_all_devices.has_key('CONFIG_NEXTCUBE')
 endif
 
 if have_system
+  if slirp.found()
+    tests += {
+      'test-slirp-guestfwd': [
+        meson.project_source_root() / 'net/slirp-guestfwd.c',
+      ],
+    }
+  endif
+
   tests += {
     'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
     'test-iov': [],

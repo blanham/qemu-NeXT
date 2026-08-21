@@ -25,6 +25,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "net/slirp.h"
+#include "net/slirp-guestfwd.h"
+#include "net/slirp-guestfwd-internal.h"
 
 
 #if defined(CONFIG_SMBD_COMMAND)
@@ -93,6 +95,11 @@ typedef struct SlirpState {
     Slirp *slirp;
     Notifier poll_notifier;
     Notifier exit_notifier;
+    struct in_addr vnetwork;
+    struct in_addr vnetmask;
+    struct in_addr vhost;
+    struct in_addr vnameserver;
+    QemuSlirpGuestFwdRegistry *guestfwds;
 #if defined(CONFIG_SMBD_COMMAND)
     gchar *smb_dir;
 #endif
@@ -105,6 +112,7 @@ static QTAILQ_HEAD(, SlirpState) slirp_stacks =
 
 static int slirp_hostfwd(SlirpState *s, const char *redir_str, Error **errp);
 static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp);
+static const QemuSlirpGuestFwdBackendOps slirp_guestfwd_backend_ops;
 
 #if defined(CONFIG_SMBD_COMMAND)
 static int slirp_smb(SlirpState *s, const char *exported_dir,
@@ -136,6 +144,7 @@ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t 
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
     slirp_input(s->slirp, buf, size);
+    qemu_slirp_guestfwd_registry_flush_deferred(s->guestfwds);
 
     return size;
 }
@@ -158,9 +167,12 @@ static void net_slirp_cleanup(NetClientState *nc)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
+    qemu_slirp_guestfwd_registry_invalidate(s->guestfwds);
+
     g_slist_free_full(s->fwd, slirp_free_fwd);
     main_loop_poll_remove_notifier(&s->poll_notifier);
     unregister_savevm(NULL, "slirp", s->slirp);
+    qemu_slirp_guestfwd_registry_free(s->guestfwds);
     slirp_cleanup(s->slirp);
     if (s->exit_notifier.notify) {
         qemu_remove_exit_notifier(&s->exit_notifier);
@@ -383,6 +395,8 @@ static void net_slirp_poll_notify(Notifier *notifier, void *data)
     case MAIN_LOOP_POLL_ERR:
         slirp_pollfds_poll(s->slirp, poll->state == MAIN_LOOP_POLL_ERR,
                            net_slirp_get_revents, poll->pollfds);
+        qemu_slirp_guestfwd_registry_flush_deferred(s->guestfwds);
+        qemu_slirp_guestfwd_registry_notify(s->guestfwds);
         break;
     default:
         g_assert_not_reached();
@@ -641,6 +655,10 @@ static int net_slirp_init(NetClientState *peer, const char *model,
                       restricted ? "on" : "off");
 
     s = DO_UPCAST(SlirpState, nc, nc);
+    s->vnetwork = net;
+    s->vnetmask = mask;
+    s->vhost = host;
+    s->vnameserver = dns;
 
     cfg.version =
          SLIRP_CHECK_VERSION(4, 9, 0) ? 6 :
@@ -664,6 +682,8 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
+    s->guestfwds = qemu_slirp_guestfwd_registry_new(
+        net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
 
     /*
@@ -717,7 +737,7 @@ static SlirpState *slirp_lookup(Monitor *mon, const char *id)
             monitor_printf(mon, "unrecognized netdev id '%s'\n", id);
             return NULL;
         }
-        if (strcmp(nc->model, "user")) {
+        if (nc->info->type != NET_CLIENT_DRIVER_USER) {
             monitor_printf(mon, "invalid device specified\n");
             return NULL;
         }
@@ -1198,6 +1218,112 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp)
  fail_syntax:
     error_setg(errp, "Invalid guest forwarding rule '%s'", config_str);
     return -1;
+}
+
+static int slirp_guestfwd_backend_add(void *opaque,
+                                      QemuSlirpGuestFwdIncoming incoming,
+                                      void *incoming_opaque,
+                                      struct in_addr addr, uint16_t port)
+{
+    SlirpState *s = opaque;
+    return slirp_add_guestfwd(s->slirp, incoming, incoming_opaque, &addr, port);
+}
+
+static int slirp_guestfwd_backend_remove(void *opaque, struct in_addr addr,
+                                         uint16_t port)
+{
+    SlirpState *s = opaque;
+    return slirp_remove_guestfwd(s->slirp, addr, port);
+}
+
+static size_t slirp_guestfwd_backend_can_send(void *opaque,
+                                              struct in_addr addr,
+                                              uint16_t port)
+{
+    SlirpState *s = opaque;
+    return slirp_socket_can_recv(s->slirp, addr, port);
+}
+
+static int slirp_guestfwd_backend_send(void *opaque, struct in_addr addr,
+                                       uint16_t port, const uint8_t *buf,
+                                       size_t len)
+{
+    SlirpState *s = opaque;
+    slirp_socket_recv(s->slirp, addr, port, buf, len);
+    return len;
+}
+
+static bool slirp_guestfwd_backend_plan9(void *opaque,
+                                         const QemuSlirpPlan9BootpConfig *cfg)
+{
+    SlirpPlan9BootpConfig slirp_cfg;
+    SlirpState *s = opaque;
+
+    if (!cfg) {
+        return slirp_set_plan9_bootp(s->slirp, NULL);
+    }
+    slirp_cfg.netmask = cfg->netmask;
+    slirp_cfg.file_server = cfg->file_server;
+    slirp_cfg.auth_server = cfg->auth_server;
+    slirp_cfg.gateway = cfg->gateway;
+    return slirp_set_plan9_bootp(s->slirp, &slirp_cfg);
+}
+
+static const QemuSlirpGuestFwdBackendOps slirp_guestfwd_backend_ops = {
+    .add = slirp_guestfwd_backend_add,
+    .remove = slirp_guestfwd_backend_remove,
+    .can_send = slirp_guestfwd_backend_can_send,
+    .send = slirp_guestfwd_backend_send,
+    .set_plan9_bootp = slirp_guestfwd_backend_plan9,
+};
+
+int qemu_slirp_guestfwd_add(const char *netdev_id,
+                            struct in_addr guest_addr, uint16_t guest_port,
+                            const QemuSlirpGuestFwdOps *ops, void *opaque,
+                            QemuSlirpGuestFwd **handle, Error **errp)
+{
+    NetClientState *nc;
+    SlirpState *s;
+
+    if (handle) {
+        *handle = NULL;
+    }
+    if (!netdev_id || !(nc = qemu_find_netdev(netdev_id))) {
+        error_setg(errp, "Unrecognized netdev id '%s'", netdev_id ?: "");
+        return -1;
+    }
+    if (nc->info->type != NET_CLIENT_DRIVER_USER) {
+        error_setg(errp, "Netdev '%s' is not a user-mode network stack",
+                   netdev_id);
+        return -1;
+    }
+    s = DO_UPCAST(SlirpState, nc, nc);
+    return qemu_slirp_guestfwd_registry_add(s->guestfwds, guest_addr,
+                                            guest_port, ops, opaque, handle,
+                                            errp);
+}
+
+size_t qemu_slirp_guestfwd_can_send(QemuSlirpGuestFwd *handle)
+{
+    return qemu_slirp_guestfwd_registry_can_send(handle);
+}
+
+int qemu_slirp_guestfwd_send(QemuSlirpGuestFwd *handle, const uint8_t *buf,
+                             size_t len)
+{
+    return qemu_slirp_guestfwd_registry_send(handle, buf, len);
+}
+
+bool qemu_slirp_guestfwd_set_plan9_bootp(
+    QemuSlirpGuestFwd *handle, const QemuSlirpPlan9BootpConfig *config,
+    Error **errp)
+{
+    return qemu_slirp_guestfwd_registry_set_plan9_bootp(handle, config, errp);
+}
+
+void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle)
+{
+    qemu_slirp_guestfwd_registry_remove(handle);
 }
 
 void hmp_info_usernet(Monitor *mon, const QDict *qdict)

@@ -1,6 +1,6 @@
 [wrap-git]
 url = https://github.com/blanham/libslirp.git
-revision = 248600520cafba0e3704c353924de4def9cb7c6f
+revision = 0454d236f6386eade10946145ffdf3bd7e28d409
 
 [provide]
 slirp = libslirp_dep
