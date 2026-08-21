@@ -38,6 +38,13 @@ void fsdev_throttle_cleanup(FsThrottle *fst)
 {
 }
 
+void coroutine_fn fsdev_co_throttle_request(FsThrottle *fst,
+                                             ThrottleDirection direction,
+                                             struct iovec *iov, int iovcnt)
+{
+    g_assert_cmpint(direction, ==, THROTTLE_READ);
+}
+
 int fsdev_throttle_parse_opts(QemuOpts *opts, FsThrottle *fst, Error **errp)
 {
     return 0;
@@ -103,7 +110,11 @@ static void setup(LocalFixture *f, gconstpointer opaque)
     g_autofree char *dir = NULL;
     g_autofree char *file = NULL;
     g_autofree char *link = NULL;
+    g_autofree char *sparse = NULL;
     GError *err = NULL;
+    static const char marker[] = "beyond-2g";
+    off_t sparse_offset = (off_t)INT32_MAX + 4096;
+    int fd;
 
     fixture = f;
     f->root = g_dir_make_tmp("qemu-9p1-local-XXXXXX", &err);
@@ -116,6 +127,12 @@ static void setup(LocalFixture *f, gconstpointer opaque)
     write_file(file, "local-backend\n");
     link = g_build_filename(f->root, "escape", NULL);
     g_assert_cmpint(symlink(f->outside, link), ==, 0);
+    sparse = g_build_filename(f->root, "sparse", NULL);
+    fd = open(sparse, O_CREAT | O_RDWR, 0600);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(pwrite(fd, marker, sizeof(marker) - 1, sparse_offset),
+                    ==, sizeof(marker) - 1);
+    g_assert_cmpint(close(fd), ==, 0);
 
     f->fse = (FsDriverEntry) {
         .fsdev_id = (char *)"localfs",
@@ -219,6 +236,20 @@ static void test_local_backend(LocalFixture *f, gconstpointer opaque)
         .type = PLAN9P1_TOPEN, .tag = 9, .fid = 3,
     };
     g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 4);
+    g_assert_cmpuint(walk(f, 4, 10, "sparse").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 11, .fid = 4,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 12, .fid = 4,
+        .offset = (uint64_t)INT32_MAX + 4096, .count = 9,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpmem(reply.data, reply.count, "beyond-2g", 9);
 }
 
 static void teardown(LocalFixture *f, gconstpointer opaque)
@@ -226,6 +257,7 @@ static void teardown(LocalFixture *f, gconstpointer opaque)
     g_autofree char *dir = g_build_filename(f->root, "a", NULL);
     g_autofree char *file = g_build_filename(dir, "file", NULL);
     g_autofree char *link = g_build_filename(f->root, "escape", NULL);
+    g_autofree char *sparse = g_build_filename(f->root, "sparse", NULL);
 
     plan9p1_server_reset(f->server);
     pump(f->server);
@@ -234,6 +266,7 @@ static void teardown(LocalFixture *f, gconstpointer opaque)
     g_byte_array_unref(f->output);
     g_assert_cmpint(g_remove(file), ==, 0);
     g_assert_cmpint(g_remove(link), ==, 0);
+    g_assert_cmpint(g_remove(sparse), ==, 0);
     g_assert_cmpint(g_rmdir(dir), ==, 0);
     g_assert_cmpint(g_rmdir(f->root), ==, 0);
     g_assert_cmpint(g_remove(f->outside), ==, 0);

@@ -60,6 +60,11 @@ typedef struct Plan9P1ServerOptions {
  * frames and queues input; it never enters a coroutine on the caller's stack.
  * The object embeds and owns the initialized V9fsBackend, and backend workers
  * hold QOM references until their main-context completion path retires.
+ * Transport callbacks may reenter receive(), reset(), can_send(), or free();
+ * destructive state changes are deferred until the callback returns.
+ * A fatal protocol or transport failure invalidates only the current session;
+ * a replacement connection must begin with Tsession before sending other
+ * requests.
  */
 
 Plan9P1Server *plan9p1_server_new(const char *fsdev_id,
@@ -88,7 +93,9 @@ bool plan9p1_server_busy(const Plan9P1Server *server);
 
 /*
  * Consumes the caller's QOM reference.  Each queued worker holds its own QOM
- * reference, so this is safe while backend work is pending.
+ * reference, so this is safe while backend work is pending.  A transport
+ * callback may consume the caller reference this way; no later API use through
+ * that caller-owned pointer is valid.
  */
 void plan9p1_server_free(Plan9P1Server *server);
 

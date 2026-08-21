@@ -38,6 +38,7 @@
 
 #include "hw/9pfs/9p.h"
 #include "hw/9pfs/plan9-9p1-codec.h"
+#include "fsdev/qemu-fsdev-throttle.h"
 #include "block/thread-pool.h"
 #include "qapi/error.h"
 #include "qemu/aio.h"
@@ -74,6 +75,7 @@ typedef struct Plan9P1QidIdentity {
     dev_t dev;
     ino_t ino;
     size_t refs;
+    uint8_t device;
     bool committed;
 } Plan9P1QidIdentity;
 
@@ -101,6 +103,11 @@ typedef struct Plan9P1Reply {
     uint16_t tag;
 } Plan9P1Reply;
 
+typedef struct Plan9P1DeferredInput {
+    uint8_t *data;
+    size_t len;
+} Plan9P1DeferredInput;
+
 typedef enum Plan9P1BackendOp {
     PLAN9P1_BACKEND_NAME_TO_PATH,
     PLAN9P1_BACKEND_LSTAT,
@@ -124,7 +131,7 @@ typedef struct Plan9P1BackendWork {
     struct iovec *iov;
     int iovcnt;
     int flags;
-    int64_t offset;
+    off_t offset;
     char dirent_name[NAME_MAX + 1];
     bool eof;
 } Plan9P1BackendWork;
@@ -140,9 +147,12 @@ struct Plan9P1Server {
     GHashTable *qid_paths;
     dev_t devices[128];
     bool device_used[128];
+    bool device_committed[128];
+    size_t device_identities[128];
     unsigned int max_devices;
     GQueue requests;
     GQueue replies;
+    GQueue deferred_inputs;
     Plan9P1Request *active;
     size_t queued_bytes;
     size_t max_queued_bytes;
@@ -150,15 +160,26 @@ struct Plan9P1Server {
     size_t max_dir_cache_bytes;
     size_t max_qid_entries;
     unsigned int pending;
+    unsigned int callback_depth;
+    size_t deferred_input_bytes;
     bool started;
     bool resetting;
     bool closing;
+    bool connection_failed;
+    bool deferred_reset;
+    bool deferred_close;
+    bool deferred_connection_failure;
     bool flushing;
 };
 
 static void server_kick(Plan9P1Server *server);
 static void server_flush(Plan9P1Server *server);
 static void server_start_cleanup(Plan9P1Server *server);
+static void server_apply_deferred(Plan9P1Server *server);
+static void server_transport_failed(Plan9P1Server *server);
+static int server_receive_internal(Plan9P1Server *server,
+                                   const uint8_t *buf, size_t len,
+                                   Error **errp);
 static void path_init(V9fsPath *path);
 static void path_free(V9fsPath *path);
 static void path_copy(V9fsPath *dst, const V9fsPath *src);
@@ -318,7 +339,7 @@ static int coroutine_fn co_opendir(Plan9P1Server *server, V9fsPath *path,
 static int coroutine_fn co_preadv(Plan9P1Server *server,
                                   V9fsFidOpenState *fs,
                                   struct iovec *iov, int iovcnt,
-                                  int64_t offset)
+                                  off_t offset)
 {
     V9fsFidOpenState candidate = *fs;
     Plan9P1BackendWork work = {
@@ -438,6 +459,12 @@ static void reply_free(Plan9P1Reply *reply)
     g_free(reply);
 }
 
+static void deferred_input_free(Plan9P1DeferredInput *input)
+{
+    g_free(input->data);
+    g_free(input);
+}
+
 static void plan9p1_server_instance_finalize(Object *obj)
 {
     Plan9P1Server *server = PLAN9P1_SERVER(obj);
@@ -446,6 +473,7 @@ static void plan9p1_server_instance_finalize(Object *obj)
     assert(!server->active);
     assert(g_queue_is_empty(&server->requests));
     assert(g_queue_is_empty(&server->replies));
+    assert(g_queue_is_empty(&server->deferred_inputs));
     assert(g_hash_table_size(server->fids) == 0);
     g_hash_table_unref(server->fids);
     g_hash_table_unref(server->qid_paths);
@@ -549,9 +577,11 @@ static int qid_from_stat(Plan9P1Server *server, const struct stat *st,
         identity->dev = st->st_dev;
         identity->ino = st->st_ino;
         identity->refs = 0;
+        identity->device = device;
         identity->committed = false;
         g_hash_table_insert(server->qid_paths, GUINT_TO_POINTER(path),
                             identity);
+        server->device_identities[device]++;
     }
     identity->refs++;
     qid->path = path;
@@ -575,6 +605,7 @@ static void qid_commit(Plan9P1Server *server, uint32_t path)
 
     assert(identity);
     identity->committed = true;
+    server->device_committed[identity->device] = true;
 }
 
 static void qid_release(Plan9P1Server *server, uint32_t path)
@@ -589,7 +620,16 @@ static void qid_release(Plan9P1Server *server, uint32_t path)
     assert(identity && identity->refs);
     identity->refs--;
     if (!identity->refs && !identity->committed) {
+        unsigned int device = identity->device;
+
+        assert(server->device_identities[device]);
+        server->device_identities[device]--;
         g_hash_table_remove(server->qid_paths, GUINT_TO_POINTER(path));
+        if (!server->device_identities[device] &&
+            !server->device_committed[device]) {
+            server->device_used[device] = false;
+            server->devices[device] = 0;
+        }
     }
 }
 
@@ -624,6 +664,8 @@ static int fill_dir(Plan9P1Server *server, const char *name,
 static void reset_qids(Plan9P1Server *server)
 {
     memset(server->device_used, 0, sizeof(server->device_used));
+    memset(server->device_committed, 0, sizeof(server->device_committed));
+    memset(server->device_identities, 0, sizeof(server->device_identities));
     memset(server->devices, 0, sizeof(server->devices));
     g_hash_table_remove_all(server->qid_paths);
 }
@@ -877,7 +919,7 @@ static int coroutine_fn open_fid(Plan9P1Request *request,
 static int append_dir_record(Plan9P1Server *server, Plan9P1Fid *fid,
                              GByteArray *cache, GArray *qids,
                              const char *name,
-                             const struct stat *st)
+                             const struct stat *st, size_t allowance)
 {
     Plan9P1Fcall stat_reply = {
         .type = PLAN9P1_RSTAT,
@@ -888,6 +930,10 @@ static int append_dir_record(Plan9P1Server *server, Plan9P1Fid *fid,
     ssize_t length;
     int ret;
 
+    if (cache->len > allowance ||
+        PLAN9P1_DIRLEN > allowance - cache->len) {
+        return -ENOSPC;
+    }
     ret = fill_dir(server, name, st, &stat_reply.dir);
     if (ret < 0) {
         return ret;
@@ -908,7 +954,8 @@ static int append_dir_record(Plan9P1Server *server, Plan9P1Fid *fid,
 }
 
 static int coroutine_fn build_dir_cache(Plan9P1Server *server,
-                                        Plan9P1Fid *fid)
+                                        Plan9P1Fid *fid,
+                                        Plan9P1Request *request)
 {
     char name[NAME_MAX + 1];
     V9fsPath path;
@@ -916,25 +963,44 @@ static int coroutine_fn build_dir_cache(Plan9P1Server *server,
     GArray *candidate_qids = g_array_new(false, false, sizeof(uint32_t));
     struct stat st;
     unsigned int i;
+    size_t allowance = server->max_dir_cache_bytes -
+                       server->dir_cache_bytes;
     int ret = 0;
 
     co_rewinddir(server, &fid->fs);
     for (;;) {
+        if (request->cancelled) {
+            ret = -EINTR;
+            break;
+        }
         ret = co_readdir(server, &fid->fs, name);
+        if (request->cancelled) {
+            ret = -EINTR;
+            break;
+        }
         if (ret <= 0) {
             break;
         }
         if (!strcmp(name, ".") || !strcmp(name, "..")) {
             continue;
         }
+        if (candidate->len > allowance ||
+            PLAN9P1_DIRLEN > allowance - candidate->len) {
+            ret = -ENOSPC;
+            break;
+        }
         path_init(&path);
         ret = co_name_to_path(server, &fid->path, name, &path);
-        if (ret >= 0) {
+        if (ret >= 0 && request->cancelled) {
+            ret = -EINTR;
+        } else if (ret >= 0) {
             ret = stat_path(server, &path, &st);
         }
-        if (ret >= 0) {
+        if (ret >= 0 && request->cancelled) {
+            ret = -EINTR;
+        } else if (ret >= 0) {
             ret = append_dir_record(server, fid, candidate, candidate_qids,
-                                    name, &st);
+                                    name, &st, allowance);
         }
         path_free(&path);
         if (ret < 0) {
@@ -942,20 +1008,15 @@ static int coroutine_fn build_dir_cache(Plan9P1Server *server,
         }
     }
     if (ret == 0) {
-        if (candidate->len > server->max_dir_cache_bytes -
-            server->dir_cache_bytes) {
-            ret = -ENOSPC;
-        } else {
-            server->dir_cache_bytes += candidate->len;
-            fid->dir_cache = candidate;
-            fid->dir_qids = candidate_qids;
-            for (i = 0; i < candidate_qids->len; i++) {
-                qid_commit(server,
-                           g_array_index(candidate_qids, uint32_t, i));
-            }
-            candidate = NULL;
-            candidate_qids = NULL;
+        server->dir_cache_bytes += candidate->len;
+        fid->dir_cache = candidate;
+        fid->dir_qids = candidate_qids;
+        for (i = 0; i < candidate_qids->len; i++) {
+            qid_commit(server,
+                       g_array_index(candidate_qids, uint32_t, i));
         }
+        candidate = NULL;
+        candidate_qids = NULL;
     }
     if (candidate) {
         g_byte_array_unref(candidate);
@@ -993,7 +1054,7 @@ static int coroutine_fn read_fid(Plan9P1Request *request,
             return -EINVAL;
         }
         if (!fid->dir_cache) {
-            ret = build_dir_cache(server, fid);
+            ret = build_dir_cache(server, fid, request);
             if (ret < 0) {
                 return ret;
             }
@@ -1009,7 +1070,9 @@ static int coroutine_fn read_fid(Plan9P1Request *request,
         return 0;
     }
 
-    if (request->tx.offset > INT32_MAX) {
+    if (request->tx.offset > INT64_MAX ||
+        request->tx.offset > INT64_MAX - request->tx.count ||
+        (uint64_t)(off_t)request->tx.offset != request->tx.offset) {
         return -EOVERFLOW;
     }
     request->data = g_malloc(request->tx.count ? request->tx.count : 1);
@@ -1018,11 +1081,21 @@ static int coroutine_fn read_fid(Plan9P1Request *request,
             .iov_base = request->data,
             .iov_len = request->tx.count,
         };
-        ssize_t ret = co_preadv(server, &fid->fs, &iov, 1,
-                               request->tx.offset);
+        ssize_t ret;
+
+        fsdev_co_throttle_request(server->backend->ctx.fst, THROTTLE_READ,
+                                  &iov, 1);
+        if (request->cancelled) {
+            return -EINTR;
+        }
+        ret = co_preadv(server, &fid->fs, &iov, 1,
+                        (off_t)request->tx.offset);
 
         if (ret < 0) {
             return ret;
+        }
+        if ((uint64_t)ret > request->tx.count) {
+            return -EIO;
         }
         count = ret;
     } else {
@@ -1197,9 +1270,7 @@ static void queue_reply(Plan9P1Server *server, const uint8_t *data, size_t len,
     Plan9P1Reply *reply;
 
     if (len > server->max_queued_bytes - server->queued_bytes) {
-        server->closing = true;
-        clear_requests(server);
-        clear_replies(server);
+        server_transport_failed(server);
         return;
     }
     reply = g_new0(Plan9P1Reply, 1);
@@ -1221,6 +1292,7 @@ static void request_complete(Plan9P1Request *request)
     if (cleanup) {
         server->resetting = false;
     } else if (!server->closing && !server->resetting &&
+               !server->connection_failed &&
                !request->cancelled && request->reply_len) {
         queue_reply(server, request->reply, request->reply_len,
                     request->tx.tag);
@@ -1233,7 +1305,7 @@ static void request_complete(Plan9P1Request *request)
     } else if (server->resetting) {
         reset_qids(server);
         server->resetting = false;
-    } else if (!server->closing) {
+    } else if (!server->closing && !server->connection_failed) {
         server_flush(server);
         server_kick(server);
     }
@@ -1277,7 +1349,8 @@ static void server_kick(Plan9P1Server *server)
 {
     Plan9P1Request *request;
 
-    if (server->active || server->closing || server->resetting) {
+    if (server->active || server->closing || server->resetting ||
+        server->connection_failed) {
         return;
     }
     request = g_queue_pop_head(&server->requests);
@@ -1288,42 +1361,135 @@ static void server_kick(Plan9P1Server *server)
     start_request(server, request);
 }
 
-static void server_transport_failed(Plan9P1Server *server)
+static void clear_deferred_inputs(Plan9P1Server *server)
 {
-    server->closing = true;
+    Plan9P1DeferredInput *input;
+
+    while ((input = g_queue_pop_head(&server->deferred_inputs))) {
+        server->deferred_input_bytes -= input->len;
+        deferred_input_free(input);
+    }
+}
+
+static void server_discard_session(Plan9P1Server *server)
+{
     plan9p1_stream_reset(&server->stream);
     clear_requests(server);
     clear_replies(server);
+    server->resetting = true;
     if (server->active) {
         server->active->cancelled = true;
     } else if (g_hash_table_size(server->fids)) {
         server_start_cleanup(server);
+    } else {
+        reset_qids(server);
+        server->resetting = false;
+    }
+}
+
+static void server_transport_failed(Plan9P1Server *server)
+{
+    server->connection_failed = true;
+    if (server->callback_depth) {
+        server->deferred_connection_failure = true;
+        return;
+    }
+    clear_deferred_inputs(server);
+    server_discard_session(server);
+}
+
+static bool server_has_deferred(const Plan9P1Server *server)
+{
+    return server->deferred_close || server->deferred_reset ||
+           server->deferred_connection_failure ||
+           server->deferred_inputs.length != 0;
+}
+
+static void server_apply_deferred(Plan9P1Server *server)
+{
+    Plan9P1DeferredInput *input;
+
+    assert(server->callback_depth == 0);
+    if (server->deferred_close) {
+        server->deferred_close = false;
+        clear_deferred_inputs(server);
+        server_discard_session(server);
+        return;
+    }
+    if (server->deferred_connection_failure) {
+        server->deferred_connection_failure = false;
+        clear_deferred_inputs(server);
+        server_discard_session(server);
+        return;
+    }
+    if (server->deferred_reset) {
+        server->deferred_reset = false;
+        clear_deferred_inputs(server);
+        server->connection_failed = false;
+        server_discard_session(server);
+        return;
+    }
+    while ((input = g_queue_pop_head(&server->deferred_inputs))) {
+        Error *local_err = NULL;
+        int ret;
+
+        server->deferred_input_bytes -= input->len;
+        ret = server_receive_internal(server, input->data, input->len,
+                                      &local_err);
+        deferred_input_free(input);
+        if (ret < 0) {
+            error_free(local_err);
+            break;
+        }
     }
 }
 
 static void server_flush(Plan9P1Server *server)
 {
-    if (server->flushing || server->closing) {
+    if (server->flushing || server->closing || server->connection_failed) {
         return;
     }
+    owner_ref(server);
     server->flushing = true;
     while (!g_queue_is_empty(&server->replies)) {
         Plan9P1Reply *reply = g_queue_peek_head(&server->replies);
         size_t remaining = reply->len - reply->delivered;
-        size_t capacity = server->transport_ops.can_send(
-            server->transport_opaque);
-        size_t amount = MIN(remaining, capacity);
+        size_t capacity;
+        size_t amount;
         int sent;
 
+        owner_ref(server);
+        server->callback_depth++;
+        capacity = server->transport_ops.can_send(server->transport_opaque);
+        server->callback_depth--;
+        owner_unref(server);
+        if (server_has_deferred(server)) {
+            server_apply_deferred(server);
+            break;
+        }
+        if (g_queue_peek_head(&server->replies) != reply) {
+            break;
+        }
+        amount = MIN(remaining, capacity);
         if (!amount) {
             break;
         }
+        owner_ref(server);
+        server->callback_depth++;
         sent = server->transport_ops.send(reply->data + reply->delivered,
                                           amount, server->transport_opaque);
+        server->callback_depth--;
+        owner_unref(server);
+        if (server_has_deferred(server)) {
+            server_apply_deferred(server);
+            break;
+        }
+        if (g_queue_peek_head(&server->replies) != reply) {
+            break;
+        }
         if (sent < 0 || (size_t)sent > amount) {
-            server->flushing = false;
             server_transport_failed(server);
-            return;
+            break;
         }
         if (!sent) {
             break;
@@ -1339,6 +1505,7 @@ static void server_flush(Plan9P1Server *server)
         }
     }
     server->flushing = false;
+    owner_unref(server);
 }
 
 static bool request_type(uint8_t type)
@@ -1429,6 +1596,7 @@ static int enqueue_frame(const uint8_t *frame, size_t length,
     if (request->tx.type == PLAN9P1_TFLUSH) {
         cancel_tag(server, request->tx.oldtag);
     } else if (request->tx.type == PLAN9P1_TSESSION) {
+        server->connection_failed = false;
         clear_requests(server);
         clear_replies(server);
         if (server->active) {
@@ -1456,6 +1624,7 @@ static void plan9p1_server_instance_init(Object *obj)
                                               NULL, qid_identity_free);
     g_queue_init(&server->requests);
     g_queue_init(&server->replies);
+    g_queue_init(&server->deferred_inputs);
     server->max_devices = 127;
     server->max_queued_bytes = PLAN9P1_DEFAULT_QUEUE_BYTES;
     server->max_dir_cache_bytes = PLAN9P1_DEFAULT_DIR_CACHE_BYTES;
@@ -1535,28 +1704,17 @@ Plan9P1Server *plan9p1_server_new(const char *fsdev_id,
     return server;
 }
 
-int plan9p1_server_receive(Plan9P1Server *server,
-                           const uint8_t *buf, size_t len,
-                           Error **errp)
+static int server_receive_internal(Plan9P1Server *server,
+                                   const uint8_t *buf, size_t len,
+                                   Error **errp)
 {
     Error *local_err = NULL;
     uint16_t tag;
     int ret;
 
-    if (!server) {
-        error_setg(errp, "9P1 server is NULL");
-        return -1;
-    }
-    if (!server->started) {
-        error_setg(errp, "9P1 server transport is not started");
-        return -1;
-    }
-    if (server->closing) {
-        error_setg(errp, "9P1 transport is closed");
-        return -1;
-    }
-    if (server->resetting) {
-        error_setg(errp, "9P1 server reset is in progress");
+    if (server->connection_failed && server->stream.used == 0 &&
+        (!len || !buf || buf[0] != PLAN9P1_TSESSION)) {
+        error_setg(errp, "9P1 reconnect must begin with Tsession");
         return -1;
     }
     ret = plan9p1_stream_feed(&server->stream, buf, len, enqueue_frame,
@@ -1588,11 +1746,59 @@ int plan9p1_server_receive(Plan9P1Server *server,
     return -1;
 }
 
+int plan9p1_server_receive(Plan9P1Server *server,
+                           const uint8_t *buf, size_t len,
+                           Error **errp)
+{
+    Plan9P1DeferredInput *input;
+    int ret;
+
+    if (!server) {
+        error_setg(errp, "9P1 server is NULL");
+        return -1;
+    }
+    owner_ref(server);
+    if (!server->started) {
+        error_setg(errp, "9P1 server transport is not started");
+        ret = -1;
+    } else if (server->closing) {
+        error_setg(errp, "9P1 transport is closed");
+        ret = -1;
+    } else if (server->resetting) {
+        error_setg(errp, "9P1 server reset is in progress");
+        ret = -1;
+    } else if (server->callback_depth) {
+        if ((!buf && len) ||
+            server->deferred_input_bytes >
+                server->max_queued_bytes - server->queued_bytes ||
+            len > server->max_queued_bytes - server->queued_bytes -
+                  server->deferred_input_bytes) {
+            error_setg(errp, "9P1 deferred input queue is full");
+            ret = -1;
+        } else {
+            input = g_new0(Plan9P1DeferredInput, 1);
+            input->data = g_memdup2(buf, len);
+            input->len = len;
+            server->deferred_input_bytes += len;
+            g_queue_push_tail(&server->deferred_inputs, input);
+            ret = 0;
+        }
+    } else {
+        ret = server_receive_internal(server, buf, len, errp);
+    }
+    owner_unref(server);
+    return ret;
+}
+
 void plan9p1_server_can_send(Plan9P1Server *server)
 {
     if (server) {
+        owner_ref(server);
         server_flush(server);
-        server_kick(server);
+        if (!server->closing && !server->connection_failed) {
+            server_kick(server);
+        }
+        owner_unref(server);
     }
 }
 
@@ -1601,6 +1807,12 @@ void plan9p1_server_reset(Plan9P1Server *server)
     if (!server || server->closing) {
         return;
     }
+    if (server->callback_depth) {
+        server->resetting = true;
+        server->deferred_reset = true;
+        return;
+    }
+    server->connection_failed = false;
     server->resetting = true;
     plan9p1_stream_reset(&server->stream);
     clear_requests(server);
@@ -1627,6 +1839,11 @@ void plan9p1_server_free(Plan9P1Server *server)
     }
     if (!server->closing) {
         server->closing = true;
+        if (server->callback_depth) {
+            server->deferred_close = true;
+            object_unref(OBJECT(server));
+            return;
+        }
         plan9p1_stream_reset(&server->stream);
         clear_requests(server);
         clear_replies(server);
