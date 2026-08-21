@@ -433,11 +433,15 @@ git commit -m "9pfs: serve Plan 9 9P1 read operations"
 
 - [ ] **Step 1: Add a failing writable lifecycle**
 
-Exercise `Tcreate`, `Twrite`, `Twstat`, `Tremove`, and their responses in one sequence: create a file, write across two offsets, stat it, truncate/rename/mode-update through wstat, reopen/read it, remove it, and prove the host export reflects the result. Add directory creation, invalid open modes, attempts to mutate the root, remove-open-fid cleanup, read-only export rejection, offset/count overflow, short writes, and error-string truncation to 64 bytes.
+Exercise `Tcreate`, `Twrite`, `Twstat`, `Tremove`, and their responses in one sequence: create a file, write across two offsets, stat it, rename/change gid/mode/mtime through wstat, reopen with `OTRUNC`, read it, remove it, and prove the host export reflects the result. Add regular and directory creation, all four legacy access modes, `ORCLOSE`, append-only files, invalid open modes, attempts to mutate the root, remove-open-fid cleanup, read-only export rejection, offset/count overflow, short writes, and error-string truncation to 64 bytes.
+
+Second Edition `Twstat` carries a complete 116-byte `Dir`; it does not use modern 9P sentinel values. Only name, gid, mode, and mtime are mutable. A changed uid is rejected, while qid, atime, length, type, and dev are not mutation requests. Prove specifically that changing `Twstat.length` does not truncate. Truncation belongs to `Topen|OTRUNC`.
 
 - [ ] **Step 2: Implement create/write/wstat/remove**
 
-Translate old open bits to host flags explicitly. Use backend operations (`open2`, `pwritev`, `rename`, `chmod`/`chown`, `truncate`, `unlinkat`/`remove`) rather than direct host syscalls. Preserve old-protocol semantics: successful remove clunks the fid, stat length encodes a 32-bit value plus four zero bytes, and reply fid fields echo the request where the protocol requires them.
+Translate `OREAD`, `OWRITE`, `ORDWR`, `OEXEC`, `OTRUNC`, `OCEXEC`, and `ORCLOSE` explicitly. Use backend operations (`open`, `open2`, `mkdir`, `pwritev`, `renameat`, `chmod`, `chown` for gid only, `utimensat`, and `unlinkat`/`remove`) rather than direct host syscalls. Treat `CHDIR` and `CHAPPEND` as legacy mode bits; reject unsupported exclusive/lock semantics rather than silently discarding them. Append-only writes ignore the supplied offset and `OTRUNC` does not truncate append-only files.
+
+Preserve old-protocol lifecycle rules: create changes the directory fid into the new opened object; `Tremove` and `Tclunk` invalidate the fid even when removal or close returns `Rerror`; `ORCLOSE` removal also runs during session/reset/free cleanup; stat length remains a 32-bit value plus four zero bytes; and reply fid fields echo the request where required. Rename commits must keep cloned and descendant fid paths coherent.
 
 - [ ] **Step 3: Run server and codec suites under sanitizers where available**
 
