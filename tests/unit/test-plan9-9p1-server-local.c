@@ -12,6 +12,9 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 
+#define PLAN9P1_ORDWR 2
+#define PLAN9P1_OTRUNC 0x10
+
 typedef struct LocalFixture {
     FsDriverEntry fse;
     Plan9P1Server *server;
@@ -42,7 +45,7 @@ void coroutine_fn fsdev_co_throttle_request(FsThrottle *fst,
                                              ThrottleDirection direction,
                                              struct iovec *iov, int iovcnt)
 {
-    g_assert_cmpint(direction, ==, THROTTLE_READ);
+    g_assert_true(direction == THROTTLE_READ || direction == THROTTLE_WRITE);
 }
 
 int fsdev_throttle_parse_opts(QemuOpts *opts, FsThrottle *fst, Error **errp)
@@ -138,7 +141,7 @@ static void setup(LocalFixture *f, gconstpointer opaque)
         .fsdev_id = (char *)"localfs",
         .path = f->root,
         .ops = &local_ops,
-        .export_flags = V9FS_SM_NONE | V9FS_RDONLY,
+        .export_flags = V9FS_SM_NONE,
         .max_xattr = V9FS_MAX_XATTR_DEFAULT,
     };
     f->output = g_byte_array_new();
@@ -252,6 +255,92 @@ static void test_local_backend(LocalFixture *f, gconstpointer opaque)
     g_assert_cmpmem(reply.data, reply.count, "beyond-2g", 9);
 }
 
+static void test_local_writable_lifecycle(LocalFixture *f,
+                                          gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    g_autofree char *created = g_build_filename(f->root, "created", NULL);
+    g_autofree char *renamed = g_build_filename(f->root, "renamed", NULL);
+    g_autofree char *contents = NULL;
+    gsize length;
+
+    attach(f, 20);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCREATE, .tag = 2, .fid = 20,
+        .mode = PLAN9P1_ORDWR, .perm = 0666,
+    };
+    set_name(call.name, "created");
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCREATE);
+    g_assert_cmpuint(reply.fid, ==, 20);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 3, .fid = 20,
+        .offset = 0, .count = 3, .data = (const uint8_t *)"abc",
+    };
+    g_assert_cmpuint(transact(f, &call).count, ==, 3);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 4, .fid = 20,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.dir.length, ==, 3);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 5, .fid = 20, .dir = reply.dir,
+    };
+    set_name(call.dir.name, "renamed");
+    call.dir.mode = 0600;
+    call.dir.mtime = 123456;
+    call.dir.length = UINT32_MAX;
+    call.dir.qid.path = UINT32_MAX;
+    call.dir.atime = UINT32_MAX;
+    call.dir.type = UINT16_MAX;
+    call.dir.dev = UINT16_MAX;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+    g_assert_false(g_file_test(created, G_FILE_TEST_EXISTS));
+    g_assert_true(g_file_get_contents(renamed, &contents, &length, NULL));
+    g_assert_cmpuint(length, ==, 3);
+    g_assert_cmpmem(contents, length, "abc", 3);
+    g_clear_pointer(&contents, g_free);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 6, .fid = 20,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+
+    attach(f, 20);
+    g_assert_cmpuint(walk(f, 20, 7, "renamed").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 8, .fid = 20,
+        .mode = PLAN9P1_ORDWR | PLAN9P1_OTRUNC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 9, .fid = 20,
+        .count = 4, .data = (const uint8_t *)"done",
+    };
+    g_assert_cmpuint(transact(f, &call).count, ==, 4);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 10, .fid = 20,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    attach(f, 20);
+    g_assert_cmpuint(walk(f, 20, 11, "renamed").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 12, .fid = 20,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 13, .fid = 20, .count = 8,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.count, ==, 4);
+    g_assert_cmpmem(reply.data, reply.count, "done", 4);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 14, .fid = 20,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+    g_assert_false(g_file_test(renamed, G_FILE_TEST_EXISTS));
+}
+
 static void teardown(LocalFixture *f, gconstpointer opaque)
 {
     g_autofree char *dir = g_build_filename(f->root, "a", NULL);
@@ -282,5 +371,7 @@ int main(int argc, char **argv)
     qemu_init_main_loop(&error_abort);
     g_test_add("/plan9-9p1-server/local-backend", LocalFixture, NULL,
                setup, test_local_backend, teardown);
+    g_test_add("/plan9-9p1-server/local-writable", LocalFixture, NULL,
+               setup, test_local_writable_lifecycle, teardown);
     return g_test_run();
 }

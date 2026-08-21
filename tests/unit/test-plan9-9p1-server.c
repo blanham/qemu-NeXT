@@ -11,6 +11,17 @@
 #include "qemu/module.h"
 #include "qom/object_interfaces.h"
 
+#define PLAN9P1_DMDIR UINT32_C(0x80000000)
+#define PLAN9P1_DMAPPEND UINT32_C(0x40000000)
+#define PLAN9P1_DMLOCK UINT32_C(0x20000000)
+#define PLAN9P1_OREAD 0
+#define PLAN9P1_OWRITE 1
+#define PLAN9P1_ORDWR 2
+#define PLAN9P1_OEXEC 3
+#define PLAN9P1_OTRUNC 0x10
+#define PLAN9P1_OCEXEC 0x20
+#define PLAN9P1_ORCLOSE 0x40
+
 typedef struct ServerFixture ServerFixture;
 
 typedef enum TransportAction {
@@ -48,7 +59,25 @@ struct ServerFixture {
     bool fail_close;
     bool fail_read;
     bool overreport_read;
+    bool short_write;
+    bool overreport_write;
+    bool fail_remove;
+    unsigned int fail_remove_once;
+    bool fail_created_lstat;
+    unsigned int fail_created_name_to_path;
+    unsigned int fail_root_resolve;
+    bool variant_walk_parent_inode;
+    bool fail_chown;
+    bool remove_null_path;
+    unsigned int open_file_handles;
+    unsigned int close_calls;
+    unsigned int remove_calls;
+    unsigned int chmod_calls;
+    unsigned int chown_calls;
+    unsigned int utimensat_calls;
+    unsigned int rename_calls;
     unsigned int throttle_reads;
+    unsigned int throttle_writes;
     bool literal_stats;
     unsigned int fail_dir_lstat_after;
     unsigned int dir_lstat_count;
@@ -98,11 +127,15 @@ void coroutine_fn fsdev_co_throttle_request(FsThrottle *fst,
                                              struct iovec *iov,
                                              int iovcnt)
 {
-    g_assert_cmpint(direction, ==, THROTTLE_READ);
     g_assert_nonnull(fst);
-    g_assert_cmpuint(fst->cfg.buckets[THROTTLE_BPS_READ].avg, ==, 1);
     g_assert_cmpint(iovcnt, >, 0);
-    fixture->throttle_reads++;
+    if (direction == THROTTLE_READ) {
+        g_assert_cmpuint(fst->cfg.buckets[THROTTLE_BPS_READ].avg, ==, 1);
+        fixture->throttle_reads++;
+    } else {
+        g_assert_cmpint(direction, ==, THROTTLE_WRITE);
+        fixture->throttle_writes++;
+    }
 }
 
 static int test_init(FsContext *ctx, Error **errp)
@@ -136,6 +169,11 @@ static int test_name_to_path(FsContext *ctx, V9fsPath *dirpath,
 
     note_backend_thread(f);
     if (!dirpath) {
+        if (f->fail_root_resolve) {
+            f->fail_root_resolve--;
+            errno = EIO;
+            return -1;
+        }
         if (strcmp(name, "/") && strcmp(name, ".") && strcmp(name, "..")) {
             errno = EINVAL;
             return -1;
@@ -155,6 +193,19 @@ static int test_name_to_path(FsContext *ctx, V9fsPath *dirpath,
     if (!name[0] || strchr(name, '/')) {
         errno = EINVAL;
         return -1;
+    }
+    if (f->fail_created_name_to_path &&
+        !strcmp(name, "rollback-nopath")) {
+        g_autofree char *dir = !strcmp(dirpath->data, ".") ?
+            g_strdup(f->root) :
+            g_build_filename(f->root, dirpath->data + 2, NULL);
+        g_autofree char *host = g_build_filename(dir, name, NULL);
+
+        if (g_file_test(host, G_FILE_TEST_EXISTS)) {
+            f->fail_created_name_to_path--;
+            errno = EIO;
+            return -1;
+        }
     }
     joined = !strcmp(dirpath->data, ".") ? g_strdup_printf("./%s", name) :
         g_strdup_printf("%s/%s", dirpath->data, name);
@@ -178,6 +229,12 @@ static int test_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
     int ret;
 
     note_backend_thread(f);
+    if (f->fail_created_lstat &&
+        (g_str_has_suffix(path->data, "/rollback") ||
+         g_str_has_suffix(path->data, "/rollback-dir"))) {
+        errno = EIO;
+        return -1;
+    }
     if (g_str_has_prefix(path->data, "./dir/")) {
         f->dir_lstat_count++;
         if (f->gate_dir_lstat &&
@@ -232,6 +289,10 @@ static int test_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
                g_str_has_suffix(path->data, "/denied")) {
         st->st_ino = (UINT64_C(1) << 24) | 7;
     }
+    if (!ret && f->variant_walk_parent_inode &&
+        !strcmp(path->data, "./a")) {
+        st->st_ino += UINT64_C(1) << 22;
+    }
     return ret;
 }
 
@@ -247,20 +308,29 @@ static int test_open(FsContext *ctx, V9fsPath *path, int flags,
         return -1;
     }
     fs->fd = open(host, flags);
+    if (fs->fd >= 0) {
+        f->open_file_handles++;
+    }
     return fs->fd;
 }
 
 static int test_close(FsContext *ctx, V9fsFidOpenState *fs)
 {
     ServerFixture *f = ctx->private;
+    int ret;
 
     note_backend_thread(f);
+    f->close_calls++;
+    ret = close(fs->fd);
+    if (ret == 0) {
+        g_assert_cmpuint(f->open_file_handles, >, 0);
+        f->open_file_handles--;
+    }
     if (f->fail_close) {
-        close(fs->fd);
         errno = EIO;
         return -1;
     }
-    return close(fs->fd);
+    return ret;
 }
 
 static int test_opendir(FsContext *ctx, V9fsPath *path,
@@ -317,6 +387,145 @@ static ssize_t test_preadv(FsContext *ctx, V9fsFidOpenState *fs,
     return preadv(fs->fd, iov, iovcnt, offset);
 }
 
+static int test_fstat(FsContext *ctx, int fid_type,
+                      V9fsFidOpenState *fs, struct stat *st)
+{
+    note_backend_thread(ctx->private);
+    return fstat(fs->fd, st);
+}
+
+static int test_open2(FsContext *ctx, V9fsPath *dirpath, const char *name,
+                      int flags, FsCred *cred, V9fsFidOpenState *fs)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *dir = host_path(ctx, dirpath);
+    g_autofree char *path = g_build_filename(dir, name, NULL);
+
+    note_backend_thread(f);
+    fs->fd = open(path, flags, cred->fc_mode);
+    if (fs->fd >= 0) {
+        f->open_file_handles++;
+    }
+    return fs->fd;
+}
+
+static int test_mkdir(FsContext *ctx, V9fsPath *dirpath, const char *name,
+                      FsCred *cred)
+{
+    g_autofree char *dir = host_path(ctx, dirpath);
+    g_autofree char *path = g_build_filename(dir, name, NULL);
+
+    note_backend_thread(ctx->private);
+    return mkdir(path, cred->fc_mode);
+}
+
+static ssize_t test_pwritev(FsContext *ctx, V9fsFidOpenState *fs,
+                            const struct iovec *iov, int iovcnt, off_t offset)
+{
+    ServerFixture *f = ctx->private;
+
+    note_backend_thread(f);
+    if (f->overreport_write) {
+        return iov[0].iov_len + 1;
+    }
+    if (f->short_write && iov[0].iov_len) {
+        struct iovec short_iov = iov[0];
+
+        short_iov.iov_len--;
+        return pwritev(fs->fd, &short_iov, 1, offset);
+    }
+    return pwritev(fs->fd, iov, iovcnt, offset);
+}
+
+static int test_chmod(FsContext *ctx, V9fsPath *path, FsCred *cred)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *host = host_path(ctx, path);
+
+    note_backend_thread(f);
+    f->chmod_calls++;
+    return chmod(host, cred->fc_mode);
+}
+
+static int test_chown(FsContext *ctx, V9fsPath *path, FsCred *cred)
+{
+    ServerFixture *f = ctx->private;
+
+    note_backend_thread(f);
+    f->chown_calls++;
+    if (f->fail_chown) {
+        errno = EIO;
+        return -1;
+    }
+    g_assert_cmpuint(cred->fc_uid, ==, (uid_t)-1);
+    return 0;
+}
+
+static int test_utimensat(FsContext *ctx, V9fsPath *path,
+                          const struct timespec *times)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *host = host_path(ctx, path);
+
+    note_backend_thread(f);
+    f->utimensat_calls++;
+    return utimensat(AT_FDCWD, host, times, AT_SYMLINK_NOFOLLOW);
+}
+
+static int test_renameat(FsContext *ctx, V9fsPath *olddir,
+                         const char *oldname, V9fsPath *newdir,
+                         const char *newname)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *old_parent = host_path(ctx, olddir);
+    g_autofree char *new_parent = host_path(ctx, newdir);
+    g_autofree char *old_path = g_build_filename(old_parent, oldname, NULL);
+    g_autofree char *new_path = g_build_filename(new_parent, newname, NULL);
+
+    note_backend_thread(f);
+    f->rename_calls++;
+    return rename(old_path, new_path);
+}
+
+static int test_unlinkat(FsContext *ctx, V9fsPath *dirpath,
+                         const char *name, int flags)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *dir = host_path(ctx, dirpath);
+    g_autofree char *path = g_build_filename(dir, name, NULL);
+
+    note_backend_thread(f);
+    f->remove_calls++;
+    if (f->fail_remove_once) {
+        f->fail_remove_once--;
+        errno = EIO;
+        return -1;
+    }
+    if (f->fail_remove) {
+        errno = EIO;
+        return -1;
+    }
+    return flags & AT_REMOVEDIR ? rmdir(path) : unlink(path);
+}
+
+static int test_remove(FsContext *ctx, const char *path)
+{
+    ServerFixture *f = ctx->private;
+    g_autofree char *host = NULL;
+
+    note_backend_thread(f);
+    f->remove_calls++;
+    if (!path) {
+        f->remove_null_path = true;
+        errno = EINVAL;
+        return -1;
+    }
+    g_assert_true(!strcmp(path, ".") || g_str_has_prefix(path, "./"));
+    host = !strcmp(path, ".") ? g_strdup(f->root) :
+        g_build_filename(f->root, path + 2, NULL);
+    return remove(host);
+}
+
 static FileOperations test_ops = {
     .init = test_init,
     .cleanup = test_cleanup,
@@ -329,6 +538,16 @@ static FileOperations test_ops = {
     .rewinddir = test_rewinddir,
     .readdir = test_readdir,
     .preadv = test_preadv,
+    .pwritev = test_pwritev,
+    .fstat = test_fstat,
+    .open2 = test_open2,
+    .mkdir = test_mkdir,
+    .chmod = test_chmod,
+    .chown = test_chown,
+    .utimensat = test_utimensat,
+    .renameat = test_renameat,
+    .unlinkat = test_unlinkat,
+    .remove = test_remove,
 };
 
 static size_t transport_can_send(void *opaque)
@@ -512,6 +731,7 @@ static void fixture_teardown(ServerFixture *f, gconstpointer opaque)
             aio_poll(qemu_get_aio_context(), true);
         }
     }
+    g_assert_cmpuint(f->open_file_handles, ==, 0);
     g_byte_array_unref(f->transport.output);
     path = g_build_filename(f->root, "68020", "init", NULL);
     g_assert_cmpint(g_remove(path), ==, 0);
@@ -755,6 +975,23 @@ static Plan9P1Dir decode_dir_record(const uint8_t *record)
     return fcall.dir;
 }
 
+static Plan9P1Dir find_dir_record(const Plan9P1Fcall *reply,
+                                  const char *name)
+{
+    unsigned int offset;
+
+    g_assert_cmpuint(reply->type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply->count % PLAN9P1_DIRLEN, ==, 0);
+    for (offset = 0; offset < reply->count; offset += PLAN9P1_DIRLEN) {
+        Plan9P1Dir dir = decode_dir_record(reply->data + offset);
+
+        if (!strncmp((char *)dir.name, name, PLAN9P1_NAMELEN)) {
+            return dir;
+        }
+    }
+    g_error("directory record '%s' was not found", name);
+}
+
 static void test_clwalk_and_directory(ServerFixture *f, gconstpointer opaque)
 {
     Plan9P1Fcall call;
@@ -807,6 +1044,17 @@ static void test_clwalk_and_directory(ServerFixture *f, gconstpointer opaque)
     g_assert_cmpuint(reply.qid.path, ==, 0);
     call = (Plan9P1Fcall) {
         .type = PLAN9P1_TSTAT, .tag = 6, .fid = 12,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 142, 10);
+    g_assert_cmpuint(walk(f, 142, 11, "dir").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 12, .fid = 142,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 13, .fid = 142,
     };
     g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
 }
@@ -1419,6 +1667,135 @@ static void test_directory_cache_retry(ServerFixture *f,
 
 static void open_directory(ServerFixture *f, uint16_t fid, uint16_t tag);
 
+static Plan9P1Dir read_cached_entry(ServerFixture *f, uint16_t fid,
+                                    uint16_t tag)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TREAD, .tag = tag, .fid = fid,
+        .count = 2 * PLAN9P1_DIRLEN,
+    };
+    Plan9P1Fcall reply = transact(f, &call);
+
+    return find_dir_record(&reply, "entry");
+}
+
+static void test_directory_cache_mutations(ServerFixture *f,
+                                           gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall stat;
+    Plan9P1Dir dir;
+    char gid[PLAN9P1_NAMELEN];
+
+    attach(f, 300, 1);
+    g_assert_cmpuint(walk(f, 300, 2, "dir").type, ==, PLAN9P1_RWALK);
+    open_directory(f, 300, 3);
+    g_assert_cmpuint(read_cached_entry(f, 300, 4).length, ==, 16);
+
+    attach(f, 301, 5);
+    g_assert_cmpuint(walk(f, 301, 6, "dir").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 301, 7, "entry").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 8, .fid = 301,
+        .mode = PLAN9P1_ORDWR,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 9, .fid = 301,
+        .offset = 16, .count = 1, .data = (const uint8_t *)"x",
+    };
+    g_assert_cmpuint(transact(f, &call).count, ==, 1);
+    g_assert_cmpuint(read_cached_entry(f, 300, 10).length, ==, 17);
+
+    f->short_write = true;
+    call.tag = 11;
+    call.offset = 17;
+    call.count = 2;
+    call.data = (const uint8_t *)"yz";
+    g_assert_cmpuint(transact(f, &call).count, ==, 1);
+    f->short_write = false;
+    g_assert_cmpuint(read_cached_entry(f, 300, 12).length, ==, 18);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 13, .fid = 301,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+
+    attach(f, 301, 14);
+    g_assert_cmpuint(walk(f, 301, 15, "dir").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 301, 16, "entry").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 17, .fid = 301,
+        .mode = PLAN9P1_OWRITE | PLAN9P1_OTRUNC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    g_assert_cmpuint(read_cached_entry(f, 300, 18).length, ==, 0);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 19, .fid = 301,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 20, .fid = 301, .dir = stat.dir,
+    };
+    call.dir.mode = PLAN9P1_DMAPPEND | 0600;
+    call.dir.mtime = 234567;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+    dir = read_cached_entry(f, 300, 21);
+    g_assert_cmpuint(dir.mode & 0777, ==, 0600);
+    g_assert_cmphex(dir.mode & PLAN9P1_DMAPPEND, ==, PLAN9P1_DMAPPEND);
+    g_assert_cmpuint(dir.mtime, ==, 234567);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 22, .fid = 301,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 23, .fid = 301, .dir = stat.dir,
+    };
+    call.dir.mode = PLAN9P1_DMAPPEND | 0640;
+    snprintf(gid, sizeof(gid), "%ju",
+             (uintmax_t)g_ascii_strtoull((char *)stat.dir.gid, NULL, 10) + 1);
+    set_name(call.dir.gid, gid);
+    f->fail_chown = true;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    f->fail_chown = false;
+    dir = read_cached_entry(f, 300, 24);
+    g_assert_cmpuint(dir.mode & 0777, ==, 0640);
+}
+
+static void test_walk_parent_rollback(ServerFixture *f,
+                                      gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall before;
+    Plan9P1Fcall after;
+
+    attach(f, 280, 1);
+    g_assert_cmpuint(walk(f, 280, 2, "a").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 280, 3, "b").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 4, .fid = 280,
+    };
+    before = transact(f, &call);
+
+    f->variant_walk_parent_inode = true;
+    f->fail_root_resolve = 1;
+    g_assert_cmpuint(walk(f, 280, 5, "..").type, ==, PLAN9P1_RERROR);
+    f->variant_walk_parent_inode = false;
+    call.tag = 6;
+    after = transact(f, &call);
+    g_assert_cmpuint(after.type, ==, PLAN9P1_RSTAT);
+    g_assert_cmpuint(after.dir.qid.path, ==, before.dir.qid.path);
+    g_assert_cmpmem(after.dir.name, 1, "b", 1);
+
+    attach(f, 281, 7);
+    g_assert_cmpuint(walk(f, 281, 8, "plain").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(walk(f, 280, 9, "..").type, ==, PLAN9P1_RWALK);
+    call.tag = 10;
+    after = transact(f, &call);
+    g_assert_cmpmem(after.dir.name, 1, "a", 1);
+}
+
 static void test_candidate_device_rollback(ServerFixture *f,
                                            gconstpointer opaque)
 {
@@ -1838,6 +2215,960 @@ static void test_flush_active_and_queued(ServerFixture *f,
     g_assert_cmpuint(f->transport.output->len, ==, 0);
 }
 
+static void test_writable_lifecycle(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    struct stat st;
+    char gid[PLAN9P1_NAMELEN];
+    g_autofree char *path = g_build_filename(f->root, "created", NULL);
+    g_autofree char *renamed = g_build_filename(f->root, "renamed", NULL);
+    g_autofree char *contents = NULL;
+    gsize length;
+
+    attach(f, 100, 1);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCREATE, .tag = 2, .fid = 100,
+        .mode = 2, .perm = 0666,
+    };
+    set_name(call.name, "created");
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCREATE);
+    g_assert_cmpuint(reply.fid, ==, 100);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 3, .fid = 100,
+        .offset = 4, .count = 3, .data = (const uint8_t *)"def",
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWRITE);
+    g_assert_cmpuint(reply.fid, ==, 100);
+    g_assert_cmpuint(reply.count, ==, 3);
+    call.tag = 4;
+    call.offset = 0;
+    call.data = (const uint8_t *)"abc";
+    g_assert_cmpuint(transact(f, &call).count, ==, 3);
+    g_assert_cmpuint(f->throttle_writes, ==, 2);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 5, .fid = 100,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RSTAT);
+    g_assert_cmpuint(reply.dir.length, ==, 7);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 6, .fid = 100, .dir = reply.dir,
+    };
+    set_name(call.dir.name, "renamed");
+    snprintf(gid, sizeof(gid), "%ju",
+             (uintmax_t)g_ascii_strtoull((char *)reply.dir.gid, NULL, 10) + 1);
+    set_name(call.dir.gid, gid);
+    call.dir.mode = 0600;
+    call.dir.mtime = 123456;
+    call.dir.length = 0; /* A complete 2E Dir: length is not truncation. */
+    call.dir.qid.path ^= 0x1234;
+    call.dir.atime ^= 0x1234;
+    call.dir.type ^= 0x1234;
+    call.dir.dev ^= 0x1234;
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWSTAT);
+    g_assert_cmpuint(reply.fid, ==, 100);
+    g_assert_cmpuint(f->chown_calls, ==, 1);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(lstat(renamed, &st), ==, 0);
+    g_assert_cmpuint(st.st_mode & 0777, ==, 0600);
+    g_assert_cmpint(st.st_mtime, ==, 123456);
+    g_assert_true(g_file_get_contents(renamed, &contents, &length, NULL));
+    g_assert_cmpuint(length, ==, 7);
+    g_assert_cmpmem(contents, length, "abc\0def", 7);
+    g_clear_pointer(&contents, g_free);
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 7, .fid = 100,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    attach(f, 100, 8);
+    g_assert_cmpuint(walk(f, 100, 9, "renamed").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 10, .fid = 100,
+        .mode = 2 | 0x10,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 11, .fid = 100, .count = 8,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREAD);
+    g_assert_cmpuint(reply.count, ==, 0);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 12, .fid = 100,
+    };
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RREMOVE);
+    g_assert_cmpuint(reply.fid, ==, 100);
+    g_assert_false(g_file_test(renamed, G_FILE_TEST_EXISTS));
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 13, .fid = 100,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+}
+
+static Plan9P1Fcall create(ServerFixture *f, uint16_t fid, uint16_t tag,
+                          const char *name, uint8_t mode, uint32_t perm)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TCREATE, .tag = tag, .fid = fid,
+        .mode = mode, .perm = perm,
+    };
+
+    set_name(call.name, name);
+    return transact(f, &call);
+}
+
+static void test_open_modes_and_create(ServerFixture *f,
+                                       gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    g_autofree char *plain = g_build_filename(f->root, "plain", NULL);
+    g_autofree char *noexec = g_build_filename(f->root, "noexec", NULL);
+
+    g_assert_cmpint(chmod(plain, 0755), ==, 0);
+    for (unsigned int access = 0; access < 4; access++) {
+        uint16_t fid = 110 + access;
+
+        attach(f, fid, 1 + access * 3);
+        g_assert_cmpuint(walk(f, fid, 2 + access * 3, "plain").type,
+                         ==, PLAN9P1_RWALK);
+        call = (Plan9P1Fcall) {
+            .type = PLAN9P1_TOPEN, .tag = 3 + access * 3,
+            .fid = fid, .mode = access | PLAN9P1_OCEXEC,
+        };
+        g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+        call = (Plan9P1Fcall) {
+            .type = PLAN9P1_TREAD, .tag = 20 + access,
+            .fid = fid, .count = 1,
+        };
+        reply = transact(f, &call);
+        g_assert_cmpuint(reply.type, ==,
+                         access == PLAN9P1_OWRITE ?
+                         PLAN9P1_RERROR : PLAN9P1_RREAD);
+        call = (Plan9P1Fcall) {
+            .type = PLAN9P1_TWRITE, .tag = 30 + access,
+            .fid = fid, .count = 1, .data = (const uint8_t *)"X",
+        };
+        reply = transact(f, &call);
+        g_assert_cmpuint(reply.type, ==,
+                         access == PLAN9P1_OWRITE || access == PLAN9P1_ORDWR ?
+                         PLAN9P1_RWRITE : PLAN9P1_RERROR);
+    }
+
+    g_assert_cmpint(chmod(plain, 0644), ==, 0);
+    attach(f, 126, 40);
+    g_assert_cmpuint(walk(f, 126, 41, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 42, .fid = 126,
+        .mode = PLAN9P1_OEXEC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpint(chmod(plain, 0755), ==, 0);
+
+    attach(f, 127, 43);
+    g_assert_cmpuint(create(f, 127, 44, "", PLAN9P1_OWRITE, 0666).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 45, "bad/name", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 46, ".", PLAN9P1_OWRITE, 0666).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 47, "..", PLAN9P1_OWRITE, 0666).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 48, "plain", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 49, "locked", PLAN9P1_OWRITE,
+                            PLAN9P1_DMLOCK | 0666).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 50, "bad-mode", 0x80, 0666).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 51, "bad-dir", PLAN9P1_OWRITE,
+                            PLAN9P1_DMDIR | 0777).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(create(f, 127, 52, "noexec", PLAN9P1_OEXEC,
+                            0666).type, ==, PLAN9P1_RERROR);
+    g_assert_false(g_file_test(noexec, G_FILE_TEST_EXISTS));
+
+    attach(f, 128, 53);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 54, .fid = 128,
+        .mode = PLAN9P1_OREAD | PLAN9P1_ORCLOSE,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    for (unsigned int modifier = PLAN9P1_OTRUNC;
+         modifier <= PLAN9P1_ORCLOSE; modifier <<= 1) {
+        uint16_t fid = 190 + modifier;
+
+        attach(f, fid, 70 + modifier);
+        g_assert_cmpuint(walk(f, fid, 71 + modifier, "dir").type,
+                         ==, PLAN9P1_RWALK);
+        call = (Plan9P1Fcall) {
+            .type = PLAN9P1_TOPEN, .tag = 72 + modifier, .fid = fid,
+            .mode = PLAN9P1_OREAD | modifier,
+        };
+        g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    }
+    attach(f, 260, 140);
+    g_assert_cmpuint(walk(f, 260, 141, "dir").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 142, .fid = 260,
+        .mode = PLAN9P1_OEXEC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 261, 143);
+    g_assert_cmpuint(walk(f, 261, 144, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 145, .fid = 261,
+        .mode = PLAN9P1_OEXEC | PLAN9P1_OTRUNC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 262, 146);
+    g_assert_cmpuint(create(f, 262, 147, "dir-trunc",
+                            PLAN9P1_OREAD | PLAN9P1_OTRUNC,
+                            PLAN9P1_DMDIR | 0700).type,
+                     ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 148, .fid = 262,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+
+    attach(f, 263, 149);
+    g_assert_cmpuint(create(f, 263, 150, "dir-cexec",
+                            PLAN9P1_OREAD | PLAN9P1_OCEXEC,
+                            PLAN9P1_DMDIR | 0700).type,
+                     ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 151, .fid = 263,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+
+    attach(f, 264, 152);
+    g_assert_cmpuint(create(f, 264, 153, "dir-orclose",
+                            PLAN9P1_OREAD | PLAN9P1_ORCLOSE,
+                            PLAN9P1_DMDIR | 0700).type,
+                     ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 154, .fid = 264,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    g_autofree char *dir_orclose =
+        g_build_filename(f->root, "dir-orclose", NULL);
+    g_assert_false(g_file_test(dir_orclose, G_FILE_TEST_EXISTS));
+
+    attach(f, 265, 155);
+    g_assert_cmpuint(create(f, 265, 156, "dir-exec", PLAN9P1_OEXEC,
+                            PLAN9P1_DMDIR | 0700).type,
+                     ==, PLAN9P1_RERROR);
+
+    attach(f, 120, 50);
+    g_assert_cmpuint(walk(f, 120, 51, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 52, .fid = 120, .mode = 0x04,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 121, 53);
+    g_assert_cmpuint(walk(f, 121, 54, "dir").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 55, .fid = 121,
+        .mode = PLAN9P1_OWRITE,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    attach(f, 122, 56);
+    reply = create(f, 122, 57, "newdir", PLAN9P1_OREAD,
+                   PLAN9P1_DMDIR | 0777);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 58, .fid = 122,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    attach(f, 123, 59);
+    g_assert_cmpuint(create(f, 123, 60, "newdir", PLAN9P1_OREAD,
+                            PLAN9P1_DMDIR | 0777).type,
+                     ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 61, .fid = 123,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    attach(f, 123, 62);
+    g_assert_cmpuint(walk(f, 123, 63, "newdir").type, ==, PLAN9P1_RWALK);
+    call.fid = 123;
+    call.tag = 64;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+
+    attach(f, 124, 65);
+    f->fail_created_lstat = true;
+    g_assert_cmpuint(create(f, 124, 66, "rollback", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    f->fail_created_lstat = false;
+    g_autofree char *rollback = g_build_filename(f->root, "rollback", NULL);
+    g_assert_false(g_file_test(rollback, G_FILE_TEST_EXISTS));
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 67, .fid = 124,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSTAT);
+
+    attach(f, 125, 68);
+    f->fail_created_lstat = true;
+    g_assert_cmpuint(create(f, 125, 69, "rollback-dir", PLAN9P1_OREAD,
+                            PLAN9P1_DMDIR | 0777).type,
+                     ==, PLAN9P1_RERROR);
+    f->fail_created_lstat = false;
+    g_autofree char *rollback_dir =
+        g_build_filename(f->root, "rollback-dir", NULL);
+    g_assert_false(g_file_test(rollback_dir, G_FILE_TEST_EXISTS));
+}
+
+static void test_append_orclose_and_write_edges(ServerFixture *f,
+                                                gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    g_autofree char *path = g_build_filename(f->root, "append", NULL);
+    g_autofree char *wstat_path =
+        g_build_filename(f->root, "wstat-append", NULL);
+    g_autofree char *data = NULL;
+    gsize length;
+    g_autofree uint8_t *maximum = g_malloc0(PLAN9P1_MAX_DATA);
+
+    attach(f, 130, 1);
+    reply = create(f, 130, 2, "append", PLAN9P1_ORDWR,
+                   PLAN9P1_DMAPPEND | 0666);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 3, .fid = 130,
+        .offset = UINT64_MAX, .count = 1, .data = (const uint8_t *)"a",
+    };
+    g_assert_cmpuint(transact(f, &call).count, ==, 1);
+    call.tag = 4;
+    call.offset = 0;
+    call.data = (const uint8_t *)"b";
+    g_assert_cmpuint(transact(f, &call).count, ==, 1);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 5, .fid = 130,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    attach(f, 130, 6);
+    g_assert_cmpuint(walk(f, 130, 7, "append").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 8, .fid = 130,
+        .mode = PLAN9P1_ORDWR | PLAN9P1_OTRUNC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 9, .fid = 130,
+        .count = 0, .data = NULL,
+    };
+    g_assert_cmpuint(transact(f, &call).count, ==, 0);
+    call.tag = 10;
+    call.count = PLAN9P1_MAX_DATA;
+    call.data = maximum;
+    g_assert_cmpuint(transact(f, &call).count, ==, PLAN9P1_MAX_DATA);
+    g_assert_true(g_file_get_contents(path, &data, &length, NULL));
+    g_assert_cmpuint(length, ==, PLAN9P1_MAX_DATA + 2);
+
+    attach(f, 131, 11);
+    g_assert_cmpuint(create(f, 131, 12, "orclose",
+                            PLAN9P1_OWRITE | PLAN9P1_ORCLOSE,
+                            0666).type, ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 13, .fid = 131,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    g_autofree char *orclose = g_build_filename(f->root, "orclose", NULL);
+    g_assert_false(g_file_test(orclose, G_FILE_TEST_EXISTS));
+
+    attach(f, 132, 14);
+    g_assert_cmpuint(walk(f, 132, 15, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 16, .fid = 132,
+        .mode = PLAN9P1_OWRITE,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 17, .fid = 132,
+        .offset = UINT64_MAX, .count = 1, .data = (const uint8_t *)"x",
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    f->short_write = true;
+    call.offset = 0;
+    call.count = 2;
+    call.data = (const uint8_t *)"xy";
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RWRITE);
+    g_assert_cmpuint(reply.count, ==, 1);
+    f->short_write = false;
+    f->overreport_write = true;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    f->overreport_write = false;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 18, .fid = 130,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+
+    attach(f, 133, 19);
+    g_assert_cmpuint(create(f, 133, 20, "orclose-fail",
+                            PLAN9P1_OWRITE | PLAN9P1_ORCLOSE,
+                            0666).type, ==, PLAN9P1_RCREATE);
+    f->fail_remove = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 21, .fid = 133,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    f->fail_remove = false;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 22, .fid = 133,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSESSION, .tag = 23,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSESSION);
+    g_autofree char *orclose_fail =
+        g_build_filename(f->root, "orclose-fail", NULL);
+    g_assert_true(g_file_test(orclose_fail, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_remove(orclose_fail), ==, 0);
+
+    attach(f, 134, 30);
+    g_assert_cmpuint(create(f, 134, 31, "wstat-append", PLAN9P1_ORDWR,
+                            0666).type, ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 32, .fid = 134,
+        .count = 1, .data = (const uint8_t *)"p",
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWRITE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 33, .fid = 134,
+    };
+    reply = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 34, .fid = 134, .dir = reply.dir,
+    };
+    call.dir.mode |= PLAN9P1_DMAPPEND;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 35, .fid = 134,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+    attach(f, 134, 36);
+    g_assert_cmpuint(walk(f, 134, 37, "wstat-append").type,
+                     ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 38, .fid = 134,
+        .mode = PLAN9P1_OWRITE | PLAN9P1_OTRUNC,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 39, .fid = 134,
+        .offset = UINT64_MAX, .count = 1, .data = (const uint8_t *)"q",
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWRITE);
+    g_clear_pointer(&data, g_free);
+    g_assert_true(g_file_get_contents(wstat_path, &data, &length, NULL));
+    g_assert_cmpuint(length, ==, 2);
+    g_assert_cmpmem(data, length, "pq", 2);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 40, .fid = 134,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+}
+
+static void test_create_rollback_ownership(ServerFixture *f,
+                                           gconstpointer opaque)
+{
+    int (*saved_unlinkat)(FsContext *, V9fsPath *, const char *, int) =
+        test_ops.unlinkat;
+    int (*saved_remove)(FsContext *, const char *) = test_ops.remove;
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    g_autofree char *path = g_build_filename(f->root, "rollback", NULL);
+    g_autofree char *nopath =
+        g_build_filename(f->root, "rollback-nopath", NULL);
+    g_autofree char *marker =
+        g_build_filename(f->root, "rollback-cache-marker", NULL);
+    unsigned int removes;
+
+    attach(f, 271, 1);
+    open_directory(f, 271, 2);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 3, .fid = 271,
+        .count = (PLAN9P1_MAX_DATA / PLAN9P1_DIRLEN) * PLAN9P1_DIRLEN,
+    };
+    reply = transact(f, &call);
+    find_dir_record(&reply, "plain");
+    write_file(marker, "marker", 6);
+
+    attach(f, 270, 1);
+    f->fail_created_lstat = true;
+    f->fail_close = true;
+    g_assert_cmpuint(create(f, 270, 2, "rollback", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    f->fail_created_lstat = false;
+    f->fail_close = false;
+    g_assert_cmpuint(f->open_file_handles, ==, 0);
+    g_assert_cmpuint(f->close_calls, ==, 1);
+    g_assert_cmpuint(f->remove_calls, ==, 1);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    call.tag = 4;
+    reply = transact(f, &call);
+    find_dir_record(&reply, "rollback-cache-marker");
+
+    removes = f->remove_calls;
+    f->fail_created_lstat = true;
+    f->fail_remove_once = 1;
+    g_assert_cmpuint(create(f, 270, 4, "rollback", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    f->fail_created_lstat = false;
+    g_assert_cmpuint(f->open_file_handles, ==, 0);
+    g_assert_cmpuint(f->remove_calls, ==, removes + 1);
+    g_assert_true(g_file_test(path, G_FILE_TEST_EXISTS));
+    call.tag = 5;
+    reply = transact(f, &call);
+    find_dir_record(&reply, "rollback");
+    g_assert_cmpint(g_remove(path), ==, 0);
+
+    test_ops.unlinkat = NULL;
+    f->fail_created_name_to_path = 1;
+    g_assert_cmpuint(create(f, 270, 5, "rollback-nopath", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    g_assert_false(f->remove_null_path);
+    g_assert_false(g_file_test(nopath, G_FILE_TEST_EXISTS));
+
+    test_ops.remove = NULL;
+    f->fail_created_lstat = true;
+    g_assert_cmpuint(create(f, 270, 6, "rollback", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    f->fail_created_lstat = false;
+    g_assert_true(g_file_test(path, G_FILE_TEST_EXISTS));
+    test_ops.remove = saved_remove;
+    g_assert_cmpint(g_remove(path), ==, 0);
+    test_ops.unlinkat = saved_unlinkat;
+
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 7, .fid = 270,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSTAT);
+    g_assert_cmpint(g_remove(marker), ==, 0);
+}
+
+static void test_append_identity_survives_remove(ServerFixture *f,
+                                                 gconstpointer opaque)
+{
+    g_autofree char *first = g_build_filename(f->root, "append-a", NULL);
+    g_autofree char *second = g_build_filename(f->root, "append-b", NULL);
+    Plan9P1Fcall call;
+    Plan9P1Fcall stat;
+
+    write_file(first, "x", 1);
+    g_assert_cmpint(link(first, second), ==, 0);
+    attach(f, 290, 1);
+    g_assert_cmpuint(walk(f, 290, 2, "append-a").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 3, .fid = 290,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 4, .fid = 290, .dir = stat.dir,
+    };
+    call.dir.mode |= PLAN9P1_DMAPPEND;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+
+    attach(f, 291, 5);
+    g_assert_cmpuint(walk(f, 291, 6, "append-b").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 7, .fid = 291, .newfid = 292,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 8, .fid = 290,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 9, .fid = 292,
+    };
+    stat = transact(f, &call);
+    g_assert_cmpuint(stat.type, ==, PLAN9P1_RSTAT);
+    g_assert_cmphex(stat.dir.mode & PLAN9P1_DMAPPEND,
+                    ==, PLAN9P1_DMAPPEND);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 10, .fid = 291,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLUNK, .tag = 11, .fid = 292,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLUNK);
+}
+
+static void test_wstat_remove_failures(ServerFixture *f,
+                                       gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    attach(f, 140, 1);
+    g_assert_cmpuint(walk(f, 140, 2, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 3, .fid = 140,
+    };
+    reply = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 4, .fid = 140, .dir = reply.dir,
+    };
+    set_name(call.dir.uid, "4294967294");
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call.dir = reply.dir;
+    call.dir.mode |= PLAN9P1_DMLOCK;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call.dir = reply.dir;
+    set_name(call.dir.gid, "12x");
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+
+    f->fail_remove = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 5, .fid = 140,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 6, .fid = 140,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    f->fail_remove = false;
+
+    attach(f, 143, 14);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 15, .fid = 143,
+    };
+    reply = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 16, .fid = 143, .dir = reply.dir,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 17, .fid = 143,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSTAT);
+
+    attach(f, 141, 7);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 8, .fid = 141,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 9, .fid = 141,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+}
+
+static void test_missing_mutation_ops(ServerFixture *f,
+                                      gconstpointer opaque)
+{
+    int (*saved_open2)(FsContext *, V9fsPath *, const char *, int,
+                       FsCred *, V9fsFidOpenState *) = test_ops.open2;
+    ssize_t (*saved_pwritev)(FsContext *, V9fsFidOpenState *,
+                             const struct iovec *, int, off_t) =
+        test_ops.pwritev;
+    int (*saved_unlinkat)(FsContext *, V9fsPath *, const char *, int) =
+        test_ops.unlinkat;
+    int (*saved_remove)(FsContext *, const char *) = test_ops.remove;
+    int (*saved_chmod)(FsContext *, V9fsPath *, FsCred *) = test_ops.chmod;
+    int (*saved_chown)(FsContext *, V9fsPath *, FsCred *) = test_ops.chown;
+    int (*saved_utimensat)(FsContext *, V9fsPath *, const struct timespec *) =
+        test_ops.utimensat;
+    int (*saved_renameat)(FsContext *, V9fsPath *, const char *,
+                          V9fsPath *, const char *) = test_ops.renameat;
+    Plan9P1Fcall call;
+    Plan9P1Fcall stat;
+    char gid[PLAN9P1_NAMELEN];
+
+    attach(f, 180, 1);
+    test_ops.open2 = NULL;
+    g_assert_cmpuint(create(f, 180, 2, "unsupported", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RERROR);
+    test_ops.open2 = saved_open2;
+
+    g_assert_cmpuint(create(f, 180, 3, "supported", PLAN9P1_OWRITE,
+                            0666).type, ==, PLAN9P1_RCREATE);
+    test_ops.pwritev = NULL;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 4, .fid = 180,
+        .count = 1, .data = (const uint8_t *)"x",
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    test_ops.pwritev = saved_pwritev;
+    test_ops.unlinkat = NULL;
+    test_ops.remove = NULL;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 5, .fid = 180,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    test_ops.unlinkat = saved_unlinkat;
+    test_ops.remove = saved_remove;
+    g_autofree char *path = g_build_filename(f->root, "supported", NULL);
+    g_assert_cmpint(g_remove(path), ==, 0);
+
+    attach(f, 181, 6);
+    g_assert_cmpuint(walk(f, 181, 7, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 8, .fid = 181,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 9, .fid = 181, .dir = stat.dir,
+    };
+    set_name(call.dir.name, "preflight-name");
+    call.dir.mode = 0600;
+    call.dir.mtime++;
+    snprintf(gid, sizeof(gid), "%ju",
+             (uintmax_t)g_ascii_strtoull((char *)stat.dir.gid, NULL, 10) + 1);
+    set_name(call.dir.gid, gid);
+
+    test_ops.chown = NULL;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->chmod_calls, ==, 0);
+    g_assert_cmpuint(f->chown_calls, ==, 0);
+    g_assert_cmpuint(f->utimensat_calls, ==, 0);
+    g_assert_cmpuint(f->rename_calls, ==, 0);
+    test_ops.chown = saved_chown;
+    call.tag++;
+    test_ops.utimensat = NULL;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->chmod_calls, ==, 0);
+    g_assert_cmpuint(f->chown_calls, ==, 0);
+    g_assert_cmpuint(f->utimensat_calls, ==, 0);
+    g_assert_cmpuint(f->rename_calls, ==, 0);
+    test_ops.utimensat = saved_utimensat;
+    call.tag++;
+    test_ops.renameat = NULL;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->chmod_calls, ==, 0);
+    g_assert_cmpuint(f->chown_calls, ==, 0);
+    g_assert_cmpuint(f->utimensat_calls, ==, 0);
+    g_assert_cmpuint(f->rename_calls, ==, 0);
+    test_ops.renameat = saved_renameat;
+    call.tag++;
+    test_ops.chmod = NULL;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->chmod_calls, ==, 0);
+    g_assert_cmpuint(f->chown_calls, ==, 0);
+    g_assert_cmpuint(f->utimensat_calls, ==, 0);
+    g_assert_cmpuint(f->rename_calls, ==, 0);
+    test_ops.chmod = saved_chmod;
+}
+
+static void recreate_read_only(ServerFixture *f)
+{
+    unsigned int cleanup_target = f->cleanup_calls + 1;
+
+    plan9p1_server_reset(f->server);
+    pump_server(f->server);
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    f->fse.export_flags |= V9FS_RDONLY;
+    f->server = plan9p1_server_new("testfs", &transport_ops,
+                                   &f->transport, NULL, &error_abort);
+}
+
+static void test_read_only_preflight(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    unsigned int calls;
+
+    recreate_read_only(f);
+    attach(f, 150, 1);
+    calls = f->backend_calls;
+    g_assert_cmpuint(create(f, 150, 2, "blocked", PLAN9P1_OWRITE, 0666).type,
+                     ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->backend_calls, ==, calls);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 150,
+        .mode = PLAN9P1_OWRITE,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->backend_calls, ==, calls);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 4, .fid = 150,
+        .count = 1, .data = (const uint8_t *)"x",
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->backend_calls, ==, calls);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 5, .fid = 150,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    g_assert_cmpuint(f->backend_calls, ==, calls);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 6, .fid = 150,
+    };
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 67);
+    g_byte_array_set_size(f->transport.output, 0);
+    g_assert_cmpuint(f->backend_calls, ==, calls);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 7, .fid = 150,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+}
+
+static void test_orclose_cleanup(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    g_autofree char *session_file =
+        g_build_filename(f->root, "session-remove", NULL);
+    g_autofree char *reset_file =
+        g_build_filename(f->root, "reset-remove", NULL);
+    g_autofree char *free_file =
+        g_build_filename(f->root, "free-remove", NULL);
+    g_autofree char *failed_file =
+        g_build_filename(f->root, "failed-remove", NULL);
+    unsigned int cleanup_target;
+
+    attach(f, 160, 1);
+    g_assert_cmpuint(create(f, 160, 2, "session-remove",
+                            PLAN9P1_OWRITE | PLAN9P1_ORCLOSE, 0666).type,
+                     ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSESSION, .tag = 3,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSESSION);
+    g_assert_false(g_file_test(session_file, G_FILE_TEST_EXISTS));
+
+    attach(f, 161, 4);
+    g_assert_cmpuint(create(f, 161, 5, "reset-remove",
+                            PLAN9P1_OWRITE | PLAN9P1_ORCLOSE, 0666).type,
+                     ==, PLAN9P1_RCREATE);
+    plan9p1_server_reset(f->server);
+    pump_server(f->server);
+    g_assert_false(g_file_test(reset_file, G_FILE_TEST_EXISTS));
+
+    attach(f, 163, 6);
+    g_assert_cmpuint(create(f, 163, 7, "failed-remove",
+                            PLAN9P1_OWRITE | PLAN9P1_ORCLOSE, 0666).type,
+                     ==, PLAN9P1_RCREATE);
+    f->fail_remove = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSESSION, .tag = 8,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSESSION);
+    f->fail_remove = false;
+    g_assert_true(g_file_test(failed_file, G_FILE_TEST_EXISTS));
+    call.tag = 9;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSESSION);
+    g_assert_true(g_file_test(failed_file, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_remove(failed_file), ==, 0);
+
+    attach(f, 162, 10);
+    g_assert_cmpuint(create(f, 162, 11, "free-remove",
+                            PLAN9P1_OWRITE | PLAN9P1_ORCLOSE, 0666).type,
+                     ==, PLAN9P1_RCREATE);
+    cleanup_target = f->cleanup_calls + 1;
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    g_assert_false(g_file_test(free_file, G_FILE_TEST_EXISTS));
+}
+
+static void test_rename_live_fids(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+    Plan9P1Fcall stat;
+
+    attach(f, 170, 1);
+    g_assert_cmpuint(walk(f, 170, 2, "a").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 3, .fid = 170, .newfid = 171,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    call.newfid = 172;
+    call.tag = 4;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    g_assert_cmpuint(walk(f, 172, 5, "b").type, ==, PLAN9P1_RWALK);
+    g_assert_cmpuint(create(f, 172, 6, "child", PLAN9P1_ORDWR, 0666).type,
+                     ==, PLAN9P1_RCREATE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 7, .fid = 170,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 8, .fid = 170, .dir = stat.dir,
+    };
+    set_name(call.dir.name, "z");
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 9, .fid = 171,
+    };
+    g_assert_cmpmem(transact(f, &call).dir.name, 1, "z", 1);
+    call.fid = 172;
+    call.tag = 10;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RSTAT);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWRITE, .tag = 11, .fid = 172,
+        .count = 1, .data = (const uint8_t *)"q",
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWRITE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREMOVE, .tag = 12, .fid = 172,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RREMOVE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 13, .fid = 171,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 14, .fid = 171, .dir = stat.dir,
+    };
+    set_name(call.dir.name, "a");
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+
+    attach(f, 173, 15);
+    g_assert_cmpuint(walk(f, 173, 16, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TCLONE, .tag = 17, .fid = 173, .newfid = 174,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RCLONE);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 18, .fid = 173,
+    };
+    stat = transact(f, &call);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 19, .fid = 173, .dir = stat.dir,
+    };
+    set_name(call.dir.name, "file-renamed");
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 20, .fid = 174,
+    };
+    stat = transact(f, &call);
+    g_assert_cmpmem(stat.dir.name, 12, "file-renamed", 12);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 21, .fid = 174,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TWSTAT, .tag = 22, .fid = 173, .dir = stat.dir,
+    };
+    set_name(call.dir.name, "plain");
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
+}
+
 int main(int argc, char **argv)
 {
     Plan9P1ServerOptions one_device = { .max_devices = 1 };
@@ -1850,6 +3181,7 @@ int main(int argc, char **argv)
     };
     Plan9P1ServerOptions qid_bound = { .max_qid_entries = 2 };
     Plan9P1ServerOptions cache_retry_qids = { .max_qid_entries = 4 };
+    Plan9P1ServerOptions walk_rollback_qids = { .max_qid_entries = 4 };
 
     g_test_init(&argc, &argv, NULL);
     module_call_init(MODULE_INIT_QOM);
@@ -1925,6 +3257,12 @@ int main(int argc, char **argv)
     g_test_add("/plan9-9p1-server/directory-cache-retry", ServerFixture,
                &cache_retry_qids, fixture_setup, test_directory_cache_retry,
                fixture_teardown);
+    g_test_add("/plan9-9p1-server/directory-cache-mutations",
+               ServerFixture, NULL, fixture_setup,
+               test_directory_cache_mutations, fixture_teardown);
+    g_test_add("/plan9-9p1-server/walk-parent-rollback", ServerFixture,
+               &walk_rollback_qids, fixture_setup, test_walk_parent_rollback,
+               fixture_teardown);
     g_test_add("/plan9-9p1-server/candidate-device-rollback",
                ServerFixture, &two_devices, fixture_setup,
                test_candidate_device_rollback, fixture_teardown);
@@ -1947,6 +3285,34 @@ int main(int argc, char **argv)
                fixture_setup, test_literal_boot_wire, fixture_teardown);
     g_test_add("/plan9-9p1-server/flush-active-queued", ServerFixture, NULL,
                fixture_setup, test_flush_active_and_queued,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/writable-lifecycle", ServerFixture, NULL,
+               fixture_setup, test_writable_lifecycle, fixture_teardown);
+    g_test_add("/plan9-9p1-server/open-modes-create", ServerFixture, NULL,
+               fixture_setup, test_open_modes_and_create, fixture_teardown);
+    g_test_add("/plan9-9p1-server/append-orclose-write-edges", ServerFixture,
+               NULL, fixture_setup, test_append_orclose_and_write_edges,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/create-rollback-ownership", ServerFixture,
+               NULL, fixture_setup, test_create_rollback_ownership,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/append-identity-remove", ServerFixture,
+               NULL, fixture_setup, test_append_identity_survives_remove,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/wstat-remove-failures", ServerFixture,
+               NULL, fixture_setup, test_wstat_remove_failures,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/missing-mutation-ops", ServerFixture,
+               NULL, fixture_setup, test_missing_mutation_ops,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/read-only-preflight", ServerFixture,
+               NULL, fixture_setup, test_read_only_preflight,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/orclose-cleanup", ServerFixture,
+               NULL, fixture_setup, test_orclose_cleanup,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/rename-live-fids", ServerFixture,
+               NULL, fixture_setup, test_rename_live_fids,
                fixture_teardown);
     return g_test_run();
 }

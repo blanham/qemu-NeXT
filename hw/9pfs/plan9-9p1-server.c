@@ -44,6 +44,7 @@
 #include "qapi/visitor.h"
 #include "qemu/aio.h"
 #include "qemu/coroutine.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qom/object_interfaces.h"
 
@@ -57,6 +58,17 @@
 #define PLAN9P1_DEFAULT_DIR_CACHE_BYTES (64 * 1024 * 1024)
 #define PLAN9P1_DEFAULT_QID_ENTRIES 65536
 #define PLAN9P1_DMDIR UINT32_C(0x80000000)
+#define PLAN9P1_DMAPPEND UINT32_C(0x40000000)
+#define PLAN9P1_DMLOCK UINT32_C(0x20000000)
+
+#define PLAN9P1_OREAD 0
+#define PLAN9P1_OWRITE 1
+#define PLAN9P1_ORDWR 2
+#define PLAN9P1_OEXEC 3
+#define PLAN9P1_OTRUNC 0x10
+#define PLAN9P1_OCEXEC 0x20
+#define PLAN9P1_ORCLOSE 0x40
+#define PLAN9P1_OPEN_MASK 0x73
 
 typedef enum Plan9P1OpenKind {
     PLAN9P1_OPEN_NONE,
@@ -68,9 +80,13 @@ typedef struct Plan9P1Fid {
     struct Plan9P1Server *server;
     uint16_t fid;
     V9fsPath path;
+    V9fsPath parent_path;
     V9fsFidOpenState fs;
     Plan9P1Qid qid;
     Plan9P1OpenKind open_kind;
+    uint8_t access;
+    bool remove_on_clunk;
+    bool append_only;
     GByteArray *dir_cache;
     GArray *dir_qids;
     GPtrArray *components;
@@ -118,8 +134,18 @@ typedef enum Plan9P1BackendOp {
     PLAN9P1_BACKEND_NAME_TO_PATH,
     PLAN9P1_BACKEND_LSTAT,
     PLAN9P1_BACKEND_OPEN,
+    PLAN9P1_BACKEND_OPEN2,
     PLAN9P1_BACKEND_OPENDIR,
     PLAN9P1_BACKEND_PREADV,
+    PLAN9P1_BACKEND_PWRITEV,
+    PLAN9P1_BACKEND_FSTAT,
+    PLAN9P1_BACKEND_MKDIR,
+    PLAN9P1_BACKEND_CHMOD,
+    PLAN9P1_BACKEND_CHOWN,
+    PLAN9P1_BACKEND_UTIMENSAT,
+    PLAN9P1_BACKEND_RENAMEAT,
+    PLAN9P1_BACKEND_UNLINKAT,
+    PLAN9P1_BACKEND_REMOVE,
     PLAN9P1_BACKEND_REWINDDIR,
     PLAN9P1_BACKEND_READDIR,
     PLAN9P1_BACKEND_CLOSE,
@@ -130,14 +156,19 @@ typedef struct Plan9P1BackendWork {
     Plan9P1BackendOp op;
     V9fsBackend *backend;
     V9fsPath *dirpath;
+    V9fsPath *newdirpath;
     V9fsPath *path;
     const char *name;
+    const char *newname;
     struct stat *st;
     V9fsFidOpenState *fs;
     struct iovec *iov;
     int iovcnt;
     int flags;
     off_t offset;
+    FsCred cred;
+    struct timespec times[2];
+    bool append;
     char dirent_name[NAME_MAX + 1];
     bool eof;
 } Plan9P1BackendWork;
@@ -151,6 +182,7 @@ struct Plan9P1Server {
     Plan9P1Stream stream;
     GHashTable *fids;
     GHashTable *qid_paths;
+    GHashTable *append_qids;
     dev_t devices[128];
     bool device_used[128];
     bool device_committed[128];
@@ -198,6 +230,7 @@ static void path_init(V9fsPath *path);
 static void path_free(V9fsPath *path);
 static void path_copy(V9fsPath *dst, const V9fsPath *src);
 static void qid_release(Plan9P1Server *server, uint32_t path);
+static void invalidate_dir_caches(Plan9P1Server *server);
 
 static int backend_worker(void *opaque)
 {
@@ -215,14 +248,93 @@ static int backend_worker(void *opaque)
         ret = ops->lstat(ctx, work->path, work->st);
         break;
     case PLAN9P1_BACKEND_OPEN:
+        if (!ops->open) {
+            return -EOPNOTSUPP;
+        }
         ret = ops->open(ctx, work->path, work->flags, work->fs);
+        break;
+    case PLAN9P1_BACKEND_OPEN2:
+        if (!ops->open2) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->open2(ctx, work->dirpath, work->name, work->flags,
+                         &work->cred, work->fs);
         break;
     case PLAN9P1_BACKEND_OPENDIR:
         ret = ops->opendir(ctx, work->path, work->fs);
         break;
     case PLAN9P1_BACKEND_PREADV:
+        if (!ops->preadv) {
+            return -EOPNOTSUPP;
+        }
         ret = ops->preadv(ctx, work->fs, work->iov, work->iovcnt,
                           work->offset);
+        break;
+    case PLAN9P1_BACKEND_PWRITEV:
+        if (!ops->pwritev) {
+            return -EOPNOTSUPP;
+        }
+        if (work->append) {
+            if (!ops->fstat) {
+                return -EOPNOTSUPP;
+            }
+            ret = ops->fstat(ctx, P9_FID_FILE, work->fs, work->st);
+            if (ret < 0) {
+                break;
+            }
+            work->offset = work->st->st_size;
+        }
+        ret = ops->pwritev(ctx, work->fs, work->iov, work->iovcnt,
+                           work->offset);
+        break;
+    case PLAN9P1_BACKEND_FSTAT:
+        if (!ops->fstat) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->fstat(ctx, P9_FID_FILE, work->fs, work->st);
+        break;
+    case PLAN9P1_BACKEND_MKDIR:
+        if (!ops->mkdir) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->mkdir(ctx, work->dirpath, work->name, &work->cred);
+        break;
+    case PLAN9P1_BACKEND_CHMOD:
+        if (!ops->chmod) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->chmod(ctx, work->path, &work->cred);
+        break;
+    case PLAN9P1_BACKEND_CHOWN:
+        if (!ops->chown) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->chown(ctx, work->path, &work->cred);
+        break;
+    case PLAN9P1_BACKEND_UTIMENSAT:
+        if (!ops->utimensat) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->utimensat(ctx, work->path, work->times);
+        break;
+    case PLAN9P1_BACKEND_RENAMEAT:
+        if (!ops->renameat) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->renameat(ctx, work->dirpath, work->name,
+                            work->newdirpath, work->newname);
+        break;
+    case PLAN9P1_BACKEND_UNLINKAT:
+        if (!ops->unlinkat) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->unlinkat(ctx, work->dirpath, work->name, work->flags);
+        break;
+    case PLAN9P1_BACKEND_REMOVE:
+        if (!ops->remove) {
+            return -EOPNOTSUPP;
+        }
+        ret = ops->remove(ctx, work->path->data);
         break;
     case PLAN9P1_BACKEND_REWINDDIR:
         ops->rewinddir(ctx, work->fs);
@@ -327,6 +439,38 @@ static int coroutine_fn co_open(Plan9P1Server *server, V9fsPath *path,
     return ret;
 }
 
+static int coroutine_fn co_open2(Plan9P1Server *server, V9fsPath *dirpath,
+                                 const char *name, int flags, mode_t mode,
+                                 gid_t gid, V9fsFidOpenState *fs)
+{
+    V9fsPath dircopy;
+    V9fsFidOpenState candidate = { 0 };
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_OPEN2,
+        .backend = server->backend,
+        .name = name,
+        .flags = flags,
+        .fs = &candidate,
+        .cred = {
+            .fc_uid = -1,
+            .fc_gid = gid,
+            .fc_mode = mode,
+            .fc_rdev = -1,
+        },
+    };
+    int ret;
+
+    path_init(&dircopy);
+    path_copy(&dircopy, dirpath);
+    work.dirpath = &dircopy;
+    ret = run_backend(&work);
+    path_free(&dircopy);
+    if (ret >= 0) {
+        *fs = candidate;
+    }
+    return ret;
+}
+
 static int coroutine_fn co_opendir(Plan9P1Server *server, V9fsPath *path,
                                    V9fsFidOpenState *fs)
 {
@@ -365,6 +509,187 @@ static int coroutine_fn co_preadv(Plan9P1Server *server,
         .offset = offset,
     };
     return run_backend(&work);
+}
+
+static int coroutine_fn co_pwritev(Plan9P1Server *server,
+                                   V9fsFidOpenState *fs,
+                                   struct iovec *iov, int iovcnt,
+                                   off_t offset, bool append)
+{
+    V9fsFidOpenState candidate = *fs;
+    struct stat st;
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_PWRITEV,
+        .backend = server->backend,
+        .fs = &candidate,
+        .iov = iov,
+        .iovcnt = iovcnt,
+        .offset = offset,
+        .append = append,
+        .st = &st,
+    };
+
+    return run_backend(&work);
+}
+
+static int coroutine_fn co_mkdir(Plan9P1Server *server, V9fsPath *dirpath,
+                                 const char *name, mode_t mode, gid_t gid)
+{
+    V9fsPath dircopy;
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_MKDIR,
+        .backend = server->backend,
+        .name = name,
+        .cred = {
+            .fc_uid = -1,
+            .fc_gid = gid,
+            .fc_mode = mode,
+            .fc_rdev = -1,
+        },
+    };
+    int ret;
+
+    path_init(&dircopy);
+    path_copy(&dircopy, dirpath);
+    work.dirpath = &dircopy;
+    ret = run_backend(&work);
+    path_free(&dircopy);
+    return ret;
+}
+
+static int coroutine_fn co_chmod(Plan9P1Server *server, V9fsPath *path,
+                                 mode_t mode)
+{
+    V9fsPath copy;
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_CHMOD,
+        .backend = server->backend,
+        .cred = {
+            .fc_uid = -1,
+            .fc_gid = -1,
+            .fc_mode = mode,
+            .fc_rdev = -1,
+        },
+    };
+    int ret;
+
+    path_init(&copy);
+    path_copy(&copy, path);
+    work.path = &copy;
+    ret = run_backend(&work);
+    path_free(&copy);
+    return ret;
+}
+
+static int coroutine_fn co_chown_gid(Plan9P1Server *server, V9fsPath *path,
+                                     gid_t gid)
+{
+    V9fsPath copy;
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_CHOWN,
+        .backend = server->backend,
+        .cred = {
+            .fc_uid = -1,
+            .fc_gid = gid,
+            .fc_mode = -1,
+            .fc_rdev = -1,
+        },
+    };
+    int ret;
+
+    path_init(&copy);
+    path_copy(&copy, path);
+    work.path = &copy;
+    ret = run_backend(&work);
+    path_free(&copy);
+    return ret;
+}
+
+static int coroutine_fn co_utimensat(Plan9P1Server *server, V9fsPath *path,
+                                     uint32_t mtime)
+{
+    V9fsPath copy;
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_UTIMENSAT,
+        .backend = server->backend,
+        .times = {
+            { .tv_nsec = UTIME_OMIT },
+            { .tv_sec = mtime, .tv_nsec = 0 },
+        },
+    };
+    int ret;
+
+    path_init(&copy);
+    path_copy(&copy, path);
+    work.path = &copy;
+    ret = run_backend(&work);
+    path_free(&copy);
+    return ret;
+}
+
+static int coroutine_fn co_renameat(Plan9P1Server *server,
+                                    V9fsPath *dirpath, const char *oldname,
+                                    const char *newname)
+{
+    V9fsPath olddir;
+    V9fsPath newdir;
+    Plan9P1BackendWork work = {
+        .op = PLAN9P1_BACKEND_RENAMEAT,
+        .backend = server->backend,
+        .name = oldname,
+        .newname = newname,
+    };
+    int ret;
+
+    path_init(&olddir);
+    path_init(&newdir);
+    path_copy(&olddir, dirpath);
+    path_copy(&newdir, dirpath);
+    work.dirpath = &olddir;
+    work.newdirpath = &newdir;
+    ret = run_backend(&work);
+    path_free(&olddir);
+    path_free(&newdir);
+    return ret;
+}
+
+static int coroutine_fn co_unlink(Plan9P1Server *server,
+                                  V9fsPath *dirpath, const char *name,
+                                  V9fsPath *path, bool directory)
+{
+    V9fsPath dircopy;
+    V9fsPath pathcopy;
+    V9fsPath resolved;
+    V9fsPath *remove_path = path;
+    Plan9P1BackendWork work = {
+        .op = server->backend->ops->unlinkat ?
+              PLAN9P1_BACKEND_UNLINKAT : PLAN9P1_BACKEND_REMOVE,
+        .backend = server->backend,
+        .name = name,
+        .flags = directory ? AT_REMOVEDIR : 0,
+    };
+    int ret;
+
+    path_init(&dircopy);
+    path_init(&pathcopy);
+    path_init(&resolved);
+    if (!server->backend->ops->unlinkat && (!path || !path->data)) {
+        ret = co_name_to_path(server, dirpath, name, &resolved);
+        if (ret < 0) {
+            goto out;
+        }
+        remove_path = &resolved;
+    }
+    path_copy(&dircopy, dirpath);
+    path_copy(&pathcopy, remove_path);
+    work.dirpath = &dircopy;
+    work.path = &pathcopy;
+    ret = run_backend(&work);
+out:
+    path_free(&dircopy);
+    path_free(&pathcopy);
+    path_free(&resolved);
+    return ret;
 }
 
 static void coroutine_fn co_rewinddir(Plan9P1Server *server,
@@ -439,6 +764,7 @@ static void fid_free(gpointer opaque)
     unsigned int i;
 
     path_free(&fid->path);
+    path_free(&fid->parent_path);
     if (fid->dir_cache) {
         assert(fid->server->dir_cache_bytes >= fid->dir_cache->len);
         fid->server->dir_cache_bytes -= fid->dir_cache->len;
@@ -501,6 +827,7 @@ static void plan9p1_server_instance_finalize(Object *obj)
     server->closing = true;
     g_hash_table_unref(server->fids);
     g_hash_table_unref(server->qid_paths);
+    g_hash_table_unref(server->append_qids);
     v9fs_backend_cleanup(&server->backend_storage);
     server->backend = NULL;
     g_free(server->fsdev_id);
@@ -696,6 +1023,7 @@ static void reset_qids(Plan9P1Server *server)
     memset(server->device_identities, 0, sizeof(server->device_identities));
     memset(server->devices, 0, sizeof(server->devices));
     g_hash_table_remove_all(server->qid_paths);
+    g_hash_table_remove_all(server->append_qids);
 }
 
 static int coroutine_fn close_fid(Plan9P1Server *server, Plan9P1Fid *fid)
@@ -708,6 +1036,25 @@ static int coroutine_fn close_fid(Plan9P1Server *server, Plan9P1Fid *fid)
         ret = co_close(server, &fid->fs, true);
     }
     fid->open_kind = PLAN9P1_OPEN_NONE;
+    fid->access = PLAN9P1_OREAD;
+    return ret;
+}
+
+static int coroutine_fn remove_fid_path(Plan9P1Server *server,
+                                        Plan9P1Fid *fid)
+{
+    const char *name;
+    int ret;
+
+    if (fid->components->len == 0) {
+        return -EPERM;
+    }
+    name = fid->components->pdata[fid->components->len - 1];
+    ret = co_unlink(server, &fid->parent_path, name, &fid->path,
+                    fid->qid.path & PLAN9P1_DMDIR);
+    if (ret >= 0) {
+        invalidate_dir_caches(server);
+    }
     return ret;
 }
 
@@ -717,7 +1064,14 @@ static void coroutine_fn cleanup_fids(Plan9P1Server *server)
     GList *link;
 
     for (link = fids; link; link = link->next) {
-        close_fid(server, link->data);
+        Plan9P1Fid *fid = link->data;
+        bool remove = fid->remove_on_clunk;
+
+        fid->remove_on_clunk = false;
+        close_fid(server, fid);
+        if (remove) {
+            remove_fid_path(server, fid);
+        }
     }
     g_list_free(fids);
     g_hash_table_remove_all(server->fids);
@@ -770,7 +1124,9 @@ static Plan9P1Fid *new_fid(Plan9P1Server *server, uint16_t number,
     fid->server = server;
     fid->fid = number;
     path_init(&fid->path);
+    path_init(&fid->parent_path);
     path_copy(&fid->path, path);
+    path_copy(&fid->parent_path, path);
     fid->qid = *qid;
     fid->components = g_ptr_array_new_with_free_func(g_free);
     if (name[0] && strcmp(name, "/")) {
@@ -778,6 +1134,33 @@ static Plan9P1Fid *new_fid(Plan9P1Server *server, uint16_t number,
     }
     fixed_string(fid->name, name);
     return fid;
+}
+
+static int coroutine_fn resolve_components(Plan9P1Server *server,
+                                           GPtrArray *components,
+                                           unsigned int count,
+                                           V9fsPath *result)
+{
+    V9fsPath current;
+    V9fsPath next;
+    unsigned int i;
+    int ret;
+
+    path_init(&current);
+    path_init(&next);
+    ret = co_name_to_path(server, NULL, "/", &current);
+    for (i = 0; ret >= 0 && i < count; i++) {
+        ret = co_name_to_path(server, &current, components->pdata[i], &next);
+        if (ret >= 0) {
+            path_copy(&current, &next);
+        }
+        path_free(&next);
+    }
+    if (ret >= 0) {
+        path_copy(result, &current);
+    }
+    path_free(&current);
+    return ret;
 }
 
 static int coroutine_fn attach_fid(Plan9P1Request *request,
@@ -840,6 +1223,8 @@ static int clone_fid(Plan9P1Request *request, bool walk,
         g_ptr_array_add(clone->components,
                         g_strdup(source->components->pdata[i]));
     }
+    path_copy(&clone->parent_path, &source->parent_path);
+    clone->append_only = source->append_only;
     memcpy(clone->name, source->name, sizeof(clone->name));
     g_hash_table_insert(server->fids, fid_key(clone->fid), clone);
     reply->type = walk ? PLAN9P1_RCLWALK : PLAN9P1_RCLONE;
@@ -854,7 +1239,9 @@ static int coroutine_fn walk_fid(Plan9P1Request *request, Plan9P1Fid *fid,
     Plan9P1Server *server = request->server;
     g_autofree char *name = decode_name(request->tx.name);
     V9fsPath path;
+    V9fsPath parent;
     struct stat st;
+    bool qid_acquired = false;
     int ret;
 
     if (!name) {
@@ -864,6 +1251,7 @@ static int coroutine_fn walk_fid(Plan9P1Request *request, Plan9P1Fid *fid,
         return fid ? -EBUSY : -ENOENT;
     }
     path_init(&path);
+    path_init(&parent);
     ret = co_name_to_path(server, &fid->path, name, &path);
     if (ret < 0) {
         goto out;
@@ -876,18 +1264,33 @@ static int coroutine_fn walk_fid(Plan9P1Request *request, Plan9P1Fid *fid,
     if (ret < 0) {
         goto out;
     }
+    qid_acquired = true;
+    if (!strcmp(name, "..")) {
+        ret = resolve_components(server, fid->components,
+                                 fid->components->len > 1 ?
+                                 fid->components->len - 2 : 0, &parent);
+        if (ret < 0) {
+            goto out;
+        }
+    } else if (strcmp(name, ".")) {
+        path_copy(&parent, &fid->path);
+    } else {
+        path_copy(&parent, &fid->parent_path);
+    }
+    if (!strcmp(name, "..") && fid->components->len) {
+        g_ptr_array_remove_index(fid->components,
+                                 fid->components->len - 1);
+    } else if (strcmp(name, ".") && strcmp(name, "..")) {
+        g_ptr_array_add(fid->components, g_strdup(name));
+    }
     path_copy(&fid->path, &path);
+    path_copy(&fid->parent_path, &parent);
     qid_release(server, fid->qid.path);
     fid->qid = *qid;
     qid_commit(server, qid->path);
-    if (!strcmp(name, "..")) {
-        if (fid->components->len) {
-            g_ptr_array_remove_index(fid->components,
-                                     fid->components->len - 1);
-        }
-    } else if (strcmp(name, ".")) {
-        g_ptr_array_add(fid->components, g_strdup(name));
-    }
+    qid_acquired = false;
+    fid->append_only = g_hash_table_contains(
+        server->append_qids, GUINT_TO_POINTER(qid->path));
     if (fid->components->len) {
         fixed_string(fid->name,
                      g_ptr_array_index(fid->components,
@@ -896,8 +1299,41 @@ static int coroutine_fn walk_fid(Plan9P1Request *request, Plan9P1Fid *fid,
         fixed_string(fid->name, "/");
     }
 out:
+    if (qid_acquired) {
+        qid_release(server, qid->path);
+    }
     path_free(&path);
+    path_free(&parent);
     return ret;
+}
+
+static bool execute_permitted(const struct stat *st)
+{
+    uid_t uid = geteuid();
+    gid_t gid = getegid();
+    int count;
+    g_autofree gid_t *groups = NULL;
+
+    if (uid == 0) {
+        return st->st_mode & 0111;
+    }
+    if (uid == st->st_uid) {
+        return st->st_mode & S_IXUSR;
+    }
+    if (gid == st->st_gid) {
+        return st->st_mode & S_IXGRP;
+    }
+    count = getgroups(0, NULL);
+    if (count > 0) {
+        groups = g_new(gid_t, count);
+        count = getgroups(count, groups);
+        for (int i = 0; i < count; i++) {
+            if (groups[i] == st->st_gid) {
+                return st->st_mode & S_IXGRP;
+            }
+        }
+    }
+    return st->st_mode & S_IXOTH;
 }
 
 static int coroutine_fn open_fid(Plan9P1Request *request,
@@ -907,6 +1343,9 @@ static int coroutine_fn open_fid(Plan9P1Request *request,
     Plan9P1Fid *fid = find_fid(server, request->tx.fid);
     struct stat st;
     unsigned int mode = request->tx.mode;
+    unsigned int access = mode & 3;
+    bool truncate = false;
+    int flags;
     int ret;
 
     if (!fid) {
@@ -915,15 +1354,27 @@ static int coroutine_fn open_fid(Plan9P1Request *request,
     if (fid->open_kind != PLAN9P1_OPEN_NONE) {
         return -EBUSY;
     }
-    if ((mode & 3) == 1 || (mode & 3) == 2 || (mode & 0x50)) {
+    if (mode & ~PLAN9P1_OPEN_MASK) {
+        return -EINVAL;
+    }
+    if ((mode & (PLAN9P1_OTRUNC | 3)) ==
+        (PLAN9P1_OTRUNC | PLAN9P1_OEXEC)) {
+        return -EINVAL;
+    }
+    if ((server->backend->ctx.export_flags & V9FS_RDONLY) &&
+        (access == PLAN9P1_OWRITE || access == PLAN9P1_ORDWR ||
+         (mode & (PLAN9P1_OTRUNC | PLAN9P1_ORCLOSE)))) {
         return -EROFS;
+    }
+    if ((mode & PLAN9P1_ORCLOSE) && fid->components->len == 0) {
+        return -EPERM;
     }
     ret = stat_path(server, &fid->path, &st);
     if (ret < 0) {
         return ret;
     }
     if (S_ISDIR(st.st_mode)) {
-        if ((mode & 3) != 0) {
+        if (mode != PLAN9P1_OREAD) {
             return -EISDIR;
         }
         ret = co_opendir(server, &fid->path, &fid->fs);
@@ -932,12 +1383,28 @@ static int coroutine_fn open_fid(Plan9P1Request *request,
         }
         fid->open_kind = PLAN9P1_OPEN_DIR;
     } else {
-        ret = co_open(server, &fid->path, O_RDONLY, &fid->fs);
+        if (access == PLAN9P1_OEXEC && !execute_permitted(&st)) {
+            return -EACCES;
+        }
+        flags = access == PLAN9P1_OWRITE ? O_WRONLY :
+                access == PLAN9P1_ORDWR ? O_RDWR : O_RDONLY;
+        fid->append_only = g_hash_table_contains(
+            server->append_qids, GUINT_TO_POINTER(fid->qid.path));
+        if ((mode & PLAN9P1_OTRUNC) && !fid->append_only) {
+            flags |= O_TRUNC;
+            truncate = true;
+        }
+        ret = co_open(server, &fid->path, flags, &fid->fs);
         if (ret < 0) {
             return ret;
         }
         fid->open_kind = PLAN9P1_OPEN_FILE;
+        if (truncate) {
+            invalidate_dir_caches(server);
+        }
     }
+    fid->access = access;
+    fid->remove_on_clunk = mode & PLAN9P1_ORCLOSE;
     reply->type = PLAN9P1_ROPEN;
     reply->fid = fid->fid;
     reply->qid = fid->qid;
@@ -965,6 +1432,10 @@ static int append_dir_record(Plan9P1Server *server, Plan9P1Fid *fid,
     ret = fill_dir(server, name, st, &stat_reply.dir);
     if (ret < 0) {
         return ret;
+    }
+    if (g_hash_table_contains(server->append_qids,
+                              GUINT_TO_POINTER(stat_reply.dir.qid.path))) {
+        stat_reply.dir.mode |= PLAN9P1_DMAPPEND;
     }
     length = plan9p1_encode(encoded, sizeof(encoded), &stat_reply, &err);
     if (length != sizeof(encoded)) {
@@ -1072,6 +1543,11 @@ static int coroutine_fn read_fid(Plan9P1Request *request,
     if (fid->open_kind == PLAN9P1_OPEN_NONE) {
         return -EBADF;
     }
+    if (fid->open_kind == PLAN9P1_OPEN_FILE &&
+        fid->access != PLAN9P1_OREAD && fid->access != PLAN9P1_ORDWR &&
+        fid->access != PLAN9P1_OEXEC) {
+        return -EBADF;
+    }
     reply->type = PLAN9P1_RREAD;
     reply->fid = fid->fid;
     if (fid->open_kind == PLAN9P1_OPEN_DIR) {
@@ -1134,6 +1610,529 @@ static int coroutine_fn read_fid(Plan9P1Request *request,
     return 0;
 }
 
+static int create_open_flags(unsigned int access)
+{
+    switch (access) {
+    case PLAN9P1_OREAD:
+    case PLAN9P1_OEXEC:
+        return O_RDONLY;
+    case PLAN9P1_OWRITE:
+        return O_WRONLY;
+    case PLAN9P1_ORDWR:
+        return O_RDWR;
+    default:
+        return -1;
+    }
+}
+
+static int coroutine_fn create_fid(Plan9P1Request *request,
+                                   Plan9P1Fcall *reply)
+{
+    Plan9P1Server *server = request->server;
+    Plan9P1Fid *fid = find_fid(server, request->tx.fid);
+    g_autofree char *name = decode_name(request->tx.name);
+    V9fsPath path;
+    V9fsPath parent;
+    V9fsFidOpenState candidate = { 0 };
+    struct stat parent_st;
+    struct stat st;
+    Plan9P1Qid qid = { 0 };
+    unsigned int access = request->tx.mode & 3;
+    uint32_t perm = request->tx.perm;
+    mode_t host_mode;
+    int flags;
+    int ret;
+    int cleanup_ret;
+    bool directory;
+    bool created = false;
+    bool opened = false;
+
+    path_init(&path);
+    path_init(&parent);
+    if (!name) {
+        return -errno;
+    }
+    if (!strcmp(name, ".") || !strcmp(name, "..")) {
+        return -EINVAL;
+    }
+    if (!fid) {
+        return -ENOENT;
+    }
+    if (fid->open_kind != PLAN9P1_OPEN_NONE) {
+        return -EBUSY;
+    }
+    if (request->tx.mode & ~PLAN9P1_OPEN_MASK) {
+        return -EINVAL;
+    }
+    if (server->backend->ctx.export_flags & V9FS_RDONLY) {
+        return -EROFS;
+    }
+    if (perm & ~(PLAN9P1_DMDIR | PLAN9P1_DMAPPEND |
+                 PLAN9P1_DMLOCK | UINT32_C(0777))) {
+        return -EINVAL;
+    }
+    if (perm & PLAN9P1_DMLOCK) {
+        return -EOPNOTSUPP;
+    }
+    ret = stat_path(server, &fid->path, &parent_st);
+    if (ret < 0) {
+        return ret;
+    }
+    if (!S_ISDIR(parent_st.st_mode)) {
+        return -ENOTDIR;
+    }
+    directory = perm & PLAN9P1_DMDIR;
+    if (directory && access != PLAN9P1_OREAD) {
+        return -EISDIR;
+    }
+    path_copy(&parent, &fid->path);
+    if (directory) {
+        host_mode = (perm & 0777) & (parent_st.st_mode & 0777);
+        ret = co_mkdir(server, &parent, name, host_mode, parent_st.st_gid);
+        if (ret < 0) {
+            goto out;
+        }
+        created = true;
+        ret = co_name_to_path(server, &parent, name, &path);
+        if (ret >= 0) {
+            ret = stat_path(server, &path, &st);
+        }
+        if (ret >= 0) {
+            ret = co_opendir(server, &path, &candidate);
+            opened = ret >= 0;
+        }
+    } else {
+        host_mode = ((perm & 0666) & (parent_st.st_mode & 0666)) |
+                    (perm & 0111);
+        if (access == PLAN9P1_OEXEC && !(host_mode & S_IXUSR)) {
+            ret = -EACCES;
+            goto out;
+        }
+        flags = create_open_flags(access) | O_CREAT | O_EXCL;
+        ret = co_open2(server, &parent, name, flags, host_mode,
+                       parent_st.st_gid, &candidate);
+        if (ret < 0) {
+            goto out;
+        }
+        created = true;
+        opened = true;
+        ret = co_name_to_path(server, &parent, name, &path);
+        if (ret >= 0) {
+            ret = stat_path(server, &path, &st);
+        }
+    }
+    if (ret >= 0) {
+        ret = qid_from_stat(server, &st, &qid);
+    }
+    if (ret < 0) {
+        goto out;
+    }
+
+    path_copy(&fid->parent_path, &parent);
+    path_copy(&fid->path, &path);
+    qid_release(server, fid->qid.path);
+    fid->qid = qid;
+    qid_commit(server, qid.path);
+    g_ptr_array_add(fid->components, g_strdup(name));
+    fixed_string(fid->name, name);
+    fid->fs = candidate;
+    fid->open_kind = directory ? PLAN9P1_OPEN_DIR : PLAN9P1_OPEN_FILE;
+    fid->access = access;
+    fid->remove_on_clunk = request->tx.mode & PLAN9P1_ORCLOSE;
+    fid->append_only = perm & PLAN9P1_DMAPPEND;
+    if (fid->append_only) {
+        g_hash_table_add(server->append_qids, GUINT_TO_POINTER(qid.path));
+    }
+    invalidate_dir_caches(server);
+    opened = false;
+    created = false;
+    reply->type = PLAN9P1_RCREATE;
+    reply->fid = fid->fid;
+    reply->qid = fid->qid;
+out:
+    if (ret < 0 && opened) {
+        cleanup_ret = co_close(server, &candidate, directory);
+        opened = false;
+        if (cleanup_ret < 0) {
+            warn_report("9pfs: 9P1 create rollback close failed: %s",
+                        g_strerror(-cleanup_ret));
+        }
+    }
+    if (ret < 0 && created) {
+        invalidate_dir_caches(server);
+        cleanup_ret = co_unlink(server, &parent, name, &path, directory);
+        created = false;
+        if (cleanup_ret < 0) {
+            warn_report("9pfs: 9P1 create rollback remove failed: %s",
+                        g_strerror(-cleanup_ret));
+        }
+    }
+    if (ret < 0 && qid.path) {
+        qid_release(server, qid.path);
+    }
+    path_free(&path);
+    path_free(&parent);
+    return ret;
+}
+
+static int coroutine_fn write_fid(Plan9P1Request *request,
+                                  Plan9P1Fcall *reply)
+{
+    Plan9P1Server *server = request->server;
+    Plan9P1Fid *fid = find_fid(server, request->tx.fid);
+    struct iovec iov;
+    ssize_t ret;
+
+    if (server->backend->ctx.export_flags & V9FS_RDONLY) {
+        return -EROFS;
+    }
+    if (!fid) {
+        return -ENOENT;
+    }
+    if (fid->open_kind != PLAN9P1_OPEN_FILE ||
+        (fid->access != PLAN9P1_OWRITE && fid->access != PLAN9P1_ORDWR)) {
+        return -EBADF;
+    }
+    if (request->tx.count > PLAN9P1_MAX_DATA ||
+        (request->tx.count && !request->tx.data)) {
+        return -EINVAL;
+    }
+    if (!fid->append_only &&
+        (request->tx.offset > INT64_MAX ||
+         request->tx.offset > INT64_MAX - request->tx.count ||
+         (uint64_t)(off_t)request->tx.offset != request->tx.offset)) {
+        return -EOVERFLOW;
+    }
+    reply->type = PLAN9P1_RWRITE;
+    reply->fid = fid->fid;
+    if (!request->tx.count) {
+        reply->count = 0;
+        return 0;
+    }
+    iov = (struct iovec) {
+        .iov_base = (void *)request->tx.data,
+        .iov_len = request->tx.count,
+    };
+    fsdev_co_throttle_request(server->backend->ctx.fst, THROTTLE_WRITE,
+                              &iov, 1);
+    if (request->cancelled) {
+        return -EINTR;
+    }
+    ret = co_pwritev(server, &fid->fs, &iov, 1,
+                     (off_t)request->tx.offset, fid->append_only);
+    if (ret < 0) {
+        return ret;
+    }
+    if (ret > 0) {
+        invalidate_dir_caches(server);
+    }
+    if ((uint64_t)ret > request->tx.count) {
+        return -EIO;
+    }
+    reply->count = ret;
+    return 0;
+}
+
+typedef struct Plan9P1RenameCandidate {
+    Plan9P1Fid *fid;
+    V9fsPath path;
+    V9fsPath parent;
+} Plan9P1RenameCandidate;
+
+static void rename_candidate_free(gpointer opaque)
+{
+    Plan9P1RenameCandidate *candidate = opaque;
+
+    path_free(&candidate->path);
+    path_free(&candidate->parent);
+    g_free(candidate);
+}
+
+static bool components_have_prefix(GPtrArray *components,
+                                   GPtrArray *prefix)
+{
+    unsigned int i;
+
+    if (components->len < prefix->len) {
+        return false;
+    }
+    for (i = 0; i < prefix->len; i++) {
+        if (strcmp(components->pdata[i], prefix->pdata[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int coroutine_fn resolve_renamed_components(Plan9P1Server *server,
+                                                   Plan9P1Fid *fid,
+                                                   unsigned int index,
+                                                   const char *newname,
+                                                   unsigned int count,
+                                                   V9fsPath *result)
+{
+    V9fsPath current;
+    V9fsPath next;
+    unsigned int i;
+    int ret;
+
+    path_init(&current);
+    path_init(&next);
+    ret = co_name_to_path(server, NULL, "/", &current);
+    for (i = 0; ret >= 0 && i < count; i++) {
+        const char *component = i == index ?
+            newname : fid->components->pdata[i];
+
+        ret = co_name_to_path(server, &current, component, &next);
+        if (ret >= 0) {
+            path_copy(&current, &next);
+        }
+        path_free(&next);
+    }
+    if (ret >= 0) {
+        path_copy(result, &current);
+    }
+    path_free(&current);
+    return ret;
+}
+
+static void invalidate_dir_caches(Plan9P1Server *server)
+{
+    GList *values = g_hash_table_get_values(server->fids);
+    GList *link;
+
+    for (link = values; link; link = link->next) {
+        Plan9P1Fid *fid = link->data;
+        unsigned int i;
+
+        if (fid->dir_cache) {
+            assert(server->dir_cache_bytes >= fid->dir_cache->len);
+            server->dir_cache_bytes -= fid->dir_cache->len;
+            g_byte_array_unref(fid->dir_cache);
+            fid->dir_cache = NULL;
+        }
+        if (fid->dir_qids) {
+            for (i = 0; i < fid->dir_qids->len; i++) {
+                qid_release(server,
+                            g_array_index(fid->dir_qids, uint32_t, i));
+            }
+            g_array_unref(fid->dir_qids);
+            fid->dir_qids = NULL;
+        }
+    }
+    g_list_free(values);
+}
+
+static char *fixed_to_string(const uint8_t value[PLAN9P1_NAMELEN])
+{
+    return g_strndup((const char *)value,
+                     strnlen((const char *)value, PLAN9P1_NAMELEN));
+}
+
+static int parse_gid(const char *text, gid_t *gid)
+{
+    char *end;
+    uint64_t value;
+
+    if (!text[0] || !g_ascii_isdigit(text[0])) {
+        return -EINVAL;
+    }
+    errno = 0;
+    value = g_ascii_strtoull(text, &end, 10);
+    if (errno || *end || (uint64_t)(gid_t)value != value) {
+        return -EINVAL;
+    }
+    *gid = value;
+    return 0;
+}
+
+static int coroutine_fn rename_fids(Plan9P1Server *server,
+                                    Plan9P1Fid *target,
+                                    const char *newname)
+{
+    g_autoptr(GPtrArray) candidates =
+        g_ptr_array_new_with_free_func(rename_candidate_free);
+    GList *values = g_hash_table_get_values(server->fids);
+    GList *link;
+    unsigned int index = target->components->len - 1;
+    int ret = 0;
+
+    for (link = values; link; link = link->next) {
+        Plan9P1Fid *fid = link->data;
+        Plan9P1RenameCandidate *candidate;
+
+        if (!components_have_prefix(fid->components, target->components)) {
+            continue;
+        }
+        candidate = g_new0(Plan9P1RenameCandidate, 1);
+        candidate->fid = fid;
+        path_init(&candidate->path);
+        path_init(&candidate->parent);
+        ret = resolve_renamed_components(server, fid, index, newname,
+                                         fid->components->len,
+                                         &candidate->path);
+        if (ret >= 0) {
+            ret = resolve_renamed_components(server, fid, index, newname,
+                                             fid->components->len - 1,
+                                             &candidate->parent);
+        }
+        if (ret < 0) {
+            rename_candidate_free(candidate);
+            break;
+        }
+        g_ptr_array_add(candidates, candidate);
+    }
+    g_list_free(values);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = co_renameat(server, &target->parent_path,
+                      target->components->pdata[index], newname);
+    if (ret < 0) {
+        return ret;
+    }
+    for (unsigned int i = 0; i < candidates->len; i++) {
+        Plan9P1RenameCandidate *candidate = candidates->pdata[i];
+
+        g_free(candidate->fid->components->pdata[index]);
+        candidate->fid->components->pdata[index] = g_strdup(newname);
+        path_copy(&candidate->fid->path, &candidate->path);
+        path_copy(&candidate->fid->parent_path, &candidate->parent);
+        if (candidate->fid->components->len == target->components->len) {
+            fixed_string(candidate->fid->name, newname);
+        }
+    }
+    invalidate_dir_caches(server);
+    return 0;
+}
+
+static int coroutine_fn wstat_fid(Plan9P1Request *request,
+                                  Plan9P1Fcall *reply)
+{
+    Plan9P1Server *server = request->server;
+    Plan9P1Fid *fid = find_fid(server, request->tx.fid);
+    g_autofree char *name = fixed_to_string(request->tx.dir.name);
+    g_autofree char *uid = fixed_to_string(request->tx.dir.uid);
+    g_autofree char *gid_text = fixed_to_string(request->tx.dir.gid);
+    char current_uid[PLAN9P1_NAMELEN + 1];
+    struct stat st;
+    gid_t gid;
+    uint32_t requested_mode = request->tx.dir.mode;
+    mode_t mode;
+    bool append;
+    bool change_mode;
+    bool change_gid;
+    bool change_mtime;
+    bool change_name;
+    bool change_append;
+    bool mutated = false;
+    int ret;
+
+    if (server->backend->ctx.export_flags & V9FS_RDONLY) {
+        return -EROFS;
+    }
+    if (!fid) {
+        return -ENOENT;
+    }
+    if (fid->components->len == 0) {
+        return -EPERM;
+    }
+    if (!name[0] || strchr(name, '/') || !strcmp(name, ".") ||
+        !strcmp(name, "..")) {
+        return -EINVAL;
+    }
+    if (requested_mode & PLAN9P1_DMLOCK) {
+        return -EOPNOTSUPP;
+    }
+    if (requested_mode & ~(PLAN9P1_DMDIR | PLAN9P1_DMAPPEND |
+                           PLAN9P1_DMLOCK | UINT32_C(0777))) {
+        return -EINVAL;
+    }
+    ret = stat_path(server, &fid->path, &st);
+    if (ret < 0) {
+        return ret;
+    }
+    snprintf(current_uid, sizeof(current_uid), "%ju", (uintmax_t)st.st_uid);
+    if (strcmp(uid, current_uid)) {
+        return -EPERM;
+    }
+    ret = parse_gid(gid_text, &gid);
+    if (ret < 0) {
+        return ret;
+    }
+    mode = requested_mode & 0777;
+    append = requested_mode & PLAN9P1_DMAPPEND;
+    change_mode = mode != (st.st_mode & 0777);
+    change_gid = gid != st.st_gid;
+    change_mtime = request->tx.dir.mtime != stat_mtime(&st);
+    change_name = strncmp(name, (char *)fid->name, PLAN9P1_NAMELEN);
+    change_append = append != g_hash_table_contains(
+        server->append_qids, GUINT_TO_POINTER(fid->qid.path));
+    if ((change_mode && !server->backend->ops->chmod) ||
+        (change_gid && !server->backend->ops->chown) ||
+        (change_mtime && !server->backend->ops->utimensat) ||
+        (change_name && !server->backend->ops->renameat)) {
+        return -EOPNOTSUPP;
+    }
+    if (change_mode) {
+        ret = co_chmod(server, &fid->path, mode);
+        if (ret < 0) {
+            goto out;
+        }
+        mutated = true;
+    }
+    if (change_gid) {
+        ret = co_chown_gid(server, &fid->path, gid);
+        if (ret < 0) {
+            goto out;
+        }
+        mutated = true;
+    }
+    if (change_mtime) {
+        ret = co_utimensat(server, &fid->path, request->tx.dir.mtime);
+        if (ret < 0) {
+            goto out;
+        }
+        mutated = true;
+    }
+    if (change_name) {
+        ret = rename_fids(server, fid, name);
+        if (ret < 0) {
+            goto out;
+        }
+        mutated = true;
+    }
+    if (change_append) {
+        GHashTableIter iter;
+        gpointer value;
+
+        if (append) {
+            g_hash_table_add(server->append_qids,
+                             GUINT_TO_POINTER(fid->qid.path));
+        } else {
+            g_hash_table_remove(server->append_qids,
+                                GUINT_TO_POINTER(fid->qid.path));
+        }
+        g_hash_table_iter_init(&iter, server->fids);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            Plan9P1Fid *other = value;
+
+            if (other->qid.path == fid->qid.path) {
+                other->append_only = append;
+            }
+        }
+        mutated = true;
+    }
+    reply->type = PLAN9P1_RWSTAT;
+    reply->fid = fid->fid;
+    ret = 0;
+out:
+    if (mutated) {
+        invalidate_dir_caches(server);
+    }
+    return ret;
+}
+
 static int coroutine_fn stat_fid(Plan9P1Request *request,
                                  Plan9P1Fcall *reply)
 {
@@ -1156,6 +2155,10 @@ static int coroutine_fn stat_fid(Plan9P1Request *request,
     if (ret < 0) {
         return ret;
     }
+    if (g_hash_table_contains(server->append_qids,
+                              GUINT_TO_POINTER(reply->dir.qid.path))) {
+        reply->dir.mode |= PLAN9P1_DMAPPEND;
+    }
     qid_commit(server, reply->dir.qid.path);
     qid_release(server, reply->dir.qid.path);
     reply->type = PLAN9P1_RSTAT;
@@ -1168,18 +2171,58 @@ static int coroutine_fn clunk_fid(Plan9P1Request *request,
 {
     Plan9P1Server *server = request->server;
     Plan9P1Fid *fid = find_fid(server, request->tx.fid);
-    int ret;
+    bool remove;
+    int close_ret;
+    int remove_ret = 0;
 
     if (!fid) {
         return -ENOENT;
     }
-    ret = close_fid(server, fid);
+    remove = fid->remove_on_clunk;
+    fid->remove_on_clunk = false;
+    close_ret = close_fid(server, fid);
+    if (remove) {
+        remove_ret = remove_fid_path(server, fid);
+    }
 
     g_hash_table_remove(server->fids, fid_key(request->tx.fid));
-    if (ret < 0) {
-        return ret;
+    if (remove_ret < 0) {
+        return remove_ret;
+    }
+    if (close_ret < 0) {
+        return close_ret;
     }
     reply->type = PLAN9P1_RCLUNK;
+    reply->fid = request->tx.fid;
+    return 0;
+}
+
+static int coroutine_fn remove_fid(Plan9P1Request *request,
+                                   Plan9P1Fcall *reply)
+{
+    Plan9P1Server *server = request->server;
+    Plan9P1Fid *fid = find_fid(server, request->tx.fid);
+    int close_ret;
+    int remove_ret;
+
+    if (!fid) {
+        return -ENOENT;
+    }
+    fid->remove_on_clunk = false;
+    close_ret = close_fid(server, fid);
+    if (server->backend->ctx.export_flags & V9FS_RDONLY) {
+        remove_ret = -EROFS;
+    } else {
+        remove_ret = remove_fid_path(server, fid);
+    }
+    g_hash_table_remove(server->fids, fid_key(request->tx.fid));
+    if (remove_ret < 0) {
+        return remove_ret;
+    }
+    if (close_ret < 0) {
+        return close_ret;
+    }
+    reply->type = PLAN9P1_RREMOVE;
     reply->fid = request->tx.fid;
     return 0;
 }
@@ -1243,8 +2286,14 @@ static void coroutine_fn handle_request(Plan9P1Request *request)
     case PLAN9P1_TOPEN:
         ret = open_fid(request, &reply);
         break;
+    case PLAN9P1_TCREATE:
+        ret = create_fid(request, &reply);
+        break;
     case PLAN9P1_TREAD:
         ret = read_fid(request, &reply);
+        break;
+    case PLAN9P1_TWRITE:
+        ret = write_fid(request, &reply);
         break;
     case PLAN9P1_TSTAT:
         ret = stat_fid(request, &reply);
@@ -1252,14 +2301,14 @@ static void coroutine_fn handle_request(Plan9P1Request *request)
     case PLAN9P1_TCLUNK:
         ret = clunk_fid(request, &reply);
         break;
+    case PLAN9P1_TREMOVE:
+        ret = remove_fid(request, &reply);
+        break;
+    case PLAN9P1_TWSTAT:
+        ret = wstat_fid(request, &reply);
+        break;
     case PLAN9P1_TFLUSH:
         reply.type = PLAN9P1_RFLUSH;
-        break;
-    case PLAN9P1_TCREATE:
-    case PLAN9P1_TWRITE:
-    case PLAN9P1_TREMOVE:
-    case PLAN9P1_TWSTAT:
-        ret = -EROFS;
         break;
     default:
         ret = -EOPNOTSUPP;
@@ -1648,6 +2697,7 @@ static void plan9p1_server_instance_init(Object *obj)
                                          NULL, fid_free);
     server->qid_paths = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                               NULL, qid_identity_free);
+    server->append_qids = g_hash_table_new(g_direct_hash, g_direct_equal);
     g_queue_init(&server->requests);
     g_queue_init(&server->replies);
     g_queue_init(&server->deferred_inputs);
