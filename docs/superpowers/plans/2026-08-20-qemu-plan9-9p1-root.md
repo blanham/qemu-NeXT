@@ -176,7 +176,9 @@ git -c core.sshCommand='ssh -F /dev/null' push origin next-bootp
 git -c core.sshCommand='ssh -F /dev/null' ls-remote origin refs/heads/next-bootp
 ```
 
-Expected: the full suite passes and the remote branch resolves to the new commit. Record that exact hash for Task 8.
+Expected: the full suite passes and the remote branch resolves to public commit
+`0454d236f6386eade10946145ffdf3bd7e28d409`. Task 3 pins this hash before using
+the new APIs.
 
 ### Task 3: Add an opaque QEMU SLiRP guest-forward adapter
 
@@ -184,6 +186,7 @@ Expected: the full suite passes and the remote branch resolves to the new commit
 - Create: `include/net/slirp-guestfwd.h`
 - Modify: `net/slirp.c`
 - Modify: `net/meson.build`
+- Modify: `subprojects/slirp.wrap`
 - Create: `tests/qtest/slirp-guestfwd-test.c`
 - Modify: `tests/qtest/meson.build`
 
@@ -236,14 +239,25 @@ socket write.
 
 - [ ] **Step 3: Implement lookup, validation, transport, and idempotent teardown**
 
-Resolve `qemu_find_netdev(netdev_id)` and require `NET_CLIENT_DRIVER_USER`. Store the opaque rule handle in QEMU's `SlirpState` forwarding list so global cleanup and object cleanup share one idempotent path. Use only `slirp_add_guestfwd`, `slirp_socket_can_recv`, `slirp_socket_recv`, `slirp_set_plan9_bootp`, and the now-safe `slirp_remove_guestfwd`; never call a host-forward API. After each SLiRP poll, scan live callback handles and invoke `ops->can_send` only when `slirp_socket_can_recv()` is nonzero. This is the retry edge for queued server replies after the guest drains SLiRP's socket buffer.
+First pin `subprojects/slirp.wrap` to public commit
+`0454d236f6386eade10946145ffdf3bd7e28d409` and update the worktree's fallback
+checkout to that exact revision. Resolve `qemu_find_netdev(netdev_id)` and
+require `NET_CLIENT_DRIVER_USER`. Store the opaque rule handle in QEMU's
+`SlirpState` forwarding list so global cleanup and object cleanup share one
+idempotent path. Use only `slirp_add_guestfwd`,
+`slirp_socket_can_recv`, `slirp_socket_recv`, `slirp_set_plan9_bootp`, and the
+now-safe `slirp_remove_guestfwd`; never call a host-forward API. After each
+SLiRP poll, scan live callback handles and invoke `ops->can_send` only when
+`slirp_socket_can_recv()` is nonzero. This is the retry edge for queued server
+replies after the guest drains SLiRP's socket buffer.
 
 - [ ] **Step 4: Verify and commit**
 
 ```bash
 ninja -C build tests/qtest/slirp-guestfwd-test
 build/tests/qtest/slirp-guestfwd-test
-git add include/net/slirp-guestfwd.h net/slirp.c net/meson.build tests/qtest
+git add include/net/slirp-guestfwd.h net/slirp.c net/meson.build \
+        subprojects/slirp.wrap tests/qtest
 git commit -m "net/slirp: expose callback guest forwards internally"
 ```
 
@@ -442,14 +456,13 @@ git add hw/9pfs/plan9-9p1-server.c tests/unit/test-plan9-9p1-server.c
 git commit -m "9pfs: complete writable Plan 9 9P1 service"
 ```
 
-### Task 8: Expose `plan9-9p1-server` through QOM/QAPI and pin libslirp
+### Task 8: Expose `plan9-9p1-server` through QOM/QAPI
 
 **Files:**
 - Modify: `hw/9pfs/plan9-9p1-server.h`
 - Modify: `hw/9pfs/plan9-9p1-server.c`
 - Modify: `hw/9pfs/meson.build`
 - Modify: `qapi/qom.json`
-- Modify: `subprojects/slirp.wrap`
 - Create: `tests/qtest/plan9-9p1-object-test.c`
 - Modify: `tests/qtest/meson.build`
 - Modify: `docs/system/devices/9p.rst`
@@ -474,9 +487,11 @@ and the `'plan9-9p1-server': 'Plan9P1ServerProperties'` branch to `ObjectOptions
 
 Create the QOM type with `fsdev`, `netdev`, `guest-address`, and `port` properties. In `complete()`, validate properties, initialize `V9fsBackend`, register the callback endpoint, configure Plan 9 BOOTP, then create the protocol server. Unwind in reverse order on failure. In `prepare_delete()`, first reject without side effects when `pending` is nonzero. Once idle, mark closing, stop acceptance of new bytes, safely remove the SLiRP endpoint, clunk fids, and clean the backend. Every queued coroutine's object reference prevents finalization during global unparent cleanup; `finalize()` performs the same ordered teardown idempotently once the final reference is released.
 
-- [ ] **Step 4: Pin the exact public libslirp commit and document usage**
+- [ ] **Step 4: Document usage and verify the public libslirp pin**
 
-Replace `revision` in `subprojects/slirp.wrap` with the exact remote hash produced by Task 2. Document that the service is guest-only and requires a named user netdev and fsdev.
+Confirm `subprojects/slirp.wrap` still names public commit
+`0454d236f6386eade10946145ffdf3bd7e28d409`, then document that the service is
+guest-only and requires a named user netdev and fsdev.
 
 - [ ] **Step 5: Verify and commit QEMU integration**
 
