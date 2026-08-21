@@ -22,9 +22,12 @@ typedef struct QemuSlirpGuestFwdBackendOps {
 } QemuSlirpGuestFwdBackendOps;
 
 QemuSlirpGuestFwdRegistry *qemu_slirp_guestfwd_registry_new(
-    struct in_addr network, struct in_addr mask, struct in_addr vhost,
-    struct in_addr dns, const QemuSlirpGuestFwdBackendOps *ops,
-    void *backend_opaque);
+    bool ipv4_enabled, struct in_addr network, struct in_addr mask,
+    struct in_addr vhost, struct in_addr dns,
+    const QemuSlirpGuestFwdBackendOps *ops, void *backend_opaque);
+/* Fault injection for otherwise-unreachable defensive checks. */
+void qemu_slirp_guestfwd_registry_set_ipv4_enabled_for_test(
+    QemuSlirpGuestFwdRegistry *registry, bool enabled);
 void qemu_slirp_guestfwd_registry_invalidate(
     QemuSlirpGuestFwdRegistry *registry);
 void qemu_slirp_guestfwd_registry_free(QemuSlirpGuestFwdRegistry *registry);
@@ -40,6 +43,8 @@ int qemu_slirp_guestfwd_registry_send(QemuSlirpGuestFwd *handle,
 bool qemu_slirp_guestfwd_registry_set_plan9_bootp(
     QemuSlirpGuestFwd *handle, const QemuSlirpPlan9BootpConfig *config,
     Error **errp);
+bool qemu_slirp_guestfwd_registry_get_ipv4_config(
+    QemuSlirpGuestFwd *handle, QemuSlirpIPv4Config *config, Error **errp);
 
 /* Consumes the caller-owned handle. Set the caller's pointer to NULL and do
  * not reuse it after this call. Passing NULL is safe. Removal from write

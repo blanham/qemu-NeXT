@@ -683,7 +683,7 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vdomainname = vdomainname;
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
     s->guestfwds = qemu_slirp_guestfwd_registry_new(
-        net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
+        ipv4, net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
 
     /*
@@ -1319,6 +1319,13 @@ bool qemu_slirp_guestfwd_set_plan9_bootp(
     Error **errp)
 {
     return qemu_slirp_guestfwd_registry_set_plan9_bootp(handle, config, errp);
+}
+
+bool qemu_slirp_guestfwd_get_ipv4_config(QemuSlirpGuestFwd *handle,
+                                         QemuSlirpIPv4Config *config,
+                                         Error **errp)
+{
+    return qemu_slirp_guestfwd_registry_get_ipv4_config(handle, config, errp);
 }
 
 void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle)
