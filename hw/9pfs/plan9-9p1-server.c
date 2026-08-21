@@ -1465,7 +1465,6 @@ static void server_flush(Plan9P1Server *server)
         owner_unref(server);
         if (server_has_deferred(server)) {
             server_apply_deferred(server);
-            break;
         }
         if (g_queue_peek_head(&server->replies) != reply) {
             break;
@@ -1482,7 +1481,6 @@ static void server_flush(Plan9P1Server *server)
         owner_unref(server);
         if (server_has_deferred(server)) {
             server_apply_deferred(server);
-            break;
         }
         if (g_queue_peek_head(&server->replies) != reply) {
             break;

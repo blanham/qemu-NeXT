@@ -16,9 +16,12 @@ typedef enum TransportAction {
     TRANSPORT_ACTION_NONE,
     TRANSPORT_ACTION_RESET_CAN_SEND,
     TRANSPORT_ACTION_FREE_CAN_SEND,
+    TRANSPORT_ACTION_NOP_CAN_SEND,
     TRANSPORT_ACTION_RESET_SEND,
     TRANSPORT_ACTION_FREE_SEND,
     TRANSPORT_ACTION_SESSION_SEND,
+    TRANSPORT_ACTION_NOP_SEND,
+    TRANSPORT_ACTION_FRAGMENTED_NOP_SEND,
 } TransportAction;
 
 typedef struct TestTransport {
@@ -333,13 +336,22 @@ static size_t transport_can_send(void *opaque)
 
     if (!transport->action_done &&
         (transport->action == TRANSPORT_ACTION_RESET_CAN_SEND ||
-         transport->action == TRANSPORT_ACTION_FREE_CAN_SEND)) {
+         transport->action == TRANSPORT_ACTION_FREE_CAN_SEND ||
+         transport->action == TRANSPORT_ACTION_NOP_CAN_SEND)) {
+        static const uint8_t tnop[3] = {
+            [0] = PLAN9P1_TNOP, [1] = 0x34, [2] = 0x12,
+        };
+
         transport->action_done = true;
         if (transport->action == TRANSPORT_ACTION_RESET_CAN_SEND) {
             plan9p1_server_reset(transport->fixture->server);
-        } else {
+        } else if (transport->action == TRANSPORT_ACTION_FREE_CAN_SEND) {
             plan9p1_server_free(transport->fixture->server);
             transport->fixture->server = NULL;
+        } else {
+            g_assert_cmpint(plan9p1_server_receive(transport->fixture->server,
+                                                   tnop, sizeof(tnop),
+                                                   &error_abort), ==, 0);
         }
     }
 
@@ -356,6 +368,9 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
         static const uint8_t tsession[11] = {
             [0] = PLAN9P1_TSESSION, [1] = 0x34, [2] = 0x12,
         };
+        static const uint8_t tnop[3] = {
+            [0] = PLAN9P1_TNOP, [1] = 0x34, [2] = 0x12,
+        };
 
         transport->action_done = true;
         if (transport->action == TRANSPORT_ACTION_RESET_SEND) {
@@ -365,11 +380,23 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
             plan9p1_server_free(transport->fixture->server);
             transport->fixture->server = NULL;
             return 0;
-        } else {
+        } else if (transport->action == TRANSPORT_ACTION_SESSION_SEND) {
             g_assert_cmpint(plan9p1_server_receive(transport->fixture->server,
                                                    tsession,
                                                    sizeof(tsession),
                                                    &error_abort), ==, 0);
+        } else if (transport->action == TRANSPORT_ACTION_NOP_SEND) {
+            g_assert_cmpint(plan9p1_server_receive(transport->fixture->server,
+                                                   tnop, sizeof(tnop),
+                                                   &error_abort), ==, 0);
+        } else {
+            size_t i;
+
+            for (i = 0; i < sizeof(tnop); i++) {
+                g_assert_cmpint(plan9p1_server_receive(
+                                    transport->fixture->server,
+                                    tnop + i, 1, &error_abort), ==, 0);
+            }
         }
     }
 
@@ -1057,6 +1084,39 @@ static void test_callback_session(ServerFixture *f, gconstpointer opaque)
     pump_server(f->server);
     g_assert_cmpmem(f->transport.output->data, f->transport.output->len,
                     expected, sizeof(expected));
+}
+
+static void test_callback_nop_common(ServerFixture *f,
+                                     TransportAction action)
+{
+    static const uint8_t expected[6] = {
+        [0] = PLAN9P1_RNOP, [1] = 7,
+        [3] = PLAN9P1_RNOP, [4] = 0x34, [5] = 0x12,
+    };
+
+    queue_nop_reply(f);
+    f->transport.action = action;
+    plan9p1_server_can_send(f->server);
+    pump_server(f->server);
+    g_assert_cmpmem(f->transport.output->data, f->transport.output->len,
+                    expected, sizeof(expected));
+}
+
+static void test_callback_nop(ServerFixture *f, gconstpointer opaque)
+{
+    test_callback_nop_common(f, TRANSPORT_ACTION_NOP_SEND);
+}
+
+static void test_callback_can_send_nop(ServerFixture *f,
+                                       gconstpointer opaque)
+{
+    test_callback_nop_common(f, TRANSPORT_ACTION_NOP_CAN_SEND);
+}
+
+static void test_callback_fragmented_nop(ServerFixture *f,
+                                         gconstpointer opaque)
+{
+    test_callback_nop_common(f, TRANSPORT_ACTION_FRAGMENTED_NOP_SEND);
 }
 
 static void test_flush_cancels_unsent(ServerFixture *f, gconstpointer opaque)
@@ -1781,6 +1841,14 @@ int main(int argc, char **argv)
                fixture_setup, test_callback_free_send, fixture_teardown);
     g_test_add("/plan9-9p1-server/callback-session", ServerFixture, NULL,
                fixture_setup, test_callback_session, fixture_teardown);
+    g_test_add("/plan9-9p1-server/callback-nop", ServerFixture, NULL,
+               fixture_setup, test_callback_nop, fixture_teardown);
+    g_test_add("/plan9-9p1-server/callback-can-send-nop", ServerFixture,
+               NULL, fixture_setup, test_callback_can_send_nop,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/callback-fragmented-nop", ServerFixture,
+               NULL, fixture_setup, test_callback_fragmented_nop,
+               fixture_teardown);
     g_test_add("/plan9-9p1-server/flush-cancels-unsent", ServerFixture, NULL,
                fixture_setup, test_flush_cancels_unsent, fixture_teardown);
     g_test_add("/plan9-9p1-server/constructor-validation", ServerFixture,
