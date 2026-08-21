@@ -25,8 +25,11 @@
 #define NEXT_INTR_SOFTINT1    0x00000002
 #define NEXT_INTR_TIMER       0x20000000
 #define NEXT_TIMER_TICK_NS    INT64_C(1000)
+#define NEXT_NANOSECONDS_PER_SECOND UINT64_C(1000000000)
+#define NEXT_PLAN9_TIMER_FREQUENCY UINT64_C(4456448)
 #define NEXT_EVENT_MASK       0x000fffff
 #define NEXT_ROM_SIZE         (128 * 1024)
+#define NEXT_TEST_TIMEOUT     (10 * G_USEC_PER_SEC)
 
 typedef struct TestROM {
     int fd;
@@ -153,6 +156,64 @@ static void arm_timer(QTestState *qts, uint16_t value)
     write_timer_latch(qts, value);
     qtest_writeb(qts, NEXT_TIMER_CSR,
                  NEXT_TIMER_ENABLE | NEXT_TIMER_UPDATE);
+}
+
+static int64_t timer_ticks_to_ns(uint64_t ticks, uint64_t frequency)
+{
+    return DIV_ROUND_UP(ticks * NEXT_NANOSECONDS_PER_SECOND, frequency);
+}
+
+static void test_frequency_override(void)
+{
+    QTestState *qts = next_cube_timer_start_with_args(
+        "-global next-pc.system-timer-frequency=4456448");
+    int64_t deadline = timer_ticks_to_ns(0xffff,
+                                         NEXT_PLAN9_TIMER_FREQUENCY);
+    uint32_t first;
+    uint32_t second;
+
+    arm_timer(qts, 0xffff);
+    qtest_clock_step(qts, deadline - 1);
+    g_assert_cmphex(timer_status(qts), ==, 0);
+    g_assert_cmphex(read_timer_count(qts), ==, 1);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(timer_status(qts), ==, NEXT_INTR_TIMER);
+    g_assert_cmphex(qtest_readb(qts, NEXT_TIMER_CSR), ==,
+                    NEXT_TIMER_ENABLE);
+    g_assert_cmphex(timer_status(qts), ==, 0);
+
+    first = read_event_snapshot(qts);
+    qtest_clock_step(qts, 1000 * NEXT_TIMER_TICK_NS);
+    second = read_event_snapshot(qts);
+    g_assert_cmphex((second - first) & NEXT_EVENT_MASK, ==, 1000);
+
+    qtest_quit(qts);
+}
+
+static void assert_invalid_frequency(const char *value)
+{
+    if (g_test_subprocess()) {
+        g_autofree char *args = g_strdup_printf(
+            "-global next-pc.system-timer-frequency=%s", value);
+        QTestState *qts = next_cube_timer_start_with_args(args);
+
+        qtest_quit(qts);
+        return;
+    }
+
+    g_test_trap_subprocess(NULL, NEXT_TEST_TIMEOUT, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr("*system-timer-frequency*");
+}
+
+static void test_frequency_rejects_zero(void)
+{
+    assert_invalid_frequency("0");
+}
+
+static void test_frequency_rejects_subnanosecond_tick(void)
+{
+    assert_invalid_frequency("1000000001");
 }
 
 static void test_mapping_and_latch(void)
@@ -429,6 +490,12 @@ int main(int argc, char **argv)
                    test_deadline_and_ack);
     qtest_add_func("/next-cube/timer/zero-is-full-period",
                    test_zero_is_full_period);
+    qtest_add_func("/next-cube/timer/frequency-override",
+                   test_frequency_override);
+    qtest_add_func("/next-cube/timer/frequency-rejects-zero",
+                   test_frequency_rejects_zero);
+    qtest_add_func("/next-cube/timer/frequency-rejects-subnanosecond-tick",
+                   test_frequency_rejects_subnanosecond_tick);
     qtest_add_func("/next-cube/timer/event-counter", test_event_counter);
     qtest_add_func("/next-cube/timer/reset-cancels-deadline",
                    test_reset_cancels_deadline);

@@ -44,6 +44,7 @@
 #include "qapi/util.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
@@ -75,7 +76,9 @@
 
 #define NEXT_TIMER_ENABLE       0x80
 #define NEXT_TIMER_UPDATE       0x40
-#define NEXT_TIMER_TICK_NS      INT64_C(1000)
+#define NEXT_SYSTEM_TIMER_DEFAULT_FREQUENCY UINT32_C(1000000)
+#define NEXT_SYSTEM_TIMER_MAX_FREQUENCY UINT32_C(1000000000)
+#define NEXT_EVENTC_TICK_NS     INT64_C(1000)
 #define NEXT_TIMER_FULL_PERIOD  0x10000
 #define NEXT_TIMER_IRQ_STATUS   0x20000000
 #define NEXT_SCR2_TIMER_IPL7    0x00008000
@@ -149,6 +152,7 @@ struct NeXTPC {
     uint32_t timer_counter;
     uint8_t timer_csr;
     bool timer_irq_pending;
+    uint32_t system_timer_frequency;
     uint32_t eventc_latched;
 
     NeXTSCSI next_scsi;
@@ -861,8 +865,9 @@ static uint32_t next_system_timer_remaining(NeXTPC *s)
         return 0;
     }
 
-    remaining = DIV_ROUND_UP((uint64_t)(deadline - now),
-                             NEXT_TIMER_TICK_NS);
+    remaining = muldiv64_round_up(deadline - now,
+                                  s->system_timer_frequency,
+                                  NANOSECONDS_PER_SECOND);
     return MIN(remaining, (uint64_t)NEXT_TIMER_FULL_PERIOD);
 }
 
@@ -877,7 +882,9 @@ static void next_system_timer_schedule(NeXTPC *s)
 
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     timer_mod(&s->system_timer,
-              now + s->timer_counter * NEXT_TIMER_TICK_NS);
+              now + muldiv64_round_up(s->timer_counter,
+                                      NANOSECONDS_PER_SECOND,
+                                      s->system_timer_frequency));
 }
 
 static void next_system_timer_expire(void *opaque)
@@ -981,7 +988,7 @@ static uint64_t next_eventc_read(void *opaque, hwaddr addr, unsigned size)
     switch (addr) {
     case 0:
         now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        s->eventc_latched = (now / NEXT_TIMER_TICK_NS) & NEXT_EVENTC_MASK;
+        s->eventc_latched = (now / NEXT_EVENTC_TICK_NS) & NEXT_EVENTC_MASK;
         trace_next_eventc_latch(s->eventc_latched, now);
         return 0;
     case 1:
@@ -1079,6 +1086,14 @@ static void next_pc_realize(DeviceState *dev, Error **errp)
     NeXTPC *s = NEXT_PC(dev);
     SysBusDevice *sbd;
     DeviceState *d;
+
+    if (!s->system_timer_frequency ||
+        s->system_timer_frequency > NEXT_SYSTEM_TIMER_MAX_FREQUENCY) {
+        error_setg(errp,
+                   "system-timer-frequency must be between 1 and %u Hz",
+                   NEXT_SYSTEM_TIMER_MAX_FREQUENCY);
+        return;
+    }
 
     if (!s->dma) {
         error_setg(errp, "'dma' link is not set");
@@ -1180,6 +1195,9 @@ static const Property next_pc_properties[] = {
     DEFINE_PROP_LINK("cpu", NeXTPC, cpu, TYPE_M68K_CPU, M68kCPU *),
     DEFINE_PROP_LINK("dma", NeXTPC, dma, TYPE_NEXT_DMA, NextDMAState *),
     DEFINE_PROP_UINT32("scr1-reset", NeXTPC, scr1_reset, 0x00011002),
+    DEFINE_PROP_UINT32("system-timer-frequency", NeXTPC,
+                       system_timer_frequency,
+                       NEXT_SYSTEM_TIMER_DEFAULT_FREQUENCY),
 };
 
 static int next_pc_post_load(void *opaque, int version_id)
