@@ -71,7 +71,9 @@ TFTP=/path/to/tftp
 ROOT=/path/to/rootfs
 QMP=/tmp/next-plan9.qmp
 
-"$QEMU" -M next-station -bios "$ROM" -m 64M -display gtk \
+"$QEMU" -M next-station \
+  -global next-pc.system-timer-frequency=4456448 \
+  -bios "$ROM" -m 64M -display gtk \
   -qmp "unix:$QMP,server=on,wait=off" \
   -fsdev "local,id=plan9root,path=$ROOT,security_model=none" \
   -netdev "user,id=nextnet,ipv6=off,tftp=$TFTP,bootfile=68020/9nextstation" \
@@ -80,10 +82,22 @@ QMP=/tmp/next-plan9.qmp
   -no-reboot
 ```
 
+The frequency override compensates for the historical kernel loading `0xffff`
+while configuring `HZ` as 68. It affects the system timer only; the event
+counter remains at its hardware rate.
+
 At the ROM prompt enter `ben() 68020/9nextstation`. At the root source prompt
-enter `tcp`, then enter `tor` at the Plan 9 `user[none]:` prompt. The companion
-NeXT lab checkout automates archive verification and staging; the direct
-command above is useful when those paths already exist.
+enter `tcp`, then accept `none` at the Plan 9 `user[none]:` prompt. This archive
+has no authentication key for `tor`, despite listing that name in `/adm/users`.
+From the resulting shell, start the normal `tor` desktop with:
+
+```rc
+home=/usr/tor
+. /usr/tor/lib/profile
+```
+
+The companion NeXT lab checkout automates archive verification and staging;
+the direct command above is useful when those paths already exist.
 
 ## Hardware support
 
