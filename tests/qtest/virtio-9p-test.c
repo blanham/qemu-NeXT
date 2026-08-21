@@ -13,7 +13,9 @@
  */
 
 #include "qemu/osdep.h"
+#include <gio/gio.h>
 #include "qemu/module.h"
+#include "libqtest.h"
 #include "libqos/virtio.h"
 #include "libqos/virtio-9p-client.h"
 
@@ -43,6 +45,148 @@
  * just use 8k for the xattr tests.
  */
 #define TEST_XATTR_SIZE (8 * 1024)
+#define BACKEND_DEVICE_ID "backend-test-9p"
+
+static void assert_qemu_start_failure(const char *fsdev,
+                                      const char *expected_error)
+{
+    const char *qemu = g_getenv("QTEST_QEMU_BINARY");
+    const char *qmp_quit =
+        "{\"execute\":\"qmp_capabilities\"}\n"
+        "{\"execute\":\"quit\"}\n";
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GSubprocess) process = NULL;
+    g_autofree char *stderr_data = NULL;
+    bool communicated;
+
+    g_assert_nonnull(qemu);
+    process = g_subprocess_new(G_SUBPROCESS_FLAGS_STDIN_PIPE |
+                               G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+                               G_SUBPROCESS_FLAGS_STDERR_PIPE,
+                               &error, qemu,
+                               "-machine", "pc",
+                               "-nodefaults",
+                               "-run-with", "exit-with-parent=on",
+                               "-display", "none",
+                               "-audio", "none",
+                               "-S",
+                               "-fsdev", fsdev,
+                               "-device", "virtio-9p-pci,fsdev=fsdev0,"
+                                          "mount_tag=qtest",
+                               "-qmp", "stdio",
+                               NULL);
+    g_assert_no_error(error);
+    g_assert_nonnull(process);
+
+    communicated = g_subprocess_communicate_utf8(process, qmp_quit, NULL,
+                                                  NULL, &stderr_data, &error);
+    g_assert_no_error(error);
+    g_assert_true(communicated);
+    g_assert_true(g_subprocess_get_if_exited(process));
+    g_assert_cmpint(g_subprocess_get_exit_status(process), !=, 0);
+    g_assert_nonnull(stderr_data);
+    g_assert_nonnull(strstr(stderr_data, expected_error));
+}
+
+static void backend_device_recreate(QTestState *qts)
+{
+    /* With no guest running, reset completes the pending PCI unplug. */
+    qtest_qmp_device_del_send(qts, BACKEND_DEVICE_ID);
+    qtest_system_reset_nowait(qts);
+    qtest_qmp_eventwait(qts, "DEVICE_DELETED");
+    qtest_qmp_device_add(qts, "virtio-9p-pci", BACKEND_DEVICE_ID,
+                         "{'fsdev': 'fsdev0', 'mount_tag': 'qtest'}");
+}
+
+static void run_backend_lifecycle(const char *fsdev)
+{
+    QTestState *qts;
+
+    qts = qtest_initf("-machine pc -nodefaults -S -fsdev %s "
+                      "-device virtio-9p-pci,id=%s,fsdev=fsdev0,"
+                      "mount_tag=qtest",
+                      fsdev, BACKEND_DEVICE_ID);
+    /*
+     * Catch state retained by either cleanup or the following initialization.
+     */
+    backend_device_recreate(qts);
+    backend_device_recreate(qts);
+    qtest_quit(qts);
+}
+
+static void test_backend_synth_lifecycle(void)
+{
+    run_backend_lifecycle("synth,id=fsdev0");
+}
+
+static void test_backend_local_throttle_lifecycle(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *fsdev = NULL;
+
+    path = g_dir_make_tmp("qtest-9p-local-lifecycle-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(path);
+    fsdev = g_strdup_printf("local,id=fsdev0,path=%s,"
+                            "security_model=mapped-xattr,"
+                            "throttling.bps-total=1000000000",
+                            path);
+
+    run_backend_lifecycle(fsdev);
+    g_assert_cmpint(rmdir(path), ==, 0);
+}
+
+static void test_backend_invalid_security_model(void)
+{
+    assert_qemu_start_failure(
+        "local,id=fsdev0,path=/tmp,security_model=invalid",
+        "invalid security_model property 'invalid'");
+}
+
+static void test_backend_invalid_throttle(void)
+{
+    assert_qemu_start_failure(
+        "local,id=fsdev0,path=/tmp,security_model=mapped-xattr,"
+        "throttling.bps-total=-5",
+        "invalid throttle configuration: bps/iops/max values must be within");
+}
+
+static void test_backend_missing_root(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *fsdev = NULL;
+
+    path = g_dir_make_tmp("qtest-9p-missing-root-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(path);
+    g_assert_cmpint(rmdir(path), ==, 0);
+    fsdev = g_strdup_printf("local,id=fsdev0,path=%s,"
+                            "security_model=mapped-xattr", path);
+
+    assert_qemu_start_failure(fsdev,
+                              "cannot initialize fsdev 'fsdev0': Could not "
+                              "open");
+}
+
+static void test_backend_non_directory_root(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *fsdev = NULL;
+    int fd;
+
+    fd = g_file_open_tmp("qtest-9p-file-root-XXXXXX", &path, &error);
+    g_assert_no_error(error);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    fsdev = g_strdup_printf("local,id=fsdev0,path=%s,"
+                            "security_model=mapped-xattr", path);
+
+    assert_qemu_start_failure(fsdev, "Not a directory");
+    g_assert_cmpint(unlink(path), ==, 0);
+}
 
 static void pci_config(void *obj, void *data, QGuestAllocator *t_alloc)
 {
@@ -1080,6 +1224,22 @@ static void register_virtio_9p_test(void)
 {
     QOSGraphTestOptions opts = {
     };
+    const char *arch = qtest_get_arch();
+
+    if (!strcmp(arch, "i386") || !strcmp(arch, "x86_64")) {
+        qtest_add_func("/9pfs/backend/synth-lifecycle",
+                       test_backend_synth_lifecycle);
+        qtest_add_func("/9pfs/backend/local-throttle-lifecycle",
+                       test_backend_local_throttle_lifecycle);
+        qtest_add_func("/9pfs/backend/invalid-security-model",
+                       test_backend_invalid_security_model);
+        qtest_add_func("/9pfs/backend/invalid-throttle",
+                       test_backend_invalid_throttle);
+        qtest_add_func("/9pfs/backend/missing-root",
+                       test_backend_missing_root);
+        qtest_add_func("/9pfs/backend/non-directory-root",
+                       test_backend_non_directory_root);
+    }
 
     /* 9pfs test cases using the 'synth' filesystem driver */
     qos_add_test("synth/config", "virtio-9p", pci_config, &opts);

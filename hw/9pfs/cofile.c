@@ -32,12 +32,12 @@ int coroutine_fn v9fs_co_st_gen(V9fsPDU *pdu, V9fsPath *path, mode_t st_mode,
     if (v9fs_request_cancelled(pdu)) {
         return -EINTR;
     }
-    if (s->ctx.exops.get_st_gen) {
+    if (s->backend.ctx.exops.get_st_gen) {
         v9fs_path_read_lock(s);
         v9fs_co_run_in_worker(
             {
-                err = s->ctx.exops.get_st_gen(&s->ctx, path, st_mode,
-                                              &v9stat->st_gen);
+                err = s->backend.ctx.exops.get_st_gen(
+                    &s->backend.ctx, path, st_mode, &v9stat->st_gen);
                 if (err < 0) {
                     err = -errno;
                 }
@@ -58,7 +58,7 @@ int coroutine_fn v9fs_co_lstat(V9fsPDU *pdu, V9fsPath *path, struct stat *stbuf)
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->lstat(&s->ctx, path, stbuf);
+            err = s->backend.ops->lstat(&s->backend.ctx, path, stbuf);
             if (err < 0) {
                 err = -errno;
             }
@@ -78,7 +78,8 @@ int coroutine_fn v9fs_co_fstat(V9fsPDU *pdu, V9fsFidState *fidp,
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->fstat(&s->ctx, fidp->fid_type, &fidp->fs, stbuf);
+            err = s->backend.ops->fstat(&s->backend.ctx, fidp->fid_type,
+                                        &fidp->fs, stbuf);
             if (err < 0) {
                 err = -errno;
             }
@@ -92,7 +93,7 @@ int coroutine_fn v9fs_co_fstat(V9fsPDU *pdu, V9fsFidState *fidp,
         if (err == -ENOENT) {
             /*
              * fstat on an unlinked file. Work with partial results
-             * returned from s->ops->fstat
+             * returned from s->backend.ops->fstat
              */
             err = 0;
         }
@@ -111,7 +112,8 @@ int coroutine_fn v9fs_co_open(V9fsPDU *pdu, V9fsFidState *fidp, int flags)
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->open(&s->ctx, &fidp->path, flags, &fidp->fs);
+            err = s->backend.ops->open(&s->backend.ctx, &fidp->path, flags,
+                                       &fidp->fs);
             if (err == -1) {
                 err = -errno;
             } else {
@@ -152,7 +154,7 @@ int coroutine_fn v9fs_co_open2(V9fsPDU *pdu, V9fsFidState *fidp,
     v9fs_path_write_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->open2(&s->ctx, &fidp->path,
+            err = s->backend.ops->open2(&s->backend.ctx, &fidp->path,
                                 name->data, flags, &cred, &fidp->fs);
             if (err < 0) {
                 err = -errno;
@@ -160,15 +162,15 @@ int coroutine_fn v9fs_co_open2(V9fsPDU *pdu, V9fsFidState *fidp,
                 v9fs_path_init(&path);
                 err = v9fs_name_to_path(s, &fidp->path, name->data, &path);
                 if (!err) {
-                    err = s->ops->lstat(&s->ctx, &path, stbuf);
+                    err = s->backend.ops->lstat(&s->backend.ctx, &path, stbuf);
                     if (err < 0) {
                         err = -errno;
-                        s->ops->close(&s->ctx, &fidp->fs);
+                        s->backend.ops->close(&s->backend.ctx, &fidp->fs);
                     } else {
                         v9fs_path_copy(&fidp->path, &path);
                     }
                 } else {
-                    s->ops->close(&s->ctx, &fidp->fs);
+                    s->backend.ops->close(&s->backend.ctx, &fidp->fs);
                 }
                 v9fs_path_free(&path);
             }
@@ -193,7 +195,7 @@ int coroutine_fn v9fs_co_close(V9fsPDU *pdu, V9fsFidOpenState *fs)
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->close(&s->ctx, fs);
+            err = s->backend.ops->close(&s->backend.ctx, fs);
             if (err < 0) {
                 err = -errno;
             }
@@ -218,7 +220,8 @@ int coroutine_fn v9fs_co_fsync(V9fsPDU *pdu, V9fsFidState *fidp, int datasync)
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->fsync(&s->ctx, fidp->fid_type, &fidp->fs, datasync);
+            err = s->backend.ops->fsync(&s->backend.ctx, fidp->fid_type,
+                                        &fidp->fs, datasync);
             if (err < 0) {
                 err = -errno;
             }
@@ -238,7 +241,7 @@ int coroutine_fn v9fs_co_link(V9fsPDU *pdu, V9fsFidState *oldfid,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->link(&s->ctx, &oldfid->path,
+            err = s->backend.ops->link(&s->backend.ctx, &oldfid->path,
                                &newdirfid->path, name->data);
             if (err < 0) {
                 err = -errno;
@@ -257,10 +260,11 @@ int coroutine_fn v9fs_co_pwritev(V9fsPDU *pdu, V9fsFidState *fidp,
     if (v9fs_request_cancelled(pdu)) {
         return -EINTR;
     }
-    fsdev_co_throttle_request(s->ctx.fst, THROTTLE_WRITE, iov, iovcnt);
+    fsdev_co_throttle_request(s->backend.ctx.fst, THROTTLE_WRITE, iov, iovcnt);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->pwritev(&s->ctx, &fidp->fs, iov, iovcnt, offset);
+            err = s->backend.ops->pwritev(&s->backend.ctx, &fidp->fs, iov,
+                                          iovcnt, offset);
             if (err < 0) {
                 err = -errno;
             }
@@ -277,10 +281,11 @@ int coroutine_fn v9fs_co_preadv(V9fsPDU *pdu, V9fsFidState *fidp,
     if (v9fs_request_cancelled(pdu)) {
         return -EINTR;
     }
-    fsdev_co_throttle_request(s->ctx.fst, THROTTLE_READ, iov, iovcnt);
+    fsdev_co_throttle_request(s->backend.ctx.fst, THROTTLE_READ, iov, iovcnt);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->preadv(&s->ctx, &fidp->fs, iov, iovcnt, offset);
+            err = s->backend.ops->preadv(&s->backend.ctx, &fidp->fs, iov,
+                                         iovcnt, offset);
             if (err < 0) {
                 err = -errno;
             }

@@ -137,6 +137,14 @@ if have_system and config_all_devices.has_key('CONFIG_NEXTCUBE')
 endif
 
 if have_system
+  if have_virtfs
+    tests += {
+      'test-9p-backend': [
+        meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+      ],
+    }
+  endif
+
   if slirp.found()
     tests += {
       'test-slirp-guestfwd': [

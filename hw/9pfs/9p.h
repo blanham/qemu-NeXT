@@ -6,6 +6,7 @@
 #include <sys/resource.h>
 #include "fsdev/file-op-9p.h"
 #include "fsdev/9p-iov-marshal.h"
+#include "9p-backend.h"
 #include "qemu/thread.h"
 #include "qemu/coroutine.h"
 #include "qemu/qht.h"
@@ -283,64 +284,11 @@ struct V9fsFidState {
     QSLIST_ENTRY(V9fsFidState) reclaim_next;
 };
 
-typedef enum AffixType_t {
-    AffixType_Prefix,
-    AffixType_Suffix, /* A.k.a. postfix. */
-} AffixType_t;
-
-/*
- * Unique affix of variable length.
- *
- * An affix is (currently) either a suffix or a prefix, which is either
- * going to be prepended (prefix) or appended (suffix) with some other
- * number for the goal to generate unique numbers. Accordingly the
- * suffixes (or prefixes) we generate @b must all have the mathematical
- * property of being suffix-free (or prefix-free in case of prefixes)
- * so that no matter what number we concatenate the affix with, that we
- * always reliably get unique numbers as result after concatenation.
- */
-typedef struct VariLenAffix {
-    AffixType_t type; /* Whether this affix is a suffix or a prefix. */
-    uint64_t value; /* Actual numerical value of this affix. */
-    /*
-     * Length of the affix, that is how many (of the lowest) bits of ``value``
-     * must be used for appending/prepending this affix to its final resulting,
-     * unique number.
-     */
-    int bits;
-} VariLenAffix;
-
-/* See qid_inode_prefix_hash_bits(). */
-typedef struct {
-    dev_t dev; /* FS device on host. */
-    /*
-     * How many (high) bits of the original inode number shall be used for
-     * hashing.
-     */
-    int prefix_bits;
-} QpdEntry;
-
-/* QID path prefix entry, see stat_to_qid */
-typedef struct {
-    dev_t dev;
-    uint16_t ino_prefix;
-    uint32_t qp_affix_index;
-    VariLenAffix qp_affix;
-} QppEntry;
-
-/* QID path full entry, as above */
-typedef struct {
-    dev_t dev;
-    ino_t ino;
-    uint64_t path;
-} QpfEntry;
-
 struct V9fsState {
     QLIST_HEAD(, V9fsPDU) free_list;
     QLIST_HEAD(, V9fsPDU) active_list;
     GHashTable *fids;
-    FileOperations *ops;
-    FsContext ctx;
+    V9fsBackend backend;
     char *tag;
     P9ProtoVersion proto_version;
     int32_t msize;
@@ -354,14 +302,6 @@ struct V9fsState {
     int32_t root_fid;
     Error *migration_blocker;
     V9fsConf fsconf;
-    struct stat root_st;
-    dev_t dev_id;
-    struct qht qpd_table;
-    struct qht qpp_table;
-    struct qht qpf_table;
-    uint64_t qp_ndevices; /* Amount of entries in qpd_table. */
-    uint16_t qp_affix_next;
-    uint64_t qp_fullpath_next;
     bool reclaiming;
 };
 
@@ -427,7 +367,7 @@ extern int total_open_fd;
 static inline void coroutine_fn
 v9fs_path_write_lock(V9fsState *s)
 {
-    if (s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
+    if (s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
         qemu_co_rwlock_wrlock(&s->rename_lock);
     }
 }
@@ -435,7 +375,7 @@ v9fs_path_write_lock(V9fsState *s)
 static inline void coroutine_fn
 v9fs_path_read_lock(V9fsState *s)
 {
-    if (s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
+    if (s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
         qemu_co_rwlock_rdlock(&s->rename_lock);
     }
 }
@@ -443,7 +383,7 @@ v9fs_path_read_lock(V9fsState *s)
 static inline void coroutine_fn
 v9fs_path_unlock(V9fsState *s)
 {
-    if (s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
+    if (s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
         qemu_co_rwlock_unlock(&s->rename_lock);
     }
 }

@@ -218,11 +218,12 @@ The First Edition kernel is a follow-up compatibility run against the same
 
 ## Licensing
 
-New standalone QEMU 9P1 and adapter files will use the NCSA license with Bryce
-Lanham's copyright. Small changes to existing GPL QEMU 9pfs files retain those
-files' existing licenses. Changes to libslirp retain libslirp's existing
-license. The historical Plan 9 sources are protocol references and test
-oracles; their implementation is not copied into QEMU.
+New standalone QEMU 9P1 protocol/server and slirp adapter files will use the
+NCSA license with Bryce Lanham's copyright. The shared backend files extracted
+from existing GPL QEMU 9pfs code, and small changes to that code, retain its
+existing license and attribution. Changes to libslirp retain libslirp's
+existing license. The historical Plan 9 sources are protocol references and
+test oracles; their implementation is not copied into QEMU.
 
 ## Out of scope
 

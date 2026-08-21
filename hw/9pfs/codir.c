@@ -36,7 +36,7 @@ static int do_readdir(V9fsPDU *pdu, V9fsFidState *fidp, struct dirent **dent)
     struct dirent *entry;
 
     errno = 0;
-    entry = s->ops->readdir(&s->ctx, &fidp->fs);
+    entry = s->backend.ops->readdir(&s->backend.ctx, &fidp->fs);
     if (!entry && errno) {
         *dent = NULL;
         err = -errno;
@@ -99,13 +99,13 @@ do_readdir_many(V9fsPDU *pdu, V9fsFidState *fidp, struct V9fsDirEnt **entries,
 
     /* seek directory to requested initial position */
     if (offset == 0) {
-        s->ops->rewinddir(&s->ctx, &fidp->fs);
+        s->backend.ops->rewinddir(&s->backend.ctx, &fidp->fs);
     } else {
-        s->ops->seekdir(&s->ctx, &fidp->fs, offset);
+        s->backend.ops->seekdir(&s->backend.ctx, &fidp->fs, offset);
     }
 
     /* save the directory position */
-    saved_dir_pos = s->ops->telldir(&s->ctx, &fidp->fs);
+    saved_dir_pos = s->backend.ops->telldir(&s->backend.ctx, &fidp->fs);
     if (saved_dir_pos < 0) {
         err = saved_dir_pos;
         goto out;
@@ -149,15 +149,15 @@ do_readdir_many(V9fsPDU *pdu, V9fsFidState *fidp, struct V9fsDirEnt **entries,
 
         /* perform a full stat() for directory entry if requested by caller */
         if (dostat) {
-            err = s->ops->name_to_path(
-                &s->ctx, &fidp->path, dent->d_name, &path
+            err = s->backend.ops->name_to_path(
+                &s->backend.ctx, &fidp->path, dent->d_name, &path
             );
             if (err < 0) {
                 err = -errno;
                 break;
             }
 
-            err = s->ops->lstat(&s->ctx, &path, &stbuf);
+            err = s->backend.ops->lstat(&s->backend.ctx, &path, &stbuf);
             if (err < 0) {
                 err = -errno;
                 break;
@@ -172,7 +172,7 @@ do_readdir_many(V9fsPDU *pdu, V9fsFidState *fidp, struct V9fsDirEnt **entries,
     }
 
     /* restore (last) saved position */
-    s->ops->seekdir(&s->ctx, &fidp->fs, saved_dir_pos);
+    s->backend.ops->seekdir(&s->backend.ctx, &fidp->fs, saved_dir_pos);
 
 out:
     v9fs_readdir_unlock(&fidp->fs.dir);
@@ -243,7 +243,7 @@ off_t v9fs_co_telldir(V9fsPDU *pdu, V9fsFidState *fidp)
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->telldir(&s->ctx, &fidp->fs);
+            err = s->backend.ops->telldir(&s->backend.ctx, &fidp->fs);
             if (err < 0) {
                 err = -errno;
             }
@@ -260,7 +260,7 @@ void coroutine_fn v9fs_co_seekdir(V9fsPDU *pdu, V9fsFidState *fidp,
     }
     v9fs_co_run_in_worker(
         {
-            s->ops->seekdir(&s->ctx, &fidp->fs, offset);
+            s->backend.ops->seekdir(&s->backend.ctx, &fidp->fs, offset);
         });
 }
 
@@ -272,7 +272,7 @@ void coroutine_fn v9fs_co_rewinddir(V9fsPDU *pdu, V9fsFidState *fidp)
     }
     v9fs_co_run_in_worker(
         {
-            s->ops->rewinddir(&s->ctx, &fidp->fs);
+            s->backend.ops->rewinddir(&s->backend.ctx, &fidp->fs);
         });
 }
 
@@ -295,14 +295,15 @@ int coroutine_fn v9fs_co_mkdir(V9fsPDU *pdu, V9fsFidState *fidp,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->mkdir(&s->ctx, &fidp->path, name->data,  &cred);
+            err = s->backend.ops->mkdir(&s->backend.ctx, &fidp->path,
+                                        name->data, &cred);
             if (err < 0) {
                 err = -errno;
             } else {
                 v9fs_path_init(&path);
                 err = v9fs_name_to_path(s, &fidp->path, name->data, &path);
                 if (!err) {
-                    err = s->ops->lstat(&s->ctx, &path, stbuf);
+                    err = s->backend.ops->lstat(&s->backend.ctx, &path, stbuf);
                     if (err < 0) {
                         err = -errno;
                     }
@@ -325,7 +326,8 @@ int coroutine_fn v9fs_co_opendir(V9fsPDU *pdu, V9fsFidState *fidp)
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->opendir(&s->ctx, &fidp->path, &fidp->fs);
+            err = s->backend.ops->opendir(&s->backend.ctx, &fidp->path,
+                                          &fidp->fs);
             if (err < 0) {
                 err = -errno;
             } else {
@@ -352,7 +354,7 @@ int coroutine_fn v9fs_co_closedir(V9fsPDU *pdu, V9fsFidOpenState *fs)
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->closedir(&s->ctx, fs);
+            err = s->backend.ops->closedir(&s->backend.ctx, fs);
             if (err < 0) {
                 err = -errno;
             }

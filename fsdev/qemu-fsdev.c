@@ -167,7 +167,7 @@ int qemu_fsdev_add(QemuOpts *opts, Error **errp)
     return 0;
 }
 
-FsDriverEntry *get_fsdev_fsentry(char *id)
+FsDriverEntry *get_fsdev_fsentry(const char *id)
 {
     if (id) {
         struct FsDriverListEntry *fsle;

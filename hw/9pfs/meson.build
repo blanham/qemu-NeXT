@@ -1,6 +1,7 @@
 fs_ss = ss.source_set()
 fs_ss.add(files(
   '9p-local.c',
+  '9p-backend.c',
   '9p-posix-acl.c',
   '9p-synth.c',
   '9p-util-generic.c',

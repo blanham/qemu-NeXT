@@ -2529,6 +2529,7 @@ X: hw/9pfs/xen-9p*
 F: fsdev/
 F: tests/qtest/virtio-9p-test.c
 F: tests/qtest/libqos/virtio-9p*
+F: tests/unit/test-9p-backend.c
 T: git https://github.com/cschoenebeck/qemu.git 9p.next
 
 virtio-blk

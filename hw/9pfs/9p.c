@@ -234,7 +234,7 @@ int v9fs_name_to_path(V9fsState *s, V9fsPath *dirpath,
                       const char *name, V9fsPath *path)
 {
     int err;
-    err = s->ops->name_to_path(&s->ctx, dirpath, name, path);
+    err = s->backend.ops->name_to_path(&s->backend.ctx, dirpath, name, path);
     if (err < 0) {
         err = -errno;
     }
@@ -269,13 +269,13 @@ static int xattr_fid_count_inc(V9fsPDU *pdu)
 {
     V9fsState *s = pdu->s;
 
-    if (s->ctx.xattr_fid_limit > 0 &&
-        s->ctx.xattr_fid_count >= s->ctx.xattr_fid_limit) {
+    if (s->backend.ctx.xattr_fid_limit > 0 &&
+        s->backend.ctx.xattr_fid_count >= s->backend.ctx.xattr_fid_limit) {
         error_report_once("9pfs: xattr_fid_count limit exceeded "
                           "(configurable by option 'max_xattr').");
         return -ENOSPC;
     }
-    s->ctx.xattr_fid_count++;
+    s->backend.ctx.xattr_fid_count++;
     return 0;
 }
 
@@ -283,8 +283,8 @@ static void xattr_fid_count_decr(V9fsPDU *pdu)
 {
     V9fsState *s = pdu->s;
 
-    if (s->ctx.xattr_fid_count > 0) {
-        s->ctx.xattr_fid_count--;
+    if (s->backend.ctx.xattr_fid_count > 0) {
+        s->backend.ctx.xattr_fid_count--;
     } else {
         error_report_once("9pfs: xattr_fid_count underflow detected");
     }
@@ -546,8 +546,8 @@ void coroutine_fn v9fs_reclaim_fd(V9fsPDU *pdu)
     v9fs_co_run_in_worker({
         QSLIST_FOREACH(f, &reclaim_list, reclaim_next) {
             err = (f->fid_type == P9_FID_DIR) ?
-                s->ops->closedir(&s->ctx, &f->fs_reclaim) :
-                s->ops->close(&s->ctx, &f->fs_reclaim);
+                s->backend.ops->closedir(&s->backend.ctx, &f->fs_reclaim) :
+                s->backend.ops->close(&s->backend.ctx, &f->fs_reclaim);
 
             /* 'man 2 close' suggests to ignore close() errors except of EBADF */
             if (unlikely(err && errno == EBADF)) {
@@ -667,7 +667,7 @@ static void coroutine_fn virtfs_reset(V9fsPDU *pdu)
      * free_fid() already decrements the counter for each P9_FID_XATTR, so the
      * counter should already be zero, hence this is just a defensive measure.
      */
-    s->ctx.xattr_fid_count = 0;
+    s->backend.ctx.xattr_fid_count = 0;
 }
 
 #define P9_QID_TYPE_DIR         0x80
@@ -819,53 +819,6 @@ static uint32_t qpf_hash(QpfEntry e)
     return qemu_xxhash4(e.ino, e.dev);
 }
 
-static bool qpd_cmp_func(const void *obj, const void *userp)
-{
-    const QpdEntry *e1 = obj, *e2 = userp;
-    return e1->dev == e2->dev;
-}
-
-static bool qpp_cmp_func(const void *obj, const void *userp)
-{
-    const QppEntry *e1 = obj, *e2 = userp;
-    return e1->dev == e2->dev && e1->ino_prefix == e2->ino_prefix;
-}
-
-static bool qpf_cmp_func(const void *obj, const void *userp)
-{
-    const QpfEntry *e1 = obj, *e2 = userp;
-    return e1->dev == e2->dev && e1->ino == e2->ino;
-}
-
-static void qp_table_remove(void *p, uint32_t h, void *up)
-{
-    g_free(p);
-}
-
-static void qp_table_destroy(struct qht *ht)
-{
-    if (!ht || !ht->map) {
-        return;
-    }
-    qht_iter(ht, qp_table_remove, NULL);
-    qht_destroy(ht);
-}
-
-static void qpd_table_init(struct qht *ht)
-{
-    qht_init(ht, qpd_cmp_func, 1, QHT_MODE_AUTO_RESIZE);
-}
-
-static void qpp_table_init(struct qht *ht)
-{
-    qht_init(ht, qpp_cmp_func, 1, QHT_MODE_AUTO_RESIZE);
-}
-
-static void qpf_table_init(struct qht *ht)
-{
-    qht_init(ht, qpf_cmp_func, 1 << 16, QHT_MODE_AUTO_RESIZE);
-}
-
 /*
  * Returns how many (high end) bits of inode numbers of the passed fs
  * device shall be used (in combination with the device number) to
@@ -887,14 +840,14 @@ static int qid_inode_prefix_hash_bits(V9fsPDU *pdu, dev_t dev)
     uint32_t hash = dev;
     VariLenAffix affix;
 
-    val = qht_lookup(&pdu->s->qpd_table, &lookup, hash);
+    val = qht_lookup(&pdu->s->backend.qpd_table, &lookup, hash);
     if (!val) {
         val = g_new0(QpdEntry, 1);
         *val = lookup;
-        affix = affixForIndex(pdu->s->qp_affix_next);
+        affix = affixForIndex(pdu->s->backend.qp_affix_next);
         val->prefix_bits = affix.bits;
-        qht_insert(&pdu->s->qpd_table, val, hash, NULL);
-        pdu->s->qp_ndevices++;
+        qht_insert(&pdu->s->backend.qpd_table, val, hash, NULL);
+        pdu->s->backend.qp_ndevices++;
     }
     return val->prefix_bits;
 }
@@ -925,10 +878,10 @@ static int qid_path_fullmap(V9fsPDU *pdu, const struct stat *stbuf,
     uint32_t hash = qpf_hash(lookup);
     VariLenAffix affix;
 
-    val = qht_lookup(&pdu->s->qpf_table, &lookup, hash);
+    val = qht_lookup(&pdu->s->backend.qpf_table, &lookup, hash);
 
     if (!val) {
-        if (pdu->s->qp_fullpath_next == 0) {
+        if (pdu->s->backend.qp_fullpath_next == 0) {
             /* no more files can be mapped :'( */
             error_report_once(
                 "9p: No more prefixes available for remapping inodes from "
@@ -942,11 +895,12 @@ static int qid_path_fullmap(V9fsPDU *pdu, const struct stat *stbuf,
 
         /* new unique inode and device combo */
         affix = affixForIndex(
-            1ULL << (sizeof(pdu->s->qp_affix_next) * 8)
+            1ULL << (sizeof(pdu->s->backend.qp_affix_next) * 8)
         );
-        val->path = (pdu->s->qp_fullpath_next++ << affix.bits) | affix.value;
-        pdu->s->qp_fullpath_next &= ((1ULL << (64 - affix.bits)) - 1);
-        qht_insert(&pdu->s->qpf_table, val, hash, NULL);
+        val->path = (pdu->s->backend.qp_fullpath_next++ << affix.bits) |
+                    affix.value;
+        pdu->s->backend.qp_fullpath_next &= ((1ULL << (64 - affix.bits)) - 1);
+        qht_insert(&pdu->s->backend.qpf_table, val, hash, NULL);
     }
 
     *path = val->path;
@@ -1002,10 +956,10 @@ static int qid_path_suffixmap(V9fsPDU *pdu, const struct stat *stbuf,
     }, *val;
     uint32_t hash = qpp_hash(lookup);
 
-    val = qht_lookup(&pdu->s->qpp_table, &lookup, hash);
+    val = qht_lookup(&pdu->s->backend.qpp_table, &lookup, hash);
 
     if (!val) {
-        if (pdu->s->qp_affix_next == 0) {
+        if (pdu->s->backend.qp_affix_next == 0) {
             /* we ran out of affixes */
             warn_report_once(
                 "9p: Potential degraded performance of inode remapping"
@@ -1017,9 +971,9 @@ static int qid_path_suffixmap(V9fsPDU *pdu, const struct stat *stbuf,
         *val = lookup;
 
         /* new unique inode affix and device combo */
-        val->qp_affix_index = pdu->s->qp_affix_next++;
+        val->qp_affix_index = pdu->s->backend.qp_affix_next++;
         val->qp_affix = affixForIndex(val->qp_affix_index);
-        qht_insert(&pdu->s->qpp_table, val, hash, NULL);
+        qht_insert(&pdu->s->backend.qpp_table, val, hash, NULL);
     }
     /* assuming generated affix to be suffix type, not prefix */
     *path = (stbuf->st_ino << val->qp_affix.bits) | val->qp_affix.value;
@@ -1031,7 +985,7 @@ static int stat_to_qid(V9fsPDU *pdu, const struct stat *stbuf, V9fsQID *qidp)
     int err;
     size_t size;
 
-    if (pdu->s->ctx.export_flags & V9FS_REMAP_INODES) {
+    if (pdu->s->backend.ctx.export_flags & V9FS_REMAP_INODES) {
         /* map inode+device to qid path (fast path) */
         err = qid_path_suffixmap(pdu, stbuf, &qidp->path);
         if (err == -ENFILE) {
@@ -1042,8 +996,8 @@ static int stat_to_qid(V9fsPDU *pdu, const struct stat *stbuf, V9fsQID *qidp)
             return err;
         }
     } else {
-        if (pdu->s->dev_id != stbuf->st_dev) {
-            if (pdu->s->ctx.export_flags & V9FS_FORBID_MULTIDEVS) {
+        if (pdu->s->backend.dev_id != stbuf->st_dev) {
+            if (pdu->s->backend.ctx.export_flags & V9FS_FORBID_MULTIDEVS) {
                 error_report_once(
                     "9p: Multiple devices detected in same VirtFS export. "
                     "Access of guest to additional devices is (partly) "
@@ -1514,7 +1468,8 @@ static void coroutine_fn v9fs_version(void *opaque)
     }
 
     /* 8192 is the default msize of Linux clients */
-    if (s->msize <= 8192 && !(s->ctx.export_flags & V9FS_NO_PERF_WARN)) {
+    if (s->msize <= 8192 &&
+        !(s->backend.ctx.export_flags & V9FS_NO_PERF_WARN)) {
         warn_report_once(
             "9p: degraded performance: a reasonable high msize should be "
             "chosen on client/guest side (chosen msize is <= 8192). See "
@@ -1587,7 +1542,9 @@ static void coroutine_fn v9fs_attach(void *opaque)
     if (!s->migration_blocker) {
         error_setg(&s->migration_blocker,
                    "Migration is disabled when VirtFS export path '%s' is mounted in the guest using mount_tag '%s'",
-                   s->ctx.fs_root ? s->ctx.fs_root : "NULL", s->tag);
+                   s->backend.ctx.fs_root ?
+                       s->backend.ctx.fs_root : "NULL",
+                   s->tag);
         err = migrate_add_blocker(&s->migration_blocker, NULL);
         if (err < 0) {
             clunk_fid(s, fid);
@@ -1603,7 +1560,7 @@ static void coroutine_fn v9fs_attach(void *opaque)
     }
     err += offset;
 
-    memcpy(&s->root_st, &stbuf, sizeof(stbuf));
+    memcpy(&s->backend.root_st, &stbuf, sizeof(stbuf));
     trace_v9fs_attach_return(pdu->tag, pdu->id,
                              qid.type, qid.version, qid.path);
 out:
@@ -1663,7 +1620,7 @@ out_nofid:
 
 static bool fid_has_valid_file_handle(V9fsState *s, V9fsFidState *fidp)
 {
-    return s->ops->has_valid_file_handle(fidp->fid_type, &fidp->fs);
+    return s->backend.ops->has_valid_file_handle(fidp->fid_type, &fidp->fs);
 }
 
 static void coroutine_fn v9fs_getattr(void *opaque)
@@ -1988,7 +1945,7 @@ static void coroutine_fn v9fs_walk(void *opaque)
             any_err |= err = -EINTR;
             break;
         }
-        err = s->ops->lstat(&s->ctx, &dpath, &fidst);
+        err = s->backend.ops->lstat(&s->backend.ctx, &dpath, &fidst);
         if (err < 0) {
             any_err |= err = -errno;
             break;
@@ -1999,10 +1956,10 @@ static void coroutine_fn v9fs_walk(void *opaque)
                 any_err |= err = -EINTR;
                 break;
             }
-            if (!same_stat_id(&pdu->s->root_st, &stbuf) ||
+            if (!same_stat_id(&pdu->s->backend.root_st, &stbuf) ||
                 strcmp("..", wnames[nwalked].data))
             {
-                err = s->ops->name_to_path(&s->ctx, &dpath,
+                err = s->backend.ops->name_to_path(&s->backend.ctx, &dpath,
                                            wnames[nwalked].data,
                                            &pathes[nwalked]);
                 if (err < 0) {
@@ -2013,7 +1970,8 @@ static void coroutine_fn v9fs_walk(void *opaque)
                     any_err |= err = -EINTR;
                     break;
                 }
-                err = s->ops->lstat(&s->ctx, &pathes[nwalked], &stbuf);
+                err = s->backend.ops->lstat(&s->backend.ctx,
+                                            &pathes[nwalked], &stbuf);
                 if (err < 0) {
                     any_err |= err = -errno;
                     break;
@@ -2047,7 +2005,7 @@ static void coroutine_fn v9fs_walk(void *opaque)
     v9fs_path_copy(&path, &fidp->path);
 
     for (name_idx = 0; name_idx < nwalked; name_idx++) {
-        if (!same_stat_id(&pdu->s->root_st, &stbuf) ||
+        if (!same_stat_id(&pdu->s->backend.root_st, &stbuf) ||
             strcmp("..", wnames[name_idx].data))
         {
             stbuf = stbufs[name_idx];
@@ -2180,7 +2138,7 @@ static void coroutine_fn v9fs_open(void *opaque)
         } else {
             flags = omode_to_uflags(mode);
         }
-        if (is_ro_export(&s->ctx)) {
+        if (is_ro_export(&s->backend.ctx)) {
             if (mode & O_WRONLY || mode & O_RDWR ||
                 mode & O_APPEND || mode & O_TRUNC) {
                 err = -EROFS;
@@ -2629,7 +2587,7 @@ static int coroutine_fn v9fs_do_readdir(V9fsPDU *pdu, V9fsFidState *fidp,
      * different for different directory entries, so if inode remapping is
      * enabled we have to make a full stat for each directory entry
      */
-    const bool dostat = pdu->s->ctx.export_flags & V9FS_REMAP_INODES;
+    const bool dostat = pdu->s->backend.ctx.export_flags & V9FS_REMAP_INODES;
 
     /*
      * Fetch all required directory entries altogether on a background IO
@@ -2649,7 +2607,7 @@ static int coroutine_fn v9fs_do_readdir(V9fsPDU *pdu, V9fsFidState *fidp,
     for (struct V9fsDirEnt *e = entries; e; e = e->next) {
         dent = e->dent;
 
-        if (pdu->s->ctx.export_flags & V9FS_REMAP_INODES) {
+        if (pdu->s->backend.ctx.export_flags & V9FS_REMAP_INODES) {
             st = e->st;
             /* e->st should never be NULL, but just to be sure */
             if (!st) {
@@ -3270,7 +3228,7 @@ static void coroutine_fn v9fs_remove(void *opaque)
         goto out_nofid;
     }
     /* if fs driver is not path based, return EOPNOTSUPP */
-    if (!(pdu->s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
+    if (!(pdu->s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
         err = -EOPNOTSUPP;
         goto out_err;
     }
@@ -3468,7 +3426,7 @@ static void coroutine_fn v9fs_rename(void *opaque)
         goto out;
     }
     /* if fs driver is not path based, return EOPNOTSUPP */
-    if (!(pdu->s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
+    if (!(pdu->s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
         err = -EOPNOTSUPP;
         goto out;
     }
@@ -3557,7 +3515,7 @@ static int coroutine_fn v9fs_complete_renameat(V9fsPDU *pdu, int32_t olddirfid,
     if (err < 0) {
         goto out;
     }
-    if (s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
+    if (s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
         /* Only for path based fid  we need to do the below fixup */
         err = v9fs_fix_fid_paths(pdu, &olddirfidp->path, old_name,
                                  &newdirfidp->path, new_name);
@@ -3599,7 +3557,7 @@ static void coroutine_fn v9fs_renameat(void *opaque)
     }
 
     /* if fs driver is not path based, return EOPNOTSUPP */
-    if (!(s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
+    if (!(s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
         err = -EOPNOTSUPP;
         goto out_err;
     }
@@ -3699,7 +3657,7 @@ static void coroutine_fn v9fs_wstat(void *opaque)
     }
     if (v9stat.name.size != 0) {
         /* if fs driver is not path based, return EOPNOTSUPP */
-        if (!(s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
+        if (!(s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT)) {
             err = -EOPNOTSUPP;
             goto out;
         }
@@ -4385,7 +4343,7 @@ void pdu_submit(V9fsPDU *pdu, P9MsgHeader *hdr)
     if (pdu->id >= ARRAY_SIZE(pdu_co_handlers) ||
         (pdu_co_handlers[pdu->id] == NULL)) {
         handler = v9fs_op_not_supp;
-    } else if (is_ro_export(&s->ctx) && !is_read_only_op(pdu)) {
+    } else if (is_ro_export(&s->backend.ctx) && !is_read_only_op(pdu)) {
         handler = v9fs_fs_ro;
     } else {
         handler = pdu_co_handlers[pdu->id];
@@ -4402,9 +4360,7 @@ int v9fs_device_realize_common(V9fsState *s, const V9fsTransport *t,
 {
     ERRP_GUARD();
     int i, len;
-    struct stat stat;
     FsDriverEntry *fse;
-    V9fsPath path;
     int rc = 1;
 
     assert(!s->transport);
@@ -4419,8 +4375,11 @@ int v9fs_device_realize_common(V9fsState *s, const V9fsTransport *t,
         s->pdus[i].idx = i;
     }
 
-    v9fs_path_init(&path);
-
+    /*
+     * Preserve the existing error ordering: an unknown fsdev is reported
+     * before a missing or invalid mount tag.  Backend initialization repeats
+     * this lookup because it is also used independently of this transport.
+     */
     fse = get_fsdev_fsentry(s->fsconf.fsdev_id);
 
     if (!fse) {
@@ -4438,9 +4397,6 @@ int v9fs_device_realize_common(V9fsState *s, const V9fsTransport *t,
         goto out;
     }
 
-    s->ctx.export_flags = fse->export_flags;
-    s->ctx.fs_root = g_strdup(fse->path);
-    s->ctx.exops.get_st_gen = NULL;
     len = strlen(s->fsconf.tag);
     if (len > MAX_TAG_LEN - 1) {
         error_setg(errp, "mount tag '%s' (%d bytes) is longer than "
@@ -4449,87 +4405,33 @@ int v9fs_device_realize_common(V9fsState *s, const V9fsTransport *t,
     }
 
     s->tag = g_strdup(s->fsconf.tag);
-    s->ctx.uid = -1;
-
-    s->ops = fse->ops;
-
-    s->ctx.fmode = fse->fmode;
-    s->ctx.dmode = fse->dmode;
 
     s->fids = g_hash_table_new(NULL, NULL);
     qemu_co_rwlock_init(&s->rename_lock);
 
-    if (s->ops->init(&s->ctx, errp) < 0) {
-        error_prepend(errp, "cannot initialize fsdev '%s': ",
-                      s->fsconf.fsdev_id);
+    if (v9fs_backend_init(&s->backend, s->fsconf.fsdev_id, errp) < 0) {
         goto out;
     }
-
-    /*
-     * Check details of export path, We need to use fs driver
-     * call back to do that. Since we are in the init path, we don't
-     * use co-routines here.
-     */
-    if (s->ops->name_to_path(&s->ctx, NULL, "/", &path) < 0) {
-        error_setg_errno(errp, errno, "error in converting name to path");
-        goto out;
-    }
-    if (s->ops->lstat(&s->ctx, &path, &stat)) {
-        error_setg(errp, "share path %s does not exist", fse->path);
-        goto out;
-    } else if (!S_ISDIR(stat.st_mode)) {
-        error_setg(errp, "share path %s is not a directory", fse->path);
-        goto out;
-    }
-
-    s->dev_id = stat.st_dev;
-
-    /* init inode remapping : */
-    /* hash table for variable length inode suffixes */
-    qpd_table_init(&s->qpd_table);
-    /* hash table for slow/full inode remapping (most users won't need it) */
-    qpf_table_init(&s->qpf_table);
-    /* hash table for quick inode remapping */
-    qpp_table_init(&s->qpp_table);
-    s->qp_ndevices = 0;
-    s->qp_affix_next = 1; /* reserve 0 to detect overflow */
-    s->qp_fullpath_next = 1;
-
-    s->ctx.fst = &fse->fst;
-    fsdev_throttle_init(s->ctx.fst);
 
     s->reclaiming = false;
-
-    /* init xattr FID limit from fsdev config */
-    s->ctx.xattr_fid_limit = fse->max_xattr;
-    s->ctx.xattr_fid_count = 0;
 
     rc = 0;
 out:
     if (rc) {
         v9fs_device_unrealize_common(s);
     }
-    v9fs_path_free(&path);
     return rc;
 }
 
 void v9fs_device_unrealize_common(V9fsState *s)
 {
-    if (s->ops && s->ops->cleanup) {
-        s->ops->cleanup(&s->ctx);
-    }
-    if (s->ctx.fst) {
-        fsdev_throttle_cleanup(s->ctx.fst);
-    }
+    v9fs_backend_cleanup(&s->backend);
     if (s->fids) {
         g_hash_table_destroy(s->fids);
         s->fids = NULL;
     }
     g_free(s->tag);
-    qp_table_destroy(&s->qpd_table);
-    qp_table_destroy(&s->qpp_table);
-    qp_table_destroy(&s->qpf_table);
-    g_free(s->ctx.fs_root);
+    s->tag = NULL;
 }
 
 typedef struct VirtfsCoResetData {

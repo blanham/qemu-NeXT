@@ -28,7 +28,8 @@ static ssize_t __readlink(V9fsState *s, V9fsPath *path, V9fsString *buf)
 
     buf->data = g_malloc(PATH_MAX);
     for (;;) {
-        len = s->ops->readlink(&s->ctx, path, buf->data, maxlen);
+        len = s->backend.ops->readlink(&s->backend.ctx, path, buf->data,
+                                       maxlen);
         if (len < 0) {
             g_free(buf->data);
             buf->data = NULL;
@@ -86,7 +87,7 @@ int coroutine_fn v9fs_co_statfs(V9fsPDU *pdu, V9fsPath *path,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->statfs(&s->ctx, path, stbuf);
+            err = s->backend.ops->statfs(&s->backend.ctx, path, stbuf);
             if (err < 0) {
                 err = -errno;
             }
@@ -109,7 +110,7 @@ int coroutine_fn v9fs_co_chmod(V9fsPDU *pdu, V9fsPath *path, mode_t mode)
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->chmod(&s->ctx, path, &cred);
+            err = s->backend.ops->chmod(&s->backend.ctx, path, &cred);
             if (err < 0) {
                 err = -errno;
             }
@@ -130,7 +131,7 @@ int coroutine_fn v9fs_co_utimensat(V9fsPDU *pdu, V9fsPath *path,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->utimensat(&s->ctx, path, times);
+            err = s->backend.ops->utimensat(&s->backend.ctx, path, times);
             if (err < 0) {
                 err = -errno;
             }
@@ -150,7 +151,8 @@ int coroutine_fn v9fs_co_futimens(V9fsPDU *pdu, V9fsFidState *fidp,
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->futimens(&s->ctx, fidp->fid_type, &fidp->fs, times);
+            err = s->backend.ops->futimens(&s->backend.ctx, fidp->fid_type,
+                                           &fidp->fs, times);
             if (err < 0) {
                 err = -errno;
             }
@@ -174,7 +176,7 @@ int coroutine_fn v9fs_co_chown(V9fsPDU *pdu, V9fsPath *path, uid_t uid,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->chown(&s->ctx, path, &cred);
+            err = s->backend.ops->chown(&s->backend.ctx, path, &cred);
             if (err < 0) {
                 err = -errno;
             }
@@ -194,7 +196,7 @@ int coroutine_fn v9fs_co_truncate(V9fsPDU *pdu, V9fsPath *path, off_t size)
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->truncate(&s->ctx, path, size);
+            err = s->backend.ops->truncate(&s->backend.ctx, path, size);
             if (err < 0) {
                 err = -errno;
             }
@@ -213,7 +215,8 @@ int coroutine_fn v9fs_co_ftruncate(V9fsPDU *pdu, V9fsFidState *fidp, off_t size)
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->ftruncate(&s->ctx, fidp->fid_type, &fidp->fs, size);
+            err = s->backend.ops->ftruncate(&s->backend.ctx, fidp->fid_type,
+                                            &fidp->fs, size);
             if (err < 0) {
                 err = -errno;
             }
@@ -241,14 +244,15 @@ int coroutine_fn v9fs_co_mknod(V9fsPDU *pdu, V9fsFidState *fidp,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->mknod(&s->ctx, &fidp->path, name->data, &cred);
+            err = s->backend.ops->mknod(&s->backend.ctx, &fidp->path,
+                                        name->data, &cred);
             if (err < 0) {
                 err = -errno;
             } else {
                 v9fs_path_init(&path);
                 err = v9fs_name_to_path(s, &fidp->path, name->data, &path);
                 if (!err) {
-                    err = s->ops->lstat(&s->ctx, &path, stbuf);
+                    err = s->backend.ops->lstat(&s->backend.ctx, &path, stbuf);
                     if (err < 0) {
                         err = -errno;
                     }
@@ -272,7 +276,7 @@ int coroutine_fn v9fs_co_remove(V9fsPDU *pdu, V9fsPath *path)
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->remove(&s->ctx, path->data);
+            err = s->backend.ops->remove(&s->backend.ctx, path->data);
             if (err < 0) {
                 err = -errno;
             }
@@ -293,7 +297,8 @@ int coroutine_fn v9fs_co_unlinkat(V9fsPDU *pdu, V9fsPath *path,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->unlinkat(&s->ctx, path, name->data, flags);
+            err = s->backend.ops->unlinkat(&s->backend.ctx, path,
+                                           name->data, flags);
             if (err < 0) {
                 err = -errno;
             }
@@ -314,7 +319,8 @@ int coroutine_fn v9fs_co_rename(V9fsPDU *pdu, V9fsPath *oldpath,
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->rename(&s->ctx, oldpath->data, newpath->data);
+            err = s->backend.ops->rename(&s->backend.ctx, oldpath->data,
+                                         newpath->data);
             if (err < 0) {
                 err = -errno;
             }
@@ -334,8 +340,9 @@ int coroutine_fn v9fs_co_renameat(V9fsPDU *pdu, V9fsPath *olddirpath,
     }
     v9fs_co_run_in_worker(
         {
-            err = s->ops->renameat(&s->ctx, olddirpath, oldname->data,
-                                   newdirpath, newname->data);
+            err = s->backend.ops->renameat(&s->backend.ctx, olddirpath,
+                                           oldname->data, newdirpath,
+                                           newname->data);
             if (err < 0) {
                 err = -errno;
             }
@@ -362,15 +369,15 @@ int coroutine_fn v9fs_co_symlink(V9fsPDU *pdu, V9fsFidState *dfidp,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->symlink(&s->ctx, oldpath, &dfidp->path,
-                                  name->data, &cred);
+            err = s->backend.ops->symlink(&s->backend.ctx, oldpath,
+                                          &dfidp->path, name->data, &cred);
             if (err < 0) {
                 err = -errno;
             } else {
                 v9fs_path_init(&path);
                 err = v9fs_name_to_path(s, &dfidp->path, name->data, &path);
                 if (!err) {
-                    err = s->ops->lstat(&s->ctx, &path, stbuf);
+                    err = s->backend.ops->lstat(&s->backend.ctx, &path, stbuf);
                     if (err < 0) {
                         err = -errno;
                     }
@@ -392,8 +399,9 @@ int coroutine_fn v9fs_co_name_to_path(V9fsPDU *pdu, V9fsPath *dirpath,
     int err;
     V9fsState *s = pdu->s;
 
-    if (s->ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
-        err = s->ops->name_to_path(&s->ctx, dirpath, name, path);
+    if (s->backend.ctx.export_flags & V9FS_PATHNAME_FSCONTEXT) {
+        err = s->backend.ops->name_to_path(&s->backend.ctx, dirpath, name,
+                                           path);
         if (err < 0) {
             err = -errno;
         }
@@ -403,7 +411,8 @@ int coroutine_fn v9fs_co_name_to_path(V9fsPDU *pdu, V9fsPath *dirpath,
         }
         v9fs_co_run_in_worker(
             {
-                err = s->ops->name_to_path(&s->ctx, dirpath, name, path);
+                err = s->backend.ops->name_to_path(&s->backend.ctx, dirpath,
+                                                   name, path);
                 if (err < 0) {
                     err = -errno;
                 }

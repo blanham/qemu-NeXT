@@ -34,7 +34,8 @@ int coroutine_fn v9fs_co_llistxattr(V9fsPDU *pdu, V9fsPath *path, void *value,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->llistxattr(&s->ctx, path, value, size);
+            err = s->backend.ops->llistxattr(&s->backend.ctx, path, value,
+                                             size);
             if (err < 0) {
                 err = -errno;
             }
@@ -56,7 +57,7 @@ int coroutine_fn v9fs_co_lgetxattr(V9fsPDU *pdu, V9fsPath *path,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->lgetxattr(&s->ctx, path,
+            err = s->backend.ops->lgetxattr(&s->backend.ctx, path,
                                     xattr_name->data,
                                     value, size);
             if (err < 0) {
@@ -80,7 +81,7 @@ int coroutine_fn v9fs_co_lsetxattr(V9fsPDU *pdu, V9fsPath *path,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->lsetxattr(&s->ctx, path,
+            err = s->backend.ops->lsetxattr(&s->backend.ctx, path,
                                     xattr_name->data, value,
                                     size, flags);
             if (err < 0) {
@@ -103,7 +104,8 @@ int coroutine_fn v9fs_co_lremovexattr(V9fsPDU *pdu, V9fsPath *path,
     v9fs_path_read_lock(s);
     v9fs_co_run_in_worker(
         {
-            err = s->ops->lremovexattr(&s->ctx, path, xattr_name->data);
+            err = s->backend.ops->lremovexattr(&s->backend.ctx, path,
+                                               xattr_name->data);
             if (err < 0) {
                 err = -errno;
             }
