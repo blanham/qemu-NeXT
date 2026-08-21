@@ -51,6 +51,9 @@ tests = {
   'test-fifo': [],
   'test-envlist': [],
   'test-icount-period': [],
+  'test-plan9-9p1-codec': [
+    meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
+  ],
 }
 
 if have_system or have_tools
