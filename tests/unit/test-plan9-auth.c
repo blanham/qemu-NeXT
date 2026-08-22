@@ -262,6 +262,247 @@ static void test_invalid_arguments(void)
     error_free(err);
 }
 
+static void assert_zeroed(const void *data, size_t len)
+{
+    const uint8_t *bytes = data;
+
+    for (size_t i = 0; i < len; i++) {
+        g_assert_cmpuint(bytes[i], ==, 0);
+    }
+}
+
+static void test_encode_failure_wipes_output(void)
+{
+    Plan9AuthTicketRequest request = {
+        .authid = "p9fs",
+        .authdom = "nextlab",
+        .hostid = "tor",
+        .uid = "tor",
+    };
+    Plan9AuthTicket ticket = {
+        .cuid = "tor",
+        .suid = "p9fs",
+        .key = { 1, 2, 3, 4, 5, 6, 7 },
+    };
+    Plan9AuthAuthenticator auth = { 0 };
+    uint8_t request_wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN];
+    uint8_t auth_wire[PLAN9_AUTH_AUTHENTICATOR_LEN];
+    Error *err = NULL;
+
+    memset(request_wire, 0xa5, sizeof(request_wire));
+    g_assert_cmpint(plan9_auth_ticket_request_encode(NULL, request_wire, &err),
+                    <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(request_wire, sizeof(request_wire));
+    err = NULL;
+
+    memset(request.authid, 'x', PLAN9_AUTH_NAMELEN);
+    memset(request_wire, 0xa5, sizeof(request_wire));
+    g_assert_cmpint(plan9_auth_ticket_request_encode(&request, request_wire,
+                                                      &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(request_wire, sizeof(request_wire));
+    err = NULL;
+
+    memset(ticket_wire, 0xa5, sizeof(ticket_wire));
+    g_assert_cmpint(plan9_auth_ticket_encode(NULL, ticket_wire, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(ticket_wire, sizeof(ticket_wire));
+    err = NULL;
+
+    memset(auth_wire, 0xa5, sizeof(auth_wire));
+    g_assert_cmpint(plan9_auth_authenticator_encode(NULL, auth_wire, &err),
+                    <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(auth_wire, sizeof(auth_wire));
+    err = NULL;
+
+    g_assert_cmpint(plan9_auth_ticket_request_encode(&request, NULL, &err),
+                    <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    g_assert_cmpint(plan9_auth_ticket_encode(&ticket, NULL, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    g_assert_cmpint(plan9_auth_authenticator_encode(&auth, NULL, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_decode_failure_wipes_destination(void)
+{
+    uint8_t request_wire[PLAN9_AUTH_TICKET_REQUEST_LEN] = { 0 };
+    uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN] = { 0 };
+    uint8_t auth_wire[PLAN9_AUTH_AUTHENTICATOR_LEN] = { 0 };
+    Plan9AuthTicketRequest request;
+    Plan9AuthTicket ticket;
+    Plan9AuthAuthenticator auth;
+    Error *err = NULL;
+
+    memset(&request, 0xa5, sizeof(request));
+    g_assert_cmpint(plan9_auth_ticket_request_decode(NULL, sizeof(request_wire),
+                                                      &request, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&request, sizeof(request));
+    err = NULL;
+
+    memset(&request, 0xa5, sizeof(request));
+    g_assert_cmpint(plan9_auth_ticket_request_decode(request_wire,
+                                                      sizeof(request_wire) - 1,
+                                                      &request, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&request, sizeof(request));
+    err = NULL;
+
+    memset(&request, 0xa5, sizeof(request));
+    g_assert_cmpint(plan9_auth_ticket_request_decode(request_wire,
+                                                      sizeof(request_wire) + 1,
+                                                      &request, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&request, sizeof(request));
+    err = NULL;
+
+    memset(&ticket, 0xa5, sizeof(ticket));
+    g_assert_cmpint(plan9_auth_ticket_decode(NULL, sizeof(ticket_wire),
+                                              &ticket, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&ticket, sizeof(ticket));
+    err = NULL;
+
+    memset(&ticket, 0xa5, sizeof(ticket));
+    g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire,
+                                              sizeof(ticket_wire) - 1,
+                                              &ticket, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&ticket, sizeof(ticket));
+    err = NULL;
+
+    memset(&ticket, 0xa5, sizeof(ticket));
+    g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire,
+                                              sizeof(ticket_wire) + 1,
+                                              &ticket, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&ticket, sizeof(ticket));
+    err = NULL;
+
+    memset(&auth, 0xa5, sizeof(auth));
+    g_assert_cmpint(plan9_auth_authenticator_decode(NULL, sizeof(auth_wire),
+                                                     &auth, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&auth, sizeof(auth));
+    err = NULL;
+
+    memset(&auth, 0xa5, sizeof(auth));
+    g_assert_cmpint(plan9_auth_authenticator_decode(auth_wire,
+                                                     sizeof(auth_wire) - 1,
+                                                     &auth, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&auth, sizeof(auth));
+    err = NULL;
+
+    memset(&auth, 0xa5, sizeof(auth));
+    g_assert_cmpint(plan9_auth_authenticator_decode(auth_wire,
+                                                     sizeof(auth_wire) + 1,
+                                                     &auth, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(&auth, sizeof(auth));
+}
+
+static void test_decode_rejects_unterminated_strings(void)
+{
+    uint8_t request_wire[PLAN9_AUTH_TICKET_REQUEST_LEN] = { 0 };
+    uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN] = { 0 };
+    Plan9AuthTicketRequest request;
+    Plan9AuthTicket ticket;
+    Error *err = NULL;
+    const size_t request_fields[] = { 1, 29, 85, 113 };
+    const size_t request_sizes[] = {
+        PLAN9_AUTH_NAMELEN, PLAN9_AUTH_DOMLEN,
+        PLAN9_AUTH_NAMELEN, PLAN9_AUTH_NAMELEN,
+    };
+    const size_t ticket_fields[] = { 9, 37 };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(request_fields); i++) {
+        memset(request_wire, 0, sizeof(request_wire));
+        memset(request_wire + request_fields[i], 'x', request_sizes[i]);
+        memset(&request, 0xa5, sizeof(request));
+        g_assert_cmpint(plan9_auth_ticket_request_decode(request_wire,
+                                                          sizeof(request_wire),
+                                                          &request, &err),
+                        <, 0);
+        g_assert_nonnull(err);
+        error_free(err);
+        assert_zeroed(&request, sizeof(request));
+        err = NULL;
+    }
+
+    for (size_t i = 0; i < G_N_ELEMENTS(ticket_fields); i++) {
+        memset(ticket_wire, 0, sizeof(ticket_wire));
+        memset(ticket_wire + ticket_fields[i], 'x', PLAN9_AUTH_NAMELEN);
+        memset(&ticket, 0xa5, sizeof(ticket));
+        g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire,
+                                                  sizeof(ticket_wire),
+                                                  &ticket, &err), <, 0);
+        g_assert_nonnull(err);
+        error_free(err);
+        assert_zeroed(&ticket, sizeof(ticket));
+        err = NULL;
+    }
+
+    memset(request_wire, 0, sizeof(request_wire));
+    request_wire[1] = 'a';
+    request_wire[2] = 0;
+    request_wire[3] = 0xa5;
+    request_wire[29] = 'd';
+    request_wire[30] = 0;
+    request_wire[31] = 0xa5;
+    request_wire[85] = 'h';
+    request_wire[86] = 0;
+    request_wire[87] = 0xa5;
+    request_wire[113] = 'u';
+    request_wire[114] = 0;
+    request_wire[115] = 0xa5;
+    g_assert_cmpint(plan9_auth_ticket_request_decode(request_wire,
+                                                      sizeof(request_wire),
+                                                      &request, &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpstr(request.authid, ==, "a");
+    g_assert_cmpstr(request.authdom, ==, "d");
+    g_assert_cmpstr(request.hostid, ==, "h");
+    g_assert_cmpstr(request.uid, ==, "u");
+
+    memset(ticket_wire, 0, sizeof(ticket_wire));
+    ticket_wire[9] = 'c';
+    ticket_wire[10] = 0;
+    ticket_wire[11] = 0xa5;
+    ticket_wire[37] = 's';
+    ticket_wire[38] = 0;
+    ticket_wire[39] = 0xa5;
+    g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire, sizeof(ticket_wire),
+                                              &ticket, &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpstr(ticket.cuid, ==, "c");
+    g_assert_cmpstr(ticket.suid, ==, "s");
+    plan9_auth_ticket_clear(&ticket);
+    assert_zeroed(&ticket, sizeof(ticket));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -275,5 +516,11 @@ int main(int argc, char **argv)
     g_test_add_func("/plan9-auth/rejections-wipe-ticket-output",
                     test_rejections_wipe_ticket_output);
     g_test_add_func("/plan9-auth/invalid-arguments", test_invalid_arguments);
+    g_test_add_func("/plan9-auth/encode-failure-wipes-output",
+                    test_encode_failure_wipes_output);
+    g_test_add_func("/plan9-auth/decode-failure-wipes-destination",
+                    test_decode_failure_wipes_destination);
+    g_test_add_func("/plan9-auth/decode-unterminated-strings",
+                    test_decode_rejects_unterminated_strings);
     return g_test_run();
 }

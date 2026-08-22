@@ -53,6 +53,12 @@ typedef struct Plan9AuthAuthenticator {
     uint32_t id;
 } Plan9AuthAuthenticator;
 
+/*
+ * A successfully decoded ticket contains a conversation key.  Call this
+ * after use; successful encode output is likewise caller-owned plaintext.
+ */
+void plan9_auth_ticket_clear(Plan9AuthTicket *ticket);
+
 /* Passwords must be representable in a historical NAMELEN field (<= 27). */
 int plan9_auth_passtokey(uint8_t key[PLAN9_AUTH_DES_KEY_LEN],
                          const char *password, Error **errp);

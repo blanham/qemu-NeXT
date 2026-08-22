@@ -21,6 +21,13 @@ static void plan9_auth_wipe(void *ptr, size_t len)
     }
 }
 
+void plan9_auth_ticket_clear(Plan9AuthTicket *ticket)
+{
+    if (ticket) {
+        plan9_auth_wipe(ticket, sizeof(*ticket));
+    }
+}
+
 static uint8_t odd_parity(uint8_t value)
 {
     uint8_t bits = value & 0xfe;
@@ -196,7 +203,7 @@ int plan9_auth_passtokey(uint8_t key[PLAN9_AUTH_DES_KEY_LEN],
 
 out:
     if (ret && key) {
-        memset(key, 0, PLAN9_AUTH_DES_KEY_LEN);
+        plan9_auth_wipe(key, PLAN9_AUTH_DES_KEY_LEN);
     }
     plan9_auth_wipe(work_key, sizeof(work_key));
     plan9_auth_wipe(password_buffer, sizeof(password_buffer));
@@ -222,10 +229,17 @@ static int put_string(const char *string, uint8_t *out, size_t len,
     return 0;
 }
 
-static void get_string(char *out, const uint8_t *wire, size_t len)
+static int get_string(char *out, const uint8_t *wire, size_t len,
+                      const char *field, Error **errp)
 {
-    memcpy(out, wire, len);
-    out[len] = 0;
+    const uint8_t *nul = memchr(wire, 0, len);
+
+    if (!nul) {
+        error_setg(errp, "Plan 9 %s is not NUL terminated", field);
+        return -1;
+    }
+    memcpy(out, wire, nul - wire);
+    return 0;
 }
 
 static int check_length(size_t got, size_t expected, const char *name,
@@ -246,6 +260,9 @@ int plan9_auth_ticket_request_encode(const Plan9AuthTicketRequest *request,
     uint8_t *p = out;
 
     if (!request || !out) {
+        if (out) {
+            plan9_auth_wipe(out, PLAN9_AUTH_TICKET_REQUEST_LEN);
+        }
         error_setg(errp, "Plan 9 ticket request and output are required");
         return -1;
     }
@@ -281,6 +298,9 @@ int plan9_auth_ticket_request_decode(const uint8_t *wire, size_t len,
 {
     const uint8_t *p = wire;
 
+    if (request) {
+        plan9_auth_wipe(request, sizeof(*request));
+    }
     if (!wire || !request) {
         error_setg(errp, "Plan 9 ticket request input and output are required");
         return -1;
@@ -289,18 +309,32 @@ int plan9_auth_ticket_request_decode(const uint8_t *wire, size_t len,
                      errp)) {
         return -1;
     }
-    memset(request, 0, sizeof(*request));
     request->type = *p++;
-    get_string(request->authid, p, PLAN9_AUTH_NAMELEN);
+    if (get_string(request->authid, p, PLAN9_AUTH_NAMELEN, "auth-id",
+                   errp)) {
+        goto error;
+    }
     p += PLAN9_AUTH_NAMELEN;
-    get_string(request->authdom, p, PLAN9_AUTH_DOMLEN);
+    if (get_string(request->authdom, p, PLAN9_AUTH_DOMLEN, "auth-domain",
+                   errp)) {
+        goto error;
+    }
     p += PLAN9_AUTH_DOMLEN;
     memcpy(request->challenge, p, PLAN9_AUTH_CHALLENGE_LEN);
     p += PLAN9_AUTH_CHALLENGE_LEN;
-    get_string(request->hostid, p, PLAN9_AUTH_NAMELEN);
+    if (get_string(request->hostid, p, PLAN9_AUTH_NAMELEN, "host-id",
+                   errp)) {
+        goto error;
+    }
     p += PLAN9_AUTH_NAMELEN;
-    get_string(request->uid, p, PLAN9_AUTH_NAMELEN);
+    if (get_string(request->uid, p, PLAN9_AUTH_NAMELEN, "user-id", errp)) {
+        goto error;
+    }
     return 0;
+
+error:
+    plan9_auth_wipe(request, sizeof(*request));
+    return -1;
 }
 
 int plan9_auth_ticket_encode(const Plan9AuthTicket *ticket,
@@ -309,6 +343,9 @@ int plan9_auth_ticket_encode(const Plan9AuthTicket *ticket,
     uint8_t *p = out;
 
     if (!ticket || !out) {
+        if (out) {
+            plan9_auth_wipe(out, PLAN9_AUTH_TICKET_LEN);
+        }
         error_setg(errp, "Plan 9 ticket and output are required");
         return -1;
     }
@@ -338,6 +375,7 @@ int plan9_auth_ticket_decode(const uint8_t *wire, size_t len,
 {
     const uint8_t *p = wire;
 
+    plan9_auth_ticket_clear(ticket);
     if (!wire || !ticket) {
         error_setg(errp, "Plan 9 ticket input and output are required");
         return -1;
@@ -345,16 +383,25 @@ int plan9_auth_ticket_decode(const uint8_t *wire, size_t len,
     if (check_length(len, PLAN9_AUTH_TICKET_LEN, "ticket", errp)) {
         return -1;
     }
-    memset(ticket, 0, sizeof(*ticket));
     ticket->num = *p++;
     memcpy(ticket->challenge, p, PLAN9_AUTH_CHALLENGE_LEN);
     p += PLAN9_AUTH_CHALLENGE_LEN;
-    get_string(ticket->cuid, p, PLAN9_AUTH_NAMELEN);
+    if (get_string(ticket->cuid, p, PLAN9_AUTH_NAMELEN, "ticket client",
+                   errp)) {
+        goto error;
+    }
     p += PLAN9_AUTH_NAMELEN;
-    get_string(ticket->suid, p, PLAN9_AUTH_NAMELEN);
+    if (get_string(ticket->suid, p, PLAN9_AUTH_NAMELEN, "ticket server",
+                   errp)) {
+        goto error;
+    }
     p += PLAN9_AUTH_NAMELEN;
     memcpy(ticket->key, p, PLAN9_AUTH_DES_KEY_LEN);
     return 0;
+
+error:
+    plan9_auth_ticket_clear(ticket);
+    return -1;
 }
 
 int plan9_auth_authenticator_encode(const Plan9AuthAuthenticator *auth,
@@ -362,6 +409,9 @@ int plan9_auth_authenticator_encode(const Plan9AuthAuthenticator *auth,
                                     Error **errp)
 {
     if (!auth || !out) {
+        if (out) {
+            plan9_auth_wipe(out, PLAN9_AUTH_AUTHENTICATOR_LEN);
+        }
         error_setg(errp, "Plan 9 authenticator and output are required");
         return -1;
     }
@@ -378,6 +428,9 @@ int plan9_auth_authenticator_decode(const uint8_t *wire, size_t len,
                                     Plan9AuthAuthenticator *auth,
                                     Error **errp)
 {
+    if (auth) {
+        plan9_auth_wipe(auth, sizeof(*auth));
+    }
     if (!wire || !auth) {
         error_setg(errp, "Plan 9 authenticator input and output are required");
         return -1;
@@ -386,7 +439,6 @@ int plan9_auth_authenticator_decode(const uint8_t *wire, size_t len,
                      errp)) {
         return -1;
     }
-    memset(auth, 0, sizeof(*auth));
     auth->num = wire[0];
     memcpy(auth->challenge, wire + 1, PLAN9_AUTH_CHALLENGE_LEN);
     auth->id = (uint32_t)wire[9] | ((uint32_t)wire[10] << 8) |
