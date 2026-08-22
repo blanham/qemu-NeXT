@@ -1163,21 +1163,38 @@ static void test_qom_il_deferred_file_cleanup(ServerFixture *f,
     static const uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN] = {
         1, 2, 3, 4, 5, 6, 7,
     };
+    static const uint8_t client_key[PLAN9_AUTH_DES_KEY_LEN] = {
+        7, 6, 5, 4, 3, 2, 1,
+    };
     static const uint8_t conversation_key[PLAN9_AUTH_DES_KEY_LEN] = {
         0x71, 0x62, 0x53, 0x44, 0x35, 0x26, 0x17,
     };
     static const uint8_t client_challenge[PLAN9P1_CHALLEN] = {
         0x00, 0xff, 0x7f, 0x80, 0x01, 0x02, 0x00, 0xfe,
     };
-    uint8_t record[PLAN9_AUTH_KEYDB_RECORD_LEN];
+    uint8_t records[2 * PLAN9_AUTH_KEYDB_RECORD_LEN];
+    uint8_t auth_wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
     g_autofree char *keydb = g_build_filename(f->root, "qom-cleanup-keys",
                                                NULL);
     g_autofree char *secret_file =
         g_build_filename(f->root, "qom-cleanup-master", NULL);
     unsigned int cleanup_target = f->cleanup_calls + 1;
-    Plan9P1SlirpStubConnection *file, *during, *after;
+    Plan9P1SlirpStubConnection *file, *auth, *during_auth1, *during_auth2;
+    Plan9P1SlirpStubConnection *during_file, *after_auth, *after_file;
+    Plan9AuthTicketRequest auth_request = {
+        .type = PLAN9_AUTH_TREQ,
+        .authid = "p9fs",
+        .authdom = "lab",
+        .challenge = { 0x10, 0x20, 0x30, 0x40,
+                       0x50, 0x60, 0x70, 0x80 },
+        .hostid = "tor",
+        .uid = "tor",
+    };
     Plan9P1Fcall call;
     Plan9P1Fcall reply;
+    g_autoptr(GBytes) auth_reply = NULL;
+    gconstpointer auth_reply_data;
+    gsize auth_reply_len;
     Object *secret;
 
     plan9p1_server_free(f->server);
@@ -1186,11 +1203,15 @@ static void test_qom_il_deferred_file_cleanup(ServerFixture *f,
         aio_poll(qemu_get_aio_context(), true);
     }
     g_assert_cmpint(plan9_auth_keydb_record_encode(
-                        record, master_key, "p9fs", server_key, 0, 0,
+                        records, master_key, "p9fs", server_key, 0, 0,
                         UINT32_MAX, &error_abort), ==, 0);
-    write_file(keydb, record, sizeof(record));
+    g_assert_cmpint(plan9_auth_keydb_record_encode(
+                        records + PLAN9_AUTH_KEYDB_RECORD_LEN, master_key,
+                        "tor", client_key, 0, 0,
+                        UINT32_MAX, &error_abort), ==, 0);
+    write_file(keydb, records, sizeof(records));
     write_file(secret_file, master_key, sizeof(master_key));
-    plan9_auth_clear(record, sizeof(record));
+    plan9_auth_clear(records, sizeof(records));
     memcpy(f->auth_server_key, server_key, sizeof(f->auth_server_key));
 
     secret = object_new_with_props(TYPE_QCRYPTO_SECRET,
@@ -1219,20 +1240,46 @@ static void test_qom_il_deferred_file_cleanup(ServerFixture *f,
     reply = qom_il_transact(f, file, &call);
     g_assert_cmpuint(reply.type, ==, PLAN9P1_RATTACH);
 
+    auth = plan9p1_slirp_stub_open(566);
+    g_assert_true(plan9p1_slirp_stub_connection_accepted(auth));
+    g_assert_cmpint(plan9_auth_ticket_request_encode(
+                        &auth_request, auth_wire, &error_abort), ==, 0);
+    plan9p1_slirp_stub_deliver_record(auth, auth_wire, sizeof(auth_wire));
+    auth_reply = plan9p1_slirp_stub_pop_sent_record(auth);
+    g_assert_nonnull(auth_reply);
+    auth_reply_data = g_bytes_get_data(auth_reply, &auth_reply_len);
+    g_assert_cmpuint(auth_reply_len, ==, PLAN9_AUTH_TICKET_REPLY_LEN);
+    g_assert_cmpuint(((const uint8_t *)auth_reply_data)[0], ==, PLAN9_AUTH_OK);
+
     plan9p1_slirp_stub_set_deferred_close(true);
-    plan9p1_slirp_stub_close(file);
+    resettable_reset(OBJECT(f->server), RESET_TYPE_COLD);
     g_assert_cmpuint(plan9p1_slirp_stub_connection_close_requests(file), ==,
                      1);
+    g_assert_cmpuint(plan9p1_slirp_stub_connection_close_requests(auth), ==,
+                     1);
+    during_auth1 = plan9p1_slirp_stub_open(566);
+    g_assert_false(plan9p1_slirp_stub_connection_accepted(during_auth1));
+    plan9p1_slirp_stub_deliver_close(during_auth1);
+    plan9p1_slirp_stub_deliver_close(auth);
+    during_auth2 = plan9p1_slirp_stub_open(566);
+    g_assert_false(plan9p1_slirp_stub_connection_accepted(during_auth2));
+    plan9p1_slirp_stub_deliver_close(during_auth2);
     plan9p1_slirp_stub_deliver_close(file);
-    during = plan9p1_slirp_stub_open(17008);
-    g_assert_false(plan9p1_slirp_stub_connection_accepted(during));
-    plan9p1_slirp_stub_deliver_close(during);
+    g_assert_false(plan9p1_server_record_connection_ready(f->server));
+
+    after_auth = plan9p1_slirp_stub_open(566);
+    g_assert_true(plan9p1_slirp_stub_connection_accepted(after_auth));
+    during_file = plan9p1_slirp_stub_open(17008);
+    g_assert_false(plan9p1_slirp_stub_connection_accepted(during_file));
+    plan9p1_slirp_stub_deliver_close(during_file);
+    plan9p1_slirp_stub_close(after_auth);
+    plan9p1_slirp_stub_deliver_close(after_auth);
     pump_server(f->server);
     g_assert_true(plan9p1_server_record_connection_ready(f->server));
-    after = plan9p1_slirp_stub_open(17008);
-    g_assert_true(plan9p1_slirp_stub_connection_accepted(after));
-    plan9p1_slirp_stub_close(after);
-    plan9p1_slirp_stub_deliver_close(after);
+    after_file = plan9p1_slirp_stub_open(17008);
+    g_assert_true(plan9p1_slirp_stub_connection_accepted(after_file));
+    plan9p1_slirp_stub_close(after_file);
+    plan9p1_slirp_stub_deliver_close(after_file);
 
     object_unparent(OBJECT(f->server));
     f->server = NULL;

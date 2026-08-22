@@ -3659,14 +3659,15 @@ static void plan9p1_server_il_release(Plan9P1Server *server)
 
 static bool plan9p1_server_il_may_accept(Plan9P1Server *server)
 {
-    bool ready = plan9p1_server_record_connection_ready(server);
-
-    if (!server->il_accepting && ready &&
-        (!server->il_reset_draining || !server->il_connections)) {
+    if (!server->completed || server->closing) {
+        return false;
+    }
+    if (!server->il_accepting && server->il_reset_draining &&
+        !server->il_connections) {
         server->il_reset_draining = false;
         server->il_accepting = true;
     }
-    return server->il_accepting && !server->closing && ready;
+    return server->il_accepting;
 }
 
 static size_t plan9p1_server_il_can_send(void *opaque)
@@ -3710,6 +3711,7 @@ static void *plan9p1_server_file_open(QemuSlirpILConnection *connection,
     Plan9P1Server *server = opaque;
 
     if (!plan9p1_server_il_may_accept(server) || server->file_connection ||
+        !plan9p1_server_record_connection_ready(server) ||
         !plan9p1_server_il_acquire(server)) {
         qemu_slirp_il_connection_close(connection);
         return NULL;
