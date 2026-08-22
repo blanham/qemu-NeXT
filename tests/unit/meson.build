@@ -175,11 +175,16 @@ if have_system
   endif
 
   if slirp.found()
-    tests += {
-      'test-slirp-guestfwd': [
-        meson.project_source_root() / 'net/slirp-guestfwd.c',
-      ],
-    }
+  tests += {
+    'test-slirp-guestfwd': [
+      meson.project_source_root() / 'net/slirp-guestfwd.c',
+    ],
+    'test-slirp-il-integration': [
+      meson.project_source_root() / 'net/slirp-il.c',
+      meson.project_source_root() / 'net/slirp-guestfwd.c',
+      slirp,
+    ],
+  }
   endif
 
   tests += {
@@ -258,7 +263,13 @@ foreach test_name, extra: tests
     src += test_ss.all_sources()
     deps += test_ss.all_dependencies()
   endif
-  exe = executable(test_name, src, genh, dependencies: deps)
+  if test_name == 'test-slirp-il-integration'
+    exe = executable(test_name, src, genh, dependencies: deps,
+                     c_args: ['-ffunction-sections'],
+                     link_args: ['-Wl,--gc-sections'])
+  else
+    exe = executable(test_name, src, genh, dependencies: deps)
+  endif
 
   test(test_name, exe,
        depends: test_deps.get(test_name, []),
