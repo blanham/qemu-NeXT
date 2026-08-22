@@ -24,6 +24,7 @@ typedef struct Fixture {
     GThread *main_thread;
     bool backend_on_main;
     uint64_t kernel_ino;
+    dev_t kernel_dev;
     uint64_t root_ino;
     uint64_t link_ino;
     int lstat_error;
@@ -34,8 +35,17 @@ typedef struct Fixture {
     bool replace_on_readlink;
     bool fail_replaced_readlink;
     bool replace_on_lookup;
+    bool replace_child_after_lstat;
+    bool replace_parent_on_second_child_lstat;
+    unsigned int child_lstat_calls;
     bool remove_child_on_lookup;
     bool fail_replaced_statfs;
+    bool kernel_resolution_notdir;
+    bool postvalidate_notdir;
+    unsigned int name_to_path_calls;
+    uint64_t backend_cookie;
+    uint64_t last_seek_cookie;
+    bool zero_cookie_continuation;
 } Fixture;
 
 static Fixture *current;
@@ -69,6 +79,7 @@ static int fake_name_to_path(FsContext *ctx, V9fsPath *dir,
                              const char *name, V9fsPath *path)
 {
     note_backend();
+    current->name_to_path_calls++;
     if (!dir) {
         if (strcmp(name, "/")) {
             errno = EINVAL;
@@ -81,9 +92,14 @@ static int fake_name_to_path(FsContext *ctx, V9fsPath *dir,
         return -1;
     }
     if (!strcmp(dir->data, "/") &&
-        (!strcmp(name, "kernel") || !strcmp(name, "link"))) {
+        (!strcmp(name, "kernel") || !strcmp(name, "link") ||
+         !strcmp(name, "collision") || !strcmp(name, "hardlink"))) {
         g_autofree char *joined = g_strconcat("/", name, NULL);
 
+        if (!strcmp(name, "kernel") && current->kernel_resolution_notdir) {
+            errno = ENOTDIR;
+            return -1;
+        }
         if (current->remove_child_on_lookup) {
             current->root_ino++;
             current->remove_child_on_lookup = false;
@@ -103,6 +119,11 @@ static int fake_name_to_path(FsContext *ctx, V9fsPath *dir,
 static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
 {
     note_backend();
+    if (current->postvalidate_notdir) {
+        current->postvalidate_notdir = false;
+        errno = ENOTDIR;
+        return -1;
+    }
     memset(st, 0, sizeof(*st));
     st->st_dev = 9;
     st->st_uid = 12;
@@ -120,17 +141,43 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
             errno = current->lstat_error;
             return -1;
         }
+        st->st_dev = current->kernel_dev;
         st->st_mode = S_IFREG | 0555;
         st->st_nlink = 1;
         st->st_ino = current->kernel_ino;
         st->st_size = 6;
         st->st_blocks = 1;
+        if (current->replace_child_after_lstat) {
+            current->kernel_ino++;
+            current->replace_child_after_lstat = false;
+        }
+        if (current->replace_parent_on_second_child_lstat &&
+            ++current->child_lstat_calls == 2) {
+            current->root_ino++;
+            current->replace_parent_on_second_child_lstat = false;
+        }
         return 0;
     }
     if (!strcmp(path->data, "/link")) {
         st->st_mode = S_IFLNK | 0777;
         st->st_nlink = 1;
         st->st_ino = current->link_ino;
+        st->st_size = 6;
+        return 0;
+    }
+    if (!strcmp(path->data, "/collision")) {
+        st->st_dev = 8;
+        st->st_mode = S_IFREG | 0444;
+        st->st_nlink = 1;
+        st->st_ino = 2;
+        st->st_size = 3;
+        return 0;
+    }
+    if (!strcmp(path->data, "/hardlink")) {
+        st->st_dev = 9;
+        st->st_mode = S_IFREG | 0555;
+        st->st_nlink = 2;
+        st->st_ino = UINT64_C(0x100000002);
         st->st_size = 6;
         return 0;
     }
@@ -173,6 +220,7 @@ static int fake_open(FsContext *ctx, V9fsPath *path, int flags,
     if (current->fail_replaced_open) {
         current->kernel_ino++;
         current->fail_replaced_open = false;
+        current->postvalidate_notdir = true;
         errno = ELOOP;
         return -1;
     }
@@ -221,6 +269,7 @@ static int fake_opendir(FsContext *ctx, V9fsPath *path,
     if (current->fail_replaced_opendir) {
         current->root_ino++;
         current->fail_replaced_opendir = false;
+        current->postvalidate_notdir = true;
         errno = ENOTDIR;
         return -1;
     }
@@ -255,7 +304,7 @@ static off_t fake_telldir(FsContext *ctx, V9fsFidOpenState *state)
     FakeOpen *open = state->private;
 
     note_backend();
-    return open->emitted ? 1 : 0;
+    return open->emitted ? current->backend_cookie : 0;
 }
 
 static void fake_seekdir(FsContext *ctx, V9fsFidOpenState *state,
@@ -264,7 +313,8 @@ static void fake_seekdir(FsContext *ctx, V9fsFidOpenState *state,
     FakeOpen *open = state->private;
 
     note_backend();
-    open->emitted = offset != 0;
+    current->last_seek_cookie = offset;
+    open->emitted = current->zero_cookie_continuation || offset != 0;
 }
 
 static int fake_statfs(FsContext *ctx, V9fsPath *path, struct statfs *st)
@@ -343,8 +393,10 @@ static void setup(Fixture *f, gconstpointer opaque)
         .ops = &fake_ops,
     };
     f->kernel_ino = UINT64_C(0x100000002);
+    f->kernel_dev = 9;
     f->root_ino = 1;
     f->link_ino = 3;
+    f->backend_cookie = 1;
     f->server = nfs2_server_new("fake-nfs", false, &transport, f,
                                 &error_abort);
     f->backend_on_main = false;
@@ -828,6 +880,7 @@ static void test_protocol_vectors(Fixture *f, gconstpointer opaque)
                    NFS2_NFSPROC_GETATTR, file.bytes, 4);
     request(f, NFS2_SERVICE_NFS, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, NFS2_RPC_GARBAGE_ARGS);
+
 }
 
 static void test_open_identity_race(Fixture *f, gconstpointer opaque)
@@ -926,6 +979,186 @@ static void test_path_identity_race(Fixture *f, gconstpointer opaque)
     g_assert_cmpuint(reply_word(f, 7), ==, 0);
 }
 
+static void test_v2_component_validation(Fixture *f, gconstpointer opaque)
+{
+    static const char *const invalid[] = { "", ".", "..", "bad/name" };
+    Nfs2FileHandle root = mount_root(f, 1);
+    uint8_t call[512], body[320];
+
+    for (size_t i = 0; i < G_N_ELEMENTS(invalid); i++) {
+        Nfs2XdrWriter w;
+        unsigned int calls = f->name_to_path_calls;
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        g_assert_true(nfs2_xdr_put_opaque(&w, root.bytes, 32));
+        g_assert_true(nfs2_xdr_put_counted_opaque(&w, invalid[i],
+                                                   strlen(invalid[i]), 256));
+        size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                              NFS2_NFSPROC_LOOKUP, body,
+                              nfs2_xdr_writer_size(&w));
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(reply_word(f, 5), ==, NFS2_RPC_GARBAGE_ARGS);
+        g_assert_cmpuint(f->name_to_path_calls, ==, calls);
+    }
+    memset(body + 36, 'x', 256);
+    stl_be_p(body + 32, 256);
+    {
+        unsigned int calls = f->name_to_path_calls;
+        size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                              NFS2_NFSPROC_LOOKUP, body, 32 + 4 + 256);
+
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(reply_word(f, 5), ==, NFS2_RPC_GARBAGE_ARGS);
+        g_assert_cmpuint(f->name_to_path_calls, ==, calls);
+    }
+}
+
+static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root2 = mount_root(f, 1);
+    Nfs2FileHandle kernel = lookup(f, 2, &root2, "kernel");
+    Nfs2FileHandle collision = lookup(f, 2, &root2, "collision");
+    Nfs2FileHandle hardlink, replacement;
+    uint8_t call[192], body[64];
+    uint32_t kernel_fileid, collision_fileid, wire_cookie;
+    size_t len;
+
+    g_assert_cmpint(memcmp(kernel.bytes, collision.bytes,
+                           sizeof(kernel.bytes)), !=, 0);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    kernel_fileid = reply_word(f, 17);
+    g_assert_cmpuint(reply_word(f, 8), ==, S_IFREG | 0555);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, collision.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    collision_fileid = reply_word(f, 17);
+    g_assert_cmpuint(kernel_fileid, !=, collision_fileid);
+    g_assert_cmpuint(kernel_fileid, !=, UINT32_MAX);
+
+    f->kernel_resolution_notdir = true;
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
+    f->kernel_resolution_notdir = false;
+
+    f->kernel_dev = 8;
+    f->kernel_ino = 2;
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
+
+    f->kernel_dev = 9;
+    f->kernel_ino = UINT64_C(0x100000002);
+    hardlink = lookup(f, 2, &root2, "hardlink");
+    g_assert_cmpmem(kernel.bytes, sizeof(kernel.bytes), hardlink.bytes,
+                    sizeof(hardlink.bytes));
+    f->kernel_resolution_notdir = true;
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    f->kernel_resolution_notdir = false;
+    f->kernel_dev = 8;
+    f->kernel_ino = 2;
+    replacement = lookup(f, 2, &root2, "kernel");
+    g_assert_cmpmem(collision.bytes, sizeof(collision.bytes),
+                    replacement.bytes, sizeof(replacement.bytes));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+
+    f->kernel_dev = 9;
+    f->kernel_ino = UINT64_C(0x100000002);
+    f->backend_cookie = UINT64_C(0x100000077);
+    memcpy(body, root2.bytes, 32);
+    stl_be_p(body + 32, 0);
+    stl_be_p(body + 36, 32);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_READDIR, body, 40);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    g_assert_cmpuint(reply_word(f, 8), ==, kernel_fileid);
+    wire_cookie = reply_word(f, 12);
+    g_assert_cmpuint(wire_cookie, !=, UINT32_MAX);
+    stl_be_p(body + 32, wire_cookie);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_READDIR, body, 40);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    g_assert_cmpuint(f->last_seek_cookie, ==, f->backend_cookie);
+
+    f->backend_cookie = 0;
+    f->zero_cookie_continuation = true;
+    stl_be_p(body + 32, 0);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_READDIR, body, 40);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    wire_cookie = reply_word(f, 12);
+    g_assert_cmpuint(wire_cookie, !=, 0);
+    f->last_seek_cookie = UINT64_MAX;
+    stl_be_p(body + 32, wire_cookie);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_READDIR, body, 40);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    g_assert_cmpuint(f->last_seek_cookie, ==, 0);
+
+    stl_be_p(body + 32, 0);
+    stl_be_p(body + 36, 4);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_READDIR, body, 40);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 5), ==, NFS2_RPC_GARBAGE_ARGS);
+
+    f->replace_child_after_lstat = true;
+    memcpy(body, root2.bytes, 32);
+    stl_be_p(body + 32, 6);
+    memcpy(body + 36, "kernel", 6);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_LOOKUP, body, 44);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
+
+    f->replace_parent_on_second_child_lstat = true;
+    f->child_lstat_calls = 0;
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_LOOKUP, body, 44);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
+}
+
+static void test_v3_wire_semantics(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root = mount_root(f, 3);
+    Nfs2FileHandle file = lookup(f, 3, &root, "kernel");
+    uint8_t call[192], body[64];
+    Nfs2XdrWriter w;
+    size_t len;
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, file.bytes, 32, 32));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1,
+                   body, nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 8), ==, 0555);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, root.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 8));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 6,
+                   body, nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 22);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -950,5 +1183,11 @@ int main(int argc, char **argv)
                test_open_identity_race, teardown);
     g_test_add("/nfs/server/path-identity-race", Fixture, NULL, setup,
                test_path_identity_race, teardown);
+    g_test_add("/nfs/server/v2-component-validation", Fixture, NULL, setup,
+               test_v2_component_validation, teardown);
+    g_test_add("/nfs/server/identity-v2-mappings", Fixture, NULL, setup,
+               test_identity_and_v2_mappings, teardown);
+    g_test_add("/nfs/server/v3-wire-semantics", Fixture, NULL, setup,
+               test_v3_wire_semantics, teardown);
     return g_test_run();
 }

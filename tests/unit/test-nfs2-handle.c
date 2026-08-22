@@ -306,6 +306,63 @@ static void test_hard_link_alias_fallback(void)
     g_assert_false(nfs2_handle_resolve(table, &primary, &path));
 }
 
+static void test_external_path_replacement(void)
+{
+    g_autoptr(Nfs2HandleTable) table = new_table();
+    Nfs2FileHandle old_handle;
+    Nfs2FileHandle new_handle;
+    V9fsPath path = { 0 };
+
+    g_assert_true(nfs2_handle_create(table, 1, "/same", &old_handle,
+                                     &error_abort));
+    g_assert_true(nfs2_handle_create(table, 2, "/same", &new_handle,
+                                     &error_abort));
+    g_assert_false(nfs2_handle_resolve(table, &old_handle, &path));
+    assert_resolves(table, &new_handle, "/same");
+}
+
+static void test_alias_snapshot(void)
+{
+    g_autoptr(Nfs2HandleTable) table = new_table();
+    g_autoptr(GPtrArray) paths = NULL;
+    Nfs2FileHandle handle;
+    Nfs2FileHandle alias;
+
+    g_assert_true(nfs2_handle_create(table, 9, "/primary", &handle,
+                                     &error_abort));
+    g_assert_true(nfs2_handle_create(table, 9, "/alias", &alias,
+                                     &error_abort));
+    paths = nfs2_handle_paths_snapshot(table, &handle);
+    g_assert_nonnull(paths);
+    g_assert_cmpuint(paths->len, ==, 2);
+    g_assert_cmpstr(((V9fsPath *)g_ptr_array_index(paths, 0))->data,
+                    ==, "/primary");
+    g_assert_cmpstr(((V9fsPath *)g_ptr_array_index(paths, 1))->data,
+                    ==, "/alias");
+    g_assert_true(nfs2_handle_remove(table, "/primary", &error_abort));
+    g_assert_cmpuint(paths->len, ==, 2);
+    g_assert_cmpstr(((V9fsPath *)g_ptr_array_index(paths, 1))->data,
+                    ==, "/alias");
+}
+
+static void test_stale_publication_guard(void)
+{
+    g_autoptr(Nfs2HandleTable) table = new_table();
+    Nfs2HandlePathState state;
+    Nfs2FileHandle old_handle;
+    Nfs2FileHandle new_handle;
+
+    g_assert_true(nfs2_handle_create(table, 1, "/same", &old_handle,
+                                     &error_abort));
+    nfs2_handle_path_state(table, "/same", &state);
+    g_assert_true(nfs2_handle_path_state_allows(table, "/same", &state, 1));
+    g_assert_true(nfs2_handle_create(table, 2, "/same", &new_handle,
+                                     &error_abort));
+    g_assert_false(nfs2_handle_path_state_allows(table, "/same", &state, 1));
+    g_assert_true(nfs2_handle_path_state_allows(table, "/same", &state, 2));
+    assert_resolves(table, &new_handle, "/same");
+}
+
 static void test_random_generation_and_clear(void)
 {
     g_autoptr(Nfs2HandleTable) first =
@@ -348,6 +405,11 @@ int main(int argc, char **argv)
     g_test_add_func("/nfs2-handle/rename-same-record",
                     test_rename_same_record_is_noop);
     g_test_add_func("/nfs2-handle/hard-link", test_hard_link_alias_fallback);
+    g_test_add_func("/nfs2-handle/external-replacement",
+                    test_external_path_replacement);
+    g_test_add_func("/nfs2-handle/alias-snapshot", test_alias_snapshot);
+    g_test_add_func("/nfs2-handle/stale-publication-guard",
+                    test_stale_publication_guard);
     g_test_add_func("/nfs2-handle/random-clear",
                     test_random_generation_and_clear);
 

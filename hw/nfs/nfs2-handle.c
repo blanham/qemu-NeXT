@@ -237,18 +237,14 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
     }
 
     path_record = g_hash_table_lookup(table->by_path, path);
-    if (path_record) {
-        if (path_record->id != id) {
-            error_setg(errp, "NFS handle path already belongs to another ID");
-            return false;
-        }
+    if (path_record && path_record->id == id) {
         if (!encode_handle(table, path_record, &encoded, errp)) {
             return false;
         }
         *handle = encoded;
         return true;
     }
-    if (table->alias_count >= NFS2_MAX_HANDLE_RECORDS) {
+    if (!path_record && table->alias_count >= NFS2_MAX_HANDLE_RECORDS) {
         error_setg(errp, "NFS handle table is full");
         return false;
     }
@@ -281,6 +277,22 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
         g_hash_table_insert(table->by_id, &record->id, record);
     }
 
+    if (path_record) {
+        for (size_t i = 0; i < path_record->aliases->len; i++) {
+            V9fsPath *old_alias = g_ptr_array_index(path_record->aliases, i);
+
+            if (strcmp(old_alias->data, path) == 0) {
+                g_hash_table_remove(table->by_path, old_alias->data);
+                g_ptr_array_remove_index(path_record->aliases, i);
+                table->alias_count--;
+                break;
+            }
+        }
+        if (path_record->aliases->len == 0) {
+            g_hash_table_remove(table->by_id, &path_record->id);
+        }
+    }
+
     alias = path_new(path);
     g_ptr_array_add(record->aliases, alias);
     g_hash_table_insert(table->by_path, alias->data, record);
@@ -289,30 +301,40 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
     return true;
 }
 
-bool nfs2_handle_resolve(Nfs2HandleTable *table,
-                         const Nfs2FileHandle *handle, V9fsPath *path)
+static Nfs2HandleRecord *resolve_record(Nfs2HandleTable *table,
+                                        const Nfs2FileHandle *handle)
 {
     uint8_t expected[NFS2_HANDLE_MAC_SIZE];
     uint64_t id;
     uint32_t generation;
     Nfs2HandleRecord *record;
-    V9fsPath *canonical;
 
-    if (!table || !table->active || !handle || !path ||
+    if (!table || !table->active || !handle ||
         !calculate_mac(table, handle->bytes, expected, NULL) ||
         !mac_equal(expected, handle->bytes + 20, sizeof(expected)) ||
         memcmp(handle->bytes, "QN2F", 4) != 0 ||
         ldl_be_p(handle->bytes + 4) != NFS2_HANDLE_VERSION) {
         secure_clear(expected, sizeof(expected));
-        return false;
+        return NULL;
     }
     secure_clear(expected, sizeof(expected));
 
     id = ldq_be_p(handle->bytes + 8);
     generation = ldl_be_p(handle->bytes + 16);
     record = g_hash_table_lookup(table->by_id, &id);
-    if (!record || record->generation != generation ||
-        record->aliases->len == 0) {
+    if (!record || record->generation != generation) {
+        return NULL;
+    }
+    return record;
+}
+
+bool nfs2_handle_resolve(Nfs2HandleTable *table,
+                         const Nfs2FileHandle *handle, V9fsPath *path)
+{
+    Nfs2HandleRecord *record = resolve_record(table, handle);
+    V9fsPath *canonical;
+
+    if (!record || !path || record->aliases->len == 0) {
         return false;
     }
 
@@ -321,6 +343,62 @@ bool nfs2_handle_resolve(Nfs2HandleTable *table,
     path->data = g_memdup2(canonical->data, canonical->size);
     path->size = canonical->size;
     return true;
+}
+
+GPtrArray *nfs2_handle_paths_snapshot(Nfs2HandleTable *table,
+                                      const Nfs2FileHandle *handle)
+{
+    Nfs2HandleRecord *record = resolve_record(table, handle);
+    GPtrArray *paths;
+
+    if (!record || record->aliases->len == 0) {
+        return NULL;
+    }
+    paths = g_ptr_array_new_with_free_func(path_free);
+    for (size_t i = 0; i < record->aliases->len; i++) {
+        V9fsPath *alias = g_ptr_array_index(record->aliases, i);
+
+        g_ptr_array_add(paths, path_new(alias->data));
+    }
+    return paths;
+}
+
+void nfs2_handle_path_state(Nfs2HandleTable *table, const char *path,
+                            Nfs2HandlePathState *state)
+{
+    Nfs2HandleRecord *record;
+
+    if (!state) {
+        return;
+    }
+    memset(state, 0, sizeof(*state));
+    if (!table || !table->active || !path) {
+        return;
+    }
+    record = g_hash_table_lookup(table->by_path, path);
+    if (record) {
+        state->id = record->id;
+        state->generation = record->generation;
+        state->present = true;
+    }
+}
+
+bool nfs2_handle_path_state_allows(Nfs2HandleTable *table, const char *path,
+                                   const Nfs2HandlePathState *state,
+                                   uint64_t new_id)
+{
+    Nfs2HandleRecord *record;
+
+    if (!table || !table->active || !path || !state) {
+        return false;
+    }
+    record = g_hash_table_lookup(table->by_path, path);
+    if (record && record->id == new_id) {
+        return true;
+    }
+    return state->present ?
+           record && record->id == state->id &&
+           record->generation == state->generation : !record;
 }
 
 static bool path_has_prefix(const char *path, const char *prefix)

@@ -20,6 +20,8 @@
 #define MOUNT3_VERSION 3U
 #define NFS3_FHSIZE 32U
 #define NFS3_COOKIEVERFSIZE 8U
+#define NFS2_MAX_IDENTITIES 65536U
+#define NFS2_MAX_COOKIES 65536U
 
 enum {
     NFS3PROC_NULL = 0, NFS3PROC_GETATTR = 1, NFS3PROC_SETATTR = 2,
@@ -90,9 +92,24 @@ typedef struct Nfs2Request {
     uint8_t data[];
 } Nfs2Request;
 
+typedef struct NfsIdentityKey {
+    dev_t device;
+    ino_t inode;
+} NfsIdentityKey;
+
+typedef struct NfsCookieKey {
+    uint64_t directory;
+    uint64_t backend_cookie;
+} NfsCookieKey;
+
 struct Nfs2Server {
     V9fsBackend backend;
     Nfs2HandleTable *handles;
+    GHashTable *identities;
+    GHashTable *cookies_by_backend;
+    GHashTable *cookies_by_wire;
+    uint32_t next_identity;
+    uint32_t next_cookie;
     Nfs2FileHandle root_handle;
     Nfs2TransportOps transport;
     void *transport_opaque;
@@ -332,9 +349,110 @@ static uint32_t clamp_u32(uint64_t value)
     return MIN(value, UINT32_MAX);
 }
 
-static uint64_t file_id(const struct stat *st)
+static guint hash_u64(uint64_t value)
 {
-    return ((uint64_t)(uint32_t)st->st_dev << 32) ^ (uint64_t)st->st_ino;
+    return value ^ (value >> 32);
+}
+
+static guint identity_hash(gconstpointer opaque)
+{
+    const NfsIdentityKey *key = opaque;
+
+    return hash_u64(key->device) ^ (hash_u64(key->inode) * 33);
+}
+
+static gboolean identity_equal(gconstpointer left, gconstpointer right)
+{
+    const NfsIdentityKey *a = left;
+    const NfsIdentityKey *b = right;
+
+    return a->device == b->device && a->inode == b->inode;
+}
+
+static guint cookie_hash(gconstpointer opaque)
+{
+    const NfsCookieKey *key = opaque;
+
+    return hash_u64(key->directory) ^
+           (hash_u64(key->backend_cookie) * 33);
+}
+
+static gboolean cookie_equal(gconstpointer left, gconstpointer right)
+{
+    const NfsCookieKey *a = left;
+    const NfsCookieKey *b = right;
+
+    return a->directory == b->directory &&
+           a->backend_cookie == b->backend_cookie;
+}
+
+static bool identity_id(Nfs2Server *server, const struct stat *st,
+                        bool create, uint32_t *id)
+{
+    NfsIdentityKey lookup = { .device = st->st_dev, .inode = st->st_ino };
+    gpointer value = g_hash_table_lookup(server->identities, &lookup);
+
+    if (value) {
+        *id = GPOINTER_TO_UINT(value);
+        return true;
+    }
+    if (!create ||
+        g_hash_table_size(server->identities) >= NFS2_MAX_IDENTITIES ||
+        server->next_identity == 0) {
+        return false;
+    }
+    NfsIdentityKey *key = g_new(NfsIdentityKey, 1);
+
+    *key = lookup;
+    *id = server->next_identity++;
+    g_hash_table_insert(server->identities, key, GUINT_TO_POINTER(*id));
+    return true;
+}
+
+static bool cookie_to_wire(Nfs2Server *server, uint64_t directory,
+                           uint64_t backend_cookie, uint32_t *wire_cookie)
+{
+    NfsCookieKey lookup = {
+        .directory = directory, .backend_cookie = backend_cookie,
+    };
+    gpointer value;
+
+    value = g_hash_table_lookup(server->cookies_by_backend, &lookup);
+    if (value) {
+        *wire_cookie = GPOINTER_TO_UINT(value);
+        return true;
+    }
+    if (g_hash_table_size(server->cookies_by_backend) >= NFS2_MAX_COOKIES ||
+        server->next_cookie == 0) {
+        return false;
+    }
+    NfsCookieKey *key = g_new(NfsCookieKey, 1);
+
+    *key = lookup;
+    *wire_cookie = server->next_cookie++;
+    g_hash_table_insert(server->cookies_by_backend, key,
+                        GUINT_TO_POINTER(*wire_cookie));
+    g_hash_table_insert(server->cookies_by_wire,
+                        GUINT_TO_POINTER(*wire_cookie), key);
+    return true;
+}
+
+static bool cookie_from_wire(Nfs2Server *server, uint64_t directory,
+                             uint32_t wire_cookie, uint64_t *backend_cookie)
+{
+    NfsCookieKey *key;
+
+    if (wire_cookie == 0) {
+        *backend_cookie = 0;
+        return true;
+    }
+    key = g_hash_table_lookup(server->cookies_by_wire,
+                              GUINT_TO_POINTER(wire_cookie));
+    if (!key || key->directory != directory) {
+        return false;
+    }
+    *backend_cookie = key->backend_cookie;
+    return true;
 }
 
 static uint32_t v2_status(int error)
@@ -442,12 +560,15 @@ static bool get_u64(Nfs2XdrReader *r, uint64_t *value)
     return true;
 }
 
-static bool put_v2_attr(Nfs2XdrWriter *w, const struct stat *st)
+static bool put_v2_attr(Nfs2Server *server, Nfs2XdrWriter *w,
+                        const struct stat *st)
 {
     uint64_t size = st->st_size < 0 ? 0 : st->st_size;
     uint64_t blocks = st->st_blocks < 0 ? 0 : st->st_blocks;
+    uint32_t identity;
 
-    return nfs2_xdr_put_u32(w, file_type(st->st_mode, false)) &&
+    return identity_id(server, st, false, &identity) &&
+           nfs2_xdr_put_u32(w, file_type(st->st_mode, false)) &&
            nfs2_xdr_put_u32(w, st->st_mode) &&
            nfs2_xdr_put_u32(w, clamp_u32(st->st_nlink)) &&
            nfs2_xdr_put_u32(w, clamp_u32(st->st_uid)) &&
@@ -457,7 +578,7 @@ static bool put_v2_attr(Nfs2XdrWriter *w, const struct stat *st)
            nfs2_xdr_put_u32(w, clamp_u32(st->st_rdev)) &&
            nfs2_xdr_put_u32(w, clamp_u32(blocks)) &&
            nfs2_xdr_put_u32(w, clamp_u32(st->st_dev)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_ino)) &&
+           nfs2_xdr_put_u32(w, identity) &&
            nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_atim.tv_sec, 0))) &&
            nfs2_xdr_put_u32(w, st->st_atim.tv_nsec / 1000) &&
            nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_mtim.tv_sec, 0))) &&
@@ -472,7 +593,7 @@ static bool put_v3_attr(Nfs2XdrWriter *w, const struct stat *st)
     uint64_t used = st->st_blocks < 0 ? 0 : (uint64_t)st->st_blocks * 512;
 
     return nfs2_xdr_put_u32(w, file_type(st->st_mode, true)) &&
-           nfs2_xdr_put_u32(w, st->st_mode) &&
+           nfs2_xdr_put_u32(w, st->st_mode & 07777) &&
            nfs2_xdr_put_u32(w, clamp_u32(st->st_nlink)) &&
            nfs2_xdr_put_u32(w, clamp_u32(st->st_uid)) &&
            nfs2_xdr_put_u32(w, clamp_u32(st->st_gid)) &&
@@ -513,29 +634,37 @@ static int coroutine_fn validate_handle_identity(Nfs2Server *server,
                                                  struct stat *st)
 {
     int ret = co_lstat(server, path, st);
+    uint32_t identity;
 
-    if (ret == -ENOENT) {
+    if (ret == -ENOENT || ret == -ENOTDIR) {
         return -ESTALE;
     }
-    if (ret >= 0 && file_id(st) != ldq_be_p(handle->bytes + 8)) {
+    if (ret >= 0 &&
+        (!identity_id(server, st, false, &identity) ||
+         identity != ldq_be_p(handle->bytes + 8))) {
         return -ESTALE;
     }
     return ret;
 }
 
-static int coroutine_fn resolve_handle(Nfs2Server *server,
-                                       const Nfs2FileHandle *handle,
-                                       V9fsPath *absolute,
-                                       V9fsPath *backend,
-                                       struct stat *st)
+static bool stat_matches_handle(Nfs2Server *server,
+                                const Nfs2FileHandle *handle,
+                                const struct stat *st)
+{
+    uint32_t identity;
+
+    return identity_id(server, st, false, &identity) &&
+           identity == ldq_be_p(handle->bytes + 8);
+}
+
+static int coroutine_fn resolve_backend_path(Nfs2Server *server,
+                                             const V9fsPath *absolute,
+                                             V9fsPath *backend)
 {
     g_auto(GStrv) components = NULL;
     V9fsPath current = { 0 };
     int ret;
 
-    if (!nfs2_handle_resolve(server->handles, handle, absolute)) {
-        return -ESTALE;
-    }
     ret = co_name_to_path(server, NULL, "/", &current);
     if (ret < 0) {
         return ret;
@@ -551,13 +680,41 @@ static int coroutine_fn resolve_handle(Nfs2Server *server,
         }
         current = next;
     }
-    ret = validate_handle_identity(server, handle, &current, st);
-    if (ret < 0) {
-        path_clear(&current);
-        return ret;
-    }
     *backend = current;
     return 0;
+}
+
+static int coroutine_fn resolve_handle(Nfs2Server *server,
+                                       const Nfs2FileHandle *handle,
+                                       V9fsPath *absolute,
+                                       V9fsPath *backend,
+                                       struct stat *st)
+{
+    g_autoptr(GPtrArray) aliases =
+        nfs2_handle_paths_snapshot(server->handles, handle);
+
+    if (!aliases) {
+        return -ESTALE;
+    }
+    for (size_t alias = 0; alias < aliases->len; alias++) {
+        V9fsPath *snapshot = g_ptr_array_index(aliases, alias);
+        int ret;
+
+        path_clear(absolute);
+        path_clear(backend);
+        path_copy(absolute, snapshot);
+        ret = resolve_backend_path(server, absolute, backend);
+        if (ret >= 0) {
+            ret = validate_handle_identity(server, handle, backend, st);
+        }
+        if (ret >= 0) {
+            return 0;
+        }
+        if (ret != -ESTALE && ret != -ENOENT && ret != -ENOTDIR) {
+            return ret;
+        }
+    }
+    return -ESTALE;
 }
 
 static char *child_absolute(const char *dir, const char *name)
@@ -572,11 +729,30 @@ static char *child_absolute(const char *dir, const char *name)
     return canonical;
 }
 
-static bool make_handle(Nfs2Server *server, const char *path,
-                        const struct stat *st, Nfs2FileHandle *handle)
+static int make_handle(Nfs2Server *server, const char *path,
+                       const struct stat *st,
+                       const Nfs2HandlePathState *path_state,
+                       Nfs2FileHandle *handle)
 {
-    return nfs2_handle_create(server->handles, file_id(st), path, handle,
-                              NULL);
+    uint32_t identity;
+
+    if (!identity_id(server, st, false, &identity)) {
+        if (path_state &&
+            !nfs2_handle_path_state_allows(server->handles, path, path_state,
+                                           0)) {
+            return -ESTALE;
+        }
+        if (!identity_id(server, st, true, &identity)) {
+            return -ENOSPC;
+        }
+    }
+    if (path_state &&
+        !nfs2_handle_path_state_allows(server->handles, path, path_state,
+                                       identity)) {
+        return -ESTALE;
+    }
+    return nfs2_handle_create(server->handles, identity, path, handle, NULL) ?
+           0 : -EIO;
 }
 
 static bool write_nfs_status(Nfs2XdrWriter *w, uint32_t status)
@@ -711,7 +887,7 @@ static bool coroutine_fn reply_getattr(Nfs2Server *server,
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && ret >= 0) {
-        ok = v3 ? put_v3_attr(w, &st) : put_v2_attr(w, &st);
+        ok = v3 ? put_v3_attr(w, &st) : put_v2_attr(server, w, &st);
     }
     path_clear(&absolute);
     path_clear(&path);
@@ -729,12 +905,14 @@ static bool decode_lookup(Nfs2RpcCall *call, bool v3, Nfs2FileHandle *dir,
         }
         *dir = args.dir;
         strcpy(name, args.name);
-        return true;
+        return strcmp(name, ".") && strcmp(name, "..") &&
+               !strchr(name, '/');
     }
     return decode_v3_handle(&call->body, dir, false) &&
            nfs2_xdr_string(&call->body, name, NFS2_MAX_NAME + 1,
-                           NFS2_MAX_NAME) && name[0] &&
-           !strchr(name, '/') && nfs2_xdr_reader_empty(&call->body);
+                           NFS2_MAX_NAME) && name[0] && strcmp(name, ".") &&
+           strcmp(name, "..") && !strchr(name, '/') &&
+           nfs2_xdr_reader_empty(&call->body);
 }
 
 static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
@@ -744,10 +922,12 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     char name[NFS2_MAX_NAME + 1];
     V9fsPath absolute = { 0 }, dir = { 0 }, child = { 0 };
     g_autofree char *child_path = NULL;
+    Nfs2HandlePathState child_path_state;
     struct stat dir_st, st;
     int ret;
     bool ok;
     bool dir_resolved;
+    bool child_revalidated = false;
 
     if (!decode_lookup(call, v3, &dir_handle, name)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
@@ -756,6 +936,15 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     dir_resolved = ret >= 0;
     if (ret >= 0 && !S_ISDIR(dir_st.st_mode)) {
         ret = -ENOTDIR;
+    }
+    if (ret >= 0) {
+        child_path = child_absolute(absolute.data, name);
+        if (!child_path) {
+            ret = -EIO;
+        } else {
+            nfs2_handle_path_state(server->handles, child_path,
+                                   &child_path_state);
+        }
     }
     if (ret >= 0) {
         ret = co_name_to_path(server, &dir, name, &child);
@@ -775,11 +964,35 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
         }
     }
     if (ret >= 0) {
-        child_path = child_absolute(absolute.data, name);
-        if (!child_path || !make_handle(server, child_path, &st,
-                                        &result_handle)) {
-            ret = -EIO;
+        struct stat current_st;
+
+        child_revalidated = true;
+        ret = co_lstat(server, &child, &current_st);
+        if (ret == -ENOENT || ret == -ENOTDIR) {
+            ret = -ESTALE;
         }
+        if (ret >= 0 && (current_st.st_dev != st.st_dev ||
+                         current_st.st_ino != st.st_ino)) {
+            ret = -ESTALE;
+        }
+        if (ret >= 0) {
+            st = current_st;
+        }
+    }
+    if (child_revalidated) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &dir_handle, &dir,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+        } else if (ret >= 0) {
+            dir_st = current_st;
+        }
+    }
+    if (ret >= 0) {
+        ret = make_handle(server, child_path, &st, &child_path_state,
+                          &result_handle);
     }
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
@@ -793,7 +1006,7 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
         } else {
             ok = nfs2_xdr_put_opaque(w, result_handle.bytes,
                                      sizeof(result_handle.bytes)) &&
-                 put_v2_attr(w, &st);
+                 put_v2_attr(server, w, &st);
         }
     } else if (ok && v3) {
         ok = put_post_attr(w, &dir_st, false);
@@ -922,7 +1135,7 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0 && !S_ISREG(st.st_mode)) {
-        ret = S_ISDIR(st.st_mode) ? -EISDIR : -EINVAL;
+        ret = v3 ? -EINVAL : (S_ISDIR(st.st_mode) ? -EISDIR : -EINVAL);
     }
     if (ret >= 0) {
         open_attempted = true;
@@ -933,7 +1146,7 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
         struct stat opened_st;
 
         ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
-        if (ret >= 0 && file_id(&opened_st) != ldq_be_p(handle.bytes + 8)) {
+        if (ret >= 0 && !stat_matches_handle(server, &handle, &opened_st)) {
             ret = -ESTALE;
         }
         if (ret >= 0) {
@@ -971,7 +1184,7 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
                  nfs2_xdr_put_u32(w, offset + ret >= (uint64_t)st.st_size) &&
                  nfs2_xdr_put_counted_opaque(w, data, ret, NFS2_MAX_DATA);
         } else {
-            ok = put_v2_attr(w, &st) &&
+            ok = put_v2_attr(server, w, &st) &&
                  nfs2_xdr_put_counted_opaque(w, data, ret, NFS2_MAX_DATA);
         }
     } else if (ok && v3) {
@@ -1006,7 +1219,8 @@ static bool decode_readdir(Nfs2RpcCall *call, bool v3,
 
     if (!nfs2_xdr_opaque(&call->body, handle->bytes, NFS2_FHSIZE) ||
         !nfs2_xdr_u32(&call->body, &cookie32) ||
-        !nfs2_xdr_u32(&call->body, count) || *count > NFS2_MAX_DATA ||
+        !nfs2_xdr_u32(&call->body, count) || *count < 8 ||
+        *count > NFS2_MAX_DATA ||
         !nfs2_xdr_reader_empty(&call->body)) {
         return false;
     }
@@ -1016,10 +1230,14 @@ static bool decode_readdir(Nfs2RpcCall *call, bool v3,
     return true;
 }
 
-static void directory_verifier(const struct stat *st,
+static void directory_verifier(Nfs2Server *server, const struct stat *st,
                                uint8_t verifier[NFS3_COOKIEVERFSIZE])
 {
-    uint64_t value = file_id(st) ^ ((uint64_t)st->st_mtim.tv_sec << 32) ^
+    uint32_t identity = 0;
+    uint64_t value;
+
+    identity_id(server, st, false, &identity);
+    value = identity ^ ((uint64_t)st->st_mtim.tv_sec << 32) ^
                      st->st_mtim.tv_nsec ^ ((uint64_t)st->st_ctim.tv_sec << 1);
 
     stq_be_p(verifier, value ? value : 1);
@@ -1034,6 +1252,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
     struct stat dir_st = { 0 };
     V9fsFidOpenState open = { 0 };
     uint64_t cookie = 0;
+    uint64_t directory_identity;
     uint8_t supplied_verifier[NFS3_COOKIEVERFSIZE];
     uint8_t current_verifier[NFS3_COOKIEVERFSIZE] = { 0 };
     uint32_t dircount = 0, count;
@@ -1042,12 +1261,15 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
     bool opened = false, opendir_attempted = false, dir_bound = false;
     bool eof = false, emitted = false, ok;
     bool dir_attr_valid = false;
+    bool seek_requested;
 
     if (!decode_readdir(call, v3, &handle, &cookie, supplied_verifier,
                         &dircount, &count, plus)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &dir_st);
+    directory_identity = ldq_be_p(handle.bytes + 8);
+    seek_requested = cookie != 0;
     dir_attr_valid = ret >= 0;
     if (ret >= 0 && !S_ISDIR(dir_st.st_mode)) {
         ret = -ENOTDIR;
@@ -1068,7 +1290,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         struct stat opened_st;
 
         ret = co_fstat(server, P9_FID_DIR, &open, &opened_st);
-        if (ret >= 0 && file_id(&opened_st) != ldq_be_p(handle.bytes + 8)) {
+        if (ret >= 0 && !stat_matches_handle(server, &handle, &opened_st)) {
             ret = -ESTALE;
         }
         if (ret >= 0) {
@@ -1091,14 +1313,26 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
     if (ret >= 0 && v3) {
         static const uint8_t zero[NFS3_COOKIEVERFSIZE];
 
-        directory_verifier(&dir_st, current_verifier);
+        directory_verifier(server, &dir_st, current_verifier);
         if (memcmp(supplied_verifier, zero, sizeof(zero)) &&
             memcmp(supplied_verifier, current_verifier,
                    sizeof(current_verifier))) {
             ret = -EBADMSG;
         }
     }
-    if (ret >= 0 && cookie) {
+    if (ret >= 0 && seek_requested) {
+        if (!v3) {
+            uint64_t backend_cookie;
+
+            if (!cookie_from_wire(server, directory_identity, cookie,
+                                  &backend_cookie)) {
+                ret = -EINVAL;
+            } else {
+                cookie = backend_cookie;
+            }
+        }
+    }
+    if (ret >= 0 && seek_requested) {
         BackendWork work = {
             .op = BACKEND_SEEKDIR, .backend = &server->backend,
             .open = &open, .cookie = cookie,
@@ -1126,6 +1360,8 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         g_autofree char *child_abs = NULL;
         struct stat child_st;
         Nfs2FileHandle child_handle;
+        Nfs2HandlePathState child_path_state;
+        uint32_t child_identity = 0;
         bool child_valid = false;
         size_t before = nfs2_xdr_writer_size(w), directory_end;
 
@@ -1139,15 +1375,27 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
             continue;
         }
         if (plus) {
+            child_abs = child_absolute(absolute.data, work.dirent_name);
+            if (!child_abs) {
+                ret = -EIO;
+                break;
+            }
+            nfs2_handle_path_state(server->handles, child_abs,
+                                   &child_path_state);
+        }
+        if (plus || !v3) {
             ret = co_name_to_path(server, &path, work.dirent_name, &child);
             if (ret >= 0) {
                 ret = co_lstat(server, &child, &child_st);
             }
-            if (ret >= 0) {
-                child_abs = child_absolute(absolute.data, work.dirent_name);
-                child_valid = child_abs && make_handle(server, child_abs,
-                                                       &child_st,
-                                                       &child_handle);
+            if (ret >= 0 && !v3 &&
+                !identity_id(server, &child_st, true, &child_identity)) {
+                ret = -ENOSPC;
+            }
+            if (ret >= 0 && plus) {
+                child_valid = make_handle(server, child_abs, &child_st,
+                                          &child_path_state,
+                                          &child_handle) >= 0;
             }
             path_clear(&child);
             if (ret < 0) {
@@ -1165,11 +1413,22 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
                 path_clear(&child);
                 break;
             }
-            cookie = tell.cookie;
+            if (!v3) {
+                uint32_t wire_cookie;
+
+                if (!cookie_to_wire(server, directory_identity, tell.cookie,
+                                    &wire_cookie)) {
+                    ret = -ENOSPC;
+                    break;
+                }
+                cookie = wire_cookie;
+            } else {
+                cookie = tell.cookie;
+            }
         }
         if (!nfs2_xdr_put_u32(w, 1) ||
             !(v3 ? put_u64(w, work.dirent_ino) :
-                   nfs2_xdr_put_u32(w, clamp_u32(work.dirent_ino))) ||
+                   nfs2_xdr_put_u32(w, child_identity)) ||
             !nfs2_xdr_put_counted_opaque(w, work.dirent_name,
                                           strlen(work.dirent_name),
                                           NFS2_MAX_NAME) ||
@@ -1193,7 +1452,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
             eof = false;
             break;
         }
-        if (nfs2_xdr_writer_size(w) - (v3 ? 28 : 24) + 8 > count) {
+        if (nfs2_xdr_writer_size(w) - 28 + 8 > count) {
             w->cursor = w->start + before;
             ret = (v3 && !emitted) ? -EMSGSIZE : 0;
             eof = false;
@@ -1202,7 +1461,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         dir_used += directory_end - before;
         emitted = true;
     }
-    if (opened && plus) {
+    if (opened && (plus || !v3)) {
         struct stat current_st;
         int identity_ret = validate_handle_identity(server, &handle, &path,
                                                      &current_st);
@@ -1541,6 +1800,7 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
                             void *transport_opaque, Error **errp)
 {
     Nfs2Server *server;
+    uint32_t root_identity;
 
     if (!fsdev_id || !fsdev_id[0] || !transport || !transport->send) {
         error_setg(errp, "NFS server configuration is incomplete");
@@ -1557,12 +1817,23 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
         g_free(server);
         return NULL;
     }
+    server->identities = g_hash_table_new_full(identity_hash, identity_equal,
+                                                g_free, NULL);
+    server->cookies_by_backend = g_hash_table_new_full(cookie_hash,
+                                                        cookie_equal,
+                                                        g_free, NULL);
+    server->cookies_by_wire = g_hash_table_new(g_direct_hash, g_direct_equal);
+    server->next_identity = 1;
+    server->next_cookie = 1;
     server->handles = nfs2_handle_table_new(NULL, 0, errp);
     if (!server->handles ||
-        !nfs2_handle_create(server->handles,
-                            file_id(&server->backend.root_st), "/",
+        !identity_id(server, &server->backend.root_st, true, &root_identity) ||
+        !nfs2_handle_create(server->handles, root_identity, "/",
                             &server->root_handle, errp)) {
         nfs2_handle_table_free(server->handles);
+        g_hash_table_destroy(server->cookies_by_wire);
+        g_hash_table_destroy(server->cookies_by_backend);
+        g_hash_table_destroy(server->identities);
         v9fs_backend_cleanup(&server->backend);
         g_free(server);
         return NULL;
@@ -1622,6 +1893,9 @@ void nfs2_server_free(Nfs2Server *server)
     g_assert(!server->pending);
     server->closing = true;
     nfs2_handle_table_free(server->handles);
+    g_hash_table_destroy(server->cookies_by_wire);
+    g_hash_table_destroy(server->cookies_by_backend);
+    g_hash_table_destroy(server->identities);
     v9fs_backend_cleanup(&server->backend);
     g_free(server);
 }

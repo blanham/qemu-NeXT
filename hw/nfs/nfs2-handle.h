@@ -6,6 +6,12 @@
 
 typedef struct Nfs2HandleTable Nfs2HandleTable;
 
+typedef struct Nfs2HandlePathState {
+    uint64_t id;
+    uint32_t generation;
+    bool present;
+} Nfs2HandlePathState;
+
 Nfs2HandleTable *nfs2_handle_table_new(const uint8_t *key, size_t key_length,
                                        Error **errp);
 void nfs2_handle_table_clear(Nfs2HandleTable *table);
@@ -18,6 +24,13 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
                         Error **errp);
 bool nfs2_handle_resolve(Nfs2HandleTable *table,
                          const Nfs2FileHandle *handle, V9fsPath *path);
+GPtrArray *nfs2_handle_paths_snapshot(Nfs2HandleTable *table,
+                                      const Nfs2FileHandle *handle);
+void nfs2_handle_path_state(Nfs2HandleTable *table, const char *path,
+                            Nfs2HandlePathState *state);
+bool nfs2_handle_path_state_allows(Nfs2HandleTable *table, const char *path,
+                                   const Nfs2HandlePathState *state,
+                                   uint64_t new_id);
 bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
                         const char *new_path, Error **errp);
 bool nfs2_handle_remove(Nfs2HandleTable *table, const char *path,
