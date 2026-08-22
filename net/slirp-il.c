@@ -12,6 +12,7 @@ struct QemuSlirpILRegistry {
     QTAILQ_HEAD(, QemuSlirpILListener) deferred;
     bool valid;
     bool ipv4_enabled;
+    unsigned progress_generation;
 };
 
 struct QemuSlirpILListener {
@@ -540,6 +541,13 @@ void qemu_slirp_il_registry_flush_deferred(QemuSlirpILRegistry *registry)
 void qemu_slirp_il_registry_progress(QemuSlirpILRegistry *registry)
 {
     qemu_slirp_il_registry_flush_deferred(registry);
+    registry->progress_generation++;
+}
+
+unsigned qemu_slirp_il_registry_get_progress_generation(
+    QemuSlirpILRegistry *registry)
+{
+    return registry->progress_generation;
 }
 
 void qemu_slirp_il_registry_cleanup(QemuSlirpILRegistry *registry,

@@ -51,6 +51,8 @@ int qemu_slirp_il_registry_listen(QemuSlirpILRegistry *registry,
                                   Error **errp);
 void qemu_slirp_il_registry_flush_deferred(QemuSlirpILRegistry *registry);
 void qemu_slirp_il_registry_progress(QemuSlirpILRegistry *registry);
+unsigned qemu_slirp_il_registry_get_progress_generation(
+    QemuSlirpILRegistry *registry);
 void qemu_slirp_il_registry_cleanup(QemuSlirpILRegistry *registry,
                                     QemuSlirpILCleanup cleanup,
                                     void *cleanup_opaque);

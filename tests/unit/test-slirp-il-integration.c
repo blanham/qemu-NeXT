@@ -4,6 +4,7 @@
 #include "net/slirp-il.h"
 #include "net/slirp.h"
 #include "qapi/error.h"
+#include <libslirp.h>
 
 static NetClientState *test_netdev;
 
@@ -32,7 +33,10 @@ NetClientState *qemu_find_netdev(const char *id)
     return NULL;
 }
 
+static void tracked_slirp_cleanup(Slirp *slirp);
+#define slirp_cleanup tracked_slirp_cleanup
 #include "../../net/slirp.c"
+#undef slirp_cleanup
 
 ssize_t qemu_send_packet(NetClientState *nc, const uint8_t *buf, int size)
 {
@@ -69,6 +73,45 @@ int qemu_file_get_error(QEMUFile *f)
 
 void qemu_chr_fe_deinit(CharFrontend *c, bool del)
 {
+}
+
+#ifdef CONFIG_SLIRP_IL
+typedef struct TrackingState {
+    unsigned listener_removes;
+    bool cleanup_called;
+} TrackingState;
+
+static TrackingState tracking;
+
+static int tracking_listen(void *opaque, struct in_addr addr, uint16_t port,
+                           const QemuSlirpILBackendCallbacks *callbacks,
+                           void *callbacks_opaque, void **backend_listener)
+{
+    return slirp_il_backend_ops.listen(opaque, addr, port, callbacks,
+                                       callbacks_opaque, backend_listener);
+}
+
+static void tracking_listener_remove(void *opaque, void *backend_listener)
+{
+    tracking.listener_removes++;
+    slirp_il_backend_ops.listener_remove(opaque, backend_listener);
+}
+
+static const QemuSlirpILBackendOps tracking_ops = {
+    .listen = tracking_listen,
+    .listener_remove = tracking_listener_remove,
+    .send_record = slirp_il_backend_send_record,
+    .connection_close = slirp_il_backend_connection_close,
+};
+#endif
+
+static void tracked_slirp_cleanup(Slirp *slirp)
+{
+#ifdef CONFIG_SLIRP_IL
+    g_assert_cmpuint(tracking.listener_removes, ==, 2);
+    tracking.cleanup_called = true;
+#endif
+    slirp_cleanup(slirp);
 }
 
 static struct in_addr test_addr(void)
@@ -122,8 +165,9 @@ static SlirpState *new_user_netdev(void)
     s->guestfwds = qemu_slirp_guestfwd_registry_new(
         true, net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
 #ifdef CONFIG_SLIRP_IL
+    tracking = (TrackingState) {0};
     s->il_registry = qemu_slirp_il_registry_new(
-        true, net, mask, host, dns, &slirp_il_backend_ops, s);
+        true, net, mask, host, dns, &tracking_ops, s);
 #endif
     s->poll_notifier.notify = net_slirp_poll_notify;
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
@@ -173,6 +217,7 @@ static void test_user_netdev_lifecycle_paths(void)
 #ifdef CONFIG_SLIRP_IL
     NetClientInfo non_user = { .type = NET_CLIENT_DRIVER_NONE };
     NetClientInfo *user_info = s->nc.info;
+    unsigned progress;
 
     s->nc.info = &non_user;
     g_assert_cmpint(qemu_slirp_il_listen("user0", test_addr(), 17008,
@@ -187,11 +232,25 @@ static void test_user_netdev_lifecycle_paths(void)
                                          &listener_ops, NULL, &listener, &err),
                     ==, 0);
     g_assert_nonnull(listener);
+    progress = qemu_slirp_il_registry_get_progress_generation(s->il_registry);
+    s->nc.info->receive(&s->nc, packet, sizeof(packet));
+    g_assert_cmpuint(qemu_slirp_il_registry_get_progress_generation(
+                         s->il_registry), ==, progress + 1);
+    s->poll_notifier.notify(&s->poll_notifier, &poll);
+    g_assert_cmpuint(qemu_slirp_il_registry_get_progress_generation(
+                         s->il_registry), ==, progress + 2);
     g_assert_cmpint(qemu_slirp_il_listen("user0", test_addr(), 17008,
                                          &listener_ops, NULL, NULL, &err),
                     ==, -1);
     g_assert_nonnull(err);
     error_free(err);
+    qemu_slirp_il_listener_remove(listener);
+    g_assert_cmpuint(tracking.listener_removes, ==, 1);
+    listener = NULL;
+    g_assert_cmpint(qemu_slirp_il_listen("user0", test_addr(), 17009,
+                                         &listener_ops, NULL, &listener, &err),
+                    ==, 0);
+    g_assert_nonnull(listener);
 #else
     g_assert_cmpint(qemu_slirp_il_listen("user0", test_addr(), 17008,
                                          &listener_ops, NULL, &listener, &err),
@@ -203,7 +262,9 @@ static void test_user_netdev_lifecycle_paths(void)
     g_array_free(poll.pollfds, true);
     destroy_user_netdev(s);
 #ifdef CONFIG_SLIRP_IL
-    /* Cleanup removed the backend listener before slirp died. */
+    g_assert_true(tracking.cleanup_called);
+    g_assert_cmpuint(tracking.listener_removes, ==, 2);
+    /* Caller ref survives registry invalidation and remains removable. */
     qemu_slirp_il_listener_remove(listener);
 #endif
 }
