@@ -2546,6 +2546,34 @@ static void server_flush(Plan9P1Server *server)
         if (g_queue_peek_head(&server->replies) != reply) {
             break;
         }
+        if (server->transport_ops.kind == PLAN9P1_TRANSPORT_RECORD) {
+            if (capacity < reply->len) {
+                break;
+            }
+            owner_ref(server);
+            server->callback_depth++;
+            sent = server->transport_ops.send(reply->data, reply->len,
+                                              server->transport_opaque);
+            server->callback_depth--;
+            owner_unref(server);
+            if (server_has_deferred(server)) {
+                server_apply_deferred(server);
+            }
+            if (g_queue_peek_head(&server->replies) != reply) {
+                break;
+            }
+            if (sent == -EAGAIN) {
+                break;
+            }
+            if (sent < 0 || (size_t)sent != reply->len) {
+                server_transport_failed(server);
+                break;
+            }
+            g_queue_pop_head(&server->replies);
+            server->queued_bytes -= reply->len;
+            reply_free(reply);
+            continue;
+        }
         amount = MIN(remaining, capacity);
         if (!amount) {
             break;
@@ -2759,6 +2787,11 @@ int plan9p1_server_start(Plan9P1Server *server,
         error_setg(errp, "9P1 server requires complete transport callbacks");
         return -1;
     }
+    if (ops->kind != PLAN9P1_TRANSPORT_STREAM &&
+        ops->kind != PLAN9P1_TRANSPORT_RECORD) {
+        error_setg(errp, "9P1 server transport kind is invalid");
+        return -1;
+    }
     server->transport_ops = *ops;
     server->transport_opaque = transport_opaque;
     server->started = true;
@@ -2789,6 +2822,24 @@ static int server_receive_internal(Plan9P1Server *server,
     Error *local_err = NULL;
     uint16_t tag;
     int ret;
+
+    if (server->transport_ops.kind == PLAN9P1_TRANSPORT_RECORD) {
+        if (server->connection_failed) {
+            error_setg(errp, "9P1 record transport is failed");
+            return -1;
+        }
+        if (!buf || !len) {
+            error_setg(errp, "9P1 record is empty");
+            server_transport_failed(server);
+            return -1;
+        }
+        if (enqueue_frame(buf, len, server, &local_err) == 0) {
+            return 0;
+        }
+        server_transport_failed(server);
+        error_propagate(errp, local_err);
+        return -1;
+    }
 
     if (server->connection_failed && server->stream.used == 0 &&
         (!len || !buf || buf[0] != PLAN9P1_TSESSION)) {
@@ -2878,6 +2929,18 @@ void plan9p1_server_can_send(Plan9P1Server *server)
         }
         owner_unref(server);
     }
+}
+
+void plan9p1_server_connection_closed(Plan9P1Server *server)
+{
+    if (!server || server->closing ||
+        server->transport_ops.kind != PLAN9P1_TRANSPORT_RECORD) {
+        return;
+    }
+    if (!server->callback_depth) {
+        clear_deferred_inputs(server);
+    }
+    plan9p1_server_reset(server);
 }
 
 void plan9p1_server_reset(Plan9P1Server *server)

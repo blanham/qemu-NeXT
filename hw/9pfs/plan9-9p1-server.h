@@ -43,7 +43,13 @@ typedef struct Error Error;
 #define TYPE_PLAN9P1_SERVER "plan9-9p1-server"
 OBJECT_DECLARE_SIMPLE_TYPE(Plan9P1Server, PLAN9P1_SERVER)
 
+typedef enum Plan9P1TransportKind {
+    PLAN9P1_TRANSPORT_STREAM,
+    PLAN9P1_TRANSPORT_RECORD,
+} Plan9P1TransportKind;
+
 typedef struct Plan9P1TransportOps {
+    Plan9P1TransportKind kind;
     size_t (*can_send)(void *opaque);
     int (*send)(const uint8_t *buf, size_t len, void *opaque);
 } Plan9P1TransportOps;
@@ -86,6 +92,9 @@ int plan9p1_server_receive(Plan9P1Server *server,
                            const uint8_t *buf, size_t len,
                            Error **errp);
 void plan9p1_server_can_send(Plan9P1Server *server);
+
+/* A record transport must call this after every peer disconnect. */
+void plan9p1_server_connection_closed(Plan9P1Server *server);
 
 /* Reset is asynchronous when an operation or open fid needs worker cleanup. */
 void plan9p1_server_reset(Plan9P1Server *server);

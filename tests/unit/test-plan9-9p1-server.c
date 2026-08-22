@@ -41,7 +41,11 @@ typedef struct TestTransport {
     ServerFixture *fixture;
     size_t capacity;
     size_t max_chunk;
+    size_t last_send_len;
+    unsigned int send_calls;
     bool fail;
+    bool would_block;
+    size_t short_success;
     bool action_done;
     TransportAction action;
 } TestTransport;
@@ -583,6 +587,9 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
     TestTransport *transport = opaque;
     size_t sent;
 
+    transport->last_send_len = len;
+    transport->send_calls++;
+
     if (!transport->action_done &&
         transport->action >= TRANSPORT_ACTION_RESET_SEND) {
         static const uint8_t tsession[11] = {
@@ -623,6 +630,14 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
     if (transport->fail) {
         return -1;
     }
+    if (transport->would_block) {
+        return -EAGAIN;
+    }
+    if (transport->short_success) {
+        sent = MIN(len, transport->short_success);
+        g_byte_array_append(transport->output, buf, sent);
+        return sent;
+    }
     sent = transport->max_chunk ? MIN(len, transport->max_chunk) : len;
     g_byte_array_append(transport->output, buf, sent);
     if (transport->capacity != SIZE_MAX) {
@@ -632,6 +647,12 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
 }
 
 static const Plan9P1TransportOps transport_ops = {
+    .can_send = transport_can_send,
+    .send = transport_send,
+};
+
+static const Plan9P1TransportOps record_transport_ops = {
+    .kind = PLAN9P1_TRANSPORT_RECORD,
     .can_send = transport_can_send,
     .send = transport_send,
 };
@@ -2984,6 +3005,150 @@ static void recreate_read_only(ServerFixture *f)
                                    &f->transport, NULL, &error_abort);
 }
 
+static void recreate_record(ServerFixture *f)
+{
+    unsigned int cleanup_target = f->cleanup_calls + 1;
+
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    f->server = plan9p1_server_new("testfs", &record_transport_ops,
+                                   &f->transport, NULL, &error_abort);
+}
+
+static ssize_t encode_call(uint8_t wire[PLAN9P1_MAX_FRAME],
+                           const Plan9P1Fcall *call)
+{
+    return plan9p1_encode(wire, PLAN9P1_MAX_FRAME, call, &error_abort);
+}
+
+static void test_record_exact_frame(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TNOP, .tag = 0x1234 };
+    uint8_t wire[PLAN9P1_MAX_FRAME];
+    ssize_t len;
+
+    recreate_record(f);
+    len = encode_call(wire, &call);
+    g_assert_cmpint(plan9p1_server_receive(f->server, wire, len,
+                                           &error_abort), ==, 0);
+    g_assert_cmpuint(take_reply(f).type, ==, PLAN9P1_RNOP);
+}
+
+static void test_record_rejects_empty(ServerFixture *f, gconstpointer opaque)
+{
+    Error *err = NULL;
+
+    recreate_record(f);
+    g_assert_cmpint(plan9p1_server_receive(f->server, NULL, 0, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_record_rejects_partial(ServerFixture *f,
+                                        gconstpointer opaque)
+{
+    static const uint8_t partial[] = { PLAN9P1_TNOP, 0x34 };
+    Error *err = NULL;
+
+    recreate_record(f);
+    g_assert_cmpint(plan9p1_server_receive(f->server, partial,
+                                           sizeof(partial), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_record_rejects_trailing(ServerFixture *f,
+                                         gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TNOP, .tag = 1 };
+    uint8_t wire[PLAN9P1_MAX_FRAME];
+    Error *err = NULL;
+    ssize_t len;
+
+    recreate_record(f);
+    len = encode_call(wire, &call);
+    memcpy(wire + len, wire, len);
+    g_assert_cmpint(plan9p1_server_receive(f->server, wire, len * 2, &err),
+                    <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_record_atomic_reply(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TNOP, .tag = 1 };
+    uint8_t wire[PLAN9P1_MAX_FRAME];
+    Error *err = NULL;
+    ssize_t len;
+
+    recreate_record(f);
+    f->transport.capacity = 2;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.send_calls, ==, 0);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+
+    f->transport.capacity = 3;
+    plan9p1_server_can_send(f->server);
+    g_assert_cmpuint(f->transport.send_calls, ==, 1);
+    g_assert_cmpuint(f->transport.last_send_len, ==, 3);
+    g_assert_cmpuint(f->transport.output->len, ==, 3);
+
+    f->transport.capacity = SIZE_MAX;
+    f->transport.short_success = 2;
+    call.tag = 2;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.last_send_len, ==, 3);
+    g_assert_cmpuint(f->transport.output->len, ==, 5);
+    call.tag = 3;
+    len = encode_call(wire, &call);
+    g_assert_cmpint(plan9p1_server_receive(f->server, wire, len, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_record_backpressure(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TNOP, .tag = 1 };
+
+    recreate_record(f);
+    f->transport.would_block = true;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.send_calls, ==, 1);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+
+    f->transport.would_block = false;
+    plan9p1_server_can_send(f->server);
+    g_assert_cmpuint(f->transport.send_calls, ==, 2);
+    g_assert_cmpuint(f->transport.last_send_len, ==, 3);
+    g_assert_cmpuint(f->transport.output->len, ==, 3);
+    g_assert_cmpuint(take_reply(f).type, ==, PLAN9P1_RNOP);
+}
+
+static void test_record_close_reset(ServerFixture *f, gconstpointer opaque)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH, .tag = 1, .fid = 99,
+    };
+
+    recreate_record(f);
+    f->transport.capacity = 0;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    plan9p1_server_connection_closed(f->server);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+
+    f->transport.capacity = SIZE_MAX;
+    call.tag = 2;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RATTACH);
+}
+
 static void test_read_only_preflight(ServerFixture *f, gconstpointer opaque)
 {
     Plan9P1Fcall call;
@@ -3196,6 +3361,20 @@ int main(int argc, char **argv)
                fixture_setup, test_clwalk_and_directory, fixture_teardown);
     g_test_add("/plan9-9p1-server/backpressure", ServerFixture, NULL,
                fixture_setup, test_backpressure, fixture_teardown);
+    g_test_add("/record-exact-frame", ServerFixture, NULL,
+               fixture_setup, test_record_exact_frame, fixture_teardown);
+    g_test_add("/record-rejects-empty", ServerFixture, NULL,
+               fixture_setup, test_record_rejects_empty, fixture_teardown);
+    g_test_add("/record-rejects-partial", ServerFixture, NULL,
+               fixture_setup, test_record_rejects_partial, fixture_teardown);
+    g_test_add("/record-rejects-trailing", ServerFixture, NULL,
+               fixture_setup, test_record_rejects_trailing, fixture_teardown);
+    g_test_add("/record-atomic-reply", ServerFixture, NULL,
+               fixture_setup, test_record_atomic_reply, fixture_teardown);
+    g_test_add("/record-backpressure", ServerFixture, NULL,
+               fixture_setup, test_record_backpressure, fixture_teardown);
+    g_test_add("/record-close-reset", ServerFixture, NULL,
+               fixture_setup, test_record_close_reset, fixture_teardown);
     g_test_add("/plan9-9p1-server/coalesced-order", ServerFixture, NULL,
                fixture_setup, test_coalesced_order, fixture_teardown);
     g_test_add("/plan9-9p1-server/reset-queued", ServerFixture, NULL,
