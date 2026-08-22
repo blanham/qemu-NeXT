@@ -2,6 +2,7 @@ fs_ss = ss.source_set()
 fs_ss.add(files(
   '9p-local.c',
   '9p-backend.c',
+  'plan9-auth.c',
   'plan9-9p1-codec.c',
   'plan9-9p1-server.c',
   '9p-posix-acl.c',

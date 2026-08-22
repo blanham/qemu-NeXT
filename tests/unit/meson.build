@@ -54,6 +54,10 @@ tests = {
   'test-plan9-9p1-codec': [
     meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
   ],
+  'test-plan9-auth': [
+    meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
+    crypto,
+  ],
 }
 
 if have_system or have_tools
