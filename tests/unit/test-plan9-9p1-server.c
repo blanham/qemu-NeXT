@@ -34,6 +34,7 @@ typedef enum TransportAction {
     TRANSPORT_ACTION_SESSION_SEND,
     TRANSPORT_ACTION_NOP_SEND,
     TRANSPORT_ACTION_FRAGMENTED_NOP_SEND,
+    TRANSPORT_ACTION_RECORD_CLOSE_SEND,
 } TransportAction;
 
 typedef struct TestTransport {
@@ -616,6 +617,8 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
             g_assert_cmpint(plan9p1_server_receive(transport->fixture->server,
                                                    tnop, sizeof(tnop),
                                                    &error_abort), ==, 0);
+        } else if (transport->action == TRANSPORT_ACTION_RECORD_CLOSE_SEND) {
+            plan9p1_server_connection_closed(transport->fixture->server);
         } else {
             size_t i;
 
@@ -649,6 +652,11 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
 static const Plan9P1TransportOps transport_ops = {
     .can_send = transport_can_send,
     .send = transport_send,
+};
+
+static const Plan9P1TransportOps positional_transport_ops = {
+    transport_can_send,
+    transport_send,
 };
 
 static const Plan9P1TransportOps record_transport_ops = {
@@ -744,11 +752,13 @@ static void pump_server(Plan9P1Server *server)
 static void fixture_teardown(ServerFixture *f, gconstpointer opaque)
 {
     g_autofree char *path = NULL;
+    unsigned int cleanup_target;
 
     if (f->server) {
+        cleanup_target = f->cleanup_calls + 1;
         plan9p1_server_free(f->server);
         f->server = NULL;
-        while (f->cleanup_calls == 0) {
+        while (f->cleanup_calls < cleanup_target) {
             aio_poll(qemu_get_aio_context(), true);
         }
     }
@@ -1463,10 +1473,21 @@ static void test_constructor_validation(ServerFixture *f,
 {
     Plan9P1ServerOptions too_many = { .max_devices = 128 };
     Plan9P1TransportOps incomplete = { .can_send = transport_can_send };
+    Plan9P1TransportOps invalid = {
+        .kind = 2,
+        .can_send = transport_can_send,
+        .send = transport_send,
+    };
     Plan9P1Server *server;
     Error *err = NULL;
 
     server = plan9p1_server_new("missing", &transport_ops, &f->transport,
+                                NULL, &err);
+    g_assert_null(server);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    server = plan9p1_server_new("testfs", &invalid, &f->transport,
                                 NULL, &err);
     g_assert_null(server);
     g_assert_nonnull(err);
@@ -3018,6 +3039,19 @@ static void recreate_record(ServerFixture *f)
                                    &f->transport, NULL, &error_abort);
 }
 
+static void recreate_positional_stream(ServerFixture *f)
+{
+    unsigned int cleanup_target = f->cleanup_calls + 1;
+
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    f->server = plan9p1_server_new("testfs", &positional_transport_ops,
+                                   &f->transport, NULL, &error_abort);
+}
+
 static ssize_t encode_call(uint8_t wire[PLAN9P1_MAX_FRAME],
                            const Plan9P1Fcall *call)
 {
@@ -3034,6 +3068,16 @@ static void test_record_exact_frame(ServerFixture *f, gconstpointer opaque)
     len = encode_call(wire, &call);
     g_assert_cmpint(plan9p1_server_receive(f->server, wire, len,
                                            &error_abort), ==, 0);
+    g_assert_cmpuint(take_reply(f).type, ==, PLAN9P1_RNOP);
+}
+
+static void test_transport_positional_compat(ServerFixture *f,
+                                             gconstpointer opaque)
+{
+    Plan9P1Fcall call = { .type = PLAN9P1_TNOP, .tag = 0x1234 };
+
+    recreate_positional_stream(f);
+    send_call(f, &call, true);
     g_assert_cmpuint(take_reply(f).type, ==, PLAN9P1_RNOP);
 }
 
@@ -3145,6 +3189,61 @@ static void test_record_close_reset(ServerFixture *f, gconstpointer opaque)
     g_assert_cmpuint(f->transport.output->len, ==, 0);
 
     f->transport.capacity = SIZE_MAX;
+    call.tag = 2;
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RATTACH);
+}
+
+static void test_record_close_active_reset(ServerFixture *f,
+                                           gconstpointer opaque)
+{
+    Plan9P1Fcall call;
+
+    recreate_record(f);
+    attach(f, 98, 1);
+    g_assert_cmpuint(walk(f, 98, 2, "plain").type, ==, PLAN9P1_RWALK);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TOPEN, .tag = 3, .fid = 98,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_ROPEN);
+    f->transport.capacity = 0;
+    f->gate_read = true;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TREAD, .tag = 4, .fid = 98, .count = 1,
+    };
+    send_call(f, &call, false);
+    aio_poll(qemu_get_aio_context(), false);
+    qemu_event_wait(&f->read_started);
+    plan9p1_server_connection_closed(f->server);
+    qemu_event_set(&f->read_release);
+    pump_server(f->server);
+    f->gate_read = false;
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+
+    f->transport.capacity = SIZE_MAX;
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TATTACH, .tag = 5, .fid = 98,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RATTACH);
+}
+
+static void test_record_close_reentrant_send(ServerFixture *f,
+                                             gconstpointer opaque)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH, .tag = 1, .fid = 97,
+    };
+
+    recreate_record(f);
+    f->transport.capacity = 0;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    f->transport.capacity = SIZE_MAX;
+    f->transport.action = TRANSPORT_ACTION_RECORD_CLOSE_SEND;
+    plan9p1_server_can_send(f->server);
+    pump_server(f->server);
+    g_byte_array_set_size(f->transport.output, 0);
+
+    f->transport.action = TRANSPORT_ACTION_NONE;
     call.tag = 2;
     g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RATTACH);
 }
@@ -3363,6 +3462,9 @@ int main(int argc, char **argv)
                fixture_setup, test_backpressure, fixture_teardown);
     g_test_add("/record-exact-frame", ServerFixture, NULL,
                fixture_setup, test_record_exact_frame, fixture_teardown);
+    g_test_add("/transport-positional-compat", ServerFixture, NULL,
+               fixture_setup, test_transport_positional_compat,
+               fixture_teardown);
     g_test_add("/record-rejects-empty", ServerFixture, NULL,
                fixture_setup, test_record_rejects_empty, fixture_teardown);
     g_test_add("/record-rejects-partial", ServerFixture, NULL,
@@ -3375,6 +3477,12 @@ int main(int argc, char **argv)
                fixture_setup, test_record_backpressure, fixture_teardown);
     g_test_add("/record-close-reset", ServerFixture, NULL,
                fixture_setup, test_record_close_reset, fixture_teardown);
+    g_test_add("/record-close-active-reset", ServerFixture, NULL,
+               fixture_setup, test_record_close_active_reset,
+               fixture_teardown);
+    g_test_add("/record-close-reentrant-send", ServerFixture, NULL,
+               fixture_setup, test_record_close_reentrant_send,
+               fixture_teardown);
     g_test_add("/plan9-9p1-server/coalesced-order", ServerFixture, NULL,
                fixture_setup, test_coalesced_order, fixture_teardown);
     g_test_add("/plan9-9p1-server/reset-queued", ServerFixture, NULL,

@@ -49,9 +49,16 @@ typedef enum Plan9P1TransportKind {
 } Plan9P1TransportKind;
 
 typedef struct Plan9P1TransportOps {
-    Plan9P1TransportKind kind;
+    /* Stream delivery preserves its existing partial-write semantics. */
     size_t (*can_send)(void *opaque);
     int (*send)(const uint8_t *buf, size_t len, void *opaque);
+    /*
+     * Omitted initializers select STREAM.  In RECORD mode, can_send() is the
+     * capacity for one complete record and send() must return len after
+     * atomically accepting it, or -EAGAIN without consuming it.  Any other
+     * result is a fatal transport failure.
+     */
+    Plan9P1TransportKind kind;
 } Plan9P1TransportOps;
 
 typedef struct Plan9P1ServerOptions {
