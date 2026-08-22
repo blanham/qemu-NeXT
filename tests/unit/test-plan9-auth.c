@@ -18,6 +18,7 @@
 
 #ifdef HAVE_OPENPTY
 #include <pty.h>
+#include <sys/ioctl.h>
 #endif
 
 static void assert_zeroed(const void *data, size_t len);
@@ -70,6 +71,21 @@ typedef struct KeydbToolBarrier {
     unsigned int count;
 } KeydbToolBarrier;
 
+#ifdef HAVE_OPENPTY
+typedef struct KeydbToolChildSetup {
+    int slave;
+} KeydbToolChildSetup;
+
+static void keydb_tool_child_setup(void *opaque)
+{
+    KeydbToolChildSetup *setup = opaque;
+
+    if (setsid() < 0 || ioctl(setup->slave, TIOCSCTTY, 0) < 0) {
+        _exit(127);
+    }
+}
+#endif
+
 static char *read_all_fd(int fd)
 {
     GString *text = g_string_new(NULL);
@@ -98,7 +114,8 @@ static bool read_until_fd(int fd, GString *text, const char *needle)
 static KeydbToolResult keydb_tool_run_barrier(
     const char *keydb, const char *secret, const char *server_id,
     const char *password_input, bool tty, KeydbToolBarrier *barrier,
-    const char *late_collision, int signal_after_prompt)
+    const char *late_collision, int signal_after_prompt,
+    const char *stop_stage)
 {
     const char *tool = g_getenv("QEMU_PLAN9_KEYDB");
     char *argv[] = {
@@ -108,16 +125,25 @@ static KeydbToolResult keydb_tool_run_barrier(
     };
     KeydbToolResult result = { .status = -1 };
     GError *gerr = NULL;
+    g_auto(GStrv) envp = g_get_environ();
     GPid pid = 0;
+    GSpawnChildSetupFunc child_setup_func = NULL;
+    void *child_setup_data = NULL;
     int out_pipe[2], err_pipe[2];
     int input = -1;
     GString *early_err = g_string_new(NULL);
 #ifdef HAVE_OPENPTY
     int master = -1, slave = -1;
     int observe = -1;
+    GString *early_terminal = g_string_new(NULL);
+    KeydbToolChildSetup child_setup;
 #endif
 
     g_assert_nonnull(tool);
+    if (stop_stage) {
+        envp = g_environ_setenv(envp, "QEMU_PLAN9_KEYDB_TEST_STAGE",
+                                stop_stage, true);
+    }
     g_assert_cmpint(pipe(out_pipe), ==, 0);
     g_assert_cmpint(pipe(err_pipe), ==, 0);
 #ifdef HAVE_OPENPTY
@@ -127,15 +153,19 @@ static KeydbToolResult keydb_tool_run_barrier(
         g_assert_cmpint(observe, >=, 0);
         g_assert_cmpint(tcgetattr(observe, &result.termios_before), ==, 0);
         input = slave;
+        child_setup.slave = slave;
+        child_setup_func = keydb_tool_child_setup;
+        child_setup_data = &child_setup;
     } else
 #endif
     {
         input = open("/dev/null", O_RDONLY | O_CLOEXEC);
         g_assert_cmpint(input, >=, 0);
     }
-    g_assert_true(g_spawn_async_with_fds(NULL, argv, NULL,
+    g_assert_true(g_spawn_async_with_fds(NULL, argv, envp,
                                          G_SPAWN_DO_NOT_REAP_CHILD,
-                                         NULL, NULL, &pid, input,
+                                         child_setup_func, child_setup_data,
+                                         &pid, input,
                                          out_pipe[1], err_pipe[1], &gerr));
     g_assert_no_error(gerr);
     close(input);
@@ -148,7 +178,7 @@ static KeydbToolResult keydb_tool_run_barrier(
         g_assert_nonnull(password_input);
         newline = strchr(password_input, '\n');
         g_assert_nonnull(newline);
-        if (read_until_fd(err_pipe[0], early_err, "tor password: ")) {
+        if (read_until_fd(master, early_terminal, "tor password: ")) {
             if (signal_after_prompt) {
                 g_assert_cmpint(kill(pid, signal_after_prompt), ==, 0);
                 goto wait_for_child;
@@ -169,11 +199,32 @@ static KeydbToolResult keydb_tool_run_barrier(
             g_assert_cmpint(write(master, password_input,
                                   newline - password_input + 1), ==,
                             newline - password_input + 1);
-            if (read_until_fd(err_pipe[0], early_err,
+            if ((size_t)(newline - password_input) < PLAN9_AUTH_NAMELEN &&
+                read_until_fd(master, early_terminal,
                               "confirm tor password: ")) {
                 newline++;
                 g_assert_cmpint(write(master, newline, strlen(newline)), ==,
                                 strlen(newline));
+            }
+            if (stop_stage &&
+                (!strcmp(stop_stage, "after-password") ||
+                 !strcmp(stop_stage, "after-temp") ||
+                 !strcmp(stop_stage, "between-publish"))) {
+                int stopped;
+
+                g_assert_cmpint(waitpid(pid, &stopped, WUNTRACED), ==, pid);
+                g_assert_true(WIFSTOPPED(stopped));
+                g_assert_cmpint(WSTOPSIG(stopped), ==, SIGSTOP);
+                if (!strcmp(stop_stage, "between-publish")) {
+                    g_assert_true(g_file_test(keydb,
+                                              G_FILE_TEST_IS_REGULAR));
+                    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+                } else {
+                    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+                    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+                }
+                g_assert_cmpint(kill(pid, SIGTERM), ==, 0);
+                g_assert_cmpint(kill(pid, SIGCONT), ==, 0);
             }
         }
     }
@@ -201,8 +252,17 @@ wait_for_child:
         result.have_termios = true;
         close(observe);
         g_assert_cmpint(fcntl(master, F_SETFL, flags | O_NONBLOCK), ==, 0);
-        result.terminal = read_all_fd(master);
+        {
+            g_autofree char *remaining = read_all_fd(master);
+
+            g_string_append(early_terminal, remaining);
+            result.terminal = g_string_free(early_terminal, false);
+            early_terminal = NULL;
+        }
         close(master);
+    }
+    if (early_terminal) {
+        g_string_free(early_terminal, true);
     }
 #endif
     if (early_err) {
@@ -216,7 +276,7 @@ static KeydbToolResult keydb_tool_run(const char *keydb, const char *secret,
                                       const char *password_input, bool tty)
 {
     return keydb_tool_run_barrier(keydb, secret, server_id, password_input,
-                                  tty, NULL, NULL, 0);
+                                  tty, NULL, NULL, 0, NULL);
 }
 
 static void keydb_tool_result_clear(KeydbToolResult *result)
@@ -517,6 +577,7 @@ static void test_keydb_tool_success(void)
     g_assert_cmpint(WEXITSTATUS(result.status), ==, 0);
     assert_termios_restored(&result);
     g_assert_cmpstr(result.out, ==, "");
+    g_assert_cmpstr(result.err, ==, "");
     g_assert_null(strstr(result.err, fixture_password));
     g_assert_null(strstr(result.terminal, fixture_password));
     g_assert_cmpint(stat(keydb_path, &st), ==, 0);
@@ -623,17 +684,17 @@ static void test_keydb_tool_rejects_unrepresentable(void)
     assert_no_keydb_temps(dir, 0);
     keydb_tool_result_clear(&result);
 
-    result = keydb_tool_run(keydb, secret, "tor", "pw\npw\n", true);
+    result = keydb_tool_run(keydb, secret, "tor", NULL, false);
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
     keydb_tool_result_clear(&result);
     result = keydb_tool_run(keydb, secret,
                             "1234567890123456789012345678",
-                            "pw\npw\n", true);
+                            NULL, false);
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
     keydb_tool_result_clear(&result);
-    result = keydb_tool_run(keydb, keydb, "p9fs", "pw\npw\n", true);
+    result = keydb_tool_run(keydb, keydb, "p9fs", NULL, false);
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
     keydb_tool_result_clear(&result);
@@ -648,11 +709,78 @@ static void test_keydb_tool_signal_restores_terminal(void)
     g_autofree char *secret = g_build_filename(dir, "secret", NULL);
     KeydbToolResult result = keydb_tool_run_barrier(
         keydb, secret, "p9fs", "unused\nunused\n", true, NULL, NULL,
-        SIGTERM);
+        SIGTERM, NULL);
 
     g_assert_true(WIFSIGNALED(result.status));
     g_assert_cmpint(WTERMSIG(result.status), ==, SIGTERM);
     assert_termios_restored(&result);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    assert_no_keydb_temps(dir, 0);
+    keydb_tool_result_clear(&result);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_signal_transaction_stages(void)
+{
+    static const char *const stages[] = {
+        "after-password", "after-temp", "between-publish",
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(stages); i++) {
+        g_autofree char *dir = keydb_tempdir();
+        g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+        g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+        KeydbToolResult result = keydb_tool_run_barrier(
+            keydb, secret, "p9fs", "pw\npw\n", true, NULL, NULL, 0,
+            stages[i]);
+
+        g_assert_true(WIFSIGNALED(result.status));
+        g_assert_cmpint(WTERMSIG(result.status), ==, SIGTERM);
+        assert_termios_restored(&result);
+        g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+        g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+        assert_no_keydb_temps(dir, 0);
+        keydb_tool_result_clear(&result);
+        rmdir(dir);
+    }
+}
+
+static void test_keydb_tool_restore_error_is_combined(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolResult result = keydb_tool_run_barrier(
+        keydb, secret, "p9fs", "first\nsecond\n", true, NULL, NULL, 0,
+        "restore-error");
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    assert_termios_restored(&result);
+    g_assert_nonnull(strstr(result.err, "confirmation does not match"));
+    g_assert_nonnull(strstr(result.err, "Additionally, cannot restore"));
+    g_assert_null(strstr(result.out, "first"));
+    g_assert_null(strstr(result.err, "first"));
+    g_assert_null(strstr(result.terminal, "first"));
+    assert_no_keydb_temps(dir, 0);
+    keydb_tool_result_clear(&result);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_temp_fstat_failure_cleans(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolResult result = keydb_tool_run_barrier(
+        keydb, secret, "p9fs", "pw\npw\n", true, NULL, NULL, 0,
+        "temp-fstat-error");
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    assert_termios_restored(&result);
+    g_assert_nonnull(strstr(result.err, "inspect temporary output"));
     g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
     g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
     assert_no_keydb_temps(dir, 0);
@@ -670,18 +798,20 @@ static void test_keydb_tool_collision_refusal(void)
     KeydbToolResult result;
 
     g_assert_true(g_file_set_contents(keydb, "keep", 4, NULL));
-    result = keydb_tool_run(keydb, secret, "p9fs", "pw\npw\n", true);
+    result = keydb_tool_run(keydb, secret, "p9fs", NULL, false);
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
     g_assert_true(g_file_get_contents(keydb, &contents, &len, NULL));
     g_assert_cmpmem(contents, len, "keep", 4);
+    g_assert_nonnull(strstr(result.err, "incomplete"));
+    g_assert_nonnull(strstr(result.err, "remove it manually"));
     g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
     assert_no_keydb_temps(dir, 1);
     keydb_tool_result_clear(&result);
     unlink(keydb);
 
     g_assert_cmpint(symlink("missing", keydb), ==, 0);
-    result = keydb_tool_run(keydb, secret, "p9fs", "pw\npw\n", true);
+    result = keydb_tool_run(keydb, secret, "p9fs", NULL, false);
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
     g_assert_true(g_file_test(keydb, G_FILE_TEST_IS_SYMLINK));
@@ -691,7 +821,7 @@ static void test_keydb_tool_collision_refusal(void)
     unlink(keydb);
 
     g_assert_true(g_file_set_contents(secret, "keep-secret", 11, NULL));
-    result = keydb_tool_run(keydb, secret, "p9fs", "pw\npw\n", true);
+    result = keydb_tool_run(keydb, secret, "p9fs", NULL, false);
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
     g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
@@ -701,6 +831,47 @@ static void test_keydb_tool_collision_refusal(void)
     assert_no_keydb_temps(dir, 1);
     keydb_tool_result_clear(&result);
     unlink(secret);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_rejects_insecure_parent(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolResult result;
+
+    g_assert_cmpint(chmod(dir, 0750), ==, 0);
+    result = keydb_tool_run(keydb, secret, "p9fs", NULL, false);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_nonnull(strstr(result.err, "0700"));
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    keydb_tool_result_clear(&result);
+    g_assert_cmpint(chmod(dir, 0700), ==, 0);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_rejects_parent_symlink(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *real = g_build_filename(dir, "real", NULL);
+    g_autofree char *alias = g_build_filename(dir, "alias", NULL);
+    g_autofree char *keydb = g_build_filename(alias, "keys", NULL);
+    g_autofree char *secret = g_build_filename(alias, "secret", NULL);
+    KeydbToolResult result;
+
+    g_assert_cmpint(mkdir(real, 0700), ==, 0);
+    g_assert_cmpint(symlink("real", alias), ==, 0);
+    result = keydb_tool_run(keydb, secret, "p9fs", NULL, false);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    keydb_tool_result_clear(&result);
+    unlink(alias);
+    rmdir(real);
     rmdir(dir);
 }
 
@@ -717,7 +888,7 @@ static gpointer keydb_tool_thread(gpointer opaque)
 
     thread->result = keydb_tool_run_barrier(
         thread->keydb, thread->secret, "p9fs", "pw\npw\n", true,
-        thread->barrier, NULL, 0);
+        thread->barrier, NULL, 0, NULL);
     return NULL;
 }
 
@@ -766,7 +937,7 @@ static void test_keydb_tool_late_collision_rollback(void)
     g_autofree char *contents = NULL;
     gsize len;
     KeydbToolResult result = keydb_tool_run_barrier(
-        keydb, secret, "p9fs", "pw\npw\n", true, NULL, secret, 0);
+        keydb, secret, "p9fs", "pw\npw\n", true, NULL, secret, 0, NULL);
 
     g_assert_true(WIFEXITED(result.status));
     g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
@@ -1510,8 +1681,18 @@ int main(int argc, char **argv)
                     test_keydb_tool_rejects_unrepresentable);
     g_test_add_func("/plan9-auth/keydb-tool/signal-restores-terminal",
                     test_keydb_tool_signal_restores_terminal);
+    g_test_add_func("/plan9-auth/keydb-tool/signal-transaction-stages",
+                    test_keydb_tool_signal_transaction_stages);
+    g_test_add_func("/plan9-auth/keydb-tool/restore-error-combined",
+                    test_keydb_tool_restore_error_is_combined);
+    g_test_add_func("/plan9-auth/keydb-tool/temp-fstat-cleanup",
+                    test_keydb_tool_temp_fstat_failure_cleans);
     g_test_add_func("/plan9-auth/keydb-tool/collision-refusal",
                     test_keydb_tool_collision_refusal);
+    g_test_add_func("/plan9-auth/keydb-tool/insecure-parent",
+                    test_keydb_tool_rejects_insecure_parent);
+    g_test_add_func("/plan9-auth/keydb-tool/parent-symlink",
+                    test_keydb_tool_rejects_parent_symlink);
     g_test_add_func("/plan9-auth/keydb-tool/concurrent-winner",
                     test_keydb_tool_concurrent_winner);
     g_test_add_func("/plan9-auth/keydb-tool/late-collision-rollback",

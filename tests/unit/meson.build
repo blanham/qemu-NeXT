@@ -54,12 +54,17 @@ tests = {
   'test-plan9-9p1-codec': [
     meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
   ],
-  'test-plan9-auth': [
-    meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
-    crypto,
-    util,
-  ],
 }
+
+if host_os != 'windows'
+  tests += {
+    'test-plan9-auth': [
+      meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
+      crypto,
+      util,
+    ],
+  }
+endif
 
 if have_system or have_tools
   tests += {
@@ -245,12 +250,16 @@ if have_ga and host_os == 'linux'
   test_deps += {'test-qga': qga}
 endif
 
-test_deps += {'test-plan9-auth': qemu_plan9_keydb}
+if host_os != 'windows'
+  test_deps += {'test-plan9-auth': qemu_plan9_keydb_test}
+endif
 
 test_env = environment()
 test_env.set('G_TEST_SRCDIR', meson.current_source_dir())
 test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
-test_env.set('QEMU_PLAN9_KEYDB', qemu_plan9_keydb.full_path())
+if host_os != 'windows'
+  test_env.set('QEMU_PLAN9_KEYDB', qemu_plan9_keydb_test.full_path())
+endif
 
 slow_tests = {
   'test-aio-multithread' : 120,

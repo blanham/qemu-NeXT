@@ -2533,6 +2533,8 @@ F: tests/qtest/virtio-9p-test.c
 F: tests/qtest/libqos/virtio-9p*
 F: tests/unit/test-9p-backend.c
 F: tests/unit/test-plan9-9p1-*
+F: tests/unit/test-plan9-auth.c
+F: tools/qemu-plan9-keydb.c
 T: git https://github.com/cschoenebeck/qemu.git 9p.next
 
 virtio-blk
