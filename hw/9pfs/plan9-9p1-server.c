@@ -41,16 +41,22 @@
 #include "fsdev/qemu-fsdev-throttle.h"
 #include "block/thread-pool.h"
 #include "crypto/random.h"
+#include "crypto/secret_common.h"
+#include "hw/core/resettable.h"
+#include "migration/blocker.h"
 #include "qapi/error.h"
+#include "qapi/qapi-types-qom.h"
 #include "qapi/visitor.h"
 #include "qemu/aio.h"
 #include "qemu/coroutine.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "system/reset.h"
 #include "qom/object_interfaces.h"
 
 #ifdef CONFIG_SLIRP
 #include "net/slirp-guestfwd.h"
+#include "net/slirp-il.h"
 #include "net/slirp-plan9.h"
 #endif
 
@@ -156,6 +162,17 @@ typedef enum Plan9P1BackendOp {
     PLAN9P1_BACKEND_CLOSEDIR,
 } Plan9P1BackendOp;
 
+#ifdef CONFIG_SLIRP
+typedef struct Plan9P1ILAuthConnection {
+    QTAILQ_ENTRY(Plan9P1ILAuthConnection) entry;
+    Plan9P1Server *server;
+    QemuSlirpILConnection *il;
+    Plan9AuthTicketConnection *auth;
+    bool linked;
+    bool migration_counted;
+} Plan9P1ILAuthConnection;
+#endif
+
 typedef struct Plan9P1BackendWork {
     Plan9P1BackendOp op;
     V9fsBackend *backend;
@@ -227,11 +244,27 @@ struct Plan9P1Server {
 #ifdef CONFIG_SLIRP
     QemuSlirpGuestFwd *guestfwd;
     QemuSlirpPlan9BootpLease *bootp_lease;
+    QemuSlirpILListener *auth_listener;
+    QemuSlirpILListener *file_listener;
+    QemuSlirpILConnection *file_connection;
+    QTAILQ_HEAD(, Plan9P1ILAuthConnection) auth_connections;
+    Plan9AuthTicketService *ticket_service;
+    Plan9AuthKeydb *owned_keydb;
+    Error *migration_blocker;
+    unsigned int il_connections;
+    bool reset_registered;
+    bool il_accepting;
 #endif
     char *fsdev_id;
     char *netdev_id;
     char *guest_address;
+    char *keydb_path;
+    char *key_secret_id;
     uint16_t port;
+    uint16_t il_port;
+    uint16_t auth_port;
+    Plan9P1ServerTransport qom_transport;
+    ResettableState reset_state;
     bool completed;
 };
 
@@ -249,6 +282,9 @@ static void path_copy(V9fsPath *dst, const V9fsPath *src);
 static void qid_release(Plan9P1Server *server, uint32_t path);
 static void invalidate_dir_caches(Plan9P1Server *server);
 static void server_auth_session_clear(Plan9P1Server *server);
+#ifdef CONFIG_SLIRP
+static void plan9p1_server_slirp_cleanup(Plan9P1Server *server);
+#endif
 
 bool plan9p1_replay_accept(Plan9P1ReplayState *state, uint32_t id)
 {
@@ -907,12 +943,10 @@ static void plan9p1_server_instance_finalize(Object *obj)
     assert(g_queue_is_empty(&server->deferred_inputs));
     assert(g_hash_table_size(server->fids) == 0);
 #ifdef CONFIG_SLIRP
-    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
-    if (server->guestfwd) {
-        QemuSlirpGuestFwd *guestfwd = server->guestfwd;
-
-        server->guestfwd = NULL;
-        qemu_slirp_guestfwd_remove(guestfwd);
+    plan9p1_server_slirp_cleanup(server);
+    if (server->reset_registered) {
+        qemu_unregister_resettable(obj);
+        server->reset_registered = false;
     }
 #endif
     server->closing = true;
@@ -925,6 +959,8 @@ static void plan9p1_server_instance_finalize(Object *obj)
     g_free(server->fsdev_id);
     g_free(server->netdev_id);
     g_free(server->guest_address);
+    g_free(server->keydb_path);
+    g_free(server->key_secret_id);
     plan9_auth_clear(server->auth_id, sizeof(server->auth_id));
     plan9_auth_clear(server->auth_domain, sizeof(server->auth_domain));
 }
@@ -2946,12 +2982,13 @@ static void plan9p1_server_instance_init(Object *obj)
     g_queue_init(&server->requests);
     g_queue_init(&server->replies);
     g_queue_init(&server->deferred_inputs);
+#ifdef CONFIG_SLIRP
+    QTAILQ_INIT(&server->auth_connections);
+#endif
     server->max_devices = 127;
     server->max_queued_bytes = PLAN9P1_DEFAULT_QUEUE_BYTES;
     server->max_dir_cache_bytes = PLAN9P1_DEFAULT_DIR_CACHE_BYTES;
     server->max_qid_entries = PLAN9P1_DEFAULT_QID_ENTRIES;
-    server->guest_address = g_strdup("10.0.2.100");
-    server->port = 564;
 }
 
 int plan9p1_server_backend_init(Plan9P1Server *server,
@@ -3065,9 +3102,13 @@ int plan9p1_server_configure_auth(Plan9P1Server *server,
                    "available");
         goto rollback;
     }
-    g_strlcpy(server->auth_id, config->auth_id, sizeof(server->auth_id));
-    g_strlcpy(server->auth_domain, config->auth_domain,
-              sizeof(server->auth_domain));
+    if (config->auth_id != server->auth_id) {
+        g_strlcpy(server->auth_id, config->auth_id, sizeof(server->auth_id));
+    }
+    if (config->auth_domain != server->auth_domain) {
+        g_strlcpy(server->auth_domain, config->auth_domain,
+                  sizeof(server->auth_domain));
+    }
     server->auth_configured = true;
     ret = 0;
     goto out;
@@ -3283,13 +3324,7 @@ void plan9p1_server_begin_close(Plan9P1Server *server)
     server->closing = true;
     server_auth_session_clear(server);
 #ifdef CONFIG_SLIRP
-    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
-    if (server->guestfwd) {
-        QemuSlirpGuestFwd *guestfwd = server->guestfwd;
-
-        server->guestfwd = NULL;
-        qemu_slirp_guestfwd_remove(guestfwd);
-    }
+    plan9p1_server_slirp_cleanup(server);
 #endif
     if (server->callback_depth) {
         server->deferred_close = true;
@@ -3326,6 +3361,20 @@ static bool plan9p1_server_properties_mutable(Plan9P1Server *server,
         return false;
     }
     return true;
+}
+
+static int plan9p1_server_get_transport(Object *obj, Error **errp)
+{
+    return PLAN9P1_SERVER(obj)->qom_transport;
+}
+
+static void plan9p1_server_set_transport(Object *obj, int value, Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (plan9p1_server_properties_mutable(server, errp)) {
+        server->qom_transport = value;
+    }
 }
 
 static char *plan9p1_server_get_fsdev(Object *obj, Error **errp)
@@ -3379,6 +3428,82 @@ static void plan9p1_server_set_guest_address(Object *obj, const char *value,
     server->guest_address = g_strdup(value);
 }
 
+static char *plan9p1_server_get_auth_id(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->auth_id);
+}
+
+static void plan9p1_server_set_auth_id(Object *obj, const char *value,
+                                       Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    if (strlen(value) >= sizeof(server->auth_id)) {
+        error_setg(errp, "9P1 auth-id must contain at most %u bytes",
+                   PLAN9_AUTH_NAMELEN - 1);
+        return;
+    }
+    g_strlcpy(server->auth_id, value, sizeof(server->auth_id));
+}
+
+static char *plan9p1_server_get_auth_domain(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->auth_domain);
+}
+
+static void plan9p1_server_set_auth_domain(Object *obj, const char *value,
+                                           Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    if (strlen(value) >= sizeof(server->auth_domain)) {
+        error_setg(errp, "9P1 auth-domain must contain at most %u bytes",
+                   PLAN9_AUTH_DOMLEN - 1);
+        return;
+    }
+    g_strlcpy(server->auth_domain, value, sizeof(server->auth_domain));
+}
+
+static char *plan9p1_server_get_keydb(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->keydb_path);
+}
+
+static void plan9p1_server_set_keydb(Object *obj, const char *value,
+                                     Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    g_free(server->keydb_path);
+    server->keydb_path = g_strdup(value);
+}
+
+static char *plan9p1_server_get_key_secret(Object *obj, Error **errp)
+{
+    return g_strdup(PLAN9P1_SERVER(obj)->key_secret_id);
+}
+
+static void plan9p1_server_set_key_secret(Object *obj, const char *value,
+                                          Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+
+    if (!plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    g_free(server->key_secret_id);
+    server->key_secret_id = g_strdup(value);
+}
+
 static void plan9p1_server_get_port(Object *obj, Visitor *visitor,
                                     const char *name, void *opaque,
                                     Error **errp)
@@ -3404,6 +3529,60 @@ static void plan9p1_server_set_port(Object *obj, Visitor *visitor,
         return;
     }
     server->port = value;
+}
+
+static void plan9p1_server_get_il_port(Object *obj, Visitor *visitor,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    uint16_t value = PLAN9P1_SERVER(obj)->il_port;
+
+    visit_type_uint16(visitor, name, &value, errp);
+}
+
+static void plan9p1_server_set_il_port(Object *obj, Visitor *visitor,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+    uint16_t value;
+
+    if (!visit_type_uint16(visitor, name, &value, errp) ||
+        !plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    if (!value) {
+        error_setg(errp, "9P1 IL port must not be zero");
+        return;
+    }
+    server->il_port = value;
+}
+
+static void plan9p1_server_get_auth_port(Object *obj, Visitor *visitor,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    uint16_t value = PLAN9P1_SERVER(obj)->auth_port;
+
+    visit_type_uint16(visitor, name, &value, errp);
+}
+
+static void plan9p1_server_set_auth_port(Object *obj, Visitor *visitor,
+                                         const char *name, void *opaque,
+                                         Error **errp)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+    uint16_t value;
+
+    if (!visit_type_uint16(visitor, name, &value, errp) ||
+        !plan9p1_server_properties_mutable(server, errp)) {
+        return;
+    }
+    if (!value) {
+        error_setg(errp, "9P1 authentication port must not be zero");
+        return;
+    }
+    server->auth_port = value;
 }
 
 static ssize_t plan9p1_server_guest_write(const void *buf, size_t len,
@@ -3449,11 +3628,315 @@ static const Plan9P1TransportOps plan9p1_server_transport_ops = {
     .send = plan9p1_server_transport_send,
 };
 
+static bool plan9p1_server_il_acquire(Plan9P1Server *server)
+{
+    Error *local_err = NULL;
+
+    if (!server->il_connections) {
+        if (!server->migration_blocker) {
+            error_setg(&server->migration_blocker,
+                       "Plan 9 IL connections must reconnect after migration");
+        }
+        if (migrate_add_blocker(&server->migration_blocker, &local_err) < 0) {
+            error_free(local_err);
+            return false;
+        }
+    }
+    server->il_connections++;
+    return true;
+}
+
+static void plan9p1_server_il_release(Plan9P1Server *server)
+{
+    assert(server->il_connections);
+    if (!--server->il_connections) {
+        migrate_del_blocker(&server->migration_blocker);
+    }
+}
+
+static bool plan9p1_server_il_may_accept(Plan9P1Server *server)
+{
+    if (!server->il_accepting &&
+        plan9p1_server_record_connection_ready(server)) {
+        server->il_accepting = true;
+    }
+    return server->il_accepting && !server->closing;
+}
+
+static size_t plan9p1_server_il_can_send(void *opaque)
+{
+    Plan9P1Server *server = opaque;
+
+    return server->file_connection ? PLAN9P1_MAX_FRAME : 0;
+}
+
+static int plan9p1_server_il_send(const uint8_t *buf, size_t len,
+                                  void *opaque)
+{
+    Plan9P1Server *server = opaque;
+    QemuSlirpILConnection *connection = server->file_connection;
+    int ret;
+
+    if (!connection) {
+        return -ENOTCONN;
+    }
+    ret = qemu_slirp_il_send_record(connection, buf, len);
+    return ret == 0 ? len : ret;
+}
+
+static const Plan9P1TransportOps plan9p1_server_il_transport_ops = {
+    .can_send = plan9p1_server_il_can_send,
+    .send = plan9p1_server_il_send,
+    .kind = PLAN9P1_TRANSPORT_RECORD,
+};
+
+static void *plan9p1_server_file_open(QemuSlirpILConnection *connection,
+                                      void *opaque)
+{
+    Plan9P1Server *server = opaque;
+
+    if (!plan9p1_server_il_may_accept(server) || server->file_connection ||
+        !plan9p1_server_il_acquire(server)) {
+        qemu_slirp_il_connection_close(connection);
+        return NULL;
+    }
+    server->file_connection = connection;
+    return server;
+}
+
+static void plan9p1_server_file_record(QemuSlirpILConnection *connection,
+                                       const uint8_t *data, size_t len,
+                                       void *opaque)
+{
+    Plan9P1Server *server = opaque;
+    Error *local_err = NULL;
+
+    if (!server || server->file_connection != connection ||
+        plan9p1_server_receive(server, data, len, &local_err) < 0) {
+        error_free(local_err);
+        qemu_slirp_il_connection_close(connection);
+    }
+}
+
+static void plan9p1_server_file_can_send(QemuSlirpILConnection *connection,
+                                         void *opaque)
+{
+    Plan9P1Server *server = opaque;
+
+    if (server && server->file_connection == connection) {
+        plan9p1_server_can_send(server);
+    }
+}
+
+static void plan9p1_server_file_close(QemuSlirpILConnection *connection,
+                                      void *opaque)
+{
+    Plan9P1Server *server = opaque;
+
+    /* Rejected synchronous opens deliberately have a NULL opaque value. */
+    if (!server || server->file_connection != connection) {
+        return;
+    }
+    server->file_connection = NULL;
+    plan9p1_server_il_release(server);
+    plan9p1_server_connection_closed(server);
+}
+
+static const QemuSlirpILListenerOps plan9p1_server_file_listener_ops = {
+    .open = plan9p1_server_file_open,
+    .record = plan9p1_server_file_record,
+    .can_send = plan9p1_server_file_can_send,
+    .close = plan9p1_server_file_close,
+};
+
+static int plan9p1_server_auth_send(const uint8_t *buf, size_t len,
+                                    void *opaque)
+{
+    Plan9P1ILAuthConnection *state = opaque;
+    int ret;
+
+    if (!state->il) {
+        return -ENOTCONN;
+    }
+    ret = qemu_slirp_il_send_record(state->il, buf, len);
+    return ret == 0 ? len : ret;
+}
+
+static void plan9p1_server_auth_request_close(void *opaque)
+{
+    Plan9P1ILAuthConnection *state = opaque;
+
+    if (state->il) {
+        qemu_slirp_il_connection_close(state->il);
+    }
+}
+
+static const Plan9AuthTicketTransportOps plan9p1_server_auth_ops = {
+    .send_record = plan9p1_server_auth_send,
+    .close = plan9p1_server_auth_request_close,
+};
+
+static void *plan9p1_server_auth_open(QemuSlirpILConnection *connection,
+                                      void *opaque)
+{
+    Plan9P1Server *server = opaque;
+    Plan9P1ILAuthConnection *state;
+
+    if (!plan9p1_server_il_may_accept(server) ||
+        !plan9p1_server_il_acquire(server)) {
+        qemu_slirp_il_connection_close(connection);
+        return NULL;
+    }
+    state = g_new0(Plan9P1ILAuthConnection, 1);
+    state->server = server;
+    state->il = connection;
+    state->migration_counted = true;
+    state->auth = plan9_auth_ticket_connection_new(
+        server->ticket_service, &plan9p1_server_auth_ops, state, NULL);
+    if (!state->auth) {
+        plan9p1_server_il_release(server);
+        g_free(state);
+        qemu_slirp_il_connection_close(connection);
+        return NULL;
+    }
+    state->linked = true;
+    QTAILQ_INSERT_TAIL(&server->auth_connections, state, entry);
+    return state;
+}
+
+static void plan9p1_server_auth_record(QemuSlirpILConnection *connection,
+                                       const uint8_t *data, size_t len,
+                                       void *opaque)
+{
+    Plan9P1ILAuthConnection *state = opaque;
+    Error *local_err = NULL;
+
+    if (!state || state->il != connection ||
+        plan9_auth_ticket_connection_receive_record(state->auth, data, len,
+                                                     &local_err) < 0) {
+        error_free(local_err);
+        qemu_slirp_il_connection_close(connection);
+    }
+}
+
+static void plan9p1_server_auth_can_send(QemuSlirpILConnection *connection,
+                                         void *opaque)
+{
+    Plan9P1ILAuthConnection *state = opaque;
+
+    if (state && state->il == connection) {
+        plan9_auth_ticket_connection_can_send(state->auth);
+    }
+}
+
+static void plan9p1_server_auth_close(QemuSlirpILConnection *connection,
+                                      void *opaque)
+{
+    Plan9P1ILAuthConnection *state = opaque;
+    Plan9P1Server *server;
+
+    if (!state) {
+        return;
+    }
+    server = state->server;
+    state->il = NULL;
+    if (state->linked) {
+        QTAILQ_REMOVE(&server->auth_connections, state, entry);
+        state->linked = false;
+    }
+    plan9_auth_ticket_connection_free(state->auth);
+    state->auth = NULL;
+    if (state->migration_counted) {
+        state->migration_counted = false;
+        plan9p1_server_il_release(server);
+    }
+    g_free(state);
+}
+
+static const QemuSlirpILListenerOps plan9p1_server_auth_listener_ops = {
+    .open = plan9p1_server_auth_open,
+    .record = plan9p1_server_auth_record,
+    .can_send = plan9p1_server_auth_can_send,
+    .close = plan9p1_server_auth_close,
+};
+
+static void plan9p1_server_slirp_cleanup(Plan9P1Server *server)
+{
+    QemuSlirpILListener *listener;
+
+    server->il_accepting = false;
+    listener = server->file_listener;
+    server->file_listener = NULL;
+    qemu_slirp_il_listener_remove(listener);
+    listener = server->auth_listener;
+    server->auth_listener = NULL;
+    qemu_slirp_il_listener_remove(listener);
+    if (server->guestfwd) {
+        QemuSlirpGuestFwd *guestfwd = server->guestfwd;
+
+        server->guestfwd = NULL;
+        qemu_slirp_guestfwd_remove(guestfwd);
+    }
+    plan9_auth_ticket_service_free(server->ticket_service);
+    server->ticket_service = NULL;
+    plan9_auth_keydb_free(server->owned_keydb);
+    server->owned_keydb = NULL;
+    server->auth_keydb = NULL;
+    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
+    if (server->il_connections) {
+        server->il_connections = 0;
+        migrate_del_blocker(&server->migration_blocker);
+    }
+    error_free(server->migration_blocker);
+    server->migration_blocker = NULL;
+}
+
+static int plan9p1_server_current_seconds(uint32_t *seconds, Error **errp)
+{
+    time_t now = time(NULL);
+
+    if (now < 0 || (uint64_t)now > UINT32_MAX) {
+        error_setg(errp, "current time is outside the Plan 9 key range");
+        return -1;
+    }
+    *seconds = now;
+    return 0;
+}
+
+static ResettableState *plan9p1_server_reset_state(Object *obj)
+{
+    return &PLAN9P1_SERVER(obj)->reset_state;
+}
+
+static void plan9p1_server_reset_hold(Object *obj, ResetType type)
+{
+    Plan9P1Server *server = PLAN9P1_SERVER(obj);
+    Plan9P1ILAuthConnection *state;
+
+    if (!server->completed || server->closing) {
+        return;
+    }
+    if (server->qom_transport == PLAN9_P1_SERVER_TRANSPORT_IL) {
+        server->il_accepting = false;
+        if (server->file_connection) {
+            qemu_slirp_il_connection_close(server->file_connection);
+        }
+        while ((state = QTAILQ_FIRST(&server->auth_connections))) {
+            qemu_slirp_il_connection_close(state->il);
+        }
+    }
+    plan9p1_server_reset(server);
+}
+
 static void plan9p1_server_complete(UserCreatable *uc, Error **errp)
 {
     Plan9P1Server *server = PLAN9P1_SERVER(uc);
     struct in_addr guest_address;
     struct in_addr no_auth = { 0 };
+    uint8_t master_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    uint8_t *secret = NULL;
+    size_t secret_len = 0;
+    uint32_t now;
     Error *local_err = NULL;
     bool bootp_available;
 
@@ -3480,39 +3963,147 @@ static void plan9p1_server_complete(UserCreatable *uc, Error **errp)
         return;
     }
 
+    if (server->qom_transport == PLAN9_P1_SERVER_TRANSPORT_TCP) {
+        if (server->auth_id[0] || server->auth_domain[0] ||
+            (server->keydb_path && server->keydb_path[0]) ||
+            (server->key_secret_id && server->key_secret_id[0])) {
+            error_setg(errp, "9P1 authentication properties require "
+                       "transport=il");
+            return;
+        }
+    } else {
+        if (!server->il_port || !server->auth_port) {
+            error_setg(errp, "9P1 IL and authentication ports must not be "
+                       "zero");
+            return;
+        }
+        if (!server->auth_id[0] || !server->auth_domain[0] ||
+            !server->keydb_path || !server->keydb_path[0] ||
+            !server->key_secret_id || !server->key_secret_id[0]) {
+            error_setg(errp, "transport=il requires auth-id, auth-domain, "
+                       "keydb, and key-secret");
+            return;
+        }
+        if (!qemu_slirp_il_available(server->netdev_id, errp)) {
+            return;
+        }
+        bootp_available = qemu_slirp_plan9_bootp_available(server->netdev_id,
+                                                           &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
+        }
+        if (!bootp_available) {
+            error_setg(errp, "Plan 9 BOOTP is unavailable in this libslirp");
+            return;
+        }
+        if (qcrypto_secret_lookup(server->key_secret_id, &secret,
+                                  &secret_len, errp) < 0) {
+            return;
+        }
+        if (secret_len != sizeof(master_key)) {
+            error_setg(errp, "Plan 9 key Secret must contain exactly %zu "
+                       "bytes", sizeof(master_key));
+            goto fail_secret;
+        }
+        memcpy(master_key, secret, sizeof(master_key));
+        plan9_auth_clear(secret, secret_len + 1);
+        g_free(secret);
+        secret = NULL;
+        if (plan9p1_server_current_seconds(&now, errp) < 0) {
+            goto fail_secret;
+        }
+        server->owned_keydb = plan9_auth_keydb_load(
+            server->keydb_path, master_key, server->auth_id, now, errp);
+        if (!server->owned_keydb) {
+            goto fail_secret;
+        }
+    }
+
     if (plan9p1_server_backend_init(server, server->fsdev_id, NULL, errp) < 0) {
-        return;
+        goto fail_all;
     }
-    if (qemu_slirp_guestfwd_add(server->netdev_id, guest_address,
-                                server->port, &plan9p1_server_guestfwd_ops,
-                                server, &server->guestfwd, errp) < 0) {
-        goto fail_backend;
-    }
-    bootp_available = qemu_slirp_plan9_bootp_available(server->netdev_id,
-                                                       &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
-        goto fail_guestfwd;
-    }
-    if (bootp_available &&
-        !qemu_slirp_plan9_bootp_claim(server->netdev_id, guest_address,
-                                      no_auth, &server->bootp_lease, errp)) {
-        goto fail_guestfwd;
-    }
-    if (plan9p1_server_start(server, &plan9p1_server_transport_ops,
-                             server, errp) < 0) {
-        goto fail_guestfwd;
+
+    if (server->qom_transport == PLAN9_P1_SERVER_TRANSPORT_TCP) {
+        if (qemu_slirp_guestfwd_add(server->netdev_id, guest_address,
+                                    server->port,
+                                    &plan9p1_server_guestfwd_ops, server,
+                                    &server->guestfwd, errp) < 0) {
+            goto fail_all;
+        }
+        bootp_available = qemu_slirp_plan9_bootp_available(server->netdev_id,
+                                                           &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            goto fail_all;
+        }
+        if (bootp_available &&
+            !qemu_slirp_plan9_bootp_claim(server->netdev_id, guest_address,
+                                          no_auth, &server->bootp_lease,
+                                          errp)) {
+            goto fail_all;
+        }
+        if (plan9p1_server_start(server, &plan9p1_server_transport_ops,
+                                 server, errp) < 0) {
+            goto fail_all;
+        }
+    } else {
+        Plan9AuthTicketServiceConfig ticket_config = {
+            .keydb = server->owned_keydb,
+        };
+        Plan9P1AuthConfig auth_config = {
+            .keydb = server->owned_keydb,
+            .auth_id = server->auth_id,
+            .auth_domain = server->auth_domain,
+        };
+
+        if (!qemu_slirp_plan9_bootp_claim(server->netdev_id, guest_address,
+                                          guest_address,
+                                          &server->bootp_lease, errp)) {
+            goto fail_all;
+        }
+        server->ticket_service = plan9_auth_ticket_service_new(
+            &ticket_config, errp);
+        if (!server->ticket_service) {
+            goto fail_all;
+        }
+        if (qemu_slirp_il_listen(server->netdev_id, guest_address,
+                                 server->auth_port,
+                                 &plan9p1_server_auth_listener_ops, server,
+                                 &server->auth_listener, errp) < 0) {
+            goto fail_all;
+        }
+        if (qemu_slirp_il_listen(server->netdev_id, guest_address,
+                                 server->il_port,
+                                 &plan9p1_server_file_listener_ops, server,
+                                 &server->file_listener, errp) < 0) {
+            goto fail_all;
+        }
+        if (plan9p1_server_configure_auth(server, &auth_config, errp) < 0 ||
+            plan9p1_server_start(server, &plan9p1_server_il_transport_ops,
+                                 server, errp) < 0) {
+            goto fail_all;
+        }
+        server->il_accepting = true;
     }
     server->completed = true;
+    qemu_register_resettable(OBJECT(server));
+    server->reset_registered = true;
+    plan9_auth_clear(master_key, sizeof(master_key));
     return;
 
-fail_guestfwd:
-    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
-    qemu_slirp_guestfwd_remove(server->guestfwd);
-    server->guestfwd = NULL;
-fail_backend:
-    v9fs_backend_cleanup(&server->backend_storage);
-    server->backend = NULL;
+fail_all:
+    plan9p1_server_slirp_cleanup(server);
+    if (server->backend) {
+        v9fs_backend_cleanup(&server->backend_storage);
+        server->backend = NULL;
+    }
+fail_secret:
+    if (secret) {
+        plan9_auth_clear(secret, secret_len + 1);
+        g_free(secret);
+    }
+    plan9_auth_clear(master_key, sizeof(master_key));
 }
 
 static bool plan9p1_server_prepare_delete(UserCreatable *uc, Error **errp)
@@ -3535,11 +4126,14 @@ static void plan9p1_server_unparent(Object *obj)
 static void plan9p1_server_class_init(ObjectClass *oc, const void *data)
 {
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(oc);
+    ResettableClass *rc = RESETTABLE_CLASS(oc);
     ObjectProperty *property;
 
     ucc->complete = plan9p1_server_complete;
     ucc->prepare_delete = plan9p1_server_prepare_delete;
     oc->unparent = plan9p1_server_unparent;
+    rc->get_state = plan9p1_server_reset_state;
+    rc->phases.hold = plan9p1_server_reset_hold;
 
     object_class_property_add_str(oc, "fsdev", plan9p1_server_get_fsdev,
                                   plan9p1_server_set_fsdev);
@@ -3549,11 +4143,36 @@ static void plan9p1_server_class_init(ObjectClass *oc, const void *data)
         oc, "guest-address", plan9p1_server_get_guest_address,
         plan9p1_server_set_guest_address);
     object_property_set_default_str(property, "10.0.2.100");
+    property = object_class_property_add_enum(
+        oc, "transport", "Plan9P1ServerTransport",
+        &Plan9P1ServerTransport_lookup, plan9p1_server_get_transport,
+        plan9p1_server_set_transport);
+    object_property_set_default_str(property, "tcp");
     property = object_class_property_add(oc, "port", "uint16",
                                          plan9p1_server_get_port,
                                          plan9p1_server_set_port,
                                          NULL, NULL);
     object_property_set_default_uint(property, 564);
+    property = object_class_property_add(oc, "il-port", "uint16",
+                                         plan9p1_server_get_il_port,
+                                         plan9p1_server_set_il_port,
+                                         NULL, NULL);
+    object_property_set_default_uint(property, 17008);
+    property = object_class_property_add(oc, "auth-port", "uint16",
+                                         plan9p1_server_get_auth_port,
+                                         plan9p1_server_set_auth_port,
+                                         NULL, NULL);
+    object_property_set_default_uint(property, 566);
+    object_class_property_add_str(oc, "auth-id", plan9p1_server_get_auth_id,
+                                  plan9p1_server_set_auth_id);
+    object_class_property_add_str(oc, "auth-domain",
+                                  plan9p1_server_get_auth_domain,
+                                  plan9p1_server_set_auth_domain);
+    object_class_property_add_str(oc, "keydb", plan9p1_server_get_keydb,
+                                  plan9p1_server_set_keydb);
+    object_class_property_add_str(oc, "key-secret",
+                                  plan9p1_server_get_key_secret,
+                                  plan9p1_server_set_key_secret);
 }
 #endif
 
@@ -3567,6 +4186,7 @@ static const TypeInfo plan9p1_server_type_info = {
     .class_init = plan9p1_server_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
+        { TYPE_RESETTABLE_INTERFACE },
         { }
     },
 #endif

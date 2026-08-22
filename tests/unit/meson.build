@@ -163,14 +163,17 @@ if have_system
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
       ],
       'test-plan9-9p1-server': [
+        meson.project_source_root() / 'hw/core/reset.c',
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
         meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
         files('plan9-9p1-slirp-stub.c'),
         testblock,
+        hwcore,
       ],
       'test-plan9-9p1-server-local': [
+        meson.project_source_root() / 'hw/core/reset.c',
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
         meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
         meson.project_source_root() / 'hw/9pfs/9p-local.c',
@@ -182,6 +185,7 @@ if have_system
         files('plan9-9p1-slirp-stub.c'),
         plan9p1_local_test_sources,
         testblock,
+        hwcore,
       ],
     }
   endif

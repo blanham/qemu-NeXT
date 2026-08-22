@@ -1432,7 +1432,8 @@ int qemu_slirp_guestfwd_add(const char *netdev_id,
     if (handle) {
         *handle = NULL;
     }
-    if (!netdev_id || !(nc = qemu_find_netdev(netdev_id))) {
+    nc = netdev_id ? qemu_find_netdev(netdev_id) : NULL;
+    if (!nc) {
         error_setg(errp, "Unrecognized netdev id '%s'", netdev_id ?: "");
         return -1;
     }
@@ -1500,6 +1501,30 @@ bool qemu_slirp_plan9_bootp_claim(const char *netdev_id,
     s = qemu_slirp_plan9_find(netdev_id, errp);
     return s && qemu_slirp_plan9_registry_claim(
                     s->plan9, file_server, auth_server, lease, errp);
+}
+
+bool qemu_slirp_il_available(const char *netdev_id, Error **errp)
+{
+#ifndef CONFIG_SLIRP_IL
+    error_setg(errp, "SLiRP IL is unavailable in this libslirp");
+    return false;
+#else
+    NetClientState *nc;
+
+    nc = netdev_id ? qemu_find_netdev(netdev_id) : NULL;
+    if (!nc) {
+        error_setg(errp, "Unrecognized netdev id '%s'", netdev_id ?: "");
+        return false;
+    }
+    if (nc->info->type != NET_CLIENT_DRIVER_USER) {
+        error_setg(errp, "Netdev '%s' is not a user-mode network stack",
+                   netdev_id);
+        return false;
+    }
+    SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+
+    return qemu_slirp_il_registry_available(s->il_registry, errp);
+#endif
 }
 
 int qemu_slirp_il_listen(const char *netdev_id, struct in_addr guest_addr,

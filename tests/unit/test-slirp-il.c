@@ -247,6 +247,26 @@ static void test_ipv4_disabled(void)
     qemu_slirp_il_registry_free(registry);
 }
 
+static void test_availability_probe(void)
+{
+    FakeBackend backend = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    Error *err = NULL;
+
+    g_assert_true(qemu_slirp_il_registry_available(registry, &err));
+    g_assert_null(err);
+    qemu_slirp_il_registry_set_ipv4_enabled_for_test(registry, false);
+    g_assert_false(qemu_slirp_il_registry_available(registry, &err));
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    qemu_slirp_il_registry_invalidate(registry);
+    g_assert_false(qemu_slirp_il_registry_available(registry, &err));
+    g_assert_nonnull(err);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+}
+
 static void test_unavailable_feature(void)
 {
     QemuSlirpILListener *listener = (void *)0x1;
@@ -678,6 +698,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/slirp-il/validation", test_validation);
     g_test_add_func("/slirp-il/ipv4-disabled", test_ipv4_disabled);
+    g_test_add_func("/slirp-il/availability-probe", test_availability_probe);
     g_test_add_func("/slirp-il/unavailable-feature", test_unavailable_feature);
     g_test_add_func("/slirp-il/duplicate-tuple", test_duplicate_tuple);
     g_test_add_func("/slirp-il/independent-connections",

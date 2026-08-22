@@ -38,6 +38,8 @@ QemuSlirpILRegistry *qemu_slirp_il_registry_new(
     bool ipv4_enabled, struct in_addr network, struct in_addr mask,
     struct in_addr vhost, struct in_addr dns,
     const QemuSlirpILBackendOps *ops, void *backend_opaque);
+bool qemu_slirp_il_registry_available(QemuSlirpILRegistry *registry,
+                                      Error **errp);
 void qemu_slirp_il_registry_set_ipv4_enabled_for_test(
     QemuSlirpILRegistry *registry, bool enabled);
 void qemu_slirp_il_registry_invalidate(QemuSlirpILRegistry *registry);

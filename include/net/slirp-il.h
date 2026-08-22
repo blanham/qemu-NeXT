@@ -6,6 +6,9 @@ typedef struct Error Error;
 typedef struct QemuSlirpILListener QemuSlirpILListener;
 typedef struct QemuSlirpILConnection QemuSlirpILConnection;
 
+/* Validate that a named user netdev can host IL without creating a listener. */
+bool qemu_slirp_il_available(const char *netdev_id, Error **errp);
+
 /*
  * All callbacks run in the user-network main-loop context.  An open callback
  * returns the connection-private value passed to later callbacks.  An open

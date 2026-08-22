@@ -1247,6 +1247,20 @@
             '*close-action': 'MonitorQMPCloseAction' } }
 
 ##
+# @Plan9P1ServerTransport:
+#
+# Transport used by a Plan 9 Second Edition file server.
+#
+# @tcp: Unauthenticated 9P1 over the private TCP guest forward.
+#
+# @il: Authenticated record-oriented 9P1 over private IL.
+#
+# Since: 11.1
+##
+{ 'enum': 'Plan9P1ServerTransport',
+  'data': [ 'tcp', 'il' ] }
+
+##
 # @Plan9P1ServerProperties:
 #
 # @fsdev: ID of the filesystem export to serve.
@@ -1257,13 +1271,33 @@
 # @guest-address: Guest-only file-server address (default:
 #     10.0.2.100).
 #
+# @transport: Guest transport (default: tcp).
+#
 # @port: Guest-only TCP port (default: 564).
+#
+# @il-port: Guest-only IL file port (default: 17008).
+#
+# @auth-port: Guest-only IL authentication port (default: 566).
+#
+# @auth-id: File server identity required by IL authentication.
+#
+# @auth-domain: Authentication domain required by IL authentication.
+#
+# @keydb: Native encrypted Plan 9 key database path.
+#
+# @key-secret: QEMU Secret object containing the seven-byte database
+#     key.
 #
 # Since: 11.1
 ##
 { 'struct': 'Plan9P1ServerProperties',
   'data': { 'fsdev': 'str', 'netdev': 'str',
-            '*guest-address': 'str', '*port': 'uint16' },
+            '*guest-address': 'str',
+            '*transport': 'Plan9P1ServerTransport',
+            '*port': 'uint16', '*il-port': 'uint16',
+            '*auth-port': 'uint16', '*auth-id': 'str',
+            '*auth-domain': 'str', '*keydb': 'str',
+            '*key-secret': 'str' },
   'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } }
 
 ##

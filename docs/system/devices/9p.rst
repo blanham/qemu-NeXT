@@ -2,9 +2,12 @@ Plan 9 Second Edition 9P1 root service
 ======================================
 
 QEMU can serve a ``-fsdev`` export to a Plan 9 Second Edition guest using
-the release's original 9P1 protocol over TCP.  The service is a guest-only
-endpoint inside a named user-mode network stack; it does not open a host TCP
-listener.
+the release's original 9P1 protocol over TCP or IL.  The service is a
+guest-only endpoint inside a named user-mode network stack; it does not open
+a host listener.
+
+Unauthenticated TCP
+-------------------
 
 For example::
 
@@ -17,6 +20,36 @@ backend with IPv4 enabled.  ``guest-address`` defaults to ``10.0.2.100`` and
 must be an unused, non-reserved address in that backend's virtual subnet;
 ``port`` defaults to 564.  QEMU supplies the selected subnet mask, file-server
 address, and user-network gateway in the Plan 9 BOOTP vendor reply.
+
+Authenticated IL
+----------------
+
+The ``il`` transport uses the historic record-oriented IPv4 protocol and
+requires Plan 9 ticket authentication.  It is available only when QEMU is
+built with a libslirp that provides IL listeners.  A complete configuration
+looks like::
+
+  -object secret,id=plan9-master-key,file=/run/qemu/plan9-master-key \
+  -fsdev local,id=plan9root,path=/path/to/root,security_model=none \
+  -netdev user,id=nextnet,ipv6=off \
+  -object plan9-9p1-server,id=plan9fs,fsdev=plan9root,netdev=nextnet,\
+transport=il,guest-address=10.0.2.100,il-port=17008,auth-port=566,\
+auth-id=p9fs,auth-domain=lab,keydb=/path/to/adm/keys,\
+key-secret=plan9-master-key
+
+The secret file must contain exactly seven binary bytes and should be readable
+only by the QEMU process.  Use a file-backed ``secret`` object so that the
+database master key is not placed in the command line.  ``keydb`` names the
+native encrypted ``/adm/keys`` database.  ``auth-id`` is 1--27 bytes and
+``auth-domain`` is 1--47 bytes.
+
+``il-port`` defaults to 17008 and ``auth-port`` defaults to 566; both must be
+nonzero and distinct.  QEMU installs the authentication listener before the
+file listener, and advertises the selected guest address as both the file and
+authentication server in the BOOTP reply.  IL configuration is fail-closed:
+all authentication properties are required, and authentication properties
+are rejected when ``transport=tcp``.  Active IL connections block migration
+and must reconnect after a guest reset.
 
 This object implements the fixed-layout protocol used by Plan 9 Second
 Edition, not 9P2000.  It is intended for archived kernels that request their

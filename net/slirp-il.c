@@ -395,6 +395,20 @@ QemuSlirpILRegistry *qemu_slirp_il_registry_new(
     return registry;
 }
 
+bool qemu_slirp_il_registry_available(QemuSlirpILRegistry *registry,
+                                      Error **errp)
+{
+    if (!registry || !registry->valid) {
+        error_setg(errp, "SLiRP IL registry is invalid");
+        return false;
+    }
+    if (!registry->ipv4_enabled) {
+        error_setg(errp, "IPv4 is disabled for this user-mode network stack");
+        return false;
+    }
+    return true;
+}
+
 void qemu_slirp_il_registry_set_ipv4_enabled_for_test(
     QemuSlirpILRegistry *registry, bool enabled)
 {
