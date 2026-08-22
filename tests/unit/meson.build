@@ -179,6 +179,9 @@ if have_system
       'test-slirp-guestfwd': [
         meson.project_source_root() / 'net/slirp-guestfwd.c',
       ],
+      'test-slirp-il': [
+        meson.project_source_root() / 'net/slirp-il.c',
+      ],
     }
   endif
 

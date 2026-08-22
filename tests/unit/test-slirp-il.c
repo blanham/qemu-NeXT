@@ -1,0 +1,398 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#include "qemu/osdep.h"
+#include "net/slirp-il-internal.h"
+#include "qapi/error.h"
+
+typedef struct FakeConnection FakeConnection;
+typedef struct FakeBackend {
+    const QemuSlirpILBackendCallbacks *callbacks;
+    void *callbacks_opaque;
+    struct in_addr addr;
+    uint16_t port;
+    void *listener;
+    int listens, listener_removes, closes, sends;
+    int send_result;
+    bool defer_close;
+    FakeConnection *connections[4];
+    size_t nconnections;
+} FakeBackend;
+
+struct FakeConnection {
+    FakeBackend *backend;
+    void *adapter_connection;
+    bool close_requested;
+    bool close_reported;
+};
+
+static int fake_listen(void *opaque, struct in_addr addr, uint16_t port,
+                       const QemuSlirpILBackendCallbacks *callbacks,
+                       void *callbacks_opaque, void **listener)
+{
+    FakeBackend *backend = opaque;
+
+    if (backend->listener && backend->addr.s_addr == addr.s_addr &&
+        backend->port == port) {
+        return -EADDRINUSE;
+    }
+    backend->callbacks = callbacks;
+    backend->callbacks_opaque = callbacks_opaque;
+    backend->addr = addr;
+    backend->port = port;
+    backend->listener = backend;
+    backend->listens++;
+    *listener = backend;
+    return 0;
+}
+
+static void fake_close_connection(FakeConnection *connection)
+{
+    FakeBackend *backend = connection->backend;
+
+    if (connection->close_requested) {
+        return;
+    }
+    connection->close_requested = true;
+    backend->closes++;
+    if (!backend->defer_close) {
+        connection->close_reported = true;
+        backend->callbacks->close(connection, backend->callbacks_opaque);
+    }
+}
+
+static void fake_listener_remove(void *opaque, void *listener)
+{
+    FakeBackend *backend = opaque;
+    size_t i;
+
+    g_assert_true(listener == backend->listener);
+    backend->listener_removes++;
+    backend->listener = NULL;
+    for (i = 0; i < backend->nconnections; i++) {
+        fake_close_connection(backend->connections[i]);
+    }
+}
+
+static int fake_send_record(void *opaque, void *backend_connection,
+                            const uint8_t *data, size_t len)
+{
+    FakeBackend *backend = opaque;
+
+    g_assert_nonnull(backend_connection);
+    g_assert_nonnull(data);
+    g_assert_cmpuint(len, >, 0);
+    backend->sends++;
+    return backend->send_result;
+}
+
+static void fake_connection_close(void *opaque, void *backend_connection)
+{
+    fake_close_connection(backend_connection);
+}
+
+static const QemuSlirpILBackendOps backend_ops = {
+    .listen = fake_listen,
+    .listener_remove = fake_listener_remove,
+    .send_record = fake_send_record,
+    .connection_close = fake_connection_close,
+};
+
+static struct in_addr ip(uint32_t value)
+{
+    return (struct in_addr) { htonl(value) };
+}
+
+static QemuSlirpILRegistry *new_registry(FakeBackend *backend,
+                                         bool ipv4_enabled)
+{
+    return qemu_slirp_il_registry_new(ipv4_enabled, ip(0x0a000200),
+                                      ip(0xffffff00), ip(0x0a000202),
+                                      ip(0x0a000203), &backend_ops, backend);
+}
+
+typedef struct CallbackState {
+    QemuSlirpILListener *listener;
+    QemuSlirpILConnection *connections[4];
+    unsigned opened, records, ready, closed;
+    uint8_t last_record;
+    bool remove_listener_from_record;
+} CallbackState;
+
+static void *opened(QemuSlirpILConnection *connection, void *opaque)
+{
+    CallbackState *state = opaque;
+
+    state->connections[state->opened++] = connection;
+    return state;
+}
+
+static void record(QemuSlirpILConnection *connection, const uint8_t *data,
+                   size_t len, void *opaque)
+{
+    CallbackState *state = opaque;
+
+    g_assert_cmpuint(len, ==, 1);
+    state->records++;
+    state->last_record = data[0];
+    if (state->remove_listener_from_record) {
+        qemu_slirp_il_listener_remove(state->listener);
+        state->listener = NULL;
+    }
+}
+
+static void can_send(QemuSlirpILConnection *connection, void *opaque)
+{
+    CallbackState *state = opaque;
+
+    state->ready++;
+}
+
+static void closed(QemuSlirpILConnection *connection, void *opaque)
+{
+    CallbackState *state = opaque;
+
+    state->closed++;
+}
+
+static const QemuSlirpILListenerOps listener_ops = {
+    .open = opened,
+    .record = record,
+    .can_send = can_send,
+    .close = closed,
+};
+
+static FakeConnection *fake_open(FakeBackend *backend)
+{
+    FakeConnection *connection = g_new0(FakeConnection, 1);
+
+    g_assert_cmpuint(backend->nconnections, <,
+                     G_N_ELEMENTS(backend->connections));
+    connection->backend = backend;
+    backend->connections[backend->nconnections++] = connection;
+    connection->adapter_connection = backend->callbacks->open(
+        connection, backend->callbacks_opaque);
+    return connection;
+}
+
+static void assert_listen_fails(QemuSlirpILRegistry *registry,
+                                struct in_addr address, uint16_t port)
+{
+    QemuSlirpILListener *listener = (void *)0x1;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, address, port,
+                                                   &listener_ops, NULL,
+                                                   &listener, &err), ==, -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_validation(void)
+{
+    FakeBackend backend = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+
+    assert_listen_fails(registry, ip(0x0a000200), 17008);
+    assert_listen_fails(registry, ip(0x0a0002ff), 17008);
+    assert_listen_fails(registry, ip(0x0a000202), 17008);
+    assert_listen_fails(registry, ip(0x0a000203), 17008);
+    assert_listen_fails(registry, ip(0x0b000204), 17008);
+    assert_listen_fails(registry, ip(0x0a000204), 0);
+    qemu_slirp_il_registry_free(registry);
+}
+
+static void test_ipv4_disabled(void)
+{
+    FakeBackend backend = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, false);
+
+    assert_listen_fails(registry, ip(0x0a000204), 17008);
+    g_assert_cmpint(backend.listens, ==, 0);
+    qemu_slirp_il_registry_free(registry);
+}
+
+static void test_duplicate_tuple(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    assert_listen_fails(registry, ip(0x0a000204), 17008);
+    qemu_slirp_il_listener_remove(listener);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+}
+
+static void test_independent_connections(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *one, *two;
+    Error *err = NULL;
+    uint8_t first = 1, second = 2;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    one = fake_open(&backend);
+    two = fake_open(&backend);
+    g_assert_cmpuint(state.opened, ==, 2);
+    g_assert_true(state.connections[0] != state.connections[1]);
+    backend.callbacks->record(one, &first, 1, backend.callbacks_opaque);
+    backend.callbacks->record(two, &second, 1, backend.callbacks_opaque);
+    g_assert_cmpuint(state.records, ==, 2);
+    g_assert_cmpuint(state.last_record, ==, 2);
+    qemu_slirp_il_listener_remove(listener);
+    g_assert_cmpuint(state.closed, ==, 2);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(one);
+    g_free(two);
+}
+
+static void test_atomic_send_and_errors(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *connection;
+    Error *err = NULL;
+    uint8_t record_byte = 1;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    connection = fake_open(&backend);
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 1), ==, 0);
+    backend.send_result = -EAGAIN;
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 1), ==, -EAGAIN);
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              NULL, 1), ==, -EINVAL);
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 0), ==, -EINVAL);
+    qemu_slirp_il_listener_remove(listener);
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 1), ==, -ENOTCONN);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(connection);
+}
+
+static void test_send_ready_edges(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *connection;
+    Error *err = NULL;
+    uint8_t record_byte = 1;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    connection = fake_open(&backend);
+    backend.send_result = -EAGAIN;
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 1), ==, -EAGAIN);
+    backend.callbacks->can_send(connection, backend.callbacks_opaque);
+    backend.callbacks->can_send(connection, backend.callbacks_opaque);
+    g_assert_cmpuint(state.ready, ==, 1);
+    backend.send_result = 0;
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 1), ==, 0);
+    backend.send_result = -EAGAIN;
+    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
+                                              &record_byte, 1), ==, -EAGAIN);
+    backend.callbacks->can_send(connection, backend.callbacks_opaque);
+    g_assert_cmpuint(state.ready, ==, 2);
+    qemu_slirp_il_listener_remove(listener);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(connection);
+}
+
+static void test_remove_listener_from_callback(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {.remove_listener_from_record = true};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *connection;
+    Error *err = NULL;
+    uint8_t record_byte = 1;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    state.listener = listener;
+    connection = fake_open(&backend);
+    backend.callbacks->record(connection, &record_byte, 1,
+                              backend.callbacks_opaque);
+    g_assert_null(state.listener);
+    g_assert_cmpint(backend.listener_removes, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(connection);
+}
+
+static void test_repeated_close_and_invalidate(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *connection;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    connection = fake_open(&backend);
+    backend.defer_close = true;
+    qemu_slirp_il_connection_close(connection->adapter_connection);
+    qemu_slirp_il_connection_close(connection->adapter_connection);
+    g_assert_cmpint(backend.closes, ==, 1);
+    qemu_slirp_il_registry_invalidate(registry);
+    g_assert_cmpint(backend.listener_removes, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+    qemu_slirp_il_listener_remove(listener);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(connection);
+}
+
+int main(int argc, char **argv)
+{
+    g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/slirp-il/validation", test_validation);
+    g_test_add_func("/slirp-il/ipv4-disabled", test_ipv4_disabled);
+    g_test_add_func("/slirp-il/duplicate-tuple", test_duplicate_tuple);
+    g_test_add_func("/slirp-il/independent-connections",
+                    test_independent_connections);
+    g_test_add_func("/slirp-il/atomic-send-errors",
+                    test_atomic_send_and_errors);
+    g_test_add_func("/slirp-il/send-ready-edges", test_send_ready_edges);
+    g_test_add_func("/slirp-il/remove-from-callback",
+                    test_remove_listener_from_callback);
+    g_test_add_func("/slirp-il/repeated-close-invalidate",
+                    test_repeated_close_and_invalidate);
+    return g_test_run();
+}
