@@ -31,7 +31,9 @@ struct Nfs2HandleTable {
     size_t alias_count;
     uint32_t next_generation;
     bool generation_exhausted;
+#ifdef NFS2_HANDLE_TESTING
     bool fail_next_mac;
+#endif
     bool active;
 };
 
@@ -108,11 +110,13 @@ static bool calculate_mac(Nfs2HandleTable *table, const uint8_t *data,
     uint8_t *digest_ptr = digest;
     size_t digest_length = sizeof(digest);
 
+#ifdef NFS2_HANDLE_TESTING
     if (table->fail_next_mac) {
         table->fail_next_mac = false;
         error_setg(errp, "injected NFS handle HMAC failure");
         return false;
     }
+#endif
     hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256, table->key,
                             sizeof(table->key), errp);
     if (!hmac || qcrypto_hmac_bytes(hmac, (const char *)data,
@@ -516,6 +520,7 @@ size_t nfs2_handle_table_record_count(const Nfs2HandleTable *table)
     return table ? g_hash_table_size(table->by_id) : 0;
 }
 
+#ifdef NFS2_HANDLE_TESTING
 void nfs2_handle_table_set_next_generation_for_test(Nfs2HandleTable *table,
                                                      uint32_t generation)
 {
@@ -530,3 +535,4 @@ void nfs2_handle_table_fail_next_mac_for_test(Nfs2HandleTable *table)
     g_assert(table && table->active);
     table->fail_next_mac = true;
 }
+#endif

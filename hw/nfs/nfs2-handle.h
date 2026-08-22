@@ -24,9 +24,11 @@ bool nfs2_handle_remove(Nfs2HandleTable *table, const char *path,
                         Error **errp);
 size_t nfs2_handle_table_record_count(const Nfs2HandleTable *table);
 
+#ifdef NFS2_HANDLE_TESTING
 /* Test-only fault/state injection. */
 void nfs2_handle_table_set_next_generation_for_test(Nfs2HandleTable *table,
                                                      uint32_t generation);
 void nfs2_handle_table_fail_next_mac_for_test(Nfs2HandleTable *table);
+#endif
 
 #endif

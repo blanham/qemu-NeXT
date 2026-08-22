@@ -1,5 +1,8 @@
 
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
+nfs2_handle_testing = declare_dependency(
+  compile_args: ['-DNFS2_HANDLE_TESTING'],
+)
 
 tests = {
   'check-block-qdict': [],
@@ -60,6 +63,7 @@ tests = {
   'test-nfs2-handle': [
     meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
     crypto,
+    nfs2_handle_testing,
   ],
   'test-nfs2-server': [
     meson.project_source_root() / 'hw/9pfs/9p-backend.c',
@@ -342,3 +346,19 @@ foreach test_name, extra: tests
        priority: slow_tests.get(test_name, 30),
        suite: ['unit'])
 endforeach
+
+if have_system
+  nfs2_handle_nm = find_program('nm')
+  nfs2_handle_production_check = static_library(
+    'nfs2-handle-production-check',
+    meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+    genh,
+    build_by_default: false,
+    dependencies: [glib],
+  )
+  test('test-nfs2-handle-production-symbols', python,
+       args: [files('test-nfs2-handle-production-symbols.py'),
+              nfs2_handle_nm.full_path(), nfs2_handle_production_check],
+       depends: nfs2_handle_production_check,
+       suite: ['unit'])
+endif
