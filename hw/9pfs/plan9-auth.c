@@ -5,6 +5,7 @@
  * - codecs: sys/src/libauth/conv{TR,T,A}2M.c and convM2{TR,T,A}.c
  * - overlapping encryption: sys/man/2/encrypt (the preserved crypt.c is an
  *   architecture object in sys/src/libc/port/crypt.{2,8,v}.save).
+ * - ticket service and AuthErr shape: sys/src/cmd/auth/auth.srv.c
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -42,17 +43,21 @@ struct Plan9AuthTicketConnection {
     uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN];
     uint8_t conversation_key[PLAN9_AUTH_DES_KEY_LEN];
     uint8_t reply[PLAN9_AUTH_TICKET_REPLY_LEN];
+    size_t reply_len;
     unsigned int refs;
     unsigned int completed_requests;
     bool caller_ref;
     bool request_seen;
     bool reply_ready;
+    bool close_after_reply;
     bool close_requested;
     bool sending;
 };
 
 static Plan9AuthKeydbReadHook keydb_read_hook;
 static void *keydb_read_hook_opaque;
+static Plan9AuthKeydbLookupHook keydb_lookup_hook;
+static void *keydb_lookup_hook_opaque;
 
 void plan9_auth_clear(void *ptr, size_t len)
 {
@@ -192,14 +197,15 @@ static int plan9_auth_ticket_connection_send(
 {
     int sent;
 
-    if (!connection->reply_ready || connection->close_requested ||
+    if (connection->sending || !connection->reply_ready ||
+        connection->close_requested ||
         !connection->caller_ref) {
         return 0;
     }
     plan9_auth_ticket_connection_ref(connection);
     connection->sending = true;
     sent = connection->ops.send_record(connection->reply,
-                                       sizeof(connection->reply),
+                                       connection->reply_len,
                                        connection->transport_opaque);
     connection->sending = false;
     if (!connection->caller_ref) {
@@ -210,15 +216,22 @@ static int plan9_auth_ticket_connection_send(
     if (connection->close_requested) {
         connection->reply_ready = false;
         plan9_auth_clear(connection->reply, sizeof(connection->reply));
+        connection->reply_len = 0;
         error_setg(errp, "Plan 9 ticket transport closed during send");
         plan9_auth_ticket_connection_unref(connection);
         return -1;
     }
-    if (sent == sizeof(connection->reply)) {
+    if (sent == connection->reply_len) {
         connection->reply_ready = false;
         plan9_auth_clear(connection->reply, sizeof(connection->reply));
-        connection->completed_requests++;
-        connection->request_seen = false;
+        connection->reply_len = 0;
+        if (connection->close_after_reply) {
+            connection->close_after_reply = false;
+            plan9_auth_ticket_connection_close(connection);
+        } else {
+            connection->completed_requests++;
+            connection->request_seen = false;
+        }
         plan9_auth_ticket_connection_unref(connection);
         return 0;
     }
@@ -228,6 +241,7 @@ static int plan9_auth_ticket_connection_send(
     }
     connection->reply_ready = false;
     plan9_auth_clear(connection->reply, sizeof(connection->reply));
+    connection->reply_len = 0;
     error_setg(errp, "Plan 9 ticket transport failed");
     plan9_auth_ticket_connection_close(connection);
     plan9_auth_ticket_connection_unref(connection);
@@ -296,6 +310,8 @@ static int plan9_auth_ticket_connection_build_reply(
         goto out;
     }
     connection->reply_ready = true;
+    connection->reply_len = PLAN9_AUTH_TICKET_REPLY_LEN;
+    connection->close_after_reply = false;
     ret = 0;
 
 out:
@@ -308,8 +324,24 @@ out:
                      sizeof(connection->conversation_key));
     if (ret) {
         plan9_auth_clear(connection->reply, sizeof(connection->reply));
+        connection->reply_len = 0;
     }
     return ret;
+}
+
+static int plan9_auth_ticket_connection_error_reply(
+    Plan9AuthTicketConnection *connection, Error **errp)
+{
+    static const char message[] = "protocol botch";
+
+    /* replyerror() writes AuthErr followed by fixed ERRLEN (64) bytes. */
+    plan9_auth_clear(connection->reply, sizeof(connection->reply));
+    connection->reply[0] = PLAN9_AUTH_ERR;
+    memcpy(connection->reply + 1, message, sizeof(message) - 1);
+    connection->reply_len = PLAN9_AUTH_ERROR_REPLY_LEN;
+    connection->reply_ready = true;
+    connection->close_after_reply = true;
+    return plan9_auth_ticket_connection_send(connection, errp);
 }
 
 int plan9_auth_ticket_connection_receive_record(
@@ -317,6 +349,7 @@ int plan9_auth_ticket_connection_receive_record(
     Error **errp)
 {
     int ret = -1;
+    Error *decode_error = NULL;
 
     if (!connection || !connection->caller_ref) {
         error_setg(errp, "Plan 9 ticket connection is closed");
@@ -337,12 +370,16 @@ int plan9_auth_ticket_connection_receive_record(
     }
     connection->request_seen = true;
     if (plan9_auth_ticket_request_decode(buf, len, &connection->request,
-                                         errp)) {
-        goto fail;
+                                         &decode_error)) {
+        error_free(decode_error);
+        plan9_auth_clear(&connection->request, sizeof(connection->request));
+        ret = plan9_auth_ticket_connection_error_reply(connection, errp);
+        goto out;
     }
     if (connection->request.type != PLAN9_AUTH_TREQ) {
-        error_setg(errp, "Plan 9 ticket request type is invalid");
-        goto fail;
+        plan9_auth_clear(&connection->request, sizeof(connection->request));
+        ret = plan9_auth_ticket_connection_error_reply(connection, errp);
+        goto out;
     }
     if (plan9_auth_ticket_connection_build_reply(connection, errp)) {
         goto fail;
@@ -357,6 +394,7 @@ fail:
     plan9_auth_clear(&connection->request, sizeof(connection->request));
     if (!connection->sending) {
         plan9_auth_clear(connection->reply, sizeof(connection->reply));
+        connection->reply_len = 0;
     }
     plan9_auth_ticket_connection_close(connection);
 out:
@@ -392,6 +430,13 @@ void plan9_auth_keydb_set_read_hook(Plan9AuthKeydbReadHook hook,
     keydb_read_hook_opaque = opaque;
 }
 
+void plan9_auth_keydb_set_lookup_hook(Plan9AuthKeydbLookupHook hook,
+                                      void *opaque)
+{
+    keydb_lookup_hook = hook;
+    keydb_lookup_hook_opaque = opaque;
+}
+
 static bool plan9_auth_keydb_metadata_equal(const struct stat *a,
                                             const struct stat *b)
 {
@@ -421,6 +466,18 @@ plan9_auth_keydb_entry_status(const Plan9AuthKeydbEntry *entry, uint32_t now)
     return PLAN9_AUTH_KEY_AVAILABLE;
 }
 
+static uint8_t plan9_auth_keydb_name_difference(
+    const char left[PLAN9_AUTH_NAMELEN],
+    const uint8_t right[PLAN9_AUTH_NAMELEN])
+{
+    uint8_t different = 0;
+
+    for (size_t i = 0; i < PLAN9_AUTH_NAMELEN; i++) {
+        different |= (uint8_t)left[i] ^ right[i];
+    }
+    return different;
+}
+
 void plan9_auth_keydb_free(Plan9AuthKeydb *keydb)
 {
     if (!keydb) {
@@ -438,27 +495,53 @@ Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
                                            uint8_t key[
                                                PLAN9_AUTH_DES_KEY_LEN])
 {
+    uint8_t canonical[PLAN9_AUTH_NAMELEN] = { 0 };
+    uint8_t selected_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    Plan9AuthKeyStatus status = PLAN9_AUTH_KEY_MISSING;
+    size_t name_len;
+
     if (key) {
         plan9_auth_clear(key, PLAN9_AUTH_DES_KEY_LEN);
     }
     if (!keydb || !name) {
         return PLAN9_AUTH_KEY_MISSING;
     }
+    name_len = strnlen(name, PLAN9_AUTH_NAMELEN);
+    if (name_len < PLAN9_AUTH_NAMELEN) {
+        memcpy(canonical, name, name_len);
+    } else {
+        /* No canonical database name can have a nonzero final byte. */
+        canonical[PLAN9_AUTH_NAMELEN - 1] = 1;
+    }
 
     for (size_t i = 0; i < keydb->count; i++) {
         const Plan9AuthKeydbEntry *entry = &keydb->entries[i];
-        Plan9AuthKeyStatus status;
+        Plan9AuthKeyStatus candidate_status =
+            plan9_auth_keydb_entry_status(entry, now);
+        uint8_t different =
+            plan9_auth_keydb_name_difference(entry->name, canonical);
+        uint32_t equal = ((uint32_t)different - 1) >> 31;
+        uint32_t status_mask = 0 - equal;
+        uint8_t key_mask = status_mask;
 
-        if (strcmp(entry->name, name)) {
-            continue;
+        status = (status & ~status_mask) |
+                 (candidate_status & status_mask);
+        for (size_t key_byte = 0;
+             key_byte < PLAN9_AUTH_DES_KEY_LEN; key_byte++) {
+            selected_key[key_byte] =
+                (selected_key[key_byte] & ~key_mask) |
+                (entry->key[key_byte] & key_mask);
         }
-        status = plan9_auth_keydb_entry_status(entry, now);
-        if (status == PLAN9_AUTH_KEY_AVAILABLE && key) {
-            memcpy(key, entry->key, PLAN9_AUTH_DES_KEY_LEN);
+        if (keydb_lookup_hook) {
+            keydb_lookup_hook(i, keydb_lookup_hook_opaque);
         }
-        return status;
     }
-    return PLAN9_AUTH_KEY_MISSING;
+    if (status == PLAN9_AUTH_KEY_AVAILABLE && key) {
+        memcpy(key, selected_key, PLAN9_AUTH_DES_KEY_LEN);
+    }
+    plan9_auth_clear(canonical, sizeof(canonical));
+    plan9_auth_clear(selected_key, sizeof(selected_key));
+    return status;
 }
 
 int plan9_auth_keydb_record_encode(
@@ -599,6 +682,7 @@ Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
     for (size_t i = 0; i < count; i++) {
         uint8_t *record = records + i * PLAN9_AUTH_KEYDB_RECORD_LEN;
         Plan9AuthKeydbEntry *entry = &keydb->entries[i];
+        size_t entry_name_len;
 
         if (plan9_auth_decrypt(master_key, record,
                                PLAN9_AUTH_KEYDB_RECORD_LEN, errp)) {
@@ -607,6 +691,9 @@ Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
         memcpy(entry->name, record, PLAN9_AUTH_NAMELEN);
         /* Match passline(): historical full-width names lose byte 27. */
         entry->name[PLAN9_AUTH_NAMELEN - 1] = 0;
+        entry_name_len = strlen(entry->name);
+        memset(entry->name + entry_name_len, 0,
+               PLAN9_AUTH_NAMELEN - entry_name_len);
         memcpy(entry->key, record + PLAN9_AUTH_NAMELEN,
                PLAN9_AUTH_DES_KEY_LEN);
         entry->status = record[PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN];
@@ -619,7 +706,9 @@ Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
             goto fail;
         }
         for (size_t other = 0; other < i; other++) {
-            if (!strcmp(entry->name, keydb->entries[other].name)) {
+            if (!plan9_auth_keydb_name_difference(
+                    entry->name,
+                    (const uint8_t *)keydb->entries[other].name)) {
                 error_setg(errp, "Plan 9 key database has duplicate names");
                 goto fail;
             }

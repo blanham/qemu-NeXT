@@ -17,6 +17,8 @@ enum {
     PLAN9_AUTH_TICKET_REQUEST_LEN = 141,
     PLAN9_AUTH_TICKET_LEN = 72,
     PLAN9_AUTH_TICKET_REPLY_LEN = 1 + 2 * PLAN9_AUTH_TICKET_LEN,
+    PLAN9_AUTH_ERROR_LEN = 64, /* Historical libc ERRLEN. */
+    PLAN9_AUTH_ERROR_REPLY_LEN = 1 + PLAN9_AUTH_ERROR_LEN,
     /* Enough for the boot checkkey + attach exchanges, with a DoS bound. */
     PLAN9_AUTH_TICKET_MAX_REQUESTS = 4,
     PLAN9_AUTH_AUTHENTICATOR_LEN = 13,
@@ -38,6 +40,7 @@ typedef enum Plan9AuthKeyStatus {
 } Plan9AuthKeyStatus;
 
 typedef void (*Plan9AuthKeydbReadHook)(const char *path, void *opaque);
+typedef void (*Plan9AuthKeydbLookupHook)(size_t index, void *opaque);
 
 typedef int (*Plan9AuthRandomBytes)(void *buf, size_t len, void *opaque,
                                     Error **errp);
@@ -123,7 +126,8 @@ Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
  * Short-lived historical IL/566 ticket service.  Each connection accepts a
  * bounded sequence of complete AuthTreq records and sends one atomic AuthOK
  * reply for each.  Only one reply may be outstanding at a time.  Second
- * Edition boot performs two exchanges on the same connection.
+ * Edition boot performs two exchanges on the same connection.  Malformed or
+ * unsupported records receive a fixed AuthErr record before transport close.
  * Connection free consumes the caller reference and is safe from transport
  * callbacks; the pointer must not be used afterward.
  */
@@ -152,6 +156,9 @@ int plan9_auth_keydb_record_encode(
 /* Unit-test-only race injection point; production code never installs one. */
 void plan9_auth_keydb_set_read_hook(Plan9AuthKeydbReadHook hook,
                                     void *opaque);
+/* Unit-test-only visit instrumentation; production code never installs it. */
+void plan9_auth_keydb_set_lookup_hook(Plan9AuthKeydbLookupHook hook,
+                                      void *opaque);
 
 /*
  * Passwords must be representable in a historical NAMELEN field (<= 27).
