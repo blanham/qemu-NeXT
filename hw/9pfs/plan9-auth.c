@@ -38,15 +38,18 @@ void plan9_auth_des56to64(const uint8_t packed[PLAN9_AUTH_DES_KEY_LEN],
                           uint8_t expanded[PLAN9_AUTH_DES_BLOCK_LEN])
 {
     uint64_t key = 0;
+    uint64_t group = 0;
 
     for (size_t i = 0; i < PLAN9_AUTH_DES_KEY_LEN; i++) {
         key = (key << 8) | packed[i];
     }
     for (size_t i = 0; i < PLAN9_AUTH_DES_BLOCK_LEN; i++) {
-        uint64_t group = key >> ((PLAN9_AUTH_DES_BLOCK_LEN - 1 - i) * 7);
+        group = key >> ((PLAN9_AUTH_DES_BLOCK_LEN - 1 - i) * 7);
 
         expanded[i] = odd_parity((group & 0x7f) << 1);
     }
+    plan9_auth_clear(&group, sizeof(group));
+    plan9_auth_clear(&key, sizeof(key));
 }
 
 static int plan9_auth_block(QCryptoCipher *cipher, uint8_t *block,

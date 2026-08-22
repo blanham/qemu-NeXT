@@ -43,9 +43,13 @@ static inline bool qcrypto_length_check(size_t len, size_t blocksize,
 }
 
 
-static void qcrypto_cipher_ctx_free(QCryptoCipher *ctx)
-{
-    g_free(ctx);
+#define DEFINE_CTX_FREE(NAME, TYPE)                                    \
+static void NAME##_ctx_free(QCryptoCipher *cipher)                     \
+{                                                                       \
+    TYPE *ctx = container_of(cipher, TYPE, base);                       \
+                                                                        \
+    qcrypto_memzero(ctx, sizeof(*ctx));                                 \
+    g_free(ctx);                                                        \
 }
 
 static int qcrypto_cipher_no_setiv(QCryptoCipher *cipher,
@@ -96,7 +100,7 @@ static const struct QCryptoCipherDriver NAME##_driver_ecb = {           \
     .cipher_encrypt = NAME##_encrypt_ecb,                               \
     .cipher_decrypt = NAME##_decrypt_ecb,                               \
     .cipher_setiv = qcrypto_cipher_no_setiv,                            \
-    .cipher_free = qcrypto_cipher_ctx_free,                             \
+    .cipher_free = NAME##_ctx_free,                                     \
 };
 
 
@@ -125,7 +129,7 @@ static const struct QCryptoCipherDriver NAME##_driver_cbc = {           \
     .cipher_encrypt = NAME##_encrypt_cbc,                               \
     .cipher_decrypt = NAME##_decrypt_cbc,                               \
     .cipher_setiv = NAME##_setiv,                                       \
-    .cipher_free = qcrypto_cipher_ctx_free,                             \
+    .cipher_free = NAME##_ctx_free,                                     \
 };
 
 
@@ -144,7 +148,7 @@ static const struct QCryptoCipherDriver NAME##_driver_ctr = {           \
     .cipher_encrypt = NAME##_encrypt_ctr,                               \
     .cipher_decrypt = NAME##_encrypt_ctr,                               \
     .cipher_setiv = NAME##_setiv,                                       \
-    .cipher_free = qcrypto_cipher_ctx_free,                             \
+    .cipher_free = NAME##_ctx_free,                                     \
 };
 
 
@@ -179,7 +183,7 @@ static const struct QCryptoCipherDriver NAME##_driver_xts = {   \
     .cipher_encrypt = NAME##_encrypt_xts,                       \
     .cipher_decrypt = NAME##_decrypt_xts,                       \
     .cipher_setiv = NAME##_setiv,                               \
-    .cipher_free = qcrypto_cipher_ctx_free,                     \
+    .cipher_free = NAME##_ctx_free,                             \
 };
 
 
@@ -199,6 +203,8 @@ typedef struct QCryptoNettleDES {
     struct des_ctx key;
     uint8_t iv[DES_BLOCK_SIZE];
 } QCryptoNettleDES;
+
+DEFINE_CTX_FREE(qcrypto_nettle_des, QCryptoNettleDES)
 
 static void des_encrypt_native(const void *ctx, size_t length,
                                uint8_t *dst, const uint8_t *src)
@@ -222,6 +228,8 @@ typedef struct QCryptoNettleDES3 {
     uint8_t iv[DES3_BLOCK_SIZE];
 } QCryptoNettleDES3;
 
+DEFINE_CTX_FREE(qcrypto_nettle_des3, QCryptoNettleDES3)
+
 static void des3_encrypt_native(const void *ctx, size_t length,
                                 uint8_t *dst, const uint8_t *src)
 {
@@ -244,6 +252,8 @@ typedef struct QCryptoNettleAES128 {
     /* First key from pair is encode, second key is decode. */
     struct aes128_ctx key[2], key_xts[2];
 } QCryptoNettleAES128;
+
+DEFINE_CTX_FREE(qcrypto_nettle_aes128, QCryptoNettleAES128)
 
 static void aes128_encrypt_native(const void *ctx, size_t length,
                                   uint8_t *dst, const uint8_t *src)
@@ -271,6 +281,8 @@ typedef struct QCryptoNettleAES192 {
     struct aes192_ctx key[2], key_xts[2];
 } QCryptoNettleAES192;
 
+DEFINE_CTX_FREE(qcrypto_nettle_aes192, QCryptoNettleAES192)
+
 static void aes192_encrypt_native(const void *ctx, size_t length,
                                   uint8_t *dst, const uint8_t *src)
 {
@@ -297,6 +309,8 @@ typedef struct QCryptoNettleAES256 {
     struct aes256_ctx key[2], key_xts[2];
 } QCryptoNettleAES256;
 
+DEFINE_CTX_FREE(qcrypto_nettle_aes256, QCryptoNettleAES256)
+
 static void aes256_encrypt_native(const void *ctx, size_t length,
                                   uint8_t *dst, const uint8_t *src)
 {
@@ -322,6 +336,8 @@ typedef struct QCryptoNettleCAST128 {
     struct cast128_ctx key, key_xts;
 } QCryptoNettleCAST128;
 
+DEFINE_CTX_FREE(qcrypto_nettle_cast128, QCryptoNettleCAST128)
+
 static void cast128_encrypt_native(const void *ctx, size_t length,
                                    uint8_t *dst, const uint8_t *src)
 {
@@ -344,6 +360,8 @@ typedef struct QCryptoNettleSerpent {
     uint8_t iv[SERPENT_BLOCK_SIZE];
     struct serpent_ctx key, key_xts;
 } QCryptoNettleSerpent;
+
+DEFINE_CTX_FREE(qcrypto_nettle_serpent, QCryptoNettleSerpent)
 
 
 static void serpent_encrypt_native(const void *ctx, size_t length,
@@ -369,6 +387,8 @@ typedef struct QCryptoNettleTwofish {
     struct twofish_ctx key, key_xts;
 } QCryptoNettleTwofish;
 
+DEFINE_CTX_FREE(qcrypto_nettle_twofish, QCryptoNettleTwofish)
+
 static void twofish_encrypt_native(const void *ctx, size_t length,
                                    uint8_t *dst, const uint8_t *src)
 {
@@ -390,6 +410,8 @@ typedef struct QCryptoNettleSm4 {
     QCryptoCipher base;
     struct sm4_ctx key[2];
 } QCryptoNettleSm4;
+
+DEFINE_CTX_FREE(qcrypto_nettle_sm4, QCryptoNettleSm4)
 
 static void sm4_encrypt_native(void *ctx, size_t length,
                                uint8_t *dst, const uint8_t *src)
