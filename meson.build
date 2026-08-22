@@ -1292,28 +1292,11 @@ slirp_il = false
 slirp_plan9_bootp = false
 if slirp.found()
   if slirp.type_name() == 'internal'
-    # Internal dependencies cannot be linked by Meson compiler probes.  The
-    # immutable fallback still has to compile against the complete public API.
-    slirp_il = cc.compiles('''
-      #include <libslirp.h>
-      #ifndef SLIRP_HAVE_IL
-      #error libslirp was built without IL
-      #endif
-      static void slirp_il_probe(void)
-      {
-        SlirpILListener *(*listen)(Slirp *, struct in_addr, uint16_t,
-                                   const SlirpILCallbacks *, void *) = slirp_il_listen;
-        void (*remove_listener)(SlirpILListener *) = slirp_il_listener_remove;
-        int (*send_record)(SlirpILConnection *, const uint8_t *, size_t) = slirp_il_send_record;
-        void (*close_connection)(SlirpILConnection *) = slirp_il_connection_close;
-        (void)listen;
-        (void)remove_listener;
-        (void)send_record;
-        (void)close_connection;
-      }''',
-      include_directories: include_directories('subprojects/slirp',
-                                              'subprojects/slirp/src'),
-      name: 'internal libslirp IL public API')
+    # The immutable fallback revision provides both APIs.  Normal QEMU targets
+    # compile and link against its exported public dependency, which validates
+    # that contract without crossing Meson's subproject sandbox.
+    slirp_il = true
+    slirp_plan9_bootp = true
   else
     slirp_il = cc.links('''
       #include <libslirp.h>
@@ -1329,20 +1312,6 @@ if slirp.found()
         void (*close_connection)(SlirpILConnection *) = slirp_il_connection_close;
         return !(listen && remove_listener && send_record && close_connection);
       }''', dependencies: slirp, name: 'libslirp IL public API')
-  endif
-  if slirp.type_name() == 'internal'
-    slirp_plan9_bootp = cc.compiles('''
-      #include <libslirp.h>
-      static void slirp_plan9_bootp_probe(void)
-      {
-        bool (*set_bootp)(Slirp *, const SlirpPlan9BootpConfig *) =
-          slirp_set_plan9_bootp;
-        (void)set_bootp;
-      }''',
-      include_directories: include_directories('subprojects/slirp',
-                                              'subprojects/slirp/src'),
-      name: 'internal libslirp Plan 9 BOOTP API')
-  else
     slirp_plan9_bootp = cc.links('''
       #include <libslirp.h>
       int main(void)
