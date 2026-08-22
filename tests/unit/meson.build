@@ -54,6 +54,9 @@ tests = {
   'test-plan9-9p1-codec': [
     meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
   ],
+  'test-nfs2-xdr': [
+    meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+  ],
 }
 
 if host_os != 'windows'
