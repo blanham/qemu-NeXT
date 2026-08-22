@@ -1290,6 +1290,8 @@ endif
 
 slirp_il = false
 slirp_plan9_bootp = false
+slirp_udp_service = false
+slirp_bootp_root = false
 if slirp.found()
   if slirp.type_name() == 'internal'
     # The immutable fallback revision provides both APIs.  Normal QEMU targets
@@ -1297,6 +1299,8 @@ if slirp.found()
     # that contract without crossing Meson's subproject sandbox.
     slirp_il = true
     slirp_plan9_bootp = true
+    slirp_udp_service = true
+    slirp_bootp_root = true
   else
     slirp_il = cc.links('''
       #include <libslirp.h>
@@ -1320,6 +1324,26 @@ if slirp.found()
           slirp_set_plan9_bootp;
         return !set_bootp;
       }''', dependencies: slirp, name: 'libslirp Plan 9 BOOTP API')
+    slirp_udp_service = cc.links('''
+      #include <libslirp.h>
+      #ifndef SLIRP_HAVE_UDP_SERVICE
+      #error libslirp was built without guest UDP services
+      #endif
+      int main(void)
+      {
+        return !(slirp_udp_listen && slirp_udp_listener_send &&
+                 slirp_udp_listener_remove);
+      }''', dependencies: slirp,
+      name: 'libslirp guest UDP service API')
+    slirp_bootp_root = cc.links('''
+      #include <libslirp.h>
+      #ifndef SLIRP_HAVE_BOOTP_ROOT
+      #error libslirp was built without BOOTP root support
+      #endif
+      int main(void)
+      {
+        return !slirp_set_bootp_root;
+      }''', dependencies: slirp, name: 'libslirp BOOTP root API')
   endif
 endif
 
@@ -2514,6 +2538,8 @@ config_host_data.set('CONFIG_PASST', enable_passt)
 config_host_data.set('CONFIG_SLIRP', slirp.found())
 config_host_data.set('CONFIG_SLIRP_IL', slirp_il)
 config_host_data.set('CONFIG_SLIRP_PLAN9_BOOTP', slirp_plan9_bootp)
+config_host_data.set('CONFIG_SLIRP_UDP_SERVICE', slirp_udp_service)
+config_host_data.set('CONFIG_SLIRP_BOOTP_ROOT', slirp_bootp_root)
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
 config_host_data.set('CONFIG_SOLARIS', host_os == 'sunos')
 if have_tcg
