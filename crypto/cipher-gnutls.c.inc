@@ -69,6 +69,7 @@ qcrypto_gnutls_cipher_free(QCryptoCipher *cipher)
 {
     QCryptoCipherGnutls *ctx = container_of(cipher, QCryptoCipherGnutls, base);
 
+    qcrypto_memzero(ctx->key, ctx->nkey);
     g_free(ctx->key);
     if (ctx->handle) {
         gnutls_cipher_deinit(ctx->handle);

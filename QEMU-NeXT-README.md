@@ -40,10 +40,23 @@ the desktop. The model is not a claim of complete hardware fidelity.
 Native Plan 9 Second Edition support now boots the unmodified
 `68020/9nextstation` kernel through the NeXT ROM. QEMU supplies the original
 NeXT BOOTP reply, TFTP for the kernel, and a writable Second Edition 9P1 root
-service over TCP port 564. I verified the path with the v66 ROM and
-`archive/plan9/plan9-2e.tar.bz2` in a visible GTK run, through the Plan 9
-terminal. The archive uses `tor` as its user and contains `/usr/tor`;
+service. The compatibility profile uses unauthenticated TCP port 564. The
+historic profile uses authenticated IL (IPv4 protocol 40), with the ticket
+service on IL port 566 and the file service on IL port 17008. I verified the
+path with the v66 ROM and `plan9-2e.tar.bz2` in a visible GTK run, through the
+Plan 9 terminal. The archive uses `tor` as its user and contains `/usr/tor`;
 `aux/mouse` may time out while the terminal itself is usable.
+
+The historical archives are mirrored by the Oregon State University Open
+Source Lab at:
+
+```text
+https://ftp.osuosl.org/pub/plan9/history/
+https://ftp.osuosl.org/pub/plan9/history/sha256sum.txt
+```
+
+The verified Second Edition tar archive has SHA-256
+`0bb3c1446deb79b179f73886eb2419ecfac9f9964040683e3d5731f074bc2ce6`.
 
 ### Build
 
@@ -57,12 +70,16 @@ cd build-next
 ../configure --target-list=m68k-softmmu --enable-debug \
   --enable-trace-backends=log
 ./pyvenv/bin/meson setup --reconfigure --force-fallback-for=slirp . ..
-ninja -j"$(nproc)" qemu-system-m68k qemu-img
+ninja -j"$(nproc)" qemu-system-m68k qemu-img qemu-plan9-keydb
 ```
 
-The Plan 9 run needs a staged kernel directory containing
+The Plan 9 runs need a staged kernel directory containing
 `68020/9nextstation` and a staged root tree extracted from the verified
-Second Edition archive. With those paths set, the tested launch is:
+Second Edition archive.
+
+#### TCP compatibility launch
+
+With those paths set, the compatibility launch is:
 
 ```sh
 QEMU="$PWD/qemu-system-m68k"
@@ -100,6 +117,61 @@ home=/usr/tor
 The companion NeXT lab checkout automates archive verification and staging;
 the direct command above is useful when those paths already exist.
 
+#### Authenticated historical IL launch
+
+Provision the native encrypted key database and its separate QEMU Secret in a
+private directory. The tool requires that directory to be owned by the current
+user with mode 0700; it creates both output files with mode 0600 and refuses to
+overwrite either path.
+
+```sh
+KEYDIR=/path/to/private-plan9-keys
+mkdir -p "$KEYDIR"
+chmod 0700 "$KEYDIR"
+
+./qemu-plan9-keydb create \
+  --keydb "$KEYDIR/keys" \
+  --secret "$KEYDIR/master.b64" \
+  --server-id p9fs
+```
+
+Enter and confirm the password for `tor` at the controlling terminal. Do not
+put the password or the decoded seven-byte master key in argv, environment
+variables, QMP, logs, Git, or capture files.
+
+Launch QEMU with the base64 Secret file and authenticated IL transport:
+
+```sh
+QEMU="$PWD/qemu-system-m68k"
+ROM=/path/to/Rev_2.5_v66.BIN
+TFTP=/path/to/tftp
+ROOT=/path/to/rootfs
+KEYDIR=/path/to/private-plan9-keys
+QMP=/tmp/next-plan9-il.qmp
+
+"$QEMU" -M next-station \
+  -global next-pc.system-timer-frequency=4456448 \
+  -bios "$ROM" -m 64M -display gtk \
+  -qmp "unix:$QMP,server=on,wait=off" \
+  -fsdev "local,id=plan9root,path=$ROOT,security_model=none" \
+  -netdev "user,id=nextnet,ipv6=off,tftp=$TFTP,bootfile=68020/9nextstation" \
+  -object "secret,id=plan9-master-key,format=base64,file=$KEYDIR/master.b64" \
+  -object "plan9-9p1-server,id=plan9fs,fsdev=plan9root,netdev=nextnet,guest-address=10.0.2.100,transport=il,il-port=17008,auth-port=566,auth-id=p9fs,auth-domain=nextlab,keydb=$KEYDIR/keys,key-secret=plan9-master-key" \
+  -net "nic,model=next-mb8795,netdev=nextnet" \
+  -no-reboot
+```
+
+At the ROM prompt enter `ben() 68020/9nextstation`. At the root source prompt
+enter `il`, accept `tor` at `user[tor]:`, and type the provisioned password
+directly in the GTK guest console. The password must not be injected with QMP
+because QMP transcripts record key events.
+
+The DES ticket protocol is obsolete and unauthenticated encryption is not a
+modern security boundary. Use this profile only on QEMU's private user-mode
+SLiRP network. Do not expose IL/566 or IL/17008 through host forwarding or a
+bridged/TAP network. Active IL connections block live migration and must
+reconnect after guest reset.
+
 ## Hardware support
 
 | Hardware | Status | Notes |
@@ -125,9 +197,9 @@ the direct command above is useful when those paths already exist.
 | DSP | Partial | Host-interface MMIO and DMA registers are present. DSP execution is not implemented. |
 | Printer | Partial | The MMIO range is present. No printer data path or host backend is implemented. |
 
-Plan 9 support is the original 9P1 protocol only. The current netboot profile
-uses IPv4 SLiRP and the NeXT BOOTP vendor format; it is not a general Plan 9
-network configuration. The 68030 PMMU, Turbo board variants, DSP execution,
+Plan 9 support is the original 9P1 protocol only. The netboot profiles use IPv4
+SLiRP and the NeXT BOOTP vendor format; they are not a general Plan 9 network
+configuration. The 68030 PMMU, Turbo board variants, DSP execution,
 sound input, SCC DMA, NextBus cards, magneto-optical media, and printer data
 path remain future work.
 

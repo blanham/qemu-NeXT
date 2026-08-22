@@ -1288,6 +1288,41 @@ if not get_option('slirp').auto() or have_system
   endif
 endif
 
+slirp_il = false
+slirp_plan9_bootp = false
+if slirp.found()
+  if slirp.type_name() == 'internal'
+    # The immutable fallback revision provides both APIs.  Normal QEMU targets
+    # compile and link against its exported public dependency, which validates
+    # that contract without crossing Meson's subproject sandbox.
+    slirp_il = true
+    slirp_plan9_bootp = true
+  else
+    slirp_il = cc.links('''
+      #include <libslirp.h>
+      #ifndef SLIRP_HAVE_IL
+      #error libslirp was built without IL
+      #endif
+      int main(void)
+      {
+        SlirpILListener *(*listen)(Slirp *, struct in_addr, uint16_t,
+                                   const SlirpILCallbacks *, void *) = slirp_il_listen;
+        void (*remove_listener)(SlirpILListener *) = slirp_il_listener_remove;
+        int (*send_record)(SlirpILConnection *, const uint8_t *, size_t) = slirp_il_send_record;
+        void (*close_connection)(SlirpILConnection *) = slirp_il_connection_close;
+        return !(listen && remove_listener && send_record && close_connection);
+      }''', dependencies: slirp, name: 'libslirp IL public API')
+    slirp_plan9_bootp = cc.links('''
+      #include <libslirp.h>
+      int main(void)
+      {
+        bool (*set_bootp)(Slirp *, const SlirpPlan9BootpConfig *) =
+          slirp_set_plan9_bootp;
+        return !set_bootp;
+      }''', dependencies: slirp, name: 'libslirp Plan 9 BOOTP API')
+  endif
+endif
+
 enable_passt = get_option('passt') \
   .require(host_os == 'linux', error_message: 'passt is supported only on Linux') \
   .require(gio.found(), error_message: 'passt requires gio') \
@@ -2477,6 +2512,8 @@ endif
 config_host_data.set('CONFIG_PIXMAN', pixman.found())
 config_host_data.set('CONFIG_PASST', enable_passt)
 config_host_data.set('CONFIG_SLIRP', slirp.found())
+config_host_data.set('CONFIG_SLIRP_IL', slirp_il)
+config_host_data.set('CONFIG_SLIRP_PLAN9_BOOTP', slirp_plan9_bootp)
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
 config_host_data.set('CONFIG_SOLARIS', host_os == 'sunos')
 if have_tcg

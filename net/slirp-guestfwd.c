@@ -13,7 +13,6 @@ struct QemuSlirpGuestFwdRegistry {
     QTAILQ_HEAD(, QemuSlirpGuestFwd) forwards;
     bool valid;
     bool ipv4_enabled;
-    QemuSlirpGuestFwd *plan9_owner;
 };
 
 struct QemuSlirpGuestFwd {
@@ -64,10 +63,6 @@ static void detach(QemuSlirpGuestFwd *fwd)
         r->backend->remove(r->backend_opaque, fwd->addr, fwd->port);
         fwd->registered = false;
     }
-    if (r->plan9_owner == fwd) {
-        r->backend->set_plan9_bootp(r->backend_opaque, NULL);
-        r->plan9_owner = NULL;
-    }
     if (fwd->registry_ref) {
         QTAILQ_REMOVE(&r->forwards, fwd, entry);
         fwd->registry_ref = false;
@@ -84,9 +79,9 @@ qemu_slirp_guestfwd_registry_new(bool ipv4_enabled, struct in_addr network,
                                  void *backend_opaque)
 {
     QemuSlirpGuestFwdRegistry *r;
-    if (!ops || !ops->add || !ops->remove || !ops->can_send || !ops->send ||
-        !ops->set_plan9_bootp)
+    if (!ops || !ops->add || !ops->remove || !ops->can_send || !ops->send) {
         return NULL;
+    }
     r = g_new0(QemuSlirpGuestFwdRegistry, 1);
     r->network = network;
     r->mask = mask;
@@ -216,62 +211,6 @@ int qemu_slirp_guestfwd_registry_send(QemuSlirpGuestFwd *fwd,
         return -EAGAIN;
     return fwd->registry->backend->send(fwd->registry->backend_opaque,
                                         fwd->addr, fwd->port, buf, len);
-}
-
-bool qemu_slirp_guestfwd_registry_set_plan9_bootp(
-    QemuSlirpGuestFwd *fwd, const QemuSlirpPlan9BootpConfig *config,
-    Error **errp)
-{
-    QemuSlirpGuestFwdRegistry *r;
-    if (!fwd || !fwd->valid || !(r = fwd->registry)) {
-        error_setg(errp, "Guest forward handle is no longer connected");
-        return false;
-    }
-    if (!r->ipv4_enabled) {
-        error_setg(errp, "IPv4 is disabled for this user-mode network stack");
-        return false;
-    }
-    if (config && r->plan9_owner && r->plan9_owner != fwd) {
-        error_setg(errp, "Another guest forward already owns Plan 9 BOOTP");
-        return false;
-    }
-    if (!config && r->plan9_owner != fwd) {
-        error_setg(errp, "Guest forward does not own Plan 9 BOOTP");
-        return false;
-    }
-    if (!r->backend->set_plan9_bootp(r->backend_opaque, config)) {
-        error_setg(errp, "Invalid Plan 9 BOOTP configuration");
-        return false;
-    }
-    r->plan9_owner = config ? fwd : NULL;
-    return true;
-}
-
-bool qemu_slirp_guestfwd_registry_get_ipv4_config(
-    QemuSlirpGuestFwd *fwd, QemuSlirpIPv4Config *config, Error **errp)
-{
-    QemuSlirpIPv4Config snapshot;
-    QemuSlirpGuestFwdRegistry *r;
-
-    if (!fwd || !fwd->caller_ref || !fwd->valid || !fwd->registry) {
-        error_setg(errp, "Guest forward handle is no longer connected");
-        return false;
-    }
-    r = fwd->registry;
-    if (!r->ipv4_enabled) {
-        error_setg(errp, "IPv4 is disabled for this user-mode network stack");
-        return false;
-    }
-    if (!config) {
-        error_setg(errp, "IPv4 configuration output is NULL");
-        return false;
-    }
-    snapshot.network = r->network;
-    snapshot.netmask = r->mask;
-    snapshot.host = r->vhost;
-    snapshot.dns = r->dns;
-    *config = snapshot;
-    return true;
 }
 
 void qemu_slirp_guestfwd_registry_remove(QemuSlirpGuestFwd *fwd)

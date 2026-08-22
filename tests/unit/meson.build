@@ -56,6 +56,16 @@ tests = {
   ],
 }
 
+if host_os != 'windows'
+  tests += {
+    'test-plan9-auth': [
+      meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
+      crypto,
+      util,
+    ],
+  }
+endif
+
 if have_system or have_tools
   tests += {
     'test-qmp-event': [testqapi],
@@ -153,14 +163,19 @@ if have_system
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
       ],
       'test-plan9-9p1-server': [
+        meson.project_source_root() / 'hw/core/reset.c',
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
         files('plan9-9p1-slirp-stub.c'),
         testblock,
+        hwcore,
       ],
       'test-plan9-9p1-server-local': [
+        meson.project_source_root() / 'hw/core/reset.c',
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
         meson.project_source_root() / 'hw/9pfs/9p-local.c',
         meson.project_source_root() / 'hw/9pfs/9p-posix-acl.c',
         meson.project_source_root() / 'hw/9pfs/9p-xattr.c',
@@ -170,17 +185,33 @@ if have_system
         files('plan9-9p1-slirp-stub.c'),
         plan9p1_local_test_sources,
         testblock,
+        hwcore,
       ],
     }
   endif
 
   if slirp.found()
-    tests += {
-      'test-slirp-guestfwd': [
-        meson.project_source_root() / 'net/slirp-guestfwd.c',
-      ],
-    }
+  tests += {
+    'test-slirp-plan9': [
+      meson.project_source_root() / 'net/slirp-plan9.c',
+    ],
+    'test-slirp-guestfwd': [
+      meson.project_source_root() / 'net/slirp-guestfwd.c',
+    ],
+    'test-slirp-il-integration': [
+      meson.project_source_root() / 'net/slirp-il.c',
+      meson.project_source_root() / 'net/slirp-guestfwd.c',
+      meson.project_source_root() / 'net/slirp-plan9.c',
+      slirp,
+    ],
+  }
   endif
+
+  tests += {
+    'test-slirp-il': [
+      meson.project_source_root() / 'net/slirp-il.c',
+    ],
+  }
 
   tests += {
     'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
@@ -229,9 +260,16 @@ if have_ga and host_os == 'linux'
   test_deps += {'test-qga': qga}
 endif
 
+if host_os != 'windows'
+  test_deps += {'test-plan9-auth': qemu_plan9_keydb_test}
+endif
+
 test_env = environment()
 test_env.set('G_TEST_SRCDIR', meson.current_source_dir())
 test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
+if host_os != 'windows'
+  test_env.set('QEMU_PLAN9_KEYDB', qemu_plan9_keydb_test.full_path())
+endif
 
 slow_tests = {
   'test-aio-multithread' : 120,
@@ -252,7 +290,13 @@ foreach test_name, extra: tests
     src += test_ss.all_sources()
     deps += test_ss.all_dependencies()
   endif
-  exe = executable(test_name, src, genh, dependencies: deps)
+  if test_name == 'test-slirp-il-integration'
+    exe = executable(test_name, src, genh, dependencies: deps,
+                     c_args: ['-ffunction-sections'],
+                     link_args: ['-Wl,--gc-sections'])
+  else
+    exe = executable(test_name, src, genh, dependencies: deps)
+  endif
 
   test(test_name, exe,
        depends: test_deps.get(test_name, []),

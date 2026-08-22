@@ -9,8 +9,7 @@ typedef struct FakeBackend {
     struct in_addr addr;
     uint16_t port;
     size_t capacity;
-    int adds, removes, sends, plan9_sets;
-    bool plan9_valid;
+    int adds, removes, sends;
 } FakeBackend;
 
 static int fake_add(void *opaque, QemuSlirpGuestFwdIncoming cb, void *cb_opaque,
@@ -43,21 +42,11 @@ static int fake_send(void *opaque, struct in_addr addr, uint16_t port,
     ((FakeBackend *)opaque)->sends++;
     return len;
 }
-static bool fake_plan9(void *opaque, const QemuSlirpPlan9BootpConfig *cfg)
-{
-    FakeBackend *f = opaque;
-    f->plan9_sets++;
-    if (cfg && !cfg->netmask.s_addr)
-        return false;
-    f->plan9_valid = cfg != NULL;
-    return true;
-}
 static const QemuSlirpGuestFwdBackendOps backend_ops = {
     .add = fake_add,
     .remove = fake_remove,
     .can_send = fake_can_send,
     .send = fake_send,
-    .set_plan9_bootp = fake_plan9,
 };
 static struct in_addr ip(uint32_t n)
 {
@@ -94,9 +83,6 @@ typedef struct SelfRemoveWrite {
     FakeBackend *backend;
     QemuSlirpGuestFwd **handle;
     int removes_during;
-    QemuSlirpIPv4Config config;
-    Error *config_error;
-    bool config_result;
 } SelfRemoveWrite;
 static ssize_t remove_from_write(const void *buf, size_t len, void *opaque)
 {
@@ -104,8 +90,6 @@ static ssize_t remove_from_write(const void *buf, size_t len, void *opaque)
     QemuSlirpGuestFwd *handle = *self->handle;
 
     qemu_slirp_guestfwd_registry_remove(handle);
-    self->config_result = qemu_slirp_guestfwd_registry_get_ipv4_config(
-        handle, &self->config, &self->config_error);
     self->removes_during = self->backend->removes;
     *self->handle = NULL;
     return len;
@@ -139,10 +123,6 @@ static void test_validation(void)
     missing = backend_ops;
     missing.send = NULL;
     g_assert_null(new_registry_with_ops(&f, &missing));
-    missing = backend_ops;
-    missing.set_plan9_bootp = NULL;
-    g_assert_null(new_registry_with_ops(&f, &missing));
-
     g_assert_cmpint(qemu_slirp_guestfwd_registry_add(r, ip(0x0a000204), 1,
                                                      &full_ops, NULL, NULL, &e),
                     ==, -1);
@@ -236,40 +216,6 @@ static void test_send_and_results(void)
     error_free(e);
     qemu_slirp_guestfwd_registry_free(r);
 }
-static void test_plan9(void)
-{
-    FakeBackend f = {0};
-    QemuSlirpGuestFwdRegistry *r = new_registry(&f);
-    QemuSlirpGuestFwd *a, *b;
-    Error *e = NULL;
-    QemuSlirpPlan9BootpConfig cfg = {.netmask = ip(0xffffff00)};
-    g_assert_cmpint(qemu_slirp_guestfwd_registry_add(r, ip(0x0a000204), 9,
-                                                     &full_ops, NULL, &a, &e),
-                    ==, 0);
-    g_assert_cmpint(qemu_slirp_guestfwd_registry_add(r, ip(0x0a000205), 9,
-                                                     &full_ops, NULL, &b, &e),
-                    ==, 0);
-    g_assert_true(qemu_slirp_guestfwd_registry_set_plan9_bootp(a, &cfg, &e));
-    g_assert_false(qemu_slirp_guestfwd_registry_set_plan9_bootp(b, &cfg, &e));
-    error_free(e);
-    e = NULL;
-    g_assert_true(qemu_slirp_guestfwd_registry_set_plan9_bootp(a, NULL, &e));
-    cfg.netmask.s_addr = 0;
-    g_assert_false(qemu_slirp_guestfwd_registry_set_plan9_bootp(b, &cfg, &e));
-    error_free(e);
-    e = NULL;
-    cfg.netmask = ip(0xffffff00);
-    g_assert_true(qemu_slirp_guestfwd_registry_set_plan9_bootp(b, &cfg, &e));
-    qemu_slirp_guestfwd_registry_remove(a);
-    {
-        int plan9_sets = f.plan9_sets;
-        qemu_slirp_guestfwd_registry_remove(b);
-        g_assert_cmpint(f.plan9_sets, ==, plan9_sets + 1);
-    }
-    g_assert_false(f.plan9_valid);
-    error_free(e);
-    qemu_slirp_guestfwd_registry_free(r);
-}
 static void test_notify_snapshot(void)
 {
     FakeBackend f = {.capacity = 1};
@@ -308,8 +254,6 @@ static void test_deferred_remove_from_write(void)
     Error *e = NULL;
     uint8_t byte = 1;
 
-    memset(&callback.config, 0xff, sizeof(callback.config));
-
     g_assert_cmpint(qemu_slirp_guestfwd_registry_add(
                         r, ip(0x0a000204), 9, &ops, &callback, &self, &e),
                     ==, 0);
@@ -317,60 +261,9 @@ static void test_deferred_remove_from_write(void)
     g_assert_cmpint(callback.removes_during, ==, 0);
     g_assert_cmpint(f.removes, ==, 0);
     g_assert_null(self);
-    g_assert_false(callback.config_result);
-    g_assert_nonnull(callback.config_error);
-    g_assert_cmpuint(callback.config.network.s_addr, ==, UINT32_MAX);
-    g_assert_cmpuint(callback.config.netmask.s_addr, ==, UINT32_MAX);
-    g_assert_cmpuint(callback.config.host.s_addr, ==, UINT32_MAX);
-    g_assert_cmpuint(callback.config.dns.s_addr, ==, UINT32_MAX);
-
     qemu_slirp_guestfwd_registry_flush_deferred(r);
     g_assert_cmpint(f.removes, ==, 1);
     qemu_slirp_guestfwd_registry_remove(self);
-    error_free(callback.config_error);
-    error_free(e);
-    qemu_slirp_guestfwd_registry_free(r);
-}
-static void test_ipv4_config(void)
-{
-    FakeBackend f = {0};
-    QemuSlirpGuestFwdRegistry *r = qemu_slirp_guestfwd_registry_new(
-        true, ip(0xac141000), ip(0xfffff000), ip(0xac141002), ip(0xac141003),
-        &backend_ops, &f);
-    QemuSlirpGuestFwd *h = NULL;
-    QemuSlirpIPv4Config cfg = {0};
-    QemuSlirpIPv4Config unchanged;
-    Error *e = NULL;
-
-    g_assert_cmpint(qemu_slirp_guestfwd_registry_add(
-                        r, ip(0xac141004), 564, &full_ops, NULL, &h, &e),
-                    ==, 0);
-    g_assert_true(qemu_slirp_guestfwd_registry_get_ipv4_config(h, &cfg, &e));
-    g_assert_cmpuint(ntohl(cfg.network.s_addr), ==, 0xac141000);
-    g_assert_cmpuint(ntohl(cfg.netmask.s_addr), ==, 0xfffff000);
-    g_assert_cmpuint(ntohl(cfg.host.s_addr), ==, 0xac141002);
-    g_assert_cmpuint(ntohl(cfg.dns.s_addr), ==, 0xac141003);
-
-    g_assert_false(qemu_slirp_guestfwd_registry_get_ipv4_config(h, NULL, &e));
-    g_assert_nonnull(e);
-    error_free(e);
-    e = NULL;
-
-    memset(&cfg, 0xa5, sizeof(cfg));
-    unchanged = cfg;
-    g_assert_false(
-        qemu_slirp_guestfwd_registry_get_ipv4_config(NULL, &cfg, &e));
-    g_assert_nonnull(e);
-    g_assert_cmpmem(&cfg, sizeof(cfg), &unchanged, sizeof(unchanged));
-    error_free(e);
-    e = NULL;
-
-    qemu_slirp_guestfwd_registry_invalidate(r);
-    g_assert_false(qemu_slirp_guestfwd_registry_get_ipv4_config(h, &cfg, &e));
-    g_assert_nonnull(e);
-    g_assert_cmpmem(&cfg, sizeof(cfg), &unchanged, sizeof(unchanged));
-
-    qemu_slirp_guestfwd_registry_remove(h);
     error_free(e);
     qemu_slirp_guestfwd_registry_free(r);
 }
@@ -380,9 +273,6 @@ static void test_ipv4_disabled(void)
     QemuSlirpGuestFwdRegistry *r =
         new_registry_with_ipv4(&f, false, &backend_ops);
     QemuSlirpGuestFwd *h = (void *)0x1;
-    QemuSlirpIPv4Config cfg;
-    QemuSlirpIPv4Config unchanged;
-    QemuSlirpPlan9BootpConfig bootp = {.netmask = ip(0xffffff00)};
     Error *e = NULL;
 
     g_assert_cmpint(qemu_slirp_guestfwd_registry_add(
@@ -395,30 +285,6 @@ static void test_ipv4_disabled(void)
     error_free(e);
     qemu_slirp_guestfwd_registry_free(r);
 
-    e = NULL;
-    r = new_registry(&f);
-    g_assert_cmpint(qemu_slirp_guestfwd_registry_add(
-                        r, ip(0x0a000204), 564, &full_ops, NULL, &h, &e),
-                    ==, 0);
-    qemu_slirp_guestfwd_registry_set_ipv4_enabled_for_test(r, false);
-    memset(&cfg, 0xa5, sizeof(cfg));
-    unchanged = cfg;
-    g_assert_false(qemu_slirp_guestfwd_registry_get_ipv4_config(h, &cfg, &e));
-    g_assert_nonnull(e);
-    g_assert_nonnull(strstr(error_get_pretty(e), "IPv4 is disabled"));
-    g_assert_cmpmem(&cfg, sizeof(cfg), &unchanged, sizeof(unchanged));
-    error_free(e);
-    e = NULL;
-
-    g_assert_false(qemu_slirp_guestfwd_registry_set_plan9_bootp(h, &bootp,
-                                                                &e));
-    g_assert_nonnull(e);
-    g_assert_nonnull(strstr(error_get_pretty(e), "IPv4 is disabled"));
-    g_assert_cmpint(f.plan9_sets, ==, 0);
-
-    qemu_slirp_guestfwd_registry_remove(h);
-    error_free(e);
-    qemu_slirp_guestfwd_registry_free(r);
 }
 int main(int argc, char **argv)
 {
@@ -427,11 +293,9 @@ int main(int argc, char **argv)
     g_test_add_func("/slirp-guestfwd/callbacks-remove",
                     test_callbacks_and_remove);
     g_test_add_func("/slirp-guestfwd/send-results", test_send_and_results);
-    g_test_add_func("/slirp-guestfwd/plan9", test_plan9);
     g_test_add_func("/slirp-guestfwd/notify-snapshot", test_notify_snapshot);
     g_test_add_func("/slirp-guestfwd/deferred-write-remove",
                     test_deferred_remove_from_write);
-    g_test_add_func("/slirp-guestfwd/ipv4-config", test_ipv4_config);
     g_test_add_func("/slirp-guestfwd/ipv4-disabled", test_ipv4_disabled);
     return g_test_run();
 }
