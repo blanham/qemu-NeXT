@@ -333,6 +333,14 @@ static ssize_t next_mb8795_receive(NetClientState *nc,
 {
     NextMB8795State *s = qemu_get_nic_opaque(nc);
 
+    /*
+     * NetQueue flushes until a receive callback returns zero.  Re-check the
+     * DMA contract here because can_receive() is not called between packets
+     * in that loop.
+     */
+    if (!next_mb8795_can_receive(nc)) {
+        return 0;
+    }
     next_mb8795_receive_frame(s, buf, size);
     return size;
 }
