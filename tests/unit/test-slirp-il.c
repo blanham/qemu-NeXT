@@ -56,6 +56,7 @@ static void fake_close_connection(FakeConnection *connection)
     if (!backend->defer_close) {
         connection->close_reported = true;
         backend->callbacks->close(connection, backend->callbacks_opaque);
+        connection->adapter_connection = NULL;
     }
 }
 
@@ -115,6 +116,8 @@ typedef struct CallbackState {
     unsigned opened, records, ready, closed;
     uint8_t last_record;
     bool remove_listener_from_record;
+    bool check_terminal_close;
+    int terminal_send_result;
 } CallbackState;
 
 static void *opened(QemuSlirpILConnection *connection, void *opaque)
@@ -149,8 +152,21 @@ static void can_send(QemuSlirpILConnection *connection, void *opaque)
 static void closed(QemuSlirpILConnection *connection, void *opaque)
 {
     CallbackState *state = opaque;
+    size_t i;
 
     state->closed++;
+    for (i = 0; i < state->opened; i++) {
+        if (state->connections[i] == connection) {
+            state->connections[i] = NULL;
+        }
+    }
+    if (state->check_terminal_close) {
+        uint8_t record_byte = 1;
+
+        state->terminal_send_result = qemu_slirp_il_send_record(
+            connection, &record_byte, sizeof(record_byte));
+        qemu_slirp_il_connection_close(connection);
+    }
 }
 
 static const QemuSlirpILListenerOps listener_ops = {
@@ -284,8 +300,8 @@ static void test_atomic_send_and_errors(void)
     g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
                                               &record_byte, 0), ==, -EINVAL);
     qemu_slirp_il_listener_remove(listener);
-    g_assert_cmpint(qemu_slirp_il_send_record(connection->adapter_connection,
-                                              &record_byte, 1), ==, -ENOTCONN);
+    g_assert_null(state.connections[0]);
+    g_assert_null(connection->adapter_connection);
     error_free(err);
     qemu_slirp_il_registry_free(registry);
     g_free(connection);
@@ -379,6 +395,31 @@ static void test_repeated_close_and_invalidate(void)
     g_free(connection);
 }
 
+static void test_terminal_close_callback(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {.check_terminal_close = true};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *connection;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    connection = fake_open(&backend);
+    qemu_slirp_il_connection_close(state.connections[0]);
+    g_assert_cmpint(backend.closes, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+    g_assert_null(state.connections[0]);
+    g_assert_cmpint(state.terminal_send_result, ==, -ENOTCONN);
+    qemu_slirp_il_listener_remove(listener);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(connection);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -394,5 +435,7 @@ int main(int argc, char **argv)
                     test_remove_listener_from_callback);
     g_test_add_func("/slirp-il/repeated-close-invalidate",
                     test_repeated_close_and_invalidate);
+    g_test_add_func("/slirp-il/terminal-close-callback",
+                    test_terminal_close_callback);
     return g_test_run();
 }
