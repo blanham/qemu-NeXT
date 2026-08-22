@@ -1323,19 +1323,29 @@ static void test_rx_backpressure_flush(void)
     {
         TxHarness harness = tx_harness_start();
         QTestState *qts = harness.qts;
+        const uint32_t second_buffer = NEXT_RX_BUFFER + 0x1000;
+        const uint8_t second_fcs[4] = { 0x58, 0x52, 0x92, 0xee };
+        uint8_t second_frame[sizeof(rx_frame)];
         uint8_t before[sizeof(rx_frame) + sizeof(rx_fcs)];
         uint8_t after[sizeof(before)];
 
+        memcpy(second_frame, rx_frame, sizeof(second_frame));
+        second_frame[sizeof(second_frame) - 1] ^= 0xff;
         memset(before, 0xa5, sizeof(before));
         qtest_memwrite(qts, NEXT_RX_BUFFER, before, sizeof(before));
+        qtest_memwrite(qts, second_buffer, before, sizeof(before));
         qtest_writel(qts, NEXT_ENRX_NEXT, NEXT_RX_BUFFER);
         qtest_writel(qts, NEXT_ENRX_LIMIT, NEXT_RX_BUFFER + 0x1000);
         rx_prepare_controller(qts, 3);
 
         socket_write_frame(harness.backend_fd,
                            rx_frame, sizeof(rx_frame));
+        socket_write_frame(harness.backend_fd,
+                           second_frame, sizeof(second_frame));
         qtest_clock_step(qts, 1);
         qtest_memread(qts, NEXT_RX_BUFFER, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+        qtest_memread(qts, second_buffer, after, sizeof(after));
         g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
         g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
 
@@ -1347,8 +1357,21 @@ static void test_rx_backpressure_flush(void)
         g_assert_cmpmem(after + sizeof(rx_frame), sizeof(rx_fcs),
                         rx_fcs, sizeof(rx_fcs));
         g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
-        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) & DMA_COMPLETE,
-                        ==, DMA_COMPLETE);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                        (DMA_COMPLETE | DMA_BUSEXC), ==, DMA_COMPLETE);
+
+        en_writeb(qts, EN_RXSTAT, EN_RXSTAT_OK);
+        rx_program(qts, second_buffer, second_buffer + 0x1000, 0, 0,
+                   false);
+        qtest_clock_step(qts, 1);
+        qtest_memread(qts, second_buffer, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(second_frame),
+                        second_frame, sizeof(second_frame));
+        g_assert_cmpmem(after + sizeof(second_frame), sizeof(second_fcs),
+                        second_fcs, sizeof(second_fcs));
+        g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, EN_RXSTAT_OK);
+        g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                        (DMA_COMPLETE | DMA_BUSEXC), ==, DMA_COMPLETE);
 
         tx_harness_stop(&harness);
     }
