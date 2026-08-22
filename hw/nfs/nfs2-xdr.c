@@ -433,6 +433,11 @@ bool nfs2_rpc_reply_garbage_args(Nfs2XdrWriter *w, uint32_t xid)
     return rpc_reply_accepted(w, xid, NFS2_RPC_GARBAGE_ARGS, false, 0, 0);
 }
 
+bool nfs2_rpc_reply_system_err(Nfs2XdrWriter *w, uint32_t xid)
+{
+    return rpc_reply_accepted(w, xid, NFS2_RPC_SYSTEM_ERR, false, 0, 0);
+}
+
 bool nfs2_rpc_reply_rpc_mismatch(Nfs2XdrWriter *w, uint32_t xid,
                                  uint32_t low, uint32_t high)
 {

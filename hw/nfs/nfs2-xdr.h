@@ -68,6 +68,7 @@ bool nfs2_rpc_reply_prog_mismatch(Nfs2XdrWriter *w, uint32_t xid,
                                   uint32_t low, uint32_t high);
 bool nfs2_rpc_reply_proc_unavail(Nfs2XdrWriter *w, uint32_t xid);
 bool nfs2_rpc_reply_garbage_args(Nfs2XdrWriter *w, uint32_t xid);
+bool nfs2_rpc_reply_system_err(Nfs2XdrWriter *w, uint32_t xid);
 bool nfs2_rpc_reply_rpc_mismatch(Nfs2XdrWriter *w, uint32_t xid,
                                  uint32_t low, uint32_t high);
 bool nfs2_rpc_reply_auth_error(Nfs2XdrWriter *w, uint32_t xid,

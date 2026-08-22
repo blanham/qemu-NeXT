@@ -166,6 +166,11 @@ static void test_reader_rejections(void)
     start = r.cursor;
     g_assert_false(nfs2_xdr_string(&r, string, sizeof(string), 7));
     g_assert_true(r.cursor == start);
+
+    nfs2_xdr_reader_init(&r, short_word, sizeof(short_word));
+    start = r.cursor;
+    g_assert_false(nfs2_xdr_opaque(&r, NULL, SIZE_MAX));
+    g_assert_true(r.cursor == start);
 }
 
 static void test_rpc_rejections(void)
@@ -269,6 +274,35 @@ static void test_reply_vectors_and_overflow(void)
         0x12, 0x34, 0x56, 0x78, 0, 0, 0, 1,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     };
+    static const uint8_t prog_unavail[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    };
+    static const uint8_t prog_mismatch[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        0, 0, 0, 1, 0, 0, 0, 2,
+    };
+    static const uint8_t proc_unavail[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3,
+    };
+    static const uint8_t garbage_args[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4,
+    };
+    static const uint8_t system_err[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+    };
+    static const uint8_t rpc_mismatch[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+        0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 2,
+    };
+    static const uint8_t auth_error[] = {
+        0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
+        0, 0, 0, 1, 0, 0, 0, 1,
+    };
     uint8_t buffer[32];
     Nfs2XdrWriter writer;
     uint8_t *start;
@@ -285,17 +319,37 @@ static void test_reply_vectors_and_overflow(void)
 
     nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
     g_assert_true(nfs2_rpc_reply_prog_unavail(&writer, 1));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    prog_unavail, sizeof(prog_unavail));
     nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
     g_assert_true(nfs2_rpc_reply_prog_mismatch(&writer, 1, 1, 2));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    prog_mismatch, sizeof(prog_mismatch));
     nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
     g_assert_true(nfs2_rpc_reply_proc_unavail(&writer, 1));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    proc_unavail, sizeof(proc_unavail));
     nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
     g_assert_true(nfs2_rpc_reply_garbage_args(&writer, 1));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    garbage_args, sizeof(garbage_args));
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
+    g_assert_true(nfs2_rpc_reply_system_err(&writer, 1));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    system_err, sizeof(system_err));
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(system_err) - 1);
+    start = writer.cursor;
+    g_assert_false(nfs2_rpc_reply_system_err(&writer, 1));
+    g_assert_true(writer.cursor == start);
     nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
     g_assert_true(nfs2_rpc_reply_rpc_mismatch(&writer, 1, 2, 2));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    rpc_mismatch, sizeof(rpc_mismatch));
     nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
     g_assert_true(nfs2_rpc_reply_auth_error(&writer, 1,
                                             NFS2_RPC_AUTH_BADCRED));
+    g_assert_cmpmem(buffer, nfs2_xdr_writer_size(&writer),
+                    auth_error, sizeof(auth_error));
 
     nfs2_xdr_writer_init(&writer, buffer, 0);
     start = writer.cursor;
@@ -307,11 +361,68 @@ static void test_reply_vectors_and_overflow(void)
     g_assert_true(writer.cursor == start);
     g_assert_false(nfs2_rpc_reply_garbage_args(&writer, 1));
     g_assert_true(writer.cursor == start);
+    g_assert_false(nfs2_rpc_reply_system_err(&writer, 1));
+    g_assert_true(writer.cursor == start);
     g_assert_false(nfs2_rpc_reply_rpc_mismatch(&writer, 1, 2, 2));
     g_assert_true(writer.cursor == start);
     g_assert_false(nfs2_rpc_reply_auth_error(&writer, 1,
                                              NFS2_RPC_AUTH_BADCRED));
     g_assert_true(writer.cursor == start);
+}
+
+static void test_writer_rejections(void)
+{
+    uint8_t buffer[12] = { 0 };
+    uint8_t data[4] = { 1, 2, 3, 4 };
+    Nfs2XdrWriter writer;
+    uint8_t *start;
+
+    nfs2_xdr_writer_init(&writer, buffer, 3);
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_u32(&writer, 1));
+    g_assert_true(writer.cursor == start);
+
+    nfs2_xdr_writer_init(&writer, buffer, 3);
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_opaque(&writer, data, sizeof(data)));
+    g_assert_true(writer.cursor == start);
+
+    nfs2_xdr_writer_init(&writer, buffer, 7);
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_counted_opaque(&writer, data, sizeof(data),
+                                               sizeof(data)));
+    g_assert_true(writer.cursor == start);
+
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_opaque(&writer, data, SIZE_MAX));
+    g_assert_true(writer.cursor == start);
+
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_counted_opaque(&writer, data, SIZE_MAX,
+                                               SIZE_MAX));
+    g_assert_true(writer.cursor == start);
+
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_opaque(&writer, data, UINT32_MAX));
+    g_assert_true(writer.cursor == start);
+
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_counted_opaque(&writer, data, UINT32_MAX,
+                                               UINT32_MAX));
+    g_assert_true(writer.cursor == start);
+
+#if SIZE_MAX > UINT32_MAX
+    nfs2_xdr_writer_init(&writer, buffer, sizeof(buffer));
+    start = writer.cursor;
+    g_assert_false(nfs2_xdr_put_counted_opaque(&writer, data,
+                                               (size_t)UINT32_MAX + 1,
+                                               SIZE_MAX));
+    g_assert_true(writer.cursor == start);
+#endif
 }
 
 int main(int argc, char **argv)
@@ -328,6 +439,7 @@ int main(int argc, char **argv)
     g_test_add_func("/nfs2-xdr/reject/procedures",
                     test_procedure_rejections);
     g_test_add_func("/nfs2-xdr/reject/write-bounds", test_write_bounds);
+    g_test_add_func("/nfs2-xdr/reject/writers", test_writer_rejections);
     g_test_add_func("/nfs2-xdr/replies", test_reply_vectors_and_overflow);
     return g_test_run();
 }
