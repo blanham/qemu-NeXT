@@ -15,7 +15,6 @@
 typedef struct Nfs2HandleRecord {
     uint64_t id;
     uint32_t generation;
-    bool exhausted;
     GPtrArray *aliases;
 } Nfs2HandleRecord;
 
@@ -29,6 +28,10 @@ struct Nfs2HandleTable {
     uint8_t key[NFS2_HANDLE_KEY_SIZE];
     GHashTable *by_id;
     GHashTable *by_path;
+    size_t alias_count;
+    uint32_t next_generation;
+    bool generation_exhausted;
+    bool fail_next_mac;
     bool active;
 };
 
@@ -97,7 +100,7 @@ static bool path_valid(const char *path, Error **errp)
     return true;
 }
 
-static bool calculate_mac(const Nfs2HandleTable *table, const uint8_t *data,
+static bool calculate_mac(Nfs2HandleTable *table, const uint8_t *data,
                           uint8_t mac[NFS2_HANDLE_MAC_SIZE], Error **errp)
 {
     g_autoptr(QCryptoHmac) hmac = NULL;
@@ -105,6 +108,11 @@ static bool calculate_mac(const Nfs2HandleTable *table, const uint8_t *data,
     uint8_t *digest_ptr = digest;
     size_t digest_length = sizeof(digest);
 
+    if (table->fail_next_mac) {
+        table->fail_next_mac = false;
+        error_setg(errp, "injected NFS handle HMAC failure");
+        return false;
+    }
     hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256, table->key,
                             sizeof(table->key), errp);
     if (!hmac || qcrypto_hmac_bytes(hmac, (const char *)data,
@@ -128,7 +136,7 @@ static bool mac_equal(const uint8_t *left, const uint8_t *right, size_t length)
     return difference == 0;
 }
 
-static bool encode_handle(const Nfs2HandleTable *table,
+static bool encode_handle(Nfs2HandleTable *table,
                           const Nfs2HandleRecord *record,
                           Nfs2FileHandle *handle, Error **errp)
 {
@@ -177,6 +185,7 @@ Nfs2HandleTable *nfs2_handle_table_new(const uint8_t *key, size_t key_length,
     table->by_id = g_hash_table_new_full(g_int64_hash, g_int64_equal,
                                          NULL, record_free);
     table->by_path = g_hash_table_new(g_str_hash, g_str_equal);
+    table->next_generation = 1;
     table->active = true;
     return table;
 }
@@ -188,6 +197,7 @@ void nfs2_handle_table_clear(Nfs2HandleTable *table)
     }
     g_hash_table_remove_all(table->by_path);
     g_hash_table_remove_all(table->by_id);
+    table->alias_count = 0;
     secure_clear(table->key, sizeof(table->key));
     table->active = false;
 }
@@ -211,6 +221,8 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
     Nfs2HandleRecord *record;
     Nfs2HandleRecord *path_record;
     V9fsPath *alias;
+    Nfs2FileHandle encoded;
+    bool new_record = false;
 
     if (!table || !table->active || !handle) {
         error_setg(errp, "NFS handle table is not active");
@@ -226,29 +238,51 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
             error_setg(errp, "NFS handle path already belongs to another ID");
             return false;
         }
-        return encode_handle(table, path_record, handle, errp);
+        if (!encode_handle(table, path_record, &encoded, errp)) {
+            return false;
+        }
+        *handle = encoded;
+        return true;
+    }
+    if (table->alias_count >= NFS2_MAX_HANDLE_RECORDS) {
+        error_setg(errp, "NFS handle table is full");
+        return false;
     }
 
     record = g_hash_table_lookup(table->by_id, &id);
     if (!record) {
-        if (g_hash_table_size(table->by_id) >= NFS2_MAX_HANDLE_RECORDS) {
-            error_setg(errp, "NFS handle table is full");
+        if (table->generation_exhausted) {
+            error_setg(errp, "NFS handle generation exhausted");
             return false;
         }
         record = g_new0(Nfs2HandleRecord, 1);
         record->id = id;
-        record->generation = 1;
+        record->generation = table->next_generation;
         record->aliases = g_ptr_array_new_with_free_func(path_free);
-        g_hash_table_insert(table->by_id, &record->id, record);
-    } else if (record->exhausted) {
-        error_setg(errp, "NFS handle generation exhausted");
+        new_record = true;
+    }
+
+    if (!encode_handle(table, record, &encoded, errp)) {
+        if (new_record) {
+            record_free(record);
+        }
         return false;
+    }
+    if (new_record) {
+        if (table->next_generation == UINT32_MAX) {
+            table->generation_exhausted = true;
+        } else {
+            table->next_generation++;
+        }
+        g_hash_table_insert(table->by_id, &record->id, record);
     }
 
     alias = path_new(path);
     g_ptr_array_add(record->aliases, alias);
     g_hash_table_insert(table->by_path, alias->data, record);
-    return encode_handle(table, record, handle, errp);
+    table->alias_count++;
+    *handle = encoded;
+    return true;
 }
 
 bool nfs2_handle_resolve(Nfs2HandleTable *table,
@@ -308,8 +342,14 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
                                                        g_direct_equal);
     g_autoptr(GHashTable) destinations = g_hash_table_new(g_str_hash,
                                                            g_str_equal);
+    g_autoptr(GPtrArray) replacements =
+        g_ptr_array_new_with_free_func(rename_change_free);
+    g_autoptr(GHashTable) replaced = g_hash_table_new(g_direct_hash,
+                                                       g_direct_equal);
     GHashTableIter iter;
     gpointer value;
+    Nfs2HandleRecord *old_record;
+    Nfs2HandleRecord *new_record;
     size_t old_length;
 
     if (!table || !table->active || !path_valid(old_path, errp) ||
@@ -317,6 +357,11 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
         return false;
     }
     if (strcmp(old_path, new_path) == 0) {
+        return true;
+    }
+    old_record = g_hash_table_lookup(table->by_path, old_path);
+    new_record = g_hash_table_lookup(table->by_path, new_path);
+    if (old_record && old_record == new_record) {
         return true;
     }
 
@@ -359,6 +404,26 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
         }
     }
 
+    g_hash_table_iter_init(&iter, table->by_id);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        Nfs2HandleRecord *record = value;
+
+        for (size_t i = 0; i < record->aliases->len; i++) {
+            V9fsPath *alias = g_ptr_array_index(record->aliases, i);
+
+            if (path_has_prefix(alias->data, new_path) &&
+                !g_hash_table_contains(affected, alias)) {
+                Nfs2RenameChange *replacement =
+                    g_new0(Nfs2RenameChange, 1);
+
+                replacement->alias = alias;
+                replacement->record = record;
+                g_ptr_array_add(replacements, replacement);
+                g_hash_table_add(replaced, alias);
+            }
+        }
+    }
+
     for (size_t i = 0; i < changes->len; i++) {
         Nfs2RenameChange *change = g_ptr_array_index(changes, i);
         Nfs2HandleRecord *existing =
@@ -377,7 +442,8 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
                 break;
             }
         }
-        if (!g_hash_table_contains(affected, existing_alias)) {
+        if (!g_hash_table_contains(affected, existing_alias) &&
+            !g_hash_table_contains(replaced, existing_alias)) {
             error_setg(errp, "rename collides with an NFS handle path");
             return false;
         }
@@ -387,6 +453,21 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
         Nfs2RenameChange *change = g_ptr_array_index(changes, i);
 
         g_hash_table_remove(table->by_path, change->alias->data);
+    }
+    for (size_t i = 0; i < replacements->len; i++) {
+        Nfs2RenameChange *replacement = g_ptr_array_index(replacements, i);
+
+        g_hash_table_remove(table->by_path, replacement->alias->data);
+    }
+    for (size_t i = 0; i < replacements->len; i++) {
+        Nfs2RenameChange *replacement = g_ptr_array_index(replacements, i);
+        Nfs2HandleRecord *record = replacement->record;
+
+        g_assert(g_ptr_array_remove(record->aliases, replacement->alias));
+        table->alias_count--;
+        if (record->aliases->len == 0) {
+            g_hash_table_remove(table->by_id, &record->id);
+        }
     }
     for (size_t i = 0; i < changes->len; i++) {
         Nfs2RenameChange *change = g_ptr_array_index(changes, i);
@@ -420,15 +501,12 @@ bool nfs2_handle_remove(Nfs2HandleTable *table, const char *path,
         if (strcmp(alias->data, path) == 0) {
             g_hash_table_remove(table->by_path, alias->data);
             g_ptr_array_remove_index(record->aliases, i);
+            table->alias_count--;
             break;
         }
     }
     if (record->aliases->len == 0) {
-        if (record->generation == UINT32_MAX) {
-            record->exhausted = true;
-        } else {
-            record->generation++;
-        }
+        g_hash_table_remove(table->by_id, &record->id);
     }
     return true;
 }
@@ -436,4 +514,19 @@ bool nfs2_handle_remove(Nfs2HandleTable *table, const char *path,
 size_t nfs2_handle_table_record_count(const Nfs2HandleTable *table)
 {
     return table ? g_hash_table_size(table->by_id) : 0;
+}
+
+void nfs2_handle_table_set_next_generation_for_test(Nfs2HandleTable *table,
+                                                     uint32_t generation)
+{
+    g_assert(table && table->active);
+    g_assert(generation != 0);
+    table->next_generation = generation;
+    table->generation_exhausted = false;
+}
+
+void nfs2_handle_table_fail_next_mac_for_test(Nfs2HandleTable *table)
+{
+    g_assert(table && table->active);
+    table->fail_next_mac = true;
 }
