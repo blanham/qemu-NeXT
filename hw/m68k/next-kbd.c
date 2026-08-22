@@ -285,6 +285,13 @@ static const MemoryRegionOps kbd_ops = {
 
 static const int linux_to_nextkbd_keycode[] = {
     [KEY_ESC]        = 0x49,
+    /* NeXT's historic cursor-key codes (wskbdmap_next.c). */
+    [KEY_LEFT]       = 0x09,
+    [KEY_DOWN]       = 0x0f,
+    [KEY_RIGHT]      = 0x10,
+    [KEY_UP]         = 0x16,
+    /* The extended NeXT map assigns F11 to Cmd_Debugger (keycode 87). */
+    [KEY_F11]        = 0x57,
     [KEY_1]          = 0x4a,
     [KEY_2]          = 0x4b,
     [KEY_3]          = 0x4c,

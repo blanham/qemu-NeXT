@@ -59,6 +59,12 @@
 #define NEXT_MOUSE_LEFT_RELEASED  0x00000001
 #define NEXT_KEY_A        0x39
 #define NEXT_KEY_UP       0x80
+#define NEXT_KEY_LEFT_ARROW  0x09
+#define NEXT_KEY_DOWN_ARROW  0x0f
+#define NEXT_KEY_RIGHT_ARROW 0x10
+#define NEXT_KEY_UP_ARROW    0x16
+#define NEXT_KEY_ESC         0x49
+#define NEXT_KEY_DEBUGGER    0x57
 #define NEXT_ROM_SIZE     (128 * 1024)
 #define NEXT_POLL_LIMIT   10000
 #define NEXT_SOUND_TIMER_NS INT64_C(3000000)
@@ -548,6 +554,52 @@ static void test_key_irq_and_data(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
     csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_cursor_keys_and_rom_monitor_shortcut(void)
+{
+    static const struct {
+        const char *qcode;
+        uint8_t next_code;
+    } keys[] = {
+        { "left", NEXT_KEY_LEFT_ARROW },
+        { "down", NEXT_KEY_DOWN_ARROW },
+        { "right", NEXT_KEY_RIGHT_ARROW },
+        { "up", NEXT_KEY_UP_ARROW },
+    };
+    QTestState *qts = next_cube_kbd_start();
+
+    for (size_t i = 0; i < ARRAY_SIZE(keys); i++) {
+        send_key(qts, keys[i].qcode, true);
+        g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                        NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                        keys[i].next_code);
+
+        send_key(qts, keys[i].qcode, false);
+        g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                        NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                        NEXT_KEY_UP | keys[i].next_code);
+    }
+
+    /* F11 is the historic NeXT extended-keyboard debugger key. */
+    send_key(qts, "f11", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_DEBUGGER);
+    send_key(qts, "f11", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_DEBUGGER);
+
+    /* Keep the existing physical Esc/debugger key unchanged. */
+    send_key(qts, "esc", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_ESC);
+    send_key(qts, "esc", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_ESC);
 
     qtest_quit(qts);
 }
@@ -1365,6 +1417,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/kbd/key-irq-and-data",
                    test_key_irq_and_data);
+    qtest_add_func("/next-cube/kbd/cursor-keys-and-rom-monitor-shortcut",
+                   test_cursor_keys_and_rom_monitor_shortcut);
     qtest_add_func("/next-cube/kbd/duplicate-key-state-ignored",
                    test_duplicate_key_state_ignored);
     qtest_add_func("/next-cube/kbd/key-state-cleared-by-reset",
