@@ -203,7 +203,7 @@ static void test_user_netdev_lifecycle_paths(void)
     g_array_free(poll.pollfds, true);
     destroy_user_netdev(s);
 #ifdef CONFIG_SLIRP_IL
-    /* Cleanup invalidated and removed the backend listener before slirp died. */
+    /* Cleanup removed the backend listener before slirp died. */
     qemu_slirp_il_listener_remove(listener);
 #endif
 }
