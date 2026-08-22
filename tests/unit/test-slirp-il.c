@@ -531,6 +531,116 @@ static void test_listen_failure_after_open(void)
     g_free(backend.connections[0]);
 }
 
+typedef struct BridgeState {
+    void *opened_raw;
+    void *record_raw;
+    void *ready_raw;
+    void *closed_raw;
+    unsigned opened, records, ready, closed;
+} BridgeState;
+
+static void *bridge_open(void *backend_connection, void *opaque)
+{
+    BridgeState *state = opaque;
+
+    state->opened_raw = backend_connection;
+    state->opened++;
+    return state;
+}
+
+static void bridge_record(void *backend_connection, const uint8_t *data,
+                          size_t len, void *opaque)
+{
+    BridgeState *state = opaque;
+
+    g_assert_cmpuint(len, ==, 1);
+    g_assert_cmpuint(data[0], ==, 0x5a);
+    state->record_raw = backend_connection;
+    state->records++;
+}
+
+static void bridge_can_send(void *backend_connection, void *opaque)
+{
+    BridgeState *state = opaque;
+
+    state->ready_raw = backend_connection;
+    state->ready++;
+}
+
+static void bridge_close(void *backend_connection, void *opaque)
+{
+    BridgeState *state = opaque;
+
+    state->closed_raw = backend_connection;
+    state->closed++;
+}
+
+static void test_backend_bridge_raw_connection_identity(void)
+{
+    static const QemuSlirpILBackendCallbacks callbacks = {
+        .open = bridge_open,
+        .record = bridge_record,
+        .can_send = bridge_can_send,
+        .close = bridge_close,
+    };
+    BridgeState state = {0};
+    QemuSlirpILBackendBridge *bridge;
+    uint8_t record_byte = 0x5a;
+    int raw_connection;
+    void *connection_opaque;
+
+    bridge = qemu_slirp_il_backend_bridge_new(&callbacks, &state);
+    connection_opaque = qemu_slirp_il_backend_bridge_connected(
+        bridge, &raw_connection);
+    g_assert_nonnull(connection_opaque);
+    g_assert_true(state.opened_raw == &raw_connection);
+    qemu_slirp_il_backend_bridge_record(&raw_connection, &record_byte,
+                                        sizeof(record_byte), connection_opaque);
+    qemu_slirp_il_backend_bridge_can_send(&raw_connection, connection_opaque);
+    qemu_slirp_il_backend_bridge_closed(&raw_connection, connection_opaque);
+    g_assert_cmpuint(state.opened, ==, 1);
+    g_assert_cmpuint(state.records, ==, 1);
+    g_assert_cmpuint(state.ready, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+    g_assert_true(state.record_raw == &raw_connection);
+    g_assert_true(state.ready_raw == &raw_connection);
+    g_assert_true(state.closed_raw == &raw_connection);
+    qemu_slirp_il_backend_bridge_free(bridge);
+}
+
+typedef struct CleanupState {
+    FakeBackend *backend;
+    bool called;
+} CleanupState;
+
+static void cleanup_after_registry(void *opaque)
+{
+    CleanupState *state = opaque;
+
+    g_assert_cmpint(state->backend->listener_removes, ==, 1);
+    state->called = true;
+}
+
+static void test_registry_progress_and_cleanup_order(void)
+{
+    FakeBackend backend = {0};
+    CallbackState state = {0};
+    CleanupState cleanup = {.backend = &backend};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    qemu_slirp_il_registry_progress(registry);
+    g_assert_cmpint(backend.listener_removes, ==, 0);
+    qemu_slirp_il_registry_cleanup(registry, cleanup_after_registry, &cleanup);
+    g_assert_true(cleanup.called);
+    error_free(err);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -555,5 +665,9 @@ int main(int argc, char **argv)
                     test_listen_open_reentrancy);
     g_test_add_func("/slirp-il/listen-failure-after-open",
                     test_listen_failure_after_open);
+    g_test_add_func("/slirp-il/backend-bridge-raw-connection-identity",
+                    test_backend_bridge_raw_connection_identity);
+    g_test_add_func("/slirp-il/registry-progress-cleanup-order",
+                    test_registry_progress_and_cleanup_order);
     return g_test_run();
 }

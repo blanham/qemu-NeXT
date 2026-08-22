@@ -5,6 +5,8 @@
 #include "net/slirp-il.h"
 
 typedef struct QemuSlirpILRegistry QemuSlirpILRegistry;
+typedef struct QemuSlirpILBackendBridge QemuSlirpILBackendBridge;
+typedef void (*QemuSlirpILCleanup)(void *opaque);
 
 /* The named-netdev facade is intentionally supplied by Task 2's net/slirp.c. */
 
@@ -48,7 +50,29 @@ int qemu_slirp_il_registry_listen(QemuSlirpILRegistry *registry,
                                   QemuSlirpILListener **listener,
                                   Error **errp);
 void qemu_slirp_il_registry_flush_deferred(QemuSlirpILRegistry *registry);
+void qemu_slirp_il_registry_progress(QemuSlirpILRegistry *registry);
+void qemu_slirp_il_registry_cleanup(QemuSlirpILRegistry *registry,
+                                    QemuSlirpILCleanup cleanup,
+                                    void *cleanup_opaque);
 int qemu_slirp_il_listen_unavailable(QemuSlirpILListener **listener,
                                       Error **errp);
+
+/*
+ * Adapter for the libslirp IL callback convention.  backend_connection is
+ * always the raw SlirpILConnection pointer used as the registry key.  The
+ * opaque value returned by connected() belongs solely to libslirp.
+ */
+QemuSlirpILBackendBridge *qemu_slirp_il_backend_bridge_new(
+    const QemuSlirpILBackendCallbacks *callbacks, void *callbacks_opaque);
+void qemu_slirp_il_backend_bridge_free(QemuSlirpILBackendBridge *bridge);
+void *qemu_slirp_il_backend_bridge_connected(
+    QemuSlirpILBackendBridge *bridge, void *backend_connection);
+void qemu_slirp_il_backend_bridge_record(void *backend_connection,
+                                         const uint8_t *data, size_t len,
+                                         void *connection_opaque);
+void qemu_slirp_il_backend_bridge_can_send(void *backend_connection,
+                                           void *connection_opaque);
+void qemu_slirp_il_backend_bridge_closed(void *backend_connection,
+                                         void *connection_opaque);
 
 #endif /* QEMU_NET_SLIRP_IL_INTERNAL_H */

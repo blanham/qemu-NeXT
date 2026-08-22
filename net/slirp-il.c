@@ -47,7 +47,80 @@ struct QemuSlirpILConnection {
     bool send_ready;
 };
 
+struct QemuSlirpILBackendBridge {
+    const QemuSlirpILBackendCallbacks *callbacks;
+    void *opaque;
+};
+
+typedef struct QemuSlirpILBackendConnection {
+    QemuSlirpILBackendBridge *bridge;
+} QemuSlirpILBackendConnection;
+
 static void listener_finish_remove(QemuSlirpILListener *listener);
+
+QemuSlirpILBackendBridge *qemu_slirp_il_backend_bridge_new(
+    const QemuSlirpILBackendCallbacks *callbacks, void *callbacks_opaque)
+{
+    QemuSlirpILBackendBridge *bridge;
+
+    bridge = g_new(QemuSlirpILBackendBridge, 1);
+    bridge->callbacks = callbacks;
+    bridge->opaque = callbacks_opaque;
+    return bridge;
+}
+
+void qemu_slirp_il_backend_bridge_free(QemuSlirpILBackendBridge *bridge)
+{
+    g_free(bridge);
+}
+
+void *qemu_slirp_il_backend_bridge_connected(
+    QemuSlirpILBackendBridge *bridge, void *backend_connection)
+{
+    QemuSlirpILBackendConnection *connection;
+
+    connection = g_new(QemuSlirpILBackendConnection, 1);
+    connection->bridge = bridge;
+    bridge->callbacks->open(backend_connection, bridge->opaque);
+    return connection;
+}
+
+void qemu_slirp_il_backend_bridge_record(void *backend_connection,
+                                         const uint8_t *data, size_t len,
+                                         void *connection_opaque)
+{
+    QemuSlirpILBackendConnection *connection = connection_opaque;
+    const QemuSlirpILBackendCallbacks *callbacks =
+        connection->bridge->callbacks;
+    void *opaque = connection->bridge->opaque;
+
+    callbacks->record(backend_connection, data, len, opaque);
+}
+
+void qemu_slirp_il_backend_bridge_can_send(void *backend_connection,
+                                           void *connection_opaque)
+{
+    QemuSlirpILBackendConnection *connection = connection_opaque;
+    const QemuSlirpILBackendCallbacks *callbacks =
+        connection->bridge->callbacks;
+    void *opaque = connection->bridge->opaque;
+
+    if (callbacks->can_send) {
+        callbacks->can_send(backend_connection, opaque);
+    }
+}
+
+void qemu_slirp_il_backend_bridge_closed(void *backend_connection,
+                                         void *connection_opaque)
+{
+    QemuSlirpILBackendConnection *connection = connection_opaque;
+    const QemuSlirpILBackendCallbacks *callbacks =
+        connection->bridge->callbacks;
+    void *opaque = connection->bridge->opaque;
+
+    callbacks->close(backend_connection, opaque);
+    g_free(connection);
+}
 
 static void listener_ref(QemuSlirpILListener *listener)
 {
@@ -462,6 +535,20 @@ void qemu_slirp_il_registry_flush_deferred(QemuSlirpILRegistry *registry)
         listener_unref(listener);
     }
     g_ptr_array_free(listeners, true);
+}
+
+void qemu_slirp_il_registry_progress(QemuSlirpILRegistry *registry)
+{
+    qemu_slirp_il_registry_flush_deferred(registry);
+}
+
+void qemu_slirp_il_registry_cleanup(QemuSlirpILRegistry *registry,
+                                    QemuSlirpILCleanup cleanup,
+                                    void *cleanup_opaque)
+{
+    qemu_slirp_il_registry_invalidate(registry);
+    qemu_slirp_il_registry_free(registry);
+    cleanup(cleanup_opaque);
 }
 
 int qemu_slirp_il_listen_unavailable(QemuSlirpILListener **listener,
