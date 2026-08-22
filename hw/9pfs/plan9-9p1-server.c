@@ -40,6 +40,7 @@
 #include "hw/9pfs/plan9-9p1-codec.h"
 #include "fsdev/qemu-fsdev-throttle.h"
 #include "block/thread-pool.h"
+#include "crypto/random.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "qemu/aio.h"
@@ -91,6 +92,8 @@ typedef struct Plan9P1Fid {
     GArray *dir_qids;
     GPtrArray *components;
     uint8_t name[PLAN9P1_NAMELEN];
+    /* Plan 9 logical identity only; never translated to a host uid. */
+    uint8_t uname[PLAN9P1_NAMELEN];
 } Plan9P1Fid;
 
 typedef struct Plan9P1QidIdentity {
@@ -208,6 +211,18 @@ struct Plan9P1Server {
     bool deferred_close;
     bool deferred_connection_failure;
     bool flushing;
+    bool auth_configured;
+    bool auth_session_valid;
+    const Plan9AuthKeydb *auth_keydb;
+    char auth_id[PLAN9_AUTH_NAMELEN];
+    char auth_domain[PLAN9_AUTH_DOMLEN];
+    Plan9AuthRandomBytes auth_random_bytes;
+    void *auth_random_opaque;
+    Plan9AuthNowSeconds auth_now_seconds;
+    void *auth_now_opaque;
+    uint8_t auth_client_challenge[PLAN9_AUTH_CHALLENGE_LEN];
+    uint8_t auth_server_challenge[PLAN9_AUTH_CHALLENGE_LEN];
+    Plan9P1ReplayState auth_replay;
 #ifdef CONFIG_SLIRP
     QemuSlirpGuestFwd *guestfwd;
 #endif
@@ -231,6 +246,70 @@ static void path_free(V9fsPath *path);
 static void path_copy(V9fsPath *dst, const V9fsPath *src);
 static void qid_release(Plan9P1Server *server, uint32_t path);
 static void invalidate_dir_caches(Plan9P1Server *server);
+static void server_auth_session_clear(Plan9P1Server *server);
+
+bool plan9p1_replay_accept(Plan9P1ReplayState *state, uint32_t id)
+{
+    uint32_t delta;
+    uint32_t bit;
+
+    if (!state) {
+        return false;
+    }
+    /* Unsigned subtraction deliberately gives the historical natural wrap. */
+    delta = id - state->low;
+    if (delta > 31) {
+        return false;
+    }
+    bit = UINT32_C(1) << delta;
+    if (state->used & bit) {
+        return false;
+    }
+    state->used |= bit;
+    while (state->used & UINT32_C(0xffff0001)) {
+        state->used >>= 1;
+        state->low++;
+    }
+    return true;
+}
+
+static void server_auth_session_clear(Plan9P1Server *server)
+{
+    plan9_auth_clear(server->auth_client_challenge,
+                     sizeof(server->auth_client_challenge));
+    plan9_auth_clear(server->auth_server_challenge,
+                     sizeof(server->auth_server_challenge));
+    plan9_auth_clear(&server->auth_replay, sizeof(server->auth_replay));
+    server->auth_session_valid = false;
+}
+
+static int server_auth_random(Plan9P1Server *server, void *buf, size_t len,
+                              Error **errp)
+{
+    if (server->auth_random_bytes) {
+        return server->auth_random_bytes(buf, len,
+                                         server->auth_random_opaque, errp);
+    }
+    return qcrypto_random_bytes(buf, len, errp);
+}
+
+static int server_auth_now(Plan9P1Server *server, uint32_t *seconds,
+                           Error **errp)
+{
+    time_t now;
+
+    if (server->auth_now_seconds) {
+        *seconds = server->auth_now_seconds(server->auth_now_opaque);
+        return 0;
+    }
+    now = time(NULL);
+    if (now == (time_t)-1) {
+        error_setg(errp, "cannot read time for Plan 9 file authentication");
+        return -1;
+    }
+    *seconds = MIN((uint64_t)now, UINT32_MAX);
+    return 0;
+}
 
 static int backend_worker(void *opaque)
 {
@@ -779,6 +858,7 @@ static void fid_free(gpointer opaque)
     }
     qid_release(fid->server, fid->qid.path);
     g_ptr_array_unref(fid->components);
+    plan9_auth_clear(fid, sizeof(*fid));
     g_free(fid);
 }
 
@@ -789,19 +869,27 @@ static void qid_identity_free(gpointer opaque)
 
 static void request_free(Plan9P1Request *request)
 {
+    if (request->data) {
+        plan9_auth_clear(request->data, request->tx.count);
+    }
     g_free(request->data);
+    plan9_auth_clear(request, sizeof(*request));
     g_free(request);
 }
 
 static void reply_free(Plan9P1Reply *reply)
 {
+    plan9_auth_clear(reply->data, reply->len);
     g_free(reply->data);
+    plan9_auth_clear(reply, sizeof(*reply));
     g_free(reply);
 }
 
 static void deferred_input_free(Plan9P1DeferredInput *input)
 {
+    plan9_auth_clear(input->data, input->len);
     g_free(input->data);
+    plan9_auth_clear(input, sizeof(*input));
     g_free(input);
 }
 
@@ -825,6 +913,7 @@ static void plan9p1_server_instance_finalize(Object *obj)
     }
 #endif
     server->closing = true;
+    server_auth_session_clear(server);
     g_hash_table_unref(server->fids);
     g_hash_table_unref(server->qid_paths);
     g_hash_table_unref(server->append_qids);
@@ -833,6 +922,8 @@ static void plan9p1_server_instance_finalize(Object *obj)
     g_free(server->fsdev_id);
     g_free(server->netdev_id);
     g_free(server->guest_address);
+    plan9_auth_clear(server->auth_id, sizeof(server->auth_id));
+    plan9_auth_clear(server->auth_domain, sizeof(server->auth_domain));
 }
 
 static void owner_ref(Plan9P1Server *server)
@@ -1163,10 +1254,116 @@ static int coroutine_fn resolve_components(Plan9P1Server *server,
     return ret;
 }
 
+static int server_auth_session_begin(Plan9P1Server *server,
+                                     const Plan9P1Fcall *request,
+                                     Plan9P1Fcall *reply)
+{
+    Error *local_err = NULL;
+
+    server_auth_session_clear(server);
+    memcpy(server->auth_client_challenge, request->challenge,
+           sizeof(server->auth_client_challenge));
+    if (server_auth_random(server, server->auth_server_challenge,
+                           sizeof(server->auth_server_challenge),
+                           &local_err)) {
+        error_free(local_err);
+        server_auth_session_clear(server);
+        return -EACCES;
+    }
+    memcpy(reply->challenge, server->auth_server_challenge,
+           sizeof(reply->challenge));
+    memcpy(reply->authid, server->auth_id, sizeof(reply->authid));
+    memcpy(reply->authdom, server->auth_domain, sizeof(reply->authdom));
+    server->auth_session_valid = true;
+    return 0;
+}
+
+static int server_authenticate_attach(Plan9P1Request *request,
+                                      Plan9P1Fcall *reply)
+{
+    Plan9P1Server *server = request->server;
+    uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN] = { 0 };
+    uint8_t auth_wire[PLAN9_AUTH_AUTHENTICATOR_LEN] = { 0 };
+    uint8_t canonical_cuid[PLAN9P1_NAMELEN] = { 0 };
+    Plan9AuthTicket ticket = { 0 };
+    Plan9AuthAuthenticator authenticator = { 0 };
+    Error *local_err = NULL;
+    uint32_t now;
+    int ret = -EACCES;
+
+    if (!server->auth_session_valid ||
+        server_auth_now(server, &now, &local_err) ||
+        plan9_auth_keydb_lookup(server->auth_keydb, server->auth_id, now,
+                                server_key) != PLAN9_AUTH_KEY_AVAILABLE) {
+        goto out;
+    }
+
+    memcpy(ticket_wire, request->tx.ticket, sizeof(ticket_wire));
+    if (plan9_auth_decrypt(server_key, ticket_wire, sizeof(ticket_wire),
+                           &local_err) ||
+        plan9_auth_ticket_decode(ticket_wire, sizeof(ticket_wire), &ticket,
+                                 &local_err) ||
+        ticket.num != PLAN9_AUTH_TS ||
+        memcmp(ticket.challenge, server->auth_server_challenge,
+               sizeof(ticket.challenge))) {
+        goto out;
+    }
+
+    memcpy(auth_wire, request->tx.auth, sizeof(auth_wire));
+    if (plan9_auth_decrypt(ticket.key, auth_wire, sizeof(auth_wire),
+                           &local_err) ||
+        plan9_auth_authenticator_decode(auth_wire, sizeof(auth_wire),
+                                        &authenticator, &local_err) ||
+        authenticator.num != PLAN9_AUTH_AC ||
+        memcmp(authenticator.challenge, server->auth_server_challenge,
+               sizeof(authenticator.challenge))) {
+        goto out;
+    }
+
+    /* Preserve the historical order: a bad uname still burns this ID. */
+    if (!plan9p1_replay_accept(&server->auth_replay, authenticator.id)) {
+        goto out;
+    }
+    fixed_string(canonical_cuid, ticket.cuid);
+    if (memcmp(request->tx.uname, canonical_cuid,
+               sizeof(request->tx.uname))) {
+        goto out;
+    }
+
+    /* This is a Plan 9 logical identity, never a host uid impersonation. */
+    fixed_string(request->tx.uname, ticket.suid);
+    authenticator.num = PLAN9_AUTH_AS;
+    memcpy(authenticator.challenge, server->auth_client_challenge,
+           sizeof(authenticator.challenge));
+    if (plan9_auth_authenticator_encode(&authenticator, auth_wire,
+                                        &local_err) ||
+        plan9_auth_encrypt(ticket.key, auth_wire, sizeof(auth_wire),
+                           &local_err)) {
+        goto out;
+    }
+    memcpy(reply->auth, auth_wire, sizeof(reply->auth));
+    ret = 0;
+
+out:
+    error_free(local_err);
+    plan9_auth_clear(server_key, sizeof(server_key));
+    plan9_auth_clear(ticket_wire, sizeof(ticket_wire));
+    plan9_auth_clear(auth_wire, sizeof(auth_wire));
+    plan9_auth_clear(canonical_cuid, sizeof(canonical_cuid));
+    plan9_auth_ticket_clear(&ticket);
+    plan9_auth_clear(&authenticator, sizeof(authenticator));
+    if (ret) {
+        plan9_auth_clear(reply->auth, sizeof(reply->auth));
+    }
+    return ret;
+}
+
 static int coroutine_fn attach_fid(Plan9P1Request *request,
                                    Plan9P1Fcall *reply)
 {
     Plan9P1Server *server = request->server;
+    Plan9P1Fid *fid;
     V9fsPath path;
     struct stat st;
     Plan9P1Qid qid;
@@ -1188,8 +1385,9 @@ static int coroutine_fn attach_fid(Plan9P1Request *request,
     if (ret < 0) {
         goto out;
     }
-    g_hash_table_insert(server->fids, fid_key(request->tx.fid),
-                        new_fid(server, request->tx.fid, &path, &qid, "/"));
+    fid = new_fid(server, request->tx.fid, &path, &qid, "/");
+    memcpy(fid->uname, request->tx.uname, sizeof(fid->uname));
+    g_hash_table_insert(server->fids, fid_key(request->tx.fid), fid);
     qid_commit(server, qid.path);
     reply->type = PLAN9P1_RATTACH;
     reply->fid = request->tx.fid;
@@ -1226,6 +1424,7 @@ static int clone_fid(Plan9P1Request *request, bool walk,
     path_copy(&clone->parent_path, &source->parent_path);
     clone->append_only = source->append_only;
     memcpy(clone->name, source->name, sizeof(clone->name));
+    memcpy(clone->uname, source->uname, sizeof(clone->uname));
     g_hash_table_insert(server->fids, fid_key(clone->fid), clone);
     reply->type = walk ? PLAN9P1_RCLWALK : PLAN9P1_RCLONE;
     reply->fid = walk ? clone->fid : request->tx.fid;
@@ -2251,8 +2450,20 @@ static void coroutine_fn handle_request(Plan9P1Request *request)
     case PLAN9P1_TSESSION:
         cleanup_fids(server);
         reply.type = PLAN9P1_RSESSION;
+        if (server->auth_configured &&
+            server_auth_session_begin(server, &request->tx, &reply) < 0) {
+            encode_error(request, request->tx.tag, EACCES,
+                         "authentication failed");
+            return;
+        }
         break;
     case PLAN9P1_TATTACH:
+        if (server->auth_configured &&
+            server_authenticate_attach(request, &reply) < 0) {
+            encode_error(request, request->tx.tag, EACCES,
+                         "authentication failed");
+            return;
+        }
         ret = attach_fid(request, &reply);
         break;
     case PLAN9P1_TCLONE:
@@ -2450,6 +2661,7 @@ static void clear_deferred_inputs(Plan9P1Server *server)
 
 static void server_discard_session(Plan9P1Server *server)
 {
+    server_auth_session_clear(server);
     plan9p1_stream_reset(&server->stream);
     clear_requests(server);
     clear_replies(server);
@@ -2466,6 +2678,7 @@ static void server_discard_session(Plan9P1Server *server)
 
 static void server_transport_failed(Plan9P1Server *server)
 {
+    server_auth_session_clear(server);
     server->connection_failed = true;
     if (server->callback_depth) {
         server->deferred_connection_failure = true;
@@ -2699,6 +2912,7 @@ static int enqueue_frame(const uint8_t *frame, size_t length,
     if (request->tx.type == PLAN9P1_TFLUSH) {
         cancel_tag(server, request->tx.oldtag);
     } else if (request->tx.type == PLAN9P1_TSESSION) {
+        server_auth_session_clear(server);
         server->connection_failed = false;
         clear_requests(server);
         clear_replies(server);
@@ -2792,10 +3006,78 @@ int plan9p1_server_start(Plan9P1Server *server,
         error_setg(errp, "9P1 server transport kind is invalid");
         return -1;
     }
+    if (server->auth_configured &&
+        ops->kind != PLAN9P1_TRANSPORT_RECORD) {
+        error_setg(errp, "Plan 9 file authentication requires record "
+                   "transport");
+        return -1;
+    }
     server->transport_ops = *ops;
     server->transport_opaque = transport_opaque;
     server->started = true;
     return 0;
+}
+
+int plan9p1_server_configure_auth(Plan9P1Server *server,
+                                  const Plan9P1AuthConfig *config,
+                                  Error **errp)
+{
+    uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    uint32_t now;
+    size_t id_len;
+    size_t domain_len;
+    int ret = -1;
+
+    if (!server || !config || !config->keydb || !config->auth_id ||
+        !config->auth_domain) {
+        error_setg(errp, "Plan 9 file authentication configuration is "
+                   "incomplete");
+        goto out;
+    }
+    if (server->started || server->closing || server->auth_configured) {
+        error_setg(errp, "Plan 9 file authentication must be configured "
+                   "once before transport start");
+        goto out;
+    }
+    id_len = strnlen(config->auth_id, PLAN9_AUTH_NAMELEN);
+    domain_len = strnlen(config->auth_domain, PLAN9_AUTH_DOMLEN);
+    if (!id_len || id_len == PLAN9_AUTH_NAMELEN || !domain_len ||
+        domain_len == PLAN9_AUTH_DOMLEN) {
+        error_setg(errp, "Plan 9 authentication identity or domain is "
+                   "not representable");
+        goto out;
+    }
+
+    server->auth_keydb = config->keydb;
+    server->auth_random_bytes = config->random_bytes;
+    server->auth_random_opaque = config->random_opaque;
+    server->auth_now_seconds = config->now_seconds;
+    server->auth_now_opaque = config->now_opaque;
+    if (server_auth_now(server, &now, errp)) {
+        goto rollback;
+    }
+    if (plan9_auth_keydb_lookup(config->keydb, config->auth_id, now,
+                                server_key) != PLAN9_AUTH_KEY_AVAILABLE) {
+        error_setg(errp, "Plan 9 authentication server identity is not "
+                   "available");
+        goto rollback;
+    }
+    g_strlcpy(server->auth_id, config->auth_id, sizeof(server->auth_id));
+    g_strlcpy(server->auth_domain, config->auth_domain,
+              sizeof(server->auth_domain));
+    server->auth_configured = true;
+    ret = 0;
+    goto out;
+
+rollback:
+    server->auth_keydb = NULL;
+    server->auth_random_bytes = NULL;
+    server->auth_random_opaque = NULL;
+    server->auth_now_seconds = NULL;
+    server->auth_now_opaque = NULL;
+out:
+    plan9_auth_clear(server_key, sizeof(server_key));
+    return ret;
 }
 
 Plan9P1Server *plan9p1_server_new(const char *fsdev_id,
@@ -2949,12 +3231,14 @@ void plan9p1_server_reset(Plan9P1Server *server)
         return;
     }
     if (server->callback_depth) {
+        server_auth_session_clear(server);
         server->resetting = true;
         server->deferred_reset = true;
         return;
     }
     server->connection_failed = false;
     server->resetting = true;
+    server_auth_session_clear(server);
     plan9p1_stream_reset(&server->stream);
     clear_requests(server);
     clear_replies(server);
@@ -2973,6 +3257,17 @@ bool plan9p1_server_busy(const Plan9P1Server *server)
     return server && (server->pending || server->requests.length != 0);
 }
 
+bool plan9p1_server_record_connection_ready(const Plan9P1Server *server)
+{
+    return server && server->started && !server->closing &&
+           server->transport_ops.kind == PLAN9P1_TRANSPORT_RECORD &&
+           !server->resetting && !server->connection_failed &&
+           !server->active && server->requests.length == 0 &&
+           server->replies.length == 0 &&
+           server->deferred_inputs.length == 0 &&
+           g_hash_table_size(server->fids) == 0;
+}
+
 void plan9p1_server_begin_close(Plan9P1Server *server)
 {
     if (!server) {
@@ -2983,6 +3278,7 @@ void plan9p1_server_begin_close(Plan9P1Server *server)
     }
 
     server->closing = true;
+    server_auth_session_clear(server);
 #ifdef CONFIG_SLIRP
     if (server->guestfwd) {
         QemuSlirpGuestFwd *guestfwd = server->guestfwd;

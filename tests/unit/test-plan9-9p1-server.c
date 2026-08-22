@@ -6,6 +6,7 @@
 #include "hw/9pfs/9p.h"
 #include "hw/9pfs/plan9-9p1-codec.h"
 #include "hw/9pfs/plan9-9p1-server.h"
+#include "hw/9pfs/plan9-auth.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
@@ -39,6 +40,7 @@ typedef enum TransportAction {
 
 typedef struct TestTransport {
     GByteArray *output;
+    GByteArray *attempted;
     ServerFixture *fixture;
     size_t capacity;
     size_t max_chunk;
@@ -99,6 +101,10 @@ struct ServerFixture {
     bool dir_gate_reset;
     QemuEvent dir_started;
     QemuEvent dir_release;
+    Plan9AuthKeydb *auth_keydb;
+    uint8_t auth_server_key[PLAN9_AUTH_DES_KEY_LEN];
+    unsigned int auth_random_calls;
+    bool auth_random_fail;
 };
 
 static ServerFixture *fixture;
@@ -590,6 +596,7 @@ static int transport_send(const uint8_t *buf, size_t len, void *opaque)
 
     transport->last_send_len = len;
     transport->send_calls++;
+    g_byte_array_append(transport->attempted, buf, len);
 
     if (!transport->action_done &&
         transport->action >= TRANSPORT_ACTION_RESET_SEND) {
@@ -732,6 +739,7 @@ static void fixture_setup(ServerFixture *f, gconstpointer opaque)
     };
     f->fse.fst.cfg.buckets[THROTTLE_BPS_READ].avg = 1;
     f->transport.output = g_byte_array_new();
+    f->transport.attempted = g_byte_array_new();
     f->transport.fixture = f;
     f->transport.capacity = SIZE_MAX;
     f->server = plan9p1_server_new("testfs", &transport_ops,
@@ -749,6 +757,87 @@ static void pump_server(Plan9P1Server *server)
     }
 }
 
+static int auth_random_bytes(void *buf, size_t len, void *opaque,
+                             Error **errp)
+{
+    ServerFixture *f = opaque;
+    uint8_t *bytes = buf;
+    unsigned int call = f->auth_random_calls++;
+
+    if (f->auth_random_fail) {
+        error_setg(errp, "injected authentication random failure");
+        return -1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        bytes[i] = 0x40 + call * 0x10 + i;
+    }
+    return 0;
+}
+
+static uint32_t auth_now_seconds(void *opaque)
+{
+    return 1;
+}
+
+static void expected_server_challenge(unsigned int call,
+                                      uint8_t challenge[PLAN9P1_CHALLEN])
+{
+    for (size_t i = 0; i < PLAN9P1_CHALLEN; i++) {
+        challenge[i] = 0x40 + call * 0x10 + i;
+    }
+}
+
+static void auth_fixture_setup(ServerFixture *f, gconstpointer opaque)
+{
+    static const uint8_t master_key[PLAN9_AUTH_DES_KEY_LEN] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    };
+    static const uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN] = {
+        0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x17,
+    };
+    uint8_t record[PLAN9_AUTH_KEYDB_RECORD_LEN];
+    g_autofree char *path = NULL;
+    Plan9P1AuthConfig config;
+    unsigned int cleanup_target;
+
+    fixture_setup(f, NULL);
+    cleanup_target = f->cleanup_calls + 1;
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+
+    memcpy(f->auth_server_key, server_key, sizeof(server_key));
+    path = g_build_filename(f->root, "auth-keys", NULL);
+    g_assert_cmpint(plan9_auth_keydb_record_encode(
+                        record, master_key, "p9fs", server_key, 0, 0,
+                        UINT32_MAX, &error_abort), ==, 0);
+    write_file(path, record, sizeof(record));
+    f->auth_keydb = plan9_auth_keydb_load(path, master_key, "p9fs", 1,
+                                          &error_abort);
+    g_assert_nonnull(f->auth_keydb);
+    g_assert_cmpint(g_unlink(path), ==, 0);
+    plan9_auth_clear(record, sizeof(record));
+
+    f->server = PLAN9P1_SERVER(object_new(TYPE_PLAN9P1_SERVER));
+    g_assert_cmpint(plan9p1_server_backend_init(f->server, "testfs", NULL,
+                                                &error_abort), ==, 0);
+    config = (Plan9P1AuthConfig) {
+        .keydb = f->auth_keydb,
+        .auth_id = "p9fs",
+        .auth_domain = "plan9.local",
+        .random_bytes = auth_random_bytes,
+        .random_opaque = f,
+        .now_seconds = auth_now_seconds,
+        .now_opaque = f,
+    };
+    g_assert_cmpint(plan9p1_server_configure_auth(f->server, &config,
+                                                  &error_abort), ==, 0);
+    g_assert_cmpint(plan9p1_server_start(f->server, &record_transport_ops,
+                                         &f->transport, &error_abort), ==, 0);
+}
+
 static void fixture_teardown(ServerFixture *f, gconstpointer opaque)
 {
     g_autofree char *path = NULL;
@@ -763,7 +852,11 @@ static void fixture_teardown(ServerFixture *f, gconstpointer opaque)
         }
     }
     g_assert_cmpuint(f->open_file_handles, ==, 0);
+    plan9_auth_keydb_free(f->auth_keydb);
+    f->auth_keydb = NULL;
+    plan9_auth_clear(f->auth_server_key, sizeof(f->auth_server_key));
     g_byte_array_unref(f->transport.output);
+    g_byte_array_unref(f->transport.attempted);
     path = g_build_filename(f->root, "68020", "init", NULL);
     g_assert_cmpint(g_remove(path), ==, 0);
     g_free(path);
@@ -851,6 +944,81 @@ static Plan9P1Fcall transact(ServerFixture *f, Plan9P1Fcall *call)
 {
     send_call(f, call, false);
     return take_reply(f);
+}
+
+static void assert_auth_error(const Plan9P1Fcall *reply)
+{
+    g_assert_cmpuint(reply->type, ==, PLAN9P1_RERROR);
+    g_assert_cmpmem(reply->ename, strlen("authentication failed"),
+                    "authentication failed", strlen("authentication failed"));
+}
+
+static Plan9P1Fcall auth_session(ServerFixture *f,
+                                 const uint8_t client_challenge[
+                                     PLAN9P1_CHALLEN], uint16_t tag)
+{
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TSESSION,
+        .tag = tag,
+    };
+
+    memcpy(call.challenge, client_challenge, sizeof(call.challenge));
+    return transact(f, &call);
+}
+
+static Plan9P1Fcall make_auth_attach(
+    ServerFixture *f, uint16_t fid, uint16_t tag,
+    const uint8_t server_challenge[PLAN9P1_CHALLEN],
+    const uint8_t conversation_key[PLAN9_AUTH_DES_KEY_LEN], uint32_t id,
+    const char *cuid, const char *suid, const char *uname,
+    uint8_t ticket_type, uint8_t authenticator_type)
+{
+    Plan9AuthTicket ticket = {
+        .num = ticket_type,
+    };
+    Plan9AuthAuthenticator authenticator = {
+        .num = authenticator_type,
+        .id = id,
+    };
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH,
+        .tag = tag,
+        .fid = fid,
+    };
+
+    memcpy(ticket.challenge, server_challenge, sizeof(ticket.challenge));
+    g_strlcpy(ticket.cuid, cuid, sizeof(ticket.cuid));
+    g_strlcpy(ticket.suid, suid, sizeof(ticket.suid));
+    memcpy(ticket.key, conversation_key, sizeof(ticket.key));
+    memcpy(authenticator.challenge, server_challenge,
+           sizeof(authenticator.challenge));
+    set_name(call.uname, uname);
+    g_assert_cmpint(plan9_auth_ticket_encode(&ticket, call.ticket,
+                                             &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_encrypt(f->auth_server_key, call.ticket,
+                                       sizeof(call.ticket), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_authenticator_encode(&authenticator, call.auth,
+                                                    &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_encrypt(conversation_key, call.auth,
+                                       sizeof(call.auth), &error_abort),
+                    ==, 0);
+    plan9_auth_ticket_clear(&ticket);
+    plan9_auth_clear(&authenticator, sizeof(authenticator));
+    return call;
+}
+
+static Plan9P1Fcall authenticated_attach(
+    ServerFixture *f, uint16_t fid, uint16_t tag,
+    const uint8_t server_challenge[PLAN9P1_CHALLEN],
+    const uint8_t conversation_key[PLAN9_AUTH_DES_KEY_LEN], uint32_t id,
+    const char *cuid, const char *suid, const char *uname)
+{
+    Plan9P1Fcall call = make_auth_attach(
+        f, fid, tag, server_challenge, conversation_key, id, cuid, suid,
+        uname, PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+
+    return transact(f, &call);
 }
 
 static void attach(ServerFixture *f, uint16_t fid, uint16_t tag)
@@ -3433,6 +3601,528 @@ static void test_rename_live_fids(ServerFixture *f, gconstpointer opaque)
     g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RWSTAT);
 }
 
+static void test_replay_window(void)
+{
+    Plan9P1ReplayState replay = { 0 };
+
+    g_assert_true(plan9p1_replay_accept(&replay, 31));
+    g_assert_cmpuint(replay.low, ==, 16);
+    g_assert_cmphex(replay.used, ==, UINT32_C(0x00008000));
+    g_assert_false(plan9p1_replay_accept(&replay, 15));
+    g_assert_false(plan9p1_replay_accept(&replay, 48));
+    g_assert_true(plan9p1_replay_accept(&replay, 20));
+    g_assert_true(plan9p1_replay_accept(&replay, 18));
+    g_assert_false(plan9p1_replay_accept(&replay, 20));
+
+    replay = (Plan9P1ReplayState) {
+        .low = UINT32_MAX - 1,
+    };
+    g_assert_true(plan9p1_replay_accept(&replay, UINT32_MAX - 1));
+    g_assert_cmpuint(replay.low, ==, UINT32_MAX);
+    g_assert_true(plan9p1_replay_accept(&replay, UINT32_MAX));
+    g_assert_cmpuint(replay.low, ==, 0);
+    g_assert_true(plan9p1_replay_accept(&replay, 0));
+    g_assert_cmpuint(replay.low, ==, 1);
+    g_assert_false(plan9p1_replay_accept(&replay, UINT32_MAX));
+}
+
+static const uint8_t auth_conversation_key[PLAN9_AUTH_DES_KEY_LEN] = {
+    0x71, 0x62, 0x53, 0x44, 0x35, 0x26, 0x17,
+};
+
+static void test_authenticated_session_attach(ServerFixture *f,
+                                              gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = {
+        0x00, 0xff, 0x7f, 0x80, 0x01, 0x02, 0x00, 0xfe,
+    };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    uint8_t response_auth[PLAN9P1_AUTHLEN];
+    Plan9AuthAuthenticator authenticator;
+    Plan9P1Fcall reply;
+
+    expected_server_challenge(0, server_challenge);
+    reply = auth_session(f, client_challenge, 1);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RSESSION);
+    g_assert_cmpmem(reply.challenge, sizeof(reply.challenge),
+                    server_challenge, sizeof(server_challenge));
+    g_assert_cmpmem(reply.authid, 5, "p9fs", 5);
+    g_assert_cmpuint(reply.authid[5], ==, 0);
+    g_assert_cmpmem(reply.authdom, strlen("plan9.local"), "plan9.local",
+                    strlen("plan9.local"));
+    g_assert_cmpuint(reply.authdom[strlen("plan9.local")], ==, 0);
+
+    reply = authenticated_attach(f, 77, 2, server_challenge,
+                                 auth_conversation_key, 7, "tor", "bootes",
+                                 "tor");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RATTACH);
+    g_assert_cmpuint(reply.fid, ==, 77);
+    memcpy(response_auth, reply.auth, sizeof(response_auth));
+    g_assert_cmpint(plan9_auth_decrypt(auth_conversation_key, response_auth,
+                                       sizeof(response_auth), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_authenticator_decode(
+                        response_auth, sizeof(response_auth), &authenticator,
+                        &error_abort), ==, 0);
+    g_assert_cmpuint(authenticator.num, ==, PLAN9_AUTH_AS);
+    g_assert_cmpmem(authenticator.challenge, sizeof(authenticator.challenge),
+                    client_challenge, sizeof(client_challenge));
+    g_assert_cmpuint(authenticator.id, ==, 7);
+    plan9_auth_clear(response_auth, sizeof(response_auth));
+    plan9_auth_clear(&authenticator, sizeof(authenticator));
+}
+
+static void test_authenticated_attach_requires_session(ServerFixture *f,
+                                                       gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 1 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TATTACH,
+        .tag = 1,
+        .fid = 1,
+    };
+    Plan9P1Fcall reply = transact(f, &call);
+
+    assert_auth_error(&reply);
+    expected_server_challenge(0, server_challenge);
+    g_assert_cmpuint(auth_session(f, client_challenge, 2).type, ==,
+                     PLAN9P1_RSESSION);
+    call.tag = 3;
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+}
+
+static void rewrite_ticket_challenge(
+    ServerFixture *f, Plan9P1Fcall *call,
+    const uint8_t challenge[PLAN9P1_CHALLEN])
+{
+    Plan9AuthTicket ticket;
+
+    g_assert_cmpint(plan9_auth_decrypt(f->auth_server_key, call->ticket,
+                                       sizeof(call->ticket), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_decode(call->ticket,
+                                             sizeof(call->ticket), &ticket,
+                                             &error_abort), ==, 0);
+    memcpy(ticket.challenge, challenge, sizeof(ticket.challenge));
+    g_assert_cmpint(plan9_auth_ticket_encode(&ticket, call->ticket,
+                                             &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_encrypt(f->auth_server_key, call->ticket,
+                                       sizeof(call->ticket), &error_abort),
+                    ==, 0);
+    plan9_auth_ticket_clear(&ticket);
+}
+
+static void reencrypt_ticket_with_wrong_key(ServerFixture *f,
+                                            Plan9P1Fcall *call)
+{
+    static const uint8_t wrong_key[PLAN9_AUTH_DES_KEY_LEN] = {
+        0x01, 0x12, 0x23, 0x34, 0x45, 0x56, 0x67,
+    };
+
+    g_assert_cmpint(plan9_auth_decrypt(f->auth_server_key, call->ticket,
+                                       sizeof(call->ticket), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_encrypt(wrong_key, call->ticket,
+                                       sizeof(call->ticket), &error_abort),
+                    ==, 0);
+}
+
+static void rewrite_authenticator_challenge(
+    Plan9P1Fcall *call, const uint8_t challenge[PLAN9P1_CHALLEN])
+{
+    Plan9AuthAuthenticator authenticator;
+
+    g_assert_cmpint(plan9_auth_decrypt(auth_conversation_key, call->auth,
+                                       sizeof(call->auth), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_authenticator_decode(
+                        call->auth, sizeof(call->auth), &authenticator,
+                        &error_abort), ==, 0);
+    memcpy(authenticator.challenge, challenge,
+           sizeof(authenticator.challenge));
+    g_assert_cmpint(plan9_auth_authenticator_encode(
+                        &authenticator, call->auth, &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_encrypt(auth_conversation_key, call->auth,
+                                       sizeof(call->auth), &error_abort),
+                    ==, 0);
+    plan9_auth_clear(&authenticator, sizeof(authenticator));
+}
+
+static void test_authenticated_validation_errors(ServerFixture *f,
+                                                 gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 2 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    uint8_t wrong_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    unsigned int random_call = 0;
+    uint16_t tag = 1;
+
+    /* A wrong server key produces only the generic wire auth error. */
+    expected_server_challenge(random_call++, server_challenge);
+    auth_session(f, client_challenge, tag++);
+    call = make_auth_attach(f, 1, tag++, server_challenge,
+                            auth_conversation_key, 1, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    reencrypt_ticket_with_wrong_key(f, &call);
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+
+    expected_server_challenge(random_call++, server_challenge);
+    auth_session(f, client_challenge, tag++);
+    call = make_auth_attach(f, 2, tag++, server_challenge,
+                            auth_conversation_key, 2, "tor", "tor", "tor",
+                            PLAN9_AUTH_TC, PLAN9_AUTH_AC);
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+
+    expected_server_challenge(random_call++, server_challenge);
+    auth_session(f, client_challenge, tag++);
+    call = make_auth_attach(f, 3, tag++, server_challenge,
+                            auth_conversation_key, 3, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    memcpy(wrong_challenge, server_challenge, sizeof(wrong_challenge));
+    wrong_challenge[0] ^= 1;
+    rewrite_ticket_challenge(f, &call, wrong_challenge);
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+
+    expected_server_challenge(random_call++, server_challenge);
+    auth_session(f, client_challenge, tag++);
+    call = make_auth_attach(f, 4, tag++, server_challenge,
+                            auth_conversation_key, 4, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AS);
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+
+    expected_server_challenge(random_call++, server_challenge);
+    auth_session(f, client_challenge, tag++);
+    call = make_auth_attach(f, 5, tag++, server_challenge,
+                            auth_conversation_key, 5, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    rewrite_authenticator_challenge(&call, wrong_challenge);
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_replay_and_uname(ServerFixture *f,
+                                                gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 3 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall reply;
+    Plan9P1Fcall call;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    reply = authenticated_attach(f, 10, 2, server_challenge,
+                                 auth_conversation_key, 10, "tor", "bootes",
+                                 "tor");
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RATTACH);
+    reply = authenticated_attach(f, 11, 3, server_challenge,
+                                 auth_conversation_key, 10, "tor", "bootes",
+                                 "tor");
+    assert_auth_error(&reply);
+
+    /* Historical validation consumes the ID before checking uname. */
+    reply = authenticated_attach(f, 12, 4, server_challenge,
+                                 auth_conversation_key, 11, "tor", "bootes",
+                                 "wrong");
+    assert_auth_error(&reply);
+    reply = authenticated_attach(f, 12, 5, server_challenge,
+                                 auth_conversation_key, 11, "tor", "bootes",
+                                 "tor");
+    assert_auth_error(&reply);
+
+    /* The complete fixed field must be the canonical zero-padded cuid. */
+    call = make_auth_attach(f, 13, 6, server_challenge,
+                            auth_conversation_key, 12, "tor", "bootes",
+                            "tor", PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    call.uname[4] = 0x5a;
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+    reply = authenticated_attach(f, 13, 7, server_challenge,
+                                 auth_conversation_key, 12, "tor", "bootes",
+                                 "tor");
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_session_reset(ServerFixture *f,
+                                             gconstpointer opaque)
+{
+    const uint8_t first_client[PLAN9P1_CHALLEN] = { 4 };
+    const uint8_t second_client[PLAN9P1_CHALLEN] = { 5 };
+    uint8_t first_server[PLAN9P1_CHALLEN];
+    uint8_t second_server[PLAN9P1_CHALLEN];
+    Plan9P1Fcall old_attach;
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    expected_server_challenge(0, first_server);
+    auth_session(f, first_client, 1);
+    old_attach = make_auth_attach(f, 20, 2, first_server,
+                                  auth_conversation_key, 1, "tor", "tor",
+                                  "tor", PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    reply = transact(f, &old_attach);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RATTACH);
+
+    expected_server_challenge(1, second_server);
+    auth_session(f, second_client, 3);
+    call = (Plan9P1Fcall) {
+        .type = PLAN9P1_TSTAT, .tag = 4, .fid = 20,
+    };
+    g_assert_cmpuint(transact(f, &call).type, ==, PLAN9P1_RERROR);
+    old_attach.tag = 5;
+    old_attach.fid = 21;
+    reply = transact(f, &old_attach);
+    assert_auth_error(&reply);
+
+    plan9p1_server_connection_closed(f->server);
+    pump_server(f->server);
+    g_assert_true(plan9p1_server_record_connection_ready(f->server));
+    old_attach.tag = 6;
+    old_attach.fid = 22;
+    reply = transact(f, &old_attach);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_atomic_backpressure(ServerFixture *f,
+                                                   gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 6 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+    size_t reply_len;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    call = make_auth_attach(f, 30, 2, server_challenge,
+                            auth_conversation_key, 3, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    g_byte_array_set_size(f->transport.attempted, 0);
+    f->transport.would_block = true;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_cmpuint(f->transport.output->len, ==, 0);
+    g_assert_cmpuint(f->transport.attempted->len, >, 0);
+    reply_len = f->transport.attempted->len;
+    f->transport.would_block = false;
+    plan9p1_server_can_send(f->server);
+    g_assert_cmpuint(f->transport.attempted->len, ==, 2 * reply_len);
+    g_assert_cmpmem(f->transport.attempted->data, reply_len,
+                    f->transport.attempted->data + reply_len, reply_len);
+    reply = take_reply(f);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RATTACH);
+}
+
+static void test_authenticated_failures_clear_state(ServerFixture *f,
+                                                    gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 7 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    uint8_t malformed[] = { PLAN9P1_TNOP, 0, 0, 0 };
+    Plan9P1Fcall old_attach;
+    Plan9P1Fcall reply;
+    Error *err = NULL;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    old_attach = make_auth_attach(f, 40, 2, server_challenge,
+                                  auth_conversation_key, 4, "tor", "tor",
+                                  "tor", PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    g_assert_cmpint(plan9p1_server_receive(f->server, malformed,
+                                           sizeof(malformed), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    plan9p1_server_connection_closed(f->server);
+    pump_server(f->server);
+    old_attach.tag = 3;
+    reply = transact(f, &old_attach);
+    assert_auth_error(&reply);
+
+    expected_server_challenge(1, server_challenge);
+    auth_session(f, client_challenge, 4);
+    old_attach = make_auth_attach(f, 41, 5, server_challenge,
+                                  auth_conversation_key, 5, "tor", "tor",
+                                  "tor", PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    f->transport.short_success = 1;
+    send_call(f, &old_attach, false);
+    pump_server(f->server);
+    f->transport.short_success = 0;
+    g_byte_array_set_size(f->transport.output, 0);
+    plan9p1_server_connection_closed(f->server);
+    pump_server(f->server);
+    old_attach.tag = 6;
+    reply = transact(f, &old_attach);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_reentrant_close(ServerFixture *f,
+                                               gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 8 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    call = make_auth_attach(f, 50, 2, server_challenge,
+                            auth_conversation_key, 6, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    f->transport.action = TRANSPORT_ACTION_RECORD_CLOSE_SEND;
+    f->transport.action_done = false;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_true(plan9p1_server_record_connection_ready(f->server));
+    g_byte_array_set_size(f->transport.output, 0);
+    call.tag = 3;
+    call.fid = 51;
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_random_failure(ServerFixture *f,
+                                              gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 9 };
+    Plan9P1Fcall zero_attach = {
+        .type = PLAN9P1_TATTACH, .tag = 2, .fid = 60,
+    };
+    Plan9P1Fcall reply;
+
+    f->auth_random_fail = true;
+    reply = auth_session(f, client_challenge, 1);
+    assert_auth_error(&reply);
+    f->auth_random_fail = false;
+    reply = transact(f, &zero_attach);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_fatal_send(ServerFixture *f,
+                                          gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 10 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall old_attach;
+    Plan9P1Fcall reply;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    old_attach = make_auth_attach(f, 61, 2, server_challenge,
+                                  auth_conversation_key, 12, "tor", "tor",
+                                  "tor", PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    f->transport.fail = true;
+    send_call(f, &old_attach, false);
+    pump_server(f->server);
+    f->transport.fail = false;
+    plan9p1_server_connection_closed(f->server);
+    pump_server(f->server);
+    old_attach.tag = 3;
+    old_attach.fid = 62;
+    reply = transact(f, &old_attach);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_reentrant_reset(ServerFixture *f,
+                                               gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 11 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall call;
+    Plan9P1Fcall reply;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    call = make_auth_attach(f, 63, 2, server_challenge,
+                            auth_conversation_key, 13, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    f->transport.action = TRANSPORT_ACTION_RESET_SEND;
+    f->transport.action_done = false;
+    send_call(f, &call, false);
+    pump_server(f->server);
+    g_assert_true(plan9p1_server_record_connection_ready(f->server));
+    g_byte_array_set_size(f->transport.output, 0);
+    call.tag = 3;
+    call.fid = 64;
+    reply = transact(f, &call);
+    assert_auth_error(&reply);
+}
+
+static void test_authenticated_reentrant_free(ServerFixture *f,
+                                              gconstpointer opaque)
+{
+    const uint8_t client_challenge[PLAN9P1_CHALLEN] = { 12 };
+    uint8_t server_challenge[PLAN9P1_CHALLEN];
+    Plan9P1Fcall call;
+    unsigned int cleanup_target;
+
+    expected_server_challenge(0, server_challenge);
+    auth_session(f, client_challenge, 1);
+    call = make_auth_attach(f, 65, 2, server_challenge,
+                            auth_conversation_key, 14, "tor", "tor", "tor",
+                            PLAN9_AUTH_TS, PLAN9_AUTH_AC);
+    cleanup_target = f->cleanup_calls + 1;
+    f->transport.action = TRANSPORT_ACTION_FREE_SEND;
+    f->transport.action_done = false;
+    send_call(f, &call, false);
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    g_assert_null(f->server);
+}
+
+static void test_authenticated_config_lifecycle(ServerFixture *f,
+                                                gconstpointer opaque)
+{
+    Plan9P1AuthConfig config = {
+        .keydb = f->auth_keydb,
+        .auth_id = "p9fs",
+        .auth_domain = "plan9.local",
+        .random_bytes = auth_random_bytes,
+        .random_opaque = f,
+        .now_seconds = auth_now_seconds,
+        .now_opaque = f,
+    };
+    Plan9P1Server *candidate;
+    Error *err = NULL;
+    unsigned int cleanup_target = f->cleanup_calls + 1;
+
+    plan9p1_server_free(f->server);
+    f->server = NULL;
+    while (f->cleanup_calls < cleanup_target) {
+        aio_poll(qemu_get_aio_context(), true);
+    }
+    candidate = PLAN9P1_SERVER(object_new(TYPE_PLAN9P1_SERVER));
+    g_assert_cmpint(plan9p1_server_backend_init(candidate, "testfs", NULL,
+                                                &error_abort), ==, 0);
+    g_assert_cmpint(plan9p1_server_configure_auth(candidate, NULL, &err), <,
+                    0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    config.auth_id = "missing";
+    g_assert_cmpint(plan9p1_server_configure_auth(candidate, &config, &err),
+                    <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    config.auth_id = "p9fs";
+    g_assert_cmpint(plan9p1_server_configure_auth(candidate, &config,
+                                                  &error_abort), ==, 0);
+    g_assert_cmpint(plan9p1_server_start(candidate, &transport_ops,
+                                         &f->transport, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpint(plan9p1_server_start(candidate, &record_transport_ops,
+                                         &f->transport, &error_abort), ==, 0);
+    f->server = candidate;
+}
+
 int main(int argc, char **argv)
 {
     Plan9P1ServerOptions one_device = { .max_devices = 1 };
@@ -3450,6 +4140,48 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     module_call_init(MODULE_INIT_QOM);
     qemu_init_main_loop(&error_abort);
+    g_test_add_func("/plan9-9p1-server/auth/replay-window",
+                    test_replay_window);
+    g_test_add("/plan9-9p1-server/auth/session-attach", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_session_attach,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/requires-session", ServerFixture,
+               NULL, auth_fixture_setup,
+               test_authenticated_attach_requires_session,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/validation-errors", ServerFixture,
+               NULL, auth_fixture_setup, test_authenticated_validation_errors,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/replay-uname", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_replay_and_uname,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/session-reset", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_session_reset,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/atomic-backpressure", ServerFixture,
+               NULL, auth_fixture_setup,
+               test_authenticated_atomic_backpressure, fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/failures-clear-state", ServerFixture,
+               NULL, auth_fixture_setup,
+               test_authenticated_failures_clear_state, fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/reentrant-close", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_reentrant_close,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/random-failure", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_random_failure,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/fatal-send", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_fatal_send,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/reentrant-reset", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_reentrant_reset,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/reentrant-free", ServerFixture, NULL,
+               auth_fixture_setup, test_authenticated_reentrant_free,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/auth/config-lifecycle", ServerFixture,
+               NULL, auth_fixture_setup,
+               test_authenticated_config_lifecycle, fixture_teardown);
     g_test_add("/plan9-9p1-server/session", ServerFixture, NULL,
                fixture_setup, test_session_reply, fixture_teardown);
     g_test_add("/plan9-9p1-server/boot-sequence", ServerFixture, NULL,

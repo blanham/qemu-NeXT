@@ -36,6 +36,7 @@
 #define HW_9PFS_PLAN9_9P1_SERVER_H
 
 #include "hw/9pfs/9p-backend.h"
+#include "hw/9pfs/plan9-auth.h"
 #include "qom/object.h"
 
 typedef struct Error Error;
@@ -68,6 +69,26 @@ typedef struct Plan9P1ServerOptions {
     size_t max_qid_entries;         /* zero selects the built-in bound. */
 } Plan9P1ServerOptions;
 
+typedef struct Plan9P1AuthConfig {
+    /* Immutable and caller-owned; it must outlive the server. */
+    const Plan9AuthKeydb *keydb;
+    const char *auth_id;
+    const char *auth_domain;
+    /* NULL callbacks select QEMU crypto randomness and host wall time. */
+    Plan9AuthRandomBytes random_bytes;
+    void *random_opaque;
+    Plan9AuthNowSeconds now_seconds;
+    void *now_opaque;
+} Plan9P1AuthConfig;
+
+typedef struct Plan9P1ReplayState {
+    uint32_t low;
+    uint32_t used;
+} Plan9P1ReplayState;
+
+/* Exact Second Edition unsigned 32-ID replay window, including wraparound. */
+bool plan9p1_replay_accept(Plan9P1ReplayState *state, uint32_t id);
+
 /*
  * All entry points run on the server's main AioContext.  receive() only
  * frames and queues input; it never enters a coroutine on the caller's stack.
@@ -95,6 +116,12 @@ int plan9p1_server_start(Plan9P1Server *server,
                          const Plan9P1TransportOps *ops,
                          void *transport_opaque,
                          Error **errp);
+/*
+ * Must be called before start(); record transport alone does not enable auth.
+ */
+int plan9p1_server_configure_auth(Plan9P1Server *server,
+                                  const Plan9P1AuthConfig *config,
+                                  Error **errp);
 int plan9p1_server_receive(Plan9P1Server *server,
                            const uint8_t *buf, size_t len,
                            Error **errp);
@@ -106,6 +133,9 @@ void plan9p1_server_connection_closed(Plan9P1Server *server);
 /* Reset is asynchronous when an operation or open fid needs worker cleanup. */
 void plan9p1_server_reset(Plan9P1Server *server);
 bool plan9p1_server_busy(const Plan9P1Server *server);
+
+/* True after record-connection cleanup has fully retired. */
+bool plan9p1_server_record_connection_ready(const Plan9P1Server *server);
 
 /*
  * Stop accepting transport input and start asynchronous fid cleanup without

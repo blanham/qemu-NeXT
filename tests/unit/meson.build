@@ -164,6 +164,7 @@ if have_system
       ],
       'test-plan9-9p1-server': [
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
         files('plan9-9p1-slirp-stub.c'),
@@ -171,6 +172,7 @@ if have_system
       ],
       'test-plan9-9p1-server-local': [
         meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
         meson.project_source_root() / 'hw/9pfs/9p-local.c',
         meson.project_source_root() / 'hw/9pfs/9p-posix-acl.c',
         meson.project_source_root() / 'hw/9pfs/9p-xattr.c',
