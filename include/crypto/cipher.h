@@ -84,6 +84,16 @@ struct QCryptoCipher {
 };
 
 /**
+ * qcrypto_memzero:
+ * @ptr: buffer to erase (may be NULL when @len is zero)
+ * @len: number of bytes to erase
+ *
+ * Reliably clear sensitive data.  The implementation prevents the compiler
+ * from removing the stores as dead writes.
+ */
+void qcrypto_memzero(void *ptr, size_t len);
+
+/**
  * qcrypto_cipher_supports:
  * @alg: the cipher algorithm
  * @mode: the cipher mode

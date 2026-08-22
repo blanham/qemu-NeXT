@@ -68,6 +68,17 @@ static const bool mode_need_iv[QCRYPTO_CIPHER_MODE__MAX] = {
     [QCRYPTO_CIPHER_MODE_CTR] = true,
 };
 
+void qcrypto_memzero(void *ptr, size_t len)
+{
+    /* Volatile stores resist removal of sensitive-data erasure. */
+    volatile uint8_t *bytes = ptr;
+
+    while (len) {
+        *bytes++ = 0;
+        len--;
+    }
+}
+
 
 size_t qcrypto_cipher_get_block_len(QCryptoCipherAlgo alg)
 {

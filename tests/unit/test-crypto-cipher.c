@@ -810,6 +810,17 @@ static void test_cipher_short_plaintext(void)
     qcrypto_cipher_free(cipher);
 }
 
+static void test_cipher_memzero(void)
+{
+    uint8_t secret[32];
+
+    memset(secret, 0xa5, sizeof(secret));
+    qcrypto_memzero(secret, sizeof(secret));
+    for (size_t i = 0; i < sizeof(secret); i++) {
+        g_assert_cmpuint(secret[i], ==, 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     size_t i;
@@ -817,6 +828,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     g_assert(qcrypto_init(NULL) == 0);
+
+    g_test_add_func("/crypto/cipher/memzero", test_cipher_memzero);
 
     for (i = 0; i < G_N_ELEMENTS(test_data); i++) {
         if (qcrypto_cipher_supports(test_data[i].alg, test_data[i].mode)) {

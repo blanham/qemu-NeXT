@@ -54,12 +54,20 @@ typedef struct Plan9AuthAuthenticator {
 } Plan9AuthAuthenticator;
 
 /*
- * A successfully decoded ticket contains a conversation key.  Call this
- * after use; successful encode output is likewise caller-owned plaintext.
+ * Securely clear caller-owned secrets.  The implementation uses volatile
+ * stores so the compiler cannot omit the erase.  Call after every successful
+ * passtokey, decoded ticket, or plaintext ticket/authentication exchange.
  */
+void plan9_auth_clear(void *ptr, size_t len);
+
+/* A typed wrapper for a decoded ticket containing a conversation key. */
 void plan9_auth_ticket_clear(Plan9AuthTicket *ticket);
 
-/* Passwords must be representable in a historical NAMELEN field (<= 27). */
+/*
+ * Passwords must be representable in a historical NAMELEN field (<= 27).
+ * This deliberate helper constraint rejects too-long byte strings instead of
+ * silently truncating them; the count is bytes, not Unicode code points.
+ */
 int plan9_auth_passtokey(uint8_t key[PLAN9_AUTH_DES_KEY_LEN],
                          const char *password, Error **errp);
 

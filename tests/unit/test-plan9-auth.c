@@ -2,7 +2,8 @@
 /*
  * Golden values were independently checked from the preserved Second Edition
  * sources in the Plan 9 rootfs: sys/src/libauth/{passtokey,convTR2M,
- * convT2M,convA2M}.c and sys/man/2/encrypt.  The historical DES block values
+ * convM2TR,convT2M,convM2T,convA2M}.c and sys/man/2/encrypt.  The historical
+ * DES block values
  * were cross-checked with OpenSSL DES/ECB after applying the documented
  * packed 56-bit-to-odd-parity 64-bit conversion; no real credential occurs
  * in these fixtures.
@@ -43,7 +44,20 @@ static void test_passtokey(void)
         0x26, 0x1b, 0x62, 0xdb, 0x16, 0x3c, 0x49,
     };
     uint8_t key[PLAN9_AUTH_DES_KEY_LEN];
+    static const char password_27[] = "012345678901234567890123456";
+    static const char password_28[] = "0123456789012345678901234567";
+    static const char password_utf8_27[] =
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9" "a";
+    static const char password_utf8_28[] =
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9"
+        "\xc3\xa9\xc3\xa9\xc3\xa9\xc3\xa9";
     Error *err = NULL;
+
+    g_assert_cmpint(plan9_auth_passtokey(key, "", &err), ==, 0);
+    g_assert_null(err);
 
     g_assert_cmpint(plan9_auth_passtokey(key, "abc", &err), ==, 0);
     g_assert_null(err);
@@ -53,9 +67,25 @@ static void test_passtokey(void)
     g_assert_null(err);
     g_assert_cmpmem(key, sizeof(key), long_expected, sizeof(long_expected));
 
-    g_assert_cmpint(plan9_auth_passtokey(key,
-                                         "0123456789012345678901234567",
-                                         &err), <, 0);
+    g_assert_cmpuint(strlen(password_27), ==, PLAN9_AUTH_NAMELEN - 1);
+    g_assert_cmpint(plan9_auth_passtokey(key, password_27, &err), ==, 0);
+    g_assert_null(err);
+
+    g_assert_cmpuint(strlen(password_28), ==, PLAN9_AUTH_NAMELEN);
+    g_assert_cmpint(plan9_auth_passtokey(key, password_28, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    for (size_t i = 0; i < sizeof(key); i++) {
+        g_assert_cmpuint(key[i], ==, 0);
+    }
+
+    g_assert_cmpuint(strlen(password_utf8_27), ==, PLAN9_AUTH_NAMELEN - 1);
+    g_assert_cmpint(plan9_auth_passtokey(key, password_utf8_27, &err), ==, 0);
+    g_assert_null(err);
+
+    g_assert_cmpuint(strlen(password_utf8_28), ==, PLAN9_AUTH_NAMELEN);
+    g_assert_cmpint(plan9_auth_passtokey(key, password_utf8_28, &err), <, 0);
     g_assert_nonnull(err);
     error_free(err);
     for (size_t i = 0; i < sizeof(key); i++) {
@@ -271,6 +301,20 @@ static void assert_zeroed(const void *data, size_t len)
     }
 }
 
+static void test_public_clear(void)
+{
+    uint8_t plaintext[PLAN9_AUTH_TICKET_LEN];
+    Plan9AuthTicket ticket;
+
+    memset(plaintext, 0xa5, sizeof(plaintext));
+    plan9_auth_clear(plaintext, sizeof(plaintext));
+    assert_zeroed(plaintext, sizeof(plaintext));
+
+    memset(&ticket, 0xa5, sizeof(ticket));
+    plan9_auth_ticket_clear(&ticket);
+    assert_zeroed(&ticket, sizeof(ticket));
+}
+
 static void test_encode_failure_wipes_output(void)
 {
     Plan9AuthTicketRequest request = {
@@ -424,7 +468,7 @@ static void test_decode_failure_wipes_destination(void)
     assert_zeroed(&auth, sizeof(auth));
 }
 
-static void test_decode_rejects_unterminated_strings(void)
+static void test_decode_fixed_string_compatibility(void)
 {
     uint8_t request_wire[PLAN9_AUTH_TICKET_REQUEST_LEN] = { 0 };
     uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN] = { 0 };
@@ -441,28 +485,34 @@ static void test_decode_rejects_unterminated_strings(void)
     for (size_t i = 0; i < G_N_ELEMENTS(request_fields); i++) {
         memset(request_wire, 0, sizeof(request_wire));
         memset(request_wire + request_fields[i], 'x', request_sizes[i]);
+        char *const dest[] = {
+            request.authid, request.authdom, request.hostid, request.uid,
+        };
+
         memset(&request, 0xa5, sizeof(request));
         g_assert_cmpint(plan9_auth_ticket_request_decode(request_wire,
                                                           sizeof(request_wire),
                                                           &request, &err),
-                        <, 0);
-        g_assert_nonnull(err);
-        error_free(err);
-        assert_zeroed(&request, sizeof(request));
-        err = NULL;
+                        ==, 0);
+        g_assert_null(err);
+        g_assert_cmpuint(dest[i][request_sizes[i] - 2], ==, 'x');
+        g_assert_cmpuint(dest[i][request_sizes[i] - 1], ==, 0);
+        g_assert_cmpuint(dest[i][request_sizes[i]], ==, 0);
     }
 
     for (size_t i = 0; i < G_N_ELEMENTS(ticket_fields); i++) {
         memset(ticket_wire, 0, sizeof(ticket_wire));
         memset(ticket_wire + ticket_fields[i], 'x', PLAN9_AUTH_NAMELEN);
+        char *const dest[] = { ticket.cuid, ticket.suid };
+
         memset(&ticket, 0xa5, sizeof(ticket));
         g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire,
                                                   sizeof(ticket_wire),
-                                                  &ticket, &err), <, 0);
-        g_assert_nonnull(err);
-        error_free(err);
-        assert_zeroed(&ticket, sizeof(ticket));
-        err = NULL;
+                                                  &ticket, &err), ==, 0);
+        g_assert_null(err);
+        g_assert_cmpuint(dest[i][PLAN9_AUTH_NAMELEN - 2], ==, 'x');
+        g_assert_cmpuint(dest[i][PLAN9_AUTH_NAMELEN - 1], ==, 0);
+        g_assert_cmpuint(dest[i][PLAN9_AUTH_NAMELEN], ==, 0);
     }
 
     memset(request_wire, 0, sizeof(request_wire));
@@ -486,6 +536,10 @@ static void test_decode_rejects_unterminated_strings(void)
     g_assert_cmpstr(request.authdom, ==, "d");
     g_assert_cmpstr(request.hostid, ==, "h");
     g_assert_cmpstr(request.uid, ==, "u");
+    g_assert_cmpuint((uint8_t)request.authid[2], ==, 0xa5);
+    g_assert_cmpuint((uint8_t)request.authdom[2], ==, 0xa5);
+    g_assert_cmpuint((uint8_t)request.hostid[2], ==, 0xa5);
+    g_assert_cmpuint((uint8_t)request.uid[2], ==, 0xa5);
 
     memset(ticket_wire, 0, sizeof(ticket_wire));
     ticket_wire[9] = 'c';
@@ -499,6 +553,8 @@ static void test_decode_rejects_unterminated_strings(void)
     g_assert_null(err);
     g_assert_cmpstr(ticket.cuid, ==, "c");
     g_assert_cmpstr(ticket.suid, ==, "s");
+    g_assert_cmpuint((uint8_t)ticket.cuid[2], ==, 0xa5);
+    g_assert_cmpuint((uint8_t)ticket.suid[2], ==, 0xa5);
     plan9_auth_ticket_clear(&ticket);
     assert_zeroed(&ticket, sizeof(ticket));
 }
@@ -516,11 +572,12 @@ int main(int argc, char **argv)
     g_test_add_func("/plan9-auth/rejections-wipe-ticket-output",
                     test_rejections_wipe_ticket_output);
     g_test_add_func("/plan9-auth/invalid-arguments", test_invalid_arguments);
+    g_test_add_func("/plan9-auth/public-clear", test_public_clear);
     g_test_add_func("/plan9-auth/encode-failure-wipes-output",
                     test_encode_failure_wipes_output);
     g_test_add_func("/plan9-auth/decode-failure-wipes-destination",
                     test_decode_failure_wipes_destination);
-    g_test_add_func("/plan9-auth/decode-unterminated-strings",
-                    test_decode_rejects_unterminated_strings);
+    g_test_add_func("/plan9-auth/decode-fixed-string-compatibility",
+                    test_decode_fixed_string_compatibility);
     return g_test_run();
 }
