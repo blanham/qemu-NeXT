@@ -18,7 +18,21 @@ enum {
     PLAN9_AUTH_TICKET_LEN = 72,
     PLAN9_AUTH_AUTHENTICATOR_LEN = 13,
     PLAN9_AUTH_MAX_CRYPT_LEN = 4096,
+    /* A 168 KiB database is already far beyond the original 512-user keyfs. */
+    PLAN9_AUTH_KEYDB_MAX_RECORDS = 4096,
+    PLAN9_AUTH_KEYDB_RECORD_LEN = 41,
 };
+
+typedef struct Plan9AuthKeydb Plan9AuthKeydb;
+
+typedef enum Plan9AuthKeyStatus {
+    PLAN9_AUTH_KEY_MISSING,
+    PLAN9_AUTH_KEY_AVAILABLE,
+    PLAN9_AUTH_KEY_DISABLED,
+    PLAN9_AUTH_KEY_EXPIRED,
+} Plan9AuthKeyStatus;
+
+typedef void (*Plan9AuthKeydbReadHook)(const char *path, void *opaque);
 
 typedef enum Plan9AuthType {
     PLAN9_AUTH_TREQ = 1,
@@ -62,6 +76,25 @@ void plan9_auth_clear(void *ptr, size_t len);
 
 /* A typed wrapper for a decoded ticket containing a conversation key. */
 void plan9_auth_ticket_clear(Plan9AuthTicket *ticket);
+
+/*
+ * Load native Second Edition /adm/keys records encrypted independently with
+ * master_key.  server_id must name an enabled, unexpired record at now.
+ */
+Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
+                                      const uint8_t master_key[
+                                          PLAN9_AUTH_DES_KEY_LEN],
+                                      const char *server_id, uint32_t now,
+                                      Error **errp);
+void plan9_auth_keydb_free(Plan9AuthKeydb *keydb);
+Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
+                                           const char *name, uint32_t now,
+                                           uint8_t key[
+                                               PLAN9_AUTH_DES_KEY_LEN]);
+
+/* Unit-test-only race injection point; production code never installs one. */
+void plan9_auth_keydb_set_read_hook(Plan9AuthKeydbReadHook hook,
+                                    void *opaque);
 
 /*
  * Passwords must be representable in a historical NAMELEN field (<= 27).

@@ -7,9 +7,26 @@
  *   architecture object in sys/src/libc/port/crypt.{2,8,v}.save).
  */
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "crypto/cipher.h"
 #include "hw/9pfs/plan9-auth.h"
 #include "qapi/error.h"
+
+typedef struct Plan9AuthKeydbEntry {
+    char name[PLAN9_AUTH_NAMELEN];
+    uint8_t key[PLAN9_AUTH_DES_KEY_LEN];
+    uint8_t status;
+    uint8_t warnings;
+    uint32_t expiry;
+} Plan9AuthKeydbEntry;
+
+struct Plan9AuthKeydb {
+    size_t count;
+    Plan9AuthKeydbEntry *entries;
+};
+
+static Plan9AuthKeydbReadHook keydb_read_hook;
+static void *keydb_read_hook_opaque;
 
 void plan9_auth_clear(void *ptr, size_t len)
 {
@@ -21,6 +38,221 @@ void plan9_auth_ticket_clear(Plan9AuthTicket *ticket)
     if (ticket) {
         plan9_auth_clear(ticket, sizeof(*ticket));
     }
+}
+
+void plan9_auth_keydb_set_read_hook(Plan9AuthKeydbReadHook hook,
+                                    void *opaque)
+{
+    keydb_read_hook = hook;
+    keydb_read_hook_opaque = opaque;
+}
+
+static bool plan9_auth_keydb_metadata_equal(const struct stat *a,
+                                            const struct stat *b)
+{
+    if (a->st_dev != b->st_dev || a->st_ino != b->st_ino ||
+        a->st_mode != b->st_mode || a->st_size != b->st_size ||
+        a->st_mtime != b->st_mtime || a->st_ctime != b->st_ctime) {
+        return false;
+    }
+#if defined(CONFIG_DARWIN) || defined(CONFIG_FREEBSD)
+    return a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
+           a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+#else
+    return a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+           a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
+}
+
+static Plan9AuthKeyStatus
+plan9_auth_keydb_entry_status(const Plan9AuthKeydbEntry *entry, uint32_t now)
+{
+    if (entry->status == 1) {
+        return PLAN9_AUTH_KEY_DISABLED;
+    }
+    if (entry->expiry && entry->expiry < now) {
+        return PLAN9_AUTH_KEY_EXPIRED;
+    }
+    return PLAN9_AUTH_KEY_AVAILABLE;
+}
+
+void plan9_auth_keydb_free(Plan9AuthKeydb *keydb)
+{
+    if (!keydb) {
+        return;
+    }
+    plan9_auth_clear(keydb->entries,
+                    keydb->count * sizeof(*keydb->entries));
+    g_free(keydb->entries);
+    plan9_auth_clear(keydb, sizeof(*keydb));
+    g_free(keydb);
+}
+
+Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
+                                           const char *name, uint32_t now,
+                                           uint8_t key[
+                                               PLAN9_AUTH_DES_KEY_LEN])
+{
+    if (key) {
+        plan9_auth_clear(key, PLAN9_AUTH_DES_KEY_LEN);
+    }
+    if (!keydb || !name) {
+        return PLAN9_AUTH_KEY_MISSING;
+    }
+
+    for (size_t i = 0; i < keydb->count; i++) {
+        const Plan9AuthKeydbEntry *entry = &keydb->entries[i];
+        Plan9AuthKeyStatus status;
+
+        if (strcmp(entry->name, name)) {
+            continue;
+        }
+        status = plan9_auth_keydb_entry_status(entry, now);
+        if (status == PLAN9_AUTH_KEY_AVAILABLE && key) {
+            memcpy(key, entry->key, PLAN9_AUTH_DES_KEY_LEN);
+        }
+        return status;
+    }
+    return PLAN9_AUTH_KEY_MISSING;
+}
+
+Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
+                                      const uint8_t master_key[
+                                          PLAN9_AUTH_DES_KEY_LEN],
+                                      const char *server_id, uint32_t now,
+                                      Error **errp)
+{
+    Plan9AuthKeydb *keydb = NULL;
+    struct stat before, after, pathname;
+    uint8_t *records = NULL;
+    uint8_t eof;
+    int fd = -1;
+    size_t bytes = 0, count, offset = 0;
+    ssize_t got;
+
+    if (!path || !master_key || !server_id) {
+        error_setg(errp,
+                   "Plan 9 key database path, key, and server are required");
+        return NULL;
+    }
+
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "cannot open Plan 9 key database");
+        goto fail;
+    }
+    if (fstat(fd, &before) < 0) {
+        error_setg_errno(errp, errno, "cannot stat Plan 9 key database");
+        goto fail;
+    }
+    if (!S_ISREG(before.st_mode)) {
+        error_setg(errp, "Plan 9 key database is not a regular file");
+        goto fail;
+    }
+    if (before.st_size <= 0 ||
+        before.st_size % PLAN9_AUTH_KEYDB_RECORD_LEN ||
+        before.st_size / PLAN9_AUTH_KEYDB_RECORD_LEN >
+            PLAN9_AUTH_KEYDB_MAX_RECORDS) {
+        error_setg(errp, "Plan 9 key database has an invalid size");
+        goto fail;
+    }
+    bytes = before.st_size;
+    count = bytes / PLAN9_AUTH_KEYDB_RECORD_LEN;
+    records = g_malloc(bytes);
+    while (offset < bytes) {
+        got = read(fd, records + offset, bytes - offset);
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got <= 0) {
+            if (got < 0) {
+                error_setg_errno(errp, errno,
+                                 "cannot read Plan 9 key database");
+            } else {
+                error_setg(errp, "Plan 9 key database changed during read");
+            }
+            goto fail;
+        }
+        offset += got;
+    }
+    do {
+        got = read(fd, &eof, sizeof(eof));
+    } while (got < 0 && errno == EINTR);
+    if (got != 0) {
+        if (got < 0) {
+            error_setg_errno(errp, errno,
+                             "cannot finish reading Plan 9 key database");
+        } else {
+            error_setg(errp, "Plan 9 key database changed during read");
+        }
+        goto fail;
+    }
+
+    if (keydb_read_hook) {
+        keydb_read_hook(path, keydb_read_hook_opaque);
+    }
+    if (fstat(fd, &after) < 0 ||
+        fstatat(AT_FDCWD, path, &pathname, AT_SYMLINK_NOFOLLOW) < 0) {
+        error_setg_errno(errp, errno, "cannot revalidate Plan 9 key database");
+        goto fail;
+    }
+    if (!plan9_auth_keydb_metadata_equal(&before, &after) ||
+        !plan9_auth_keydb_metadata_equal(&before, &pathname)) {
+        error_setg(errp, "Plan 9 key database changed during read");
+        goto fail;
+    }
+
+    keydb = g_new0(Plan9AuthKeydb, 1);
+    keydb->count = count;
+    keydb->entries = g_new0(Plan9AuthKeydbEntry, count);
+    for (size_t i = 0; i < count; i++) {
+        uint8_t *record = records + i * PLAN9_AUTH_KEYDB_RECORD_LEN;
+        Plan9AuthKeydbEntry *entry = &keydb->entries[i];
+
+        if (plan9_auth_decrypt(master_key, record,
+                               PLAN9_AUTH_KEYDB_RECORD_LEN, errp)) {
+            goto fail;
+        }
+        memcpy(entry->name, record, PLAN9_AUTH_NAMELEN);
+        /* Match passline(): historical full-width names lose byte 27. */
+        entry->name[PLAN9_AUTH_NAMELEN - 1] = 0;
+        memcpy(entry->key, record + PLAN9_AUTH_NAMELEN,
+               PLAN9_AUTH_DES_KEY_LEN);
+        entry->status = record[PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN];
+        entry->warnings = record[PLAN9_AUTH_NAMELEN +
+                                 PLAN9_AUTH_DES_KEY_LEN + 1];
+        entry->expiry = ldl_le_p(record + PLAN9_AUTH_NAMELEN +
+                                 PLAN9_AUTH_DES_KEY_LEN + 2);
+        if (entry->status >= 2) {
+            error_setg(errp, "Plan 9 key database record has invalid status");
+            goto fail;
+        }
+        for (size_t other = 0; other < i; other++) {
+            if (!strcmp(entry->name, keydb->entries[other].name)) {
+                error_setg(errp, "Plan 9 key database has duplicate names");
+                goto fail;
+            }
+        }
+    }
+    if (plan9_auth_keydb_lookup(keydb, server_id, now, NULL) !=
+        PLAN9_AUTH_KEY_AVAILABLE) {
+        error_setg(errp, "Plan 9 key database server is unavailable");
+        goto fail;
+    }
+
+    close(fd);
+    plan9_auth_clear(records, bytes);
+    g_free(records);
+    return keydb;
+
+fail:
+    if (fd >= 0) {
+        close(fd);
+    }
+    plan9_auth_clear(records, bytes);
+    g_free(records);
+    plan9_auth_keydb_free(keydb);
+    return NULL;
 }
 
 static uint8_t odd_parity(uint8_t value)
