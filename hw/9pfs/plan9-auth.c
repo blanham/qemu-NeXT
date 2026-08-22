@@ -116,6 +116,52 @@ Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
     return PLAN9_AUTH_KEY_MISSING;
 }
 
+int plan9_auth_keydb_record_encode(
+    uint8_t out[PLAN9_AUTH_KEYDB_RECORD_LEN],
+    const uint8_t master_key[PLAN9_AUTH_DES_KEY_LEN], const char *name,
+    const uint8_t key[PLAN9_AUTH_DES_KEY_LEN], uint8_t status,
+    uint8_t warnings, uint32_t expiry, Error **errp)
+{
+    uint8_t plain[PLAN9_AUTH_KEYDB_RECORD_LEN] = { 0 };
+    size_t name_len;
+    int ret = -1;
+
+    if (out) {
+        plan9_auth_clear(out, PLAN9_AUTH_KEYDB_RECORD_LEN);
+    }
+    if (!out || !master_key || !name || !key) {
+        error_setg(errp, "Plan 9 key database record fields are required");
+        goto out;
+    }
+    name_len = strnlen(name, PLAN9_AUTH_NAMELEN);
+    if (!name_len || name_len >= PLAN9_AUTH_NAMELEN) {
+        error_setg(errp, "Plan 9 key names must be 1 to %u bytes",
+                   PLAN9_AUTH_NAMELEN - 1);
+        goto out;
+    }
+    if (status >= 2) {
+        error_setg(errp, "Plan 9 key status is invalid");
+        goto out;
+    }
+
+    memcpy(plain, name, name_len);
+    memcpy(plain + PLAN9_AUTH_NAMELEN, key, PLAN9_AUTH_DES_KEY_LEN);
+    plain[PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN] = status;
+    plain[PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN + 1] = warnings;
+    stl_le_p(plain + PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN + 2,
+             expiry);
+    memcpy(out, plain, sizeof(plain));
+    if (plan9_auth_encrypt(master_key, out, sizeof(plain), errp)) {
+        plan9_auth_clear(out, PLAN9_AUTH_KEYDB_RECORD_LEN);
+        goto out;
+    }
+    ret = 0;
+
+out:
+    plan9_auth_clear(plain, sizeof(plain));
+    return ret;
+}
+
 Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
                                       const uint8_t master_key[
                                           PLAN9_AUTH_DES_KEY_LEN],

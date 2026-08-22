@@ -57,6 +57,7 @@ tests = {
   'test-plan9-auth': [
     meson.project_source_root() / 'hw/9pfs/plan9-auth.c',
     crypto,
+    util,
   ],
 }
 
@@ -244,9 +245,12 @@ if have_ga and host_os == 'linux'
   test_deps += {'test-qga': qga}
 endif
 
+test_deps += {'test-plan9-auth': qemu_plan9_keydb}
+
 test_env = environment()
 test_env.set('G_TEST_SRCDIR', meson.current_source_dir())
 test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
+test_env.set('QEMU_PLAN9_KEYDB', qemu_plan9_keydb.full_path())
 
 slow_tests = {
   'test-aio-multithread' : 120,

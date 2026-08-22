@@ -10,8 +10,15 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/base64.h"
 #include "hw/9pfs/plan9-auth.h"
 #include "qapi/error.h"
+
+#include <termios.h>
+
+#ifdef HAVE_OPENPTY
+#include <pty.h>
+#endif
 
 static void assert_zeroed(const void *data, size_t len);
 
@@ -43,6 +50,213 @@ static void keydb_remove_tree(const char *dir)
 
     unlink(path);
     rmdir(dir);
+}
+
+typedef struct KeydbToolResult {
+    int status;
+    char *out;
+    char *err;
+    char *terminal;
+#ifdef HAVE_OPENPTY
+    struct termios termios_before;
+    struct termios termios_after;
+    bool have_termios;
+#endif
+} KeydbToolResult;
+
+typedef struct KeydbToolBarrier {
+    GMutex lock;
+    GCond ready;
+    unsigned int count;
+} KeydbToolBarrier;
+
+static char *read_all_fd(int fd)
+{
+    GString *text = g_string_new(NULL);
+    char buf[256];
+    ssize_t got;
+
+    while ((got = read(fd, buf, sizeof(buf))) > 0) {
+        g_string_append_len(text, buf, got);
+    }
+    return g_string_free(text, false);
+}
+
+static bool read_until_fd(int fd, GString *text, const char *needle)
+{
+    char byte;
+
+    while (!strstr(text->str, needle)) {
+        if (read(fd, &byte, 1) != 1) {
+            return false;
+        }
+        g_string_append_c(text, byte);
+    }
+    return true;
+}
+
+static KeydbToolResult keydb_tool_run_barrier(
+    const char *keydb, const char *secret, const char *server_id,
+    const char *password_input, bool tty, KeydbToolBarrier *barrier,
+    const char *late_collision, int signal_after_prompt)
+{
+    const char *tool = g_getenv("QEMU_PLAN9_KEYDB");
+    char *argv[] = {
+        (char *)tool, (char *)"create", (char *)"--keydb", (char *)keydb,
+        (char *)"--secret", (char *)secret, (char *)"--server-id",
+        (char *)server_id, NULL,
+    };
+    KeydbToolResult result = { .status = -1 };
+    GError *gerr = NULL;
+    GPid pid = 0;
+    int out_pipe[2], err_pipe[2];
+    int input = -1;
+    GString *early_err = g_string_new(NULL);
+#ifdef HAVE_OPENPTY
+    int master = -1, slave = -1;
+    int observe = -1;
+#endif
+
+    g_assert_nonnull(tool);
+    g_assert_cmpint(pipe(out_pipe), ==, 0);
+    g_assert_cmpint(pipe(err_pipe), ==, 0);
+#ifdef HAVE_OPENPTY
+    if (tty) {
+        g_assert_cmpint(openpty(&master, &slave, NULL, NULL, NULL), ==, 0);
+        observe = dup(slave);
+        g_assert_cmpint(observe, >=, 0);
+        g_assert_cmpint(tcgetattr(observe, &result.termios_before), ==, 0);
+        input = slave;
+    } else
+#endif
+    {
+        input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        g_assert_cmpint(input, >=, 0);
+    }
+    g_assert_true(g_spawn_async_with_fds(NULL, argv, NULL,
+                                         G_SPAWN_DO_NOT_REAP_CHILD,
+                                         NULL, NULL, &pid, input,
+                                         out_pipe[1], err_pipe[1], &gerr));
+    g_assert_no_error(gerr);
+    close(input);
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+#ifdef HAVE_OPENPTY
+    if (tty) {
+        const char *newline;
+
+        g_assert_nonnull(password_input);
+        newline = strchr(password_input, '\n');
+        g_assert_nonnull(newline);
+        if (read_until_fd(err_pipe[0], early_err, "tor password: ")) {
+            if (signal_after_prompt) {
+                g_assert_cmpint(kill(pid, signal_after_prompt), ==, 0);
+                goto wait_for_child;
+            }
+            if (late_collision) {
+                g_assert_true(g_file_set_contents(late_collision,
+                                                  "late-secret", 11, NULL));
+            }
+            if (barrier) {
+                g_mutex_lock(&barrier->lock);
+                barrier->count++;
+                g_cond_broadcast(&barrier->ready);
+                while (barrier->count < 2) {
+                    g_cond_wait(&barrier->ready, &barrier->lock);
+                }
+                g_mutex_unlock(&barrier->lock);
+            }
+            g_assert_cmpint(write(master, password_input,
+                                  newline - password_input + 1), ==,
+                            newline - password_input + 1);
+            if (read_until_fd(err_pipe[0], early_err,
+                              "confirm tor password: ")) {
+                newline++;
+                g_assert_cmpint(write(master, newline, strlen(newline)), ==,
+                                strlen(newline));
+            }
+        }
+    }
+#else
+    g_assert_false(tty);
+#endif
+wait_for_child:
+    g_assert_cmpint(waitpid(pid, &result.status, 0), ==, pid);
+    g_spawn_close_pid(pid);
+    result.out = read_all_fd(out_pipe[0]);
+    {
+        g_autofree char *remaining = read_all_fd(err_pipe[0]);
+
+        g_string_append(early_err, remaining);
+        result.err = g_string_free(early_err, false);
+        early_err = NULL;
+    }
+    close(out_pipe[0]);
+    close(err_pipe[0]);
+#ifdef HAVE_OPENPTY
+    if (tty) {
+        int flags = fcntl(master, F_GETFL);
+
+        g_assert_cmpint(tcgetattr(observe, &result.termios_after), ==, 0);
+        result.have_termios = true;
+        close(observe);
+        g_assert_cmpint(fcntl(master, F_SETFL, flags | O_NONBLOCK), ==, 0);
+        result.terminal = read_all_fd(master);
+        close(master);
+    }
+#endif
+    if (early_err) {
+        g_string_free(early_err, true);
+    }
+    return result;
+}
+
+static KeydbToolResult keydb_tool_run(const char *keydb, const char *secret,
+                                      const char *server_id,
+                                      const char *password_input, bool tty)
+{
+    return keydb_tool_run_barrier(keydb, secret, server_id, password_input,
+                                  tty, NULL, NULL, 0);
+}
+
+static void keydb_tool_result_clear(KeydbToolResult *result)
+{
+    g_free(result->out);
+    g_free(result->err);
+    g_free(result->terminal);
+}
+
+#ifdef HAVE_OPENPTY
+static void assert_termios_restored(const KeydbToolResult *result)
+{
+    g_assert_true(result->have_termios);
+    g_assert_cmpuint(result->termios_after.c_iflag, ==,
+                     result->termios_before.c_iflag);
+    g_assert_cmpuint(result->termios_after.c_oflag, ==,
+                     result->termios_before.c_oflag);
+    g_assert_cmpuint(result->termios_after.c_cflag, ==,
+                     result->termios_before.c_cflag);
+    g_assert_cmpuint(result->termios_after.c_lflag, ==,
+                     result->termios_before.c_lflag);
+    g_assert_cmpmem(result->termios_after.c_cc,
+                    sizeof(result->termios_after.c_cc),
+                    result->termios_before.c_cc,
+                    sizeof(result->termios_before.c_cc));
+}
+#endif
+
+static void assert_no_keydb_temps(const char *dir, size_t expected_files)
+{
+    g_autoptr(GDir) stream = g_dir_open(dir, 0, NULL);
+    const char *name;
+    size_t count = 0;
+
+    g_assert_nonnull(stream);
+    while ((name = g_dir_read_name(stream))) {
+        g_assert_null(strstr(name, ".qemu-plan9-keydb-"));
+        count++;
+    }
+    g_assert_cmpuint(count, ==, expected_files);
 }
 
 static void keydb_write(const char *path, const KeydbFixtureRecord *records,
@@ -162,6 +376,409 @@ static void test_keydb_golden_and_lookup(void)
     plan9_auth_keydb_free(keydb);
     keydb_remove_tree(dir);
 }
+
+static void test_keydb_record_encoder(void)
+{
+    static const uint8_t expected[PLAN9_AUTH_KEYDB_RECORD_LEN] = {
+        0x75, 0x6f, 0x1a, 0x43, 0x45, 0x3a, 0x6d, 0xb7, 0xf1, 0x32,
+        0x56, 0x77, 0x3c, 0x36, 0x05, 0xb9, 0x68, 0xaf, 0xca, 0xd1,
+        0x57, 0x13, 0xa7, 0x3c, 0x8f, 0xab, 0xcf, 0x37, 0xd7, 0xd2,
+        0x12, 0xeb, 0x03, 0xbd, 0x8d, 0x02, 0xe1, 0x88, 0x1c, 0x9f,
+        0x2b,
+    };
+    static const uint8_t record_key[PLAN9_AUTH_DES_KEY_LEN] = {
+        1, 2, 3, 4, 5, 6, 7,
+    };
+    uint8_t record[PLAN9_AUTH_KEYDB_RECORD_LEN];
+    uint8_t plain[PLAN9_AUTH_KEYDB_RECORD_LEN];
+    Error *err = NULL;
+
+    g_assert_cmpint(plan9_auth_keydb_record_encode(record, keydb_master_key,
+                                                    "p9fs", record_key,
+                                                    0, 9, 0, &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpmem(record, sizeof(record), expected, sizeof(expected));
+
+    memcpy(plain, record, sizeof(plain));
+    g_assert_cmpint(plan9_auth_decrypt(keydb_master_key, plain,
+                                      sizeof(plain), &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpmem(plain, 4, "p9fs", 4);
+    assert_zeroed(plain + 4, PLAN9_AUTH_NAMELEN - 4);
+    g_assert_cmpmem(plain + PLAN9_AUTH_NAMELEN,
+                    PLAN9_AUTH_DES_KEY_LEN, record_key,
+                    PLAN9_AUTH_DES_KEY_LEN);
+    g_assert_cmpuint(plain[PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN],
+                     ==, 0);
+    g_assert_cmpuint(plain[PLAN9_AUTH_NAMELEN + PLAN9_AUTH_DES_KEY_LEN + 1],
+                     ==, 9);
+    g_assert_cmpuint(ldl_le_p(plain + PLAN9_AUTH_NAMELEN +
+                              PLAN9_AUTH_DES_KEY_LEN + 2), ==, 0);
+
+    memset(record, 0xa5, sizeof(record));
+    g_assert_cmpint(plan9_auth_keydb_record_encode(record, keydb_master_key,
+                                                    "", record_key,
+                                                    0, 0, 0, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    assert_zeroed(record, sizeof(record));
+
+    memset(record, 0xa5, sizeof(record));
+    g_assert_cmpint(plan9_auth_keydb_record_encode(record, keydb_master_key,
+                                                    "1234567890123456789012345678",
+                                                    record_key, 0, 0, 0,
+                                                    &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    assert_zeroed(record, sizeof(record));
+
+    memset(record, 0xa5, sizeof(record));
+    g_assert_cmpint(plan9_auth_keydb_record_encode(record, keydb_master_key,
+                                                    "p9fs", record_key,
+                                                    2, 0, 0, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    assert_zeroed(record, sizeof(record));
+    plan9_auth_clear(plain, sizeof(plain));
+}
+
+static void test_keydb_tool_rejects_non_tty(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolResult result = keydb_tool_run(keydb, secret, "p9fs", NULL,
+                                            false);
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    g_assert_null(strstr(result.out, "password"));
+    assert_no_keydb_temps(dir, 0);
+    keydb_tool_result_clear(&result);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_rejects_malformed_command(void)
+{
+    const char *tool = g_getenv("QEMU_PLAN9_KEYDB");
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    g_autofree char *out = NULL;
+    g_autofree char *err = NULL;
+    char *argv[] = {
+        (char *)tool, (char *)"create", (char *)"--keydb", keydb,
+        (char *)"--keydb", secret, (char *)"--server-id",
+        (char *)"p9fs", NULL,
+    };
+    GError *gerr = NULL;
+    int status;
+
+    g_assert_nonnull(tool);
+    g_assert_true(g_spawn_sync(NULL, argv, NULL, 0, NULL, NULL, &out, &err,
+                               &status, &gerr));
+    g_assert_no_error(gerr);
+    g_assert_true(WIFEXITED(status));
+    g_assert_cmpint(WEXITSTATUS(status), !=, 0);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    assert_no_keydb_temps(dir, 0);
+    rmdir(dir);
+}
+
+#ifdef HAVE_OPENPTY
+static void test_keydb_tool_success(void)
+{
+    static const char fixture_password[] = "historical-fixture";
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb_path = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret_path = g_build_filename(dir, "secret", NULL);
+    g_autofree char *secret_text = NULL;
+    g_autofree char *keydb_text = NULL;
+    gsize secret_text_len = 0;
+    gsize keydb_text_len = 0;
+    g_autofree uint8_t *master_key = NULL;
+    size_t master_len = 0;
+    uint8_t tor_key[PLAN9_AUTH_DES_KEY_LEN];
+    uint8_t expected_tor_key[PLAN9_AUTH_DES_KEY_LEN];
+    uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN];
+    struct stat st;
+    Error *err = NULL;
+    Plan9AuthKeydb *keydb;
+    KeydbToolResult result = keydb_tool_run(
+        keydb_path, secret_path, "p9fs",
+        "historical-fixture\nhistorical-fixture\n", true);
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), ==, 0);
+    assert_termios_restored(&result);
+    g_assert_cmpstr(result.out, ==, "");
+    g_assert_null(strstr(result.err, fixture_password));
+    g_assert_null(strstr(result.terminal, fixture_password));
+    g_assert_cmpint(stat(keydb_path, &st), ==, 0);
+    g_assert_cmpint(st.st_size, ==, 2 * PLAN9_AUTH_KEYDB_RECORD_LEN);
+    g_assert_cmpuint(st.st_mode & 0777, ==, 0600);
+    g_assert_cmpint(stat(secret_path, &st), ==, 0);
+    g_assert_cmpint(st.st_size, ==, 12);
+    g_assert_cmpuint(st.st_mode & 0777, ==, 0600);
+    g_assert_true(g_file_get_contents(secret_path, &secret_text,
+                                      &secret_text_len, NULL));
+    g_assert_cmpuint(secret_text_len, ==, 12);
+    g_assert_null(memchr(secret_text, '\n', secret_text_len));
+    master_key = qbase64_decode(secret_text, secret_text_len, &master_len,
+                                &err);
+    g_assert_null(err);
+    g_assert_cmpuint(master_len, ==, PLAN9_AUTH_DES_KEY_LEN);
+    g_assert_true(g_file_get_contents(keydb_path, &keydb_text,
+                                      &keydb_text_len, NULL));
+    g_assert_cmpuint(keydb_text_len, ==, 2 * PLAN9_AUTH_KEYDB_RECORD_LEN);
+    g_assert_cmpint(plan9_auth_decrypt(master_key, (uint8_t *)keydb_text,
+                                      PLAN9_AUTH_KEYDB_RECORD_LEN,
+                                      &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpstr(keydb_text, ==, "tor");
+    g_assert_cmpint(plan9_auth_decrypt(
+                        master_key,
+                        (uint8_t *)keydb_text + PLAN9_AUTH_KEYDB_RECORD_LEN,
+                        PLAN9_AUTH_KEYDB_RECORD_LEN, &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpstr(keydb_text + PLAN9_AUTH_KEYDB_RECORD_LEN, ==, "p9fs");
+    keydb = plan9_auth_keydb_load(keydb_path, master_key, "p9fs", 0, &err);
+    g_assert_null(err);
+    g_assert_nonnull(keydb);
+    g_assert_cmpint(plan9_auth_keydb_lookup(keydb, "tor", 0, tor_key), ==,
+                    PLAN9_AUTH_KEY_AVAILABLE);
+    g_assert_cmpint(plan9_auth_keydb_lookup(keydb, "tor", UINT32_MAX,
+                                            NULL), ==,
+                    PLAN9_AUTH_KEY_AVAILABLE);
+    g_assert_cmpint(plan9_auth_passtokey(expected_tor_key, fixture_password,
+                                         &err), ==, 0);
+    g_assert_null(err);
+    g_assert_cmpmem(tor_key, sizeof(tor_key), expected_tor_key,
+                    sizeof(expected_tor_key));
+    g_assert_cmpint(plan9_auth_keydb_lookup(keydb, "p9fs", 0, server_key),
+                    ==, PLAN9_AUTH_KEY_AVAILABLE);
+    g_assert_cmpint(plan9_auth_keydb_lookup(keydb, "p9fs", UINT32_MAX,
+                                            NULL), ==,
+                    PLAN9_AUTH_KEY_AVAILABLE);
+    g_assert_cmpint(memcmp(master_key, server_key, sizeof(server_key)), !=, 0);
+    g_assert_cmpint(memcmp(tor_key, server_key, sizeof(server_key)), !=, 0);
+    plan9_auth_keydb_free(keydb);
+    plan9_auth_clear(tor_key, sizeof(tor_key));
+    plan9_auth_clear(expected_tor_key, sizeof(expected_tor_key));
+    plan9_auth_clear(server_key, sizeof(server_key));
+    plan9_auth_clear(master_key, master_len);
+    plan9_auth_clear(secret_text, secret_text_len);
+    plan9_auth_clear(keydb_text, keydb_text_len);
+    assert_no_keydb_temps(dir, 2);
+    keydb_tool_result_clear(&result);
+    unlink(secret_path);
+    unlink(keydb_path);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_password_mismatch(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolResult result = keydb_tool_run(keydb, secret, "p9fs",
+                                            "first\nsecond\n", true);
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    assert_termios_restored(&result);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    g_assert_null(strstr(result.out, "first"));
+    g_assert_null(strstr(result.err, "first"));
+    g_assert_null(strstr(result.terminal, "first"));
+    assert_no_keydb_temps(dir, 0);
+    keydb_tool_result_clear(&result);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_rejects_unrepresentable(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    static const char too_long[] = "0123456789012345678901234567";
+    KeydbToolResult result = keydb_tool_run(
+        keydb, secret, "p9fs",
+        "0123456789012345678901234567\n"
+        "0123456789012345678901234567\n", true);
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    assert_termios_restored(&result);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    g_assert_null(strstr(result.err, too_long));
+    g_assert_null(strstr(result.terminal, too_long));
+    assert_no_keydb_temps(dir, 0);
+    keydb_tool_result_clear(&result);
+
+    result = keydb_tool_run(keydb, secret, "tor", "pw\npw\n", true);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    keydb_tool_result_clear(&result);
+    result = keydb_tool_run(keydb, secret,
+                            "1234567890123456789012345678",
+                            "pw\npw\n", true);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    keydb_tool_result_clear(&result);
+    result = keydb_tool_run(keydb, keydb, "p9fs", "pw\npw\n", true);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    keydb_tool_result_clear(&result);
+    assert_no_keydb_temps(dir, 0);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_signal_restores_terminal(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolResult result = keydb_tool_run_barrier(
+        keydb, secret, "p9fs", "unused\nunused\n", true, NULL, NULL,
+        SIGTERM);
+
+    g_assert_true(WIFSIGNALED(result.status));
+    g_assert_cmpint(WTERMSIG(result.status), ==, SIGTERM);
+    assert_termios_restored(&result);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    assert_no_keydb_temps(dir, 0);
+    keydb_tool_result_clear(&result);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_collision_refusal(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    g_autofree char *contents = NULL;
+    gsize len;
+    KeydbToolResult result;
+
+    g_assert_true(g_file_set_contents(keydb, "keep", 4, NULL));
+    result = keydb_tool_run(keydb, secret, "p9fs", "pw\npw\n", true);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_true(g_file_get_contents(keydb, &contents, &len, NULL));
+    g_assert_cmpmem(contents, len, "keep", 4);
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    assert_no_keydb_temps(dir, 1);
+    keydb_tool_result_clear(&result);
+    unlink(keydb);
+
+    g_assert_cmpint(symlink("missing", keydb), ==, 0);
+    result = keydb_tool_run(keydb, secret, "p9fs", "pw\npw\n", true);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_true(g_file_test(keydb, G_FILE_TEST_IS_SYMLINK));
+    g_assert_false(g_file_test(secret, G_FILE_TEST_EXISTS));
+    assert_no_keydb_temps(dir, 1);
+    keydb_tool_result_clear(&result);
+    unlink(keydb);
+
+    g_assert_true(g_file_set_contents(secret, "keep-secret", 11, NULL));
+    result = keydb_tool_run(keydb, secret, "p9fs", "pw\npw\n", true);
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_clear_pointer(&contents, g_free);
+    g_assert_true(g_file_get_contents(secret, &contents, &len, NULL));
+    g_assert_cmpmem(contents, len, "keep-secret", 11);
+    assert_no_keydb_temps(dir, 1);
+    keydb_tool_result_clear(&result);
+    unlink(secret);
+    rmdir(dir);
+}
+
+typedef struct KeydbToolThread {
+    const char *keydb;
+    const char *secret;
+    KeydbToolBarrier *barrier;
+    KeydbToolResult result;
+} KeydbToolThread;
+
+static gpointer keydb_tool_thread(gpointer opaque)
+{
+    KeydbToolThread *thread = opaque;
+
+    thread->result = keydb_tool_run_barrier(
+        thread->keydb, thread->secret, "p9fs", "pw\npw\n", true,
+        thread->barrier, NULL, 0);
+    return NULL;
+}
+
+static void test_keydb_tool_concurrent_winner(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    KeydbToolBarrier barrier;
+    KeydbToolThread workers[2] = {
+        { .keydb = keydb, .secret = secret, .barrier = &barrier },
+        { .keydb = keydb, .secret = secret, .barrier = &barrier },
+    };
+    GThread *threads[2];
+    unsigned int successes = 0;
+
+    g_mutex_init(&barrier.lock);
+    g_cond_init(&barrier.ready);
+    barrier.count = 0;
+    for (size_t i = 0; i < G_N_ELEMENTS(threads); i++) {
+        threads[i] = g_thread_new("plan9-keydb", keydb_tool_thread,
+                                  &workers[i]);
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(threads); i++) {
+        g_thread_join(threads[i]);
+        g_assert_true(WIFEXITED(workers[i].result.status));
+        successes += WEXITSTATUS(workers[i].result.status) == 0;
+        keydb_tool_result_clear(&workers[i].result);
+    }
+    g_assert_cmpuint(successes, ==, 1);
+    g_assert_true(g_file_test(keydb, G_FILE_TEST_IS_REGULAR));
+    g_assert_true(g_file_test(secret, G_FILE_TEST_IS_REGULAR));
+    assert_no_keydb_temps(dir, 2);
+    g_cond_clear(&barrier.ready);
+    g_mutex_clear(&barrier.lock);
+    unlink(secret);
+    unlink(keydb);
+    rmdir(dir);
+}
+
+static void test_keydb_tool_late_collision_rollback(void)
+{
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *keydb = g_build_filename(dir, "keys", NULL);
+    g_autofree char *secret = g_build_filename(dir, "secret", NULL);
+    g_autofree char *contents = NULL;
+    gsize len;
+    KeydbToolResult result = keydb_tool_run_barrier(
+        keydb, secret, "p9fs", "pw\npw\n", true, NULL, secret, 0);
+
+    g_assert_true(WIFEXITED(result.status));
+    g_assert_cmpint(WEXITSTATUS(result.status), !=, 0);
+    g_assert_false(g_file_test(keydb, G_FILE_TEST_EXISTS));
+    g_assert_true(g_file_get_contents(secret, &contents, &len, NULL));
+    g_assert_cmpmem(contents, len, "late-secret", 11);
+    assert_no_keydb_temps(dir, 1);
+    keydb_tool_result_clear(&result);
+    unlink(secret);
+    rmdir(dir);
+}
+#endif
 
 static void test_keydb_rejections(void)
 {
@@ -878,6 +1495,28 @@ int main(int argc, char **argv)
                     test_decode_fixed_string_compatibility);
     g_test_add_func("/plan9-auth/keydb-golden-and-lookup",
                     test_keydb_golden_and_lookup);
+    g_test_add_func("/plan9-auth/keydb-record-encoder",
+                    test_keydb_record_encoder);
+    g_test_add_func("/plan9-auth/keydb-tool/non-tty",
+                    test_keydb_tool_rejects_non_tty);
+    g_test_add_func("/plan9-auth/keydb-tool/malformed-command",
+                    test_keydb_tool_rejects_malformed_command);
+#ifdef HAVE_OPENPTY
+    g_test_add_func("/plan9-auth/keydb-tool/success",
+                    test_keydb_tool_success);
+    g_test_add_func("/plan9-auth/keydb-tool/password-mismatch",
+                    test_keydb_tool_password_mismatch);
+    g_test_add_func("/plan9-auth/keydb-tool/rejects-unrepresentable",
+                    test_keydb_tool_rejects_unrepresentable);
+    g_test_add_func("/plan9-auth/keydb-tool/signal-restores-terminal",
+                    test_keydb_tool_signal_restores_terminal);
+    g_test_add_func("/plan9-auth/keydb-tool/collision-refusal",
+                    test_keydb_tool_collision_refusal);
+    g_test_add_func("/plan9-auth/keydb-tool/concurrent-winner",
+                    test_keydb_tool_concurrent_winner);
+    g_test_add_func("/plan9-auth/keydb-tool/late-collision-rollback",
+                    test_keydb_tool_late_collision_rollback);
+#endif
     g_test_add_func("/plan9-auth/keydb-rejections", test_keydb_rejections);
     g_test_add_func("/plan9-auth/keydb-max-and-immutable-copy",
                     test_keydb_max_and_immutable_copy);

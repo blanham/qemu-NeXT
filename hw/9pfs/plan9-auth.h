@@ -92,6 +92,13 @@ Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
                                            uint8_t key[
                                                PLAN9_AUTH_DES_KEY_LEN]);
 
+/* Pack and encrypt one native 41-byte /adm/keys record. */
+int plan9_auth_keydb_record_encode(
+    uint8_t out[PLAN9_AUTH_KEYDB_RECORD_LEN],
+    const uint8_t master_key[PLAN9_AUTH_DES_KEY_LEN], const char *name,
+    const uint8_t key[PLAN9_AUTH_DES_KEY_LEN], uint8_t status,
+    uint8_t warnings, uint32_t expiry, Error **errp);
+
 /* Unit-test-only race injection point; production code never installs one. */
 void plan9_auth_keydb_set_read_hook(Plan9AuthKeydbReadHook hook,
                                     void *opaque);
