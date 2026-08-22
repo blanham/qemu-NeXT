@@ -1294,10 +1294,10 @@ slirp_udp_service = false
 slirp_bootp_root = false
 if slirp.found()
   if slirp.type_name() == 'internal'
-    # The immutable fallback revision provides both APIs.  Normal QEMU targets
-    # compile and link against its exported public dependency, which validates
-    # that contract without crossing Meson's subproject sandbox.
-    slirp_il = true
+    # The immutable fallback revision provides the Plan 9 BOOTP API.  Normal
+    # QEMU targets compile and link against its exported public dependency,
+    # which validates that contract without crossing Meson's subproject
+    # sandbox.  The NFS fork does not carry the optional IL API.
     slirp_plan9_bootp = true
     slirp_udp_service = true
     slirp_bootp_root = true

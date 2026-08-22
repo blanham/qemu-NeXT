@@ -38,7 +38,11 @@ if enable_passt
   system_ss.add(files('passt.c'))
 endif
 
-system_ss.add(files('slirp-il.c'))
+system_ss.add(files(
+  'slirp-bootp.c',
+  'slirp-il.c',
+  'slirp-udp.c',
+))
 system_ss.add(when: slirp, if_true: files(
   'slirp.c',
   'slirp-guestfwd.c',

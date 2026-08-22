@@ -195,6 +195,10 @@ if have_system
 
   if slirp.found()
   tests += {
+    'test-slirp-udp': [
+      meson.project_source_root() / 'net/slirp-bootp.c',
+      meson.project_source_root() / 'net/slirp-udp.c',
+    ],
     'test-slirp-plan9': [
       meson.project_source_root() / 'net/slirp-plan9.c',
     ],
@@ -202,9 +206,11 @@ if have_system
       meson.project_source_root() / 'net/slirp-guestfwd.c',
     ],
     'test-slirp-il-integration': [
+      meson.project_source_root() / 'net/slirp-bootp.c',
       meson.project_source_root() / 'net/slirp-il.c',
       meson.project_source_root() / 'net/slirp-guestfwd.c',
       meson.project_source_root() / 'net/slirp-plan9.c',
+      meson.project_source_root() / 'net/slirp-udp.c',
       slirp,
     ],
   }

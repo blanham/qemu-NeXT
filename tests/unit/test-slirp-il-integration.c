@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "qemu/osdep.h"
 #include "net/net.h"
+#include "net/slirp-bootp.h"
 #include "net/slirp-il.h"
 #include "net/slirp-plan9.h"
+#include "net/slirp-udp.h"
 #include "net/slirp.h"
 #include "qapi/error.h"
 #include <libslirp.h>
@@ -11,6 +13,10 @@ static NetClientState *test_netdev;
 static uint8_t sent_packet[1024];
 static size_t sent_packet_len;
 static unsigned sent_packet_count;
+
+#define ETHERNET_HEADER_LEN 14
+#define IPV4_HEADER_LEN 20
+#define UDP_HEADER_LEN 8
 
 NetClientState *qemu_new_net_client(NetClientInfo *info,
                                     NetClientState *peer,
@@ -127,10 +133,6 @@ static struct in_addr test_addr(void)
     return (struct in_addr) { htonl(0x0a000204) };
 }
 
-#ifdef CONFIG_SLIRP_PLAN9_BOOTP
-#define ETHERNET_HEADER_LEN 14
-#define IPV4_HEADER_LEN 20
-#define UDP_HEADER_LEN 8
 #define BOOTP_FIXED_LEN 236
 #define BOOTP_VENDOR_LEN 64
 #define BOOTP_OFFSET (ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN)
@@ -158,6 +160,7 @@ static uint16_t ipv4_checksum(const uint8_t *header, size_t length)
     return ~sum;
 }
 
+#ifdef CONFIG_SLIRP_PLAN9_BOOTP
 static void send_plan9_bootp_request(SlirpState *s, const char *expected)
 {
     static const uint8_t mac[] = { 0x00, 0x00, 0x0f, 0x12, 0x34, 0x56 };
@@ -194,6 +197,164 @@ static void send_plan9_bootp_request(SlirpState *s, const char *expected)
                      BOOTP_OFFSET + BOOTP_VENDOR_OFFSET + strlen(expected));
     g_assert_cmpmem(sent_packet + BOOTP_OFFSET + BOOTP_VENDOR_OFFSET,
                     strlen(expected), expected, strlen(expected));
+}
+#endif
+
+typedef struct UdpState {
+    QemuSlirpUdpListener *listener;
+    struct sockaddr_in peer;
+    uint8_t data[32];
+    size_t len;
+    unsigned calls;
+    int send_result;
+} UdpState;
+
+static void udp_datagram(QemuSlirpUdpListener *listener,
+                         const struct sockaddr_in *peer,
+                         const uint8_t *data, size_t len, void *opaque)
+{
+    UdpState *state = opaque;
+
+    state->calls++;
+    state->peer = *peer;
+    g_assert_cmpuint(len, <=, sizeof(state->data));
+    memcpy(state->data, data, len);
+    state->len = len;
+    state->send_result = qemu_slirp_udp_send(listener, peer, data, len);
+}
+
+static const QemuSlirpUdpListenerOps udp_listener_ops = {
+    .datagram = udp_datagram,
+};
+
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+static void learn_client_arp(SlirpState *s)
+{
+    static const uint8_t mac[] = { 0x00, 0x00, 0x0f, 0x12, 0x34, 0x56 };
+    uint8_t packet[ETHERNET_HEADER_LEN + 28] = {0};
+    uint8_t *arp = packet + ETHERNET_HEADER_LEN;
+
+    memset(packet, 0xff, 6);
+    memcpy(packet + 6, mac, sizeof(mac));
+    store_be16(packet + 12, 0x0806);
+    store_be16(arp, 1);
+    store_be16(arp + 2, 0x0800);
+    arp[4] = 6;
+    arp[5] = 4;
+    store_be16(arp + 6, 1);
+    memcpy(arp + 8, mac, sizeof(mac));
+    arp[14] = 10;
+    arp[15] = 0;
+    arp[16] = 2;
+    arp[17] = 15;
+    memcpy(arp + 18, mac, sizeof(mac));
+    memcpy(arp + 24, arp + 14, 4);
+    s->nc.info->receive(&s->nc, packet, sizeof(packet));
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+}
+
+static void send_udp_request(SlirpState *s, uint16_t port,
+                             const uint8_t *payload, size_t payload_len)
+{
+    static const uint8_t mac[] = { 0x00, 0x00, 0x0f, 0x12, 0x34, 0x56 };
+    uint8_t packet[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN + 32]
+        = {0};
+    uint8_t *ip_header = packet + ETHERNET_HEADER_LEN;
+    uint8_t *udp = ip_header + IPV4_HEADER_LEN;
+    size_t length = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN +
+                    payload_len;
+
+    g_assert_cmpuint(payload_len, <=, 32);
+    packet[0] = 0x52;
+    packet[1] = 0x55;
+    packet[2] = 10;
+    packet[3] = 0;
+    packet[4] = 2;
+    packet[5] = 2;
+    memcpy(packet + 6, mac, sizeof(mac));
+    store_be16(packet + 12, 0x0800);
+    ip_header[0] = 0x45;
+    store_be16(ip_header + 2, length - ETHERNET_HEADER_LEN);
+    ip_header[8] = 64;
+    ip_header[9] = 17;
+    ip_header[12] = 10;
+    ip_header[13] = 0;
+    ip_header[14] = 2;
+    ip_header[15] = 15;
+    ip_header[16] = 10;
+    ip_header[17] = 0;
+    ip_header[18] = 2;
+    ip_header[19] = 2;
+    store_be16(ip_header + 10,
+               ipv4_checksum(ip_header, IPV4_HEADER_LEN));
+    store_be16(udp, 49152);
+    store_be16(udp + 2, port);
+    store_be16(udp + 4, UDP_HEADER_LEN + payload_len);
+    memcpy(udp + UDP_HEADER_LEN, payload, payload_len);
+
+    s->nc.info->receive(&s->nc, packet, length);
+}
+#endif
+
+static uint16_t load_be16(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint32_t load_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+#ifdef CONFIG_SLIRP_BOOTP_ROOT
+static void send_root_bootp_request(SlirpState *s)
+{
+    static const uint8_t mac[] = { 0x00, 0x00, 0x0f, 0x12, 0x34, 0x56 };
+    uint8_t request[BOOTP_REQUEST_LEN] = {0};
+    uint8_t *ip_header = request + ETHERNET_HEADER_LEN;
+    uint8_t *udp = ip_header + IPV4_HEADER_LEN;
+    uint8_t *bootp = request + BOOTP_OFFSET;
+    uint8_t *vendor = bootp + BOOTP_VENDOR_OFFSET;
+    const uint8_t *reply_bootp;
+    const uint8_t *option;
+
+    memset(request, 0xff, 6);
+    memcpy(request + 6, mac, sizeof(mac));
+    store_be16(request + 12, 0x0800);
+    ip_header[0] = 0x45;
+    store_be16(ip_header + 2, sizeof(request) - ETHERNET_HEADER_LEN);
+    ip_header[8] = 64;
+    ip_header[9] = 17;
+    memset(ip_header + 16, 0xff, sizeof(struct in_addr));
+    store_be16(ip_header + 10, ipv4_checksum(ip_header, IPV4_HEADER_LEN));
+    store_be16(udp, 68);
+    store_be16(udp + 2, 67);
+    store_be16(udp + 4, sizeof(request) - ETHERNET_HEADER_LEN -
+                             IPV4_HEADER_LEN);
+    bootp[0] = 1;
+    bootp[1] = 1;
+    bootp[2] = 6;
+    memcpy(bootp + 28, mac, sizeof(mac));
+    memcpy(vendor, "\x63\x82\x53\x63\xff", 5);
+
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    s->nc.info->receive(&s->nc, request, sizeof(request));
+    g_assert_cmpuint(sent_packet_count, ==, 1);
+    reply_bootp = sent_packet + BOOTP_OFFSET;
+    g_assert_cmphex(load_be32(reply_bootp + 20), ==, 0x0a000202);
+    option = reply_bootp + BOOTP_VENDOR_OFFSET + 4;
+    while (option + 1 < sent_packet + sent_packet_len && *option != 255) {
+        if (*option == 17) {
+            g_assert_cmpuint(option[1], ==, 1);
+            g_assert_cmpuint(option[2], ==, '/');
+            return;
+        }
+        option += option[1] + 2;
+    }
+    g_assert_not_reached();
 }
 #endif
 
@@ -244,6 +405,19 @@ static SlirpState *new_user_netdev(void)
     g_assert_nonnull(s->slirp);
     s->guestfwds = qemu_slirp_guestfwd_registry_new(
         true, net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+    s->udp_registry = qemu_slirp_udp_registry_new(
+        true, host, &slirp_udp_backend_ops, s);
+#else
+    s->udp_registry = qemu_slirp_udp_registry_new(true, host, NULL, NULL);
+#endif
+#ifdef CONFIG_SLIRP_BOOTP_ROOT
+    s->bootp_registry = qemu_slirp_bootp_registry_new(
+        true, host, &slirp_bootp_backend_ops, s);
+#else
+    s->bootp_registry = qemu_slirp_bootp_registry_new(
+        true, host, NULL, NULL);
+#endif
 #ifdef CONFIG_SLIRP_PLAN9_BOOTP
     s->plan9 = qemu_slirp_plan9_registry_new(
         true, net, mask, host, dns, &slirp_plan9_backend_ops, s);
@@ -274,6 +448,21 @@ static void test_named_netdev_facade(void)
 {
     Error *err = NULL;
     QemuSlirpILListener *listener = NULL;
+    QemuSlirpUdpListener *udp = NULL;
+    QemuSlirpBootpRootLease *root = NULL;
+
+    g_assert_cmpint(qemu_slirp_udp_listen("missing", 2049, NULL, NULL,
+                                          &udp, &err), ==, -1);
+    g_assert_nonnull(err);
+    g_assert_null(udp);
+    error_free(err);
+    err = NULL;
+    g_assert_false(qemu_slirp_bootp_root_claim("missing", "/", &root,
+                                               &err));
+    g_assert_nonnull(err);
+    g_assert_null(root);
+    error_free(err);
+    err = NULL;
 
     g_assert_false(qemu_slirp_plan9_bootp_available("missing", &err));
     g_assert_nonnull(err);
@@ -305,6 +494,12 @@ static void test_user_netdev_lifecycle_paths(void)
     QemuSlirpILListener *listener = NULL;
     uint8_t packet[ETH_HLEN] = {0};
     QemuSlirpPlan9BootpLease *bootp = NULL;
+    QemuSlirpBootpRootLease *root = NULL;
+    QemuSlirpUdpListener *udp = NULL;
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+    static const uint8_t message[] = { 0x12, 0x34, 0x56, 0x78 };
+    UdpState udp_state = {.send_result = -1};
+#endif
 
     s->nc.info->receive(&s->nc, packet, sizeof(packet));
     s->poll_notifier.notify(&s->poll_notifier, &poll);
@@ -335,8 +530,44 @@ static void test_user_netdev_lifecycle_paths(void)
         g_assert_nonnull(strstr(error_get_pretty(err), "not a user-mode"));
         error_free(err);
         err = NULL;
+        g_assert_cmpint(qemu_slirp_udp_listen("user0", 2049,
+                                              &udp_listener_ops, NULL, &udp,
+                                              &err), ==, -1);
+        g_assert_nonnull(err);
+        error_free(err);
+        err = NULL;
+        g_assert_false(qemu_slirp_bootp_root_claim("user0", "/", &root,
+                                                   &err));
+        g_assert_nonnull(err);
+        error_free(err);
+        err = NULL;
         s->nc.info = user_info;
     }
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+    g_assert_cmpint(qemu_slirp_udp_listen("user0", 2049, &udp_listener_ops,
+                                          &udp_state, &udp, &err), ==, 0);
+    udp_state.listener = udp;
+    learn_client_arp(s);
+    send_udp_request(s, 2049, message, sizeof(message));
+    g_assert_cmpuint(udp_state.calls, ==, 1);
+    g_assert_cmphex(ntohl(udp_state.peer.sin_addr.s_addr), ==, 0x0a00020f);
+    g_assert_cmpuint(ntohs(udp_state.peer.sin_port), ==, 49152);
+    g_assert_cmpmem(udp_state.data, udp_state.len, message, sizeof(message));
+    g_assert_cmpint(udp_state.send_result, ==, 0);
+    g_assert_cmpuint(sent_packet_count, ==, 1);
+    g_assert_cmphex(load_be32(sent_packet + ETHERNET_HEADER_LEN + 12), ==,
+                    0x0a000202);
+    g_assert_cmphex(load_be32(sent_packet + ETHERNET_HEADER_LEN + 16), ==,
+                    0x0a00020f);
+    g_assert_cmpuint(load_be16(sent_packet + ETHERNET_HEADER_LEN +
+                              IPV4_HEADER_LEN), ==, 2049);
+    g_assert_cmpuint(load_be16(sent_packet + ETHERNET_HEADER_LEN +
+                              IPV4_HEADER_LEN + 2), ==, 49152);
+#endif
+#ifdef CONFIG_SLIRP_BOOTP_ROOT
+    g_assert_true(qemu_slirp_bootp_root_claim("user0", "/", &root, &err));
+    send_root_bootp_request(s);
+#endif
 #ifdef CONFIG_SLIRP_IL
     NetClientInfo non_user = { .type = NET_CLIENT_DRIVER_NONE };
     NetClientInfo *user_info = s->nc.info;
@@ -393,6 +624,9 @@ static void test_user_netdev_lifecycle_paths(void)
     /* The lease remains safely releasable after its netdev is gone. */
     qemu_slirp_plan9_bootp_release(&bootp);
     g_assert_null(bootp);
+    qemu_slirp_bootp_root_release(&root);
+    g_assert_null(root);
+    qemu_slirp_udp_listener_remove(udp);
 }
 
 int main(int argc, char **argv)
