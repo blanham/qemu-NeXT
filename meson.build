@@ -1294,10 +1294,11 @@ slirp_udp_service = false
 slirp_bootp_root = false
 if slirp.found()
   if slirp.type_name() == 'internal'
-    # The immutable fallback revision provides the Plan 9 BOOTP API.  Normal
-    # QEMU targets compile and link against its exported public dependency,
-    # which validates that contract without crossing Meson's subproject
-    # sandbox.  The NFS fork does not carry the optional IL API.
+    # The immutable fallback revision provides the IL, Plan 9 BOOTP, guest UDP,
+    # and BOOTP root APIs.  Normal QEMU targets compile and link against its
+    # exported public dependency, which validates that contract without
+    # crossing Meson's subproject sandbox.
+    slirp_il = true
     slirp_plan9_bootp = true
     slirp_udp_service = true
     slirp_bootp_root = true
@@ -1331,8 +1332,13 @@ if slirp.found()
       #endif
       int main(void)
       {
-        return !(slirp_udp_listen && slirp_udp_listener_send &&
-                 slirp_udp_listener_remove);
+        SlirpUdpListener *(*listen)(Slirp *, struct in_addr, uint16_t,
+                                   const SlirpUdpCallbacks *, void *) =
+          slirp_udp_listen;
+        int (*send)(SlirpUdpListener *, const struct sockaddr_in *,
+                    const uint8_t *, size_t) = slirp_udp_listener_send;
+        void (*remove)(SlirpUdpListener *) = slirp_udp_listener_remove;
+        return !(listen && send && remove);
       }''', dependencies: slirp,
       name: 'libslirp guest UDP service API')
     slirp_bootp_root = cc.links('''
@@ -1342,7 +1348,9 @@ if slirp.found()
       #endif
       int main(void)
       {
-        return !slirp_set_bootp_root;
+        bool (*set_root)(Slirp *, const SlirpBootpRootConfig *) =
+          slirp_set_bootp_root;
+        return !set_root;
       }''', dependencies: slirp, name: 'libslirp BOOTP root API')
   endif
 endif

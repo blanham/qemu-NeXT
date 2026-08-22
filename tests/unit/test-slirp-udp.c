@@ -91,6 +91,7 @@ static QemuSlirpUdpRegistry *new_udp_registry(FakeUdpBackend *backend,
 
 typedef struct DatagramState {
     FakeUdpBackend *backend;
+    QemuSlirpUdpRegistry *registry;
     QemuSlirpUdpListener *listener;
     struct sockaddr_in peer;
     uint8_t data[32];
@@ -98,6 +99,7 @@ typedef struct DatagramState {
     unsigned calls;
     int send_result;
     bool remove;
+    bool free_registry;
     bool removed_inside_callback;
 } DatagramState;
 
@@ -116,6 +118,11 @@ static void datagram(QemuSlirpUdpListener *listener,
     if (state->remove) {
         qemu_slirp_udp_listener_remove(listener);
         state->listener = NULL;
+        state->removed_inside_callback = state->backend->removes != 0;
+    }
+    if (state->free_registry) {
+        qemu_slirp_udp_registry_free(state->registry);
+        state->registry = NULL;
         state->removed_inside_callback = state->backend->removes != 0;
     }
 }
@@ -246,6 +253,36 @@ static void test_udp_backend_invalidation(void)
     qemu_slirp_udp_registry_free(registry);
 }
 
+static void test_udp_registry_free_inside_callback(void)
+{
+    static const uint8_t payload = 0x5a;
+    const struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(0x0a00020f),
+        .sin_port = htons(49152),
+    };
+    FakeUdpBackend backend = {0};
+    DatagramState state = {
+        .backend = &backend,
+        .free_registry = true,
+    };
+    QemuSlirpUdpRegistry *registry = new_udp_registry(&backend, true);
+    Error *err = NULL;
+
+    state.registry = registry;
+    g_assert_cmpint(qemu_slirp_udp_registry_listen(
+                        registry, 2049, &udp_listener_ops, &state,
+                        &state.listener, &err), ==, 0);
+    fake_udp_deliver(backend.listeners[0], &peer, &payload, 1);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_null(state.registry);
+    g_assert_false(state.removed_inside_callback);
+    g_assert_cmpuint(backend.removes, ==, 1);
+    g_assert_cmpint(qemu_slirp_udp_send(state.listener, &peer, &payload, 1),
+                    ==, -ENOTCONN);
+    qemu_slirp_udp_listener_remove(state.listener);
+}
+
 typedef struct FakeBootpBackend {
     unsigned sets;
     unsigned clears;
@@ -351,6 +388,8 @@ int main(int argc, char **argv)
                     test_udp_delivery_reply_and_reentrant_remove);
     g_test_add_func("/slirp-udp/backend-invalidation",
                     test_udp_backend_invalidation);
+    g_test_add_func("/slirp-udp/registry-free-inside-callback",
+                    test_udp_registry_free_inside_callback);
     g_test_add_func("/slirp-bootp/claim-validation-owner",
                     test_bootp_claim_validation_and_owner);
     g_test_add_func("/slirp-bootp/unwind-invalidate-unavailable",

@@ -12,6 +12,7 @@ struct QemuSlirpUdpRegistry {
     QTAILQ_HEAD(, QemuSlirpUdpListener) deferred;
     bool valid;
     bool ipv4_enabled;
+    bool free_pending;
 };
 
 struct QemuSlirpUdpListener {
@@ -42,6 +43,14 @@ static void listener_unref(QemuSlirpUdpListener *listener)
     assert(listener->refs);
     if (!--listener->refs) {
         g_free(listener);
+    }
+}
+
+static void registry_maybe_free(QemuSlirpUdpRegistry *registry)
+{
+    if (registry->free_pending && QTAILQ_EMPTY(&registry->listeners) &&
+        QTAILQ_EMPTY(&registry->deferred)) {
+        g_free(registry);
     }
 }
 
@@ -83,6 +92,9 @@ static void listener_finish_remove(QemuSlirpUdpListener *listener)
         listener->registry_ref = false;
         listener->registry = NULL;
         listener_unref(listener);
+    }
+    if (registry) {
+        registry_maybe_free(registry);
     }
 }
 
@@ -265,8 +277,8 @@ void qemu_slirp_udp_registry_free(QemuSlirpUdpRegistry *registry)
         return;
     }
     qemu_slirp_udp_registry_invalidate(registry);
-    assert(QTAILQ_EMPTY(&registry->deferred));
-    g_free(registry);
+    registry->free_pending = true;
+    registry_maybe_free(registry);
 }
 
 int qemu_slirp_udp_listen_unavailable(QemuSlirpUdpListener **listener,
