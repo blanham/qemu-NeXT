@@ -51,6 +51,7 @@ typedef enum BackendOp {
     BACKEND_LSTAT,
     BACKEND_READLINK,
     BACKEND_OPEN,
+    BACKEND_FSTAT,
     BACKEND_CLOSE,
     BACKEND_PREADV,
     BACKEND_OPENDIR,
@@ -70,6 +71,7 @@ typedef struct BackendWork {
     struct stat *st;
     struct statfs *stfs;
     V9fsFidOpenState *open;
+    int fid_type;
     struct iovec *iov;
     off_t offset;
     char *buffer;
@@ -137,6 +139,14 @@ static int backend_worker(void *opaque)
         ret = ops->open ? ops->open(ctx, work->path, O_RDONLY, work->open) : -1;
         if (!ops->open) {
             errno = EOPNOTSUPP;
+        }
+        break;
+    case BACKEND_FSTAT:
+        if (!ops->fstat) {
+            errno = EOPNOTSUPP;
+            ret = -1;
+        } else {
+            ret = ops->fstat(ctx, work->fid_type, work->open, work->st);
         }
         break;
     case BACKEND_CLOSE:
@@ -281,6 +291,17 @@ static int coroutine_fn co_open(Nfs2Server *server, V9fsPath *path,
     return ret;
 }
 
+static int coroutine_fn co_fstat(Nfs2Server *server, int fid_type,
+                                 V9fsFidOpenState *state, struct stat *st)
+{
+    BackendWork work = {
+        .op = BACKEND_FSTAT, .backend = &server->backend, .open = state,
+        .fid_type = fid_type, .st = st,
+    };
+
+    return run_backend(&work);
+}
+
 static int coroutine_fn co_simple_open(Nfs2Server *server, BackendOp op,
                                        V9fsFidOpenState *state)
 {
@@ -372,6 +393,8 @@ static uint32_t v3_status(int error)
 #endif
     case ESTALE: return NFS3ERR_STALE;
     case EOPNOTSUPP: return NFS3ERR_NOTSUPP;
+    case EBADMSG: return NFS3ERR_BAD_COOKIE;
+    case EMSGSIZE: return NFS3ERR_TOOSMALL;
     default: return NFS3ERR_SERVERFAULT;
     }
 }
@@ -484,10 +507,27 @@ static bool decode_v3_handle(Nfs2XdrReader *r, Nfs2FileHandle *handle,
     return true;
 }
 
+static int coroutine_fn validate_handle_identity(Nfs2Server *server,
+                                                 const Nfs2FileHandle *handle,
+                                                 V9fsPath *path,
+                                                 struct stat *st)
+{
+    int ret = co_lstat(server, path, st);
+
+    if (ret == -ENOENT) {
+        return -ESTALE;
+    }
+    if (ret >= 0 && file_id(st) != ldq_be_p(handle->bytes + 8)) {
+        return -ESTALE;
+    }
+    return ret;
+}
+
 static int coroutine_fn resolve_handle(Nfs2Server *server,
                                        const Nfs2FileHandle *handle,
                                        V9fsPath *absolute,
-                                       V9fsPath *backend)
+                                       V9fsPath *backend,
+                                       struct stat *st)
 {
     g_auto(GStrv) components = NULL;
     V9fsPath current = { 0 };
@@ -510,6 +550,11 @@ static int coroutine_fn resolve_handle(Nfs2Server *server,
             return ret;
         }
         current = next;
+    }
+    ret = validate_handle_identity(server, handle, &current, st);
+    if (ret < 0) {
+        path_clear(&current);
+        return ret;
     }
     *backend = current;
     return 0;
@@ -662,10 +707,7 @@ static bool coroutine_fn reply_getattr(Nfs2Server *server,
                decode_v2_handle(call, &handle))) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && ret >= 0) {
@@ -705,14 +747,13 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     struct stat dir_st, st;
     int ret;
     bool ok;
+    bool dir_resolved;
 
     if (!decode_lookup(call, v3, &dir_handle, name)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &dir_handle, &absolute, &dir);
-    if (ret >= 0) {
-        ret = co_lstat(server, &dir, &dir_st);
-    }
+    ret = resolve_handle(server, &dir_handle, &absolute, &dir, &dir_st);
+    dir_resolved = ret >= 0;
     if (ret >= 0 && !S_ISDIR(dir_st.st_mode)) {
         ret = -ENOTDIR;
     }
@@ -721,6 +762,17 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     }
     if (ret >= 0) {
         ret = co_lstat(server, &child, &st);
+    }
+    if (dir_resolved) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &dir_handle, &dir,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+        } else if (ret >= 0) {
+            dir_st = current_st;
+        }
     }
     if (ret >= 0) {
         child_path = child_absolute(absolute.data, name);
@@ -767,13 +819,8 @@ static bool coroutine_fn reply_access(Nfs2Server *server, Nfs2RpcCall *call,
         !nfs2_xdr_reader_empty(&call->body)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
-    if (!server->writable) {
-        requested &= ~(uint32_t)(0x0004 | 0x0008 | 0x0010);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
+    requested &= ~(uint32_t)(0x0004 | 0x0008 | 0x0010);
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_post_attr(w, &st, ret >= 0);
@@ -793,22 +840,34 @@ static bool coroutine_fn reply_readlink(Nfs2Server *server,
     V9fsPath absolute = { 0 }, path = { 0 };
     struct stat st;
     char target[NFS2_MAX_PATH + 1];
+    ssize_t target_length = -1;
     int ret;
     bool ok;
+    bool readlink_attempted = false;
 
     if (!(v3 ? decode_v3_handle(&call->body, &handle, true) :
                decode_v2_handle(call, &handle))) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0 && !S_ISLNK(st.st_mode)) {
         ret = -EINVAL;
     }
     if (ret >= 0) {
+        readlink_attempted = true;
         ret = co_readlink(server, &path, target, NFS2_MAX_PATH);
+        target_length = ret;
+    }
+    if (readlink_attempted) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &handle, &path,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+        } else if (ret >= 0) {
+            st = current_st;
+        }
     }
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
@@ -816,7 +875,8 @@ static bool coroutine_fn reply_readlink(Nfs2Server *server,
         ok = put_post_attr(w, &st, ret >= 0);
     }
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_counted_opaque(w, target, ret, NFS2_MAX_PATH);
+        ok = nfs2_xdr_put_counted_opaque(w, target, target_length,
+                                          NFS2_MAX_PATH);
     }
     path_clear(&absolute);
     path_clear(&path);
@@ -854,22 +914,41 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
     uint64_t offset;
     uint32_t count;
     int ret, close_ret = 0;
-    bool opened = false;
+    bool opened = false, open_attempted = false, open_bound = false;
     bool ok;
 
     if (!decode_read(call, v3, &handle, &offset, &count)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0 && !S_ISREG(st.st_mode)) {
         ret = S_ISDIR(st.st_mode) ? -EISDIR : -EINVAL;
     }
     if (ret >= 0) {
+        open_attempted = true;
         ret = co_open(server, &path, &open);
         opened = ret >= 0;
+    }
+    if (ret >= 0) {
+        struct stat opened_st;
+
+        ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
+        if (ret >= 0 && file_id(&opened_st) != ldq_be_p(handle.bytes + 8)) {
+            ret = -ESTALE;
+        }
+        if (ret >= 0) {
+            st = opened_st;
+            open_bound = true;
+        }
+    }
+    if (open_attempted && !open_bound) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &handle, &path,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+        }
     }
     if (ret >= 0) {
         ret = co_pread(server, &open, data, count, offset);
@@ -905,19 +984,18 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
 
 static bool decode_readdir(Nfs2RpcCall *call, bool v3,
                            Nfs2FileHandle *handle, uint64_t *cookie,
-                           uint32_t *count, bool plus)
+                           uint8_t verifier[NFS3_COOKIEVERFSIZE],
+                           uint32_t *dircount, uint32_t *count, bool plus)
 {
     if (v3) {
-        uint8_t verifier[NFS3_COOKIEVERFSIZE];
-        uint32_t dircount;
-
         if (!decode_v3_handle(&call->body, handle, false) ||
             !get_u64(&call->body, cookie) ||
-            !nfs2_xdr_opaque(&call->body, verifier, sizeof(verifier))) {
+            !nfs2_xdr_opaque(&call->body, verifier,
+                             NFS3_COOKIEVERFSIZE)) {
             return false;
         }
-        if (plus && (!nfs2_xdr_u32(&call->body, &dircount) ||
-                     dircount > NFS2_MAX_DATA)) {
+        if (plus && (!nfs2_xdr_u32(&call->body, dircount) ||
+                     *dircount > NFS2_MAX_DATA)) {
             return false;
         }
         return nfs2_xdr_u32(&call->body, count) &&
@@ -933,7 +1011,18 @@ static bool decode_readdir(Nfs2RpcCall *call, bool v3,
         return false;
     }
     *cookie = cookie32;
+    memset(verifier, 0, NFS3_COOKIEVERFSIZE);
+    *dircount = *count;
     return true;
+}
+
+static void directory_verifier(const struct stat *st,
+                               uint8_t verifier[NFS3_COOKIEVERFSIZE])
+{
+    uint64_t value = file_id(st) ^ ((uint64_t)st->st_mtim.tv_sec << 32) ^
+                     st->st_mtim.tv_nsec ^ ((uint64_t)st->st_ctim.tv_sec << 1);
+
+    stq_be_p(verifier, value ? value : 1);
 }
 
 static bool coroutine_fn reply_readdir(Nfs2Server *server,
@@ -942,20 +1031,24 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
-    struct stat dir_st;
+    struct stat dir_st = { 0 };
     V9fsFidOpenState open = { 0 };
     uint64_t cookie = 0;
-    uint32_t count;
+    uint8_t supplied_verifier[NFS3_COOKIEVERFSIZE];
+    uint8_t current_verifier[NFS3_COOKIEVERFSIZE] = { 0 };
+    uint32_t dircount = 0, count;
+    size_t dir_used = 0;
     int ret;
-    bool opened = false, eof = false, ok;
+    bool opened = false, opendir_attempted = false, dir_bound = false;
+    bool eof = false, emitted = false, ok;
+    bool dir_attr_valid = false;
 
-    if (!decode_readdir(call, v3, &handle, &cookie, &count, plus)) {
+    if (!decode_readdir(call, v3, &handle, &cookie, supplied_verifier,
+                        &dircount, &count, plus)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &dir_st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &dir_st);
+    dir_attr_valid = ret >= 0;
     if (ret >= 0 && !S_ISDIR(dir_st.st_mode)) {
         ret = -ENOTDIR;
     }
@@ -966,9 +1059,44 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         };
         path_copy(&copy, &path);
         work.path = &copy;
+        opendir_attempted = true;
         ret = run_backend(&work);
         path_clear(&copy);
         opened = ret >= 0;
+    }
+    if (ret >= 0) {
+        struct stat opened_st;
+
+        ret = co_fstat(server, P9_FID_DIR, &open, &opened_st);
+        if (ret >= 0 && file_id(&opened_st) != ldq_be_p(handle.bytes + 8)) {
+            ret = -ESTALE;
+        }
+        if (ret >= 0) {
+            dir_st = opened_st;
+            dir_bound = true;
+        } else {
+            dir_attr_valid = false;
+        }
+    }
+    if (opendir_attempted && !dir_bound) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &handle, &path,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+            dir_attr_valid = false;
+        }
+    }
+    if (ret >= 0 && v3) {
+        static const uint8_t zero[NFS3_COOKIEVERFSIZE];
+
+        directory_verifier(&dir_st, current_verifier);
+        if (memcmp(supplied_verifier, zero, sizeof(zero)) &&
+            memcmp(supplied_verifier, current_verifier,
+                   sizeof(current_verifier))) {
+            ret = -EBADMSG;
+        }
     }
     if (ret >= 0 && cookie) {
         BackendWork work = {
@@ -981,8 +1109,13 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
-        ok = put_post_attr(w, &dir_st, ret >= 0) &&
-             nfs2_xdr_put_opaque(w, "\0\0\0\0\0\0\0\0", 8);
+        ok = put_post_attr(w, &dir_st, dir_attr_valid && ret >= 0) &&
+             (ret < 0 || nfs2_xdr_put_opaque(w, current_verifier,
+                                              sizeof(current_verifier)));
+        if (ok && ret >= 0 &&
+            nfs2_xdr_writer_size(w) - 28 + 8 > count) {
+            ret = -EMSGSIZE;
+        }
     }
     while (ok && ret >= 0) {
         BackendWork work = {
@@ -994,7 +1127,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         struct stat child_st;
         Nfs2FileHandle child_handle;
         bool child_valid = false;
-        size_t before = nfs2_xdr_writer_size(w);
+        size_t before = nfs2_xdr_writer_size(w), directory_end;
 
         ret = run_backend(&work);
         if (ret <= 0) {
@@ -1052,10 +1185,33 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
             eof = false;
             break;
         }
-        if (nfs2_xdr_writer_size(w) > count + 24) {
+        directory_end = before + 4 + 8 + 4 +
+                        QEMU_ALIGN_UP(strlen(work.dirent_name), 4) + 8;
+        if (plus && dir_used + directory_end - before > dircount) {
             w->cursor = w->start + before;
+            ret = emitted ? 0 : -EMSGSIZE;
             eof = false;
             break;
+        }
+        if (nfs2_xdr_writer_size(w) - (v3 ? 28 : 24) + 8 > count) {
+            w->cursor = w->start + before;
+            ret = (v3 && !emitted) ? -EMSGSIZE : 0;
+            eof = false;
+            break;
+        }
+        dir_used += directory_end - before;
+        emitted = true;
+    }
+    if (opened && plus) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &handle, &path,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+            dir_attr_valid = false;
+        } else if (ret >= 0) {
+            dir_st = current_st;
         }
     }
     if (opened) {
@@ -1071,7 +1227,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         ok = nfs2_rpc_reply_success(w, call->xid) &&
              write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
         if (ok && v3) {
-            ok = put_post_attr(w, &dir_st, true);
+            ok = put_post_attr(w, &dir_st, dir_attr_valid);
         }
         path_clear(&absolute);
         path_clear(&path);
@@ -1098,21 +1254,31 @@ static bool coroutine_fn reply_statfs(Nfs2Server *server,
     };
     int ret;
     bool ok;
+    bool statfs_attempted = false;
 
     if (!(v3 ? decode_v3_handle(&call->body, &handle, true) :
                decode_v2_handle(call, &handle))) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0) {
         V9fsPath copy = { 0 };
         path_copy(&copy, &path);
         work.path = &copy;
+        statfs_attempted = true;
         ret = run_backend(&work);
         path_clear(&copy);
+    }
+    if (statfs_attempted) {
+        struct stat current_st;
+        int identity_ret = validate_handle_identity(server, &handle, &path,
+                                                     &current_st);
+
+        if (identity_ret < 0) {
+            ret = identity_ret;
+        } else if (ret >= 0) {
+            st = current_st;
+        }
     }
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
@@ -1154,10 +1320,7 @@ static bool coroutine_fn reply_fsinfo(Nfs2Server *server,
     if (!decode_v3_handle(&call->body, &handle, true)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_post_attr(w, &st, ret >= 0);
@@ -1190,10 +1353,7 @@ static bool coroutine_fn reply_pathconf(Nfs2Server *server,
     if (!decode_v3_handle(&call->body, &handle, true)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
-    ret = resolve_handle(server, &handle, &absolute, &path);
-    if (ret >= 0) {
-        ret = co_lstat(server, &path, &st);
-    }
+    ret = resolve_handle(server, &handle, &absolute, &path, &st);
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_post_attr(w, &st, ret >= 0);

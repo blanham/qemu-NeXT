@@ -257,6 +257,21 @@ static void test_mapped_and_confined(LocalFixture *f, gconstpointer opaque)
     g_assert_cmpuint(word(f, 21), ==, 4343);
     g_assert_cmpuint(word(f, 18) & 07777, ==, 0555);
 
+    /* Exercise the real local mapped-xattr directory backend. */
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, root.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_opaque(&w, "\0\0\0\0\0\0\0\0", 8));
+    g_assert_true(nfs2_xdr_put_u32(&w, 8192));
+    g_assert_true(nfs2_xdr_put_u32(&w, 8192));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 17,
+                   body, nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, 0);
+    g_assert_nonnull(memmem(f->reply->data, f->reply->len, "netbsd", 6));
+    g_assert_nonnull(memmem(f->reply->data, f->reply->len, "sparse", 6));
+
     nfs2_xdr_writer_init(&w, body, sizeof(body));
     g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
     g_assert_true(nfs2_xdr_put_u32(&w, 0));
@@ -297,6 +312,26 @@ static void test_mapped_and_confined(LocalFixture *f, gconstpointer opaque)
     g_assert_cmpuint(word(f, 6), ==, 0);
     g_assert_cmpuint(word(f, 29), ==, 8);
     g_assert_cmpmem(f->reply->data + 128, 8, "offset64", 8);
+
+    /* A path-preserving external replacement cannot inherit an old fh. */
+    {
+        g_autofree char *kernel_path = g_build_filename(f->root, "netbsd",
+                                                        NULL);
+        g_autofree char *replacement = g_build_filename(f->root, "new", NULL);
+        GError *error = NULL;
+
+        g_assert_true(g_file_set_contents(replacement, "replacement", -1,
+                                          &error));
+        g_assert_no_error(error);
+        set_mapped(replacement, 4242, 4343, S_IFREG | 0555);
+        g_assert_cmpint(g_rename(replacement, kernel_path), ==, 0);
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
+        len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1,
+                       body, nfs2_xdr_writer_size(&w));
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(word(f, 6), ==, 70);
+    }
 }
 
 int main(int argc, char **argv)

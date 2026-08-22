@@ -229,7 +229,7 @@ Nfs2RpcDecodeResult nfs2_rpc_decode_call(const uint8_t *data, size_t len,
     uint32_t message_type;
     uint32_t rpc_version;
     uint32_t verifier_flavor;
-    bool oversized;
+    bool oversized = false;
 
     if (!data || !call) {
         return NFS2_RPC_DECODE_GARBAGE_ARGS;
