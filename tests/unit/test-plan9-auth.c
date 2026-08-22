@@ -1713,6 +1713,8 @@ typedef struct TicketServiceTransport {
     bool free_on_close;
     bool receive_on_send;
     bool can_send_on_send;
+    unsigned int ready_then_eagain;
+    bool ready_then_eagain_forever;
 } TicketServiceTransport;
 
 typedef struct TicketServiceRandom {
@@ -1752,6 +1754,14 @@ static int ticket_service_send(const uint8_t *buf, size_t len, void *opaque)
     transport->send_calls++;
     g_byte_array_set_size(transport->last_attempt, 0);
     g_byte_array_append(transport->last_attempt, buf, len);
+    if (transport->ready_then_eagain ||
+        transport->ready_then_eagain_forever) {
+        if (transport->ready_then_eagain) {
+            transport->ready_then_eagain--;
+        }
+        plan9_auth_ticket_connection_can_send(*transport->connection_slot);
+        return -EAGAIN;
+    }
     if (transport->would_block) {
         return -EAGAIN;
     }
@@ -2487,6 +2497,88 @@ static void test_ticket_service_reentrant_can_send(void)
     ticket_service_harness_clear(&harness);
 }
 
+static void test_ticket_service_deferred_can_send(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 0);
+    harness.transport.ready_then_eagain = 1;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire),
+                        &error_abort), ==, 0);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 2);
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_REPLY_LEN);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 0);
+
+    for (unsigned int i = 1; i < PLAN9_AUTH_TICKET_MAX_REQUESTS; i++) {
+        ticket_service_request_wire(wire, i);
+        g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                            harness.connection, wire, sizeof(wire),
+                            &error_abort), ==, 0);
+    }
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_MAX_REQUESTS *
+                         PLAN9_AUTH_TICKET_REPLY_LEN);
+    ticket_service_request_wire(wire, PLAN9_AUTH_TICKET_MAX_REQUESTS);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_deferred_error_can_send(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 0);
+    wire[0] = PLAN9_AUTH_AC;
+    harness.transport.ready_then_eagain = 1;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire),
+                        &error_abort), ==, 0);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 2);
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_ERROR_REPLY_LEN);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_deferred_can_send_bounded(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 0);
+    harness.transport.ready_then_eagain_forever = true;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire),
+                        &error_abort), ==, 0);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 2);
+    g_assert_cmpuint(harness.transport.output->len, ==, 0);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 0);
+
+    plan9_auth_ticket_connection_can_send(harness.connection);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 4);
+    g_assert_cmpuint(harness.transport.output->len, ==, 0);
+
+    harness.transport.ready_then_eagain_forever = false;
+    plan9_auth_ticket_connection_can_send(harness.connection);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 5);
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_REPLY_LEN);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 0);
+    ticket_service_harness_clear(&harness);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -2575,5 +2667,11 @@ int main(int argc, char **argv)
                     test_ticket_service_reentrant_record);
     g_test_add_func("/plan9-auth/ticket-service/reentrant-can-send",
                     test_ticket_service_reentrant_can_send);
+    g_test_add_func("/plan9-auth/ticket-service/deferred-can-send",
+                    test_ticket_service_deferred_can_send);
+    g_test_add_func("/plan9-auth/ticket-service/deferred-error-can-send",
+                    test_ticket_service_deferred_error_can_send);
+    g_test_add_func("/plan9-auth/ticket-service/deferred-can-send-bounded",
+                    test_ticket_service_deferred_can_send_bounded);
     return g_test_run();
 }

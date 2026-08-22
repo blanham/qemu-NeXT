@@ -52,6 +52,7 @@ struct Plan9AuthTicketConnection {
     bool close_after_reply;
     bool close_requested;
     bool sending;
+    bool send_ready_deferred;
 };
 
 static Plan9AuthKeydbReadHook keydb_read_hook;
@@ -197,55 +198,72 @@ static int plan9_auth_ticket_connection_send(
 {
     int sent;
 
-    if (connection->sending || !connection->reply_ready ||
-        connection->close_requested ||
+    if (connection->sending) {
+        connection->send_ready_deferred = true;
+        return 0;
+    }
+    if (!connection->reply_ready || connection->close_requested ||
         !connection->caller_ref) {
         return 0;
     }
     plan9_auth_ticket_connection_ref(connection);
-    connection->sending = true;
-    sent = connection->ops.send_record(connection->reply,
-                                       connection->reply_len,
-                                       connection->transport_opaque);
-    connection->sending = false;
-    if (!connection->caller_ref) {
-        error_setg(errp, "Plan 9 ticket transport closed during send");
-        plan9_auth_ticket_connection_unref(connection);
-        return -1;
-    }
-    if (connection->close_requested) {
-        connection->reply_ready = false;
-        plan9_auth_clear(connection->reply, sizeof(connection->reply));
-        connection->reply_len = 0;
-        error_setg(errp, "Plan 9 ticket transport closed during send");
-        plan9_auth_ticket_connection_unref(connection);
-        return -1;
-    }
-    if (sent == connection->reply_len) {
-        connection->reply_ready = false;
-        plan9_auth_clear(connection->reply, sizeof(connection->reply));
-        connection->reply_len = 0;
-        if (connection->close_after_reply) {
-            connection->close_after_reply = false;
-            plan9_auth_ticket_connection_close(connection);
-        } else {
-            connection->completed_requests++;
-            connection->request_seen = false;
+    for (unsigned int attempt = 0; ; attempt++) {
+        connection->send_ready_deferred = false;
+        connection->sending = true;
+        sent = connection->ops.send_record(connection->reply,
+                                           connection->reply_len,
+                                           connection->transport_opaque);
+        connection->sending = false;
+        if (!connection->caller_ref) {
+            connection->send_ready_deferred = false;
+            error_setg(errp, "Plan 9 ticket transport closed during send");
+            plan9_auth_ticket_connection_unref(connection);
+            return -1;
         }
+        if (connection->close_requested) {
+            connection->reply_ready = false;
+            connection->send_ready_deferred = false;
+            plan9_auth_clear(connection->reply, sizeof(connection->reply));
+            connection->reply_len = 0;
+            error_setg(errp, "Plan 9 ticket transport closed during send");
+            plan9_auth_ticket_connection_unref(connection);
+            return -1;
+        }
+        if (sent == connection->reply_len) {
+            connection->reply_ready = false;
+            connection->send_ready_deferred = false;
+            plan9_auth_clear(connection->reply, sizeof(connection->reply));
+            connection->reply_len = 0;
+            if (connection->close_after_reply) {
+                connection->close_after_reply = false;
+                plan9_auth_ticket_connection_close(connection);
+            } else {
+                connection->completed_requests++;
+                connection->request_seen = false;
+            }
+            plan9_auth_ticket_connection_unref(connection);
+            return 0;
+        }
+        if (sent == -EAGAIN) {
+            bool retry = connection->send_ready_deferred && attempt == 0;
+
+            /* Consume at most one synchronous readiness edge per call. */
+            connection->send_ready_deferred = false;
+            if (retry) {
+                continue;
+            }
+            plan9_auth_ticket_connection_unref(connection);
+            return 0;
+        }
+        connection->reply_ready = false;
+        connection->send_ready_deferred = false;
+        plan9_auth_clear(connection->reply, sizeof(connection->reply));
+        connection->reply_len = 0;
+        error_setg(errp, "Plan 9 ticket transport failed");
+        plan9_auth_ticket_connection_close(connection);
         plan9_auth_ticket_connection_unref(connection);
-        return 0;
+        return -1;
     }
-    if (sent == -EAGAIN) {
-        plan9_auth_ticket_connection_unref(connection);
-        return 0;
-    }
-    connection->reply_ready = false;
-    plan9_auth_clear(connection->reply, sizeof(connection->reply));
-    connection->reply_len = 0;
-    error_setg(errp, "Plan 9 ticket transport failed");
-    plan9_auth_ticket_connection_close(connection);
-    plan9_auth_ticket_connection_unref(connection);
-    return -1;
 }
 
 static int plan9_auth_ticket_connection_build_reply(
