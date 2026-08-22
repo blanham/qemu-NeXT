@@ -61,6 +61,14 @@ tests = {
     meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
     crypto,
   ],
+  'test-nfs2-server': [
+    meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+    meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+    meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+    meson.project_source_root() / 'hw/nfs/nfs2-server.c',
+    crypto,
+    testblock,
+  ],
 }
 
 if host_os != 'windows'
@@ -191,6 +199,20 @@ if have_system
         meson.project_source_root() / 'hw/9pfs/plan9-9p1-server.c',
         files('plan9-9p1-slirp-stub.c'),
         plan9p1_local_test_sources,
+        testblock,
+        hwcore,
+      ],
+      'test-nfs2-server-local': [
+        meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/9p-local.c',
+        meson.project_source_root() / 'hw/9pfs/9p-posix-acl.c',
+        meson.project_source_root() / 'hw/9pfs/9p-xattr.c',
+        meson.project_source_root() / 'hw/9pfs/9p-xattr-user.c',
+        meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+        meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+        meson.project_source_root() / 'hw/nfs/nfs2-server.c',
+        plan9p1_local_test_sources,
+        crypto,
         testblock,
         hwcore,
       ],
