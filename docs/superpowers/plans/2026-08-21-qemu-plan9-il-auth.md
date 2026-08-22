@@ -97,11 +97,11 @@ The new QOM properties are `transport=tcp|il`, `il-port=17008`, `auth-port=566`,
 
 ### Task 9: Wire QOM, Secret, IL listeners, and BOOTP
 
-**Files:** Modify `hw/9pfs/plan9-9p1-server.[ch]`, `qapi/qom.json`, `tests/qtest/plan9-9p1-object-test.c`, `tests/unit/plan9-9p1-slirp-stub.c`, `docs/system/devices/9p.rst`.
+**Files:** Modify `hw/9pfs/plan9-9p1-server.[ch]`, `qapi/qom.json`, `net/slirp.[ch]`, `net/meson.build`, `include/net/slirp-guestfwd.h`, `net/slirp-guestfwd.[ch]`, `tests/qtest/plan9-9p1-object-test.c`, `tests/unit/plan9-9p1-slirp-stub.c`, `tests/unit/test-slirp-il-integration.c`, `docs/system/devices/9p.rst`; create `include/net/slirp-plan9.h`, `net/slirp-plan9.[ch]` as needed.
 
 - [ ] Add failing qtests for TCP defaults/recreate, IL defaults, incomplete auth config, invalid names/ports, unavailable IL ABI, wrong Secret length, invalid keydb, listener collision, completion unwind, one active file connection, and BOOTP file/auth address.
 - [ ] Resolve `key-secret` with `qcrypto_secret_lookup()`, require returned length exactly seven, copy it, wipe the allocated lookup buffer, and load the DB. Never use string functions on Secret bytes.
-- [ ] Register auth port 566 and file port 17008 only inside the named user netdev. Set both Plan 9 BOOTP file and authentication addresses to `guest-address`; TCP leaves auth zero.
+- [ ] Add a netdev-scoped, single-owner Plan 9 BOOTP lease shared by TCP and IL transports; do not create a dummy TCP guest forward for IL. Register auth port 566 and file port 17008 only inside the named user netdev. Set both Plan 9 BOOTP file and authentication addresses to `guest-address`; TCP leaves auth zero.
 - [ ] Unwind in reverse order and invalidate listeners before freeing auth/server state. Explicitly reject live migration with an IL connection and require guest reconnect after reset.
 - [ ] Run unit/qtests and commit with `git commit -m "9pfs: expose authenticated 9P1 over private IL"`.
 

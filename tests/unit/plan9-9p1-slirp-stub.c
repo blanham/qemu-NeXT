@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 
 #include "net/slirp-guestfwd.h"
+#include "net/slirp-plan9.h"
 #include "qapi/error.h"
 
 int qemu_slirp_guestfwd_add(const char *netdev_id,
@@ -35,21 +36,29 @@ int qemu_slirp_guestfwd_send(QemuSlirpGuestFwd *handle,
     return -ENOTCONN;
 }
 
-bool qemu_slirp_guestfwd_set_plan9_bootp(
-    QemuSlirpGuestFwd *handle,
-    const QemuSlirpPlan9BootpConfig *config,
-    Error **errp)
+bool qemu_slirp_plan9_bootp_available(const char *netdev_id, Error **errp)
 {
+    return false;
+}
+
+bool qemu_slirp_plan9_bootp_claim(const char *netdev_id,
+                                  struct in_addr file_server,
+                                  struct in_addr auth_server,
+                                  QemuSlirpPlan9BootpLease **lease,
+                                  Error **errp)
+{
+    if (lease) {
+        *lease = NULL;
+    }
     error_setg(errp, "SLiRP is unavailable in this unit test");
     return false;
 }
 
-bool qemu_slirp_guestfwd_get_ipv4_config(QemuSlirpGuestFwd *handle,
-                                         QemuSlirpIPv4Config *config,
-                                         Error **errp)
+void qemu_slirp_plan9_bootp_release(QemuSlirpPlan9BootpLease **lease)
 {
-    error_setg(errp, "SLiRP is unavailable in this unit test");
-    return false;
+    if (lease) {
+        *lease = NULL;
+    }
 }
 
 void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle)

@@ -51,6 +51,7 @@
 
 #ifdef CONFIG_SLIRP
 #include "net/slirp-guestfwd.h"
+#include "net/slirp-plan9.h"
 #endif
 
 #define PLAN9P1_DEFAULT_QUEUE_BYTES (1024 * 1024)
@@ -225,6 +226,7 @@ struct Plan9P1Server {
     Plan9P1ReplayState auth_replay;
 #ifdef CONFIG_SLIRP
     QemuSlirpGuestFwd *guestfwd;
+    QemuSlirpPlan9BootpLease *bootp_lease;
 #endif
     char *fsdev_id;
     char *netdev_id;
@@ -905,6 +907,7 @@ static void plan9p1_server_instance_finalize(Object *obj)
     assert(g_queue_is_empty(&server->deferred_inputs));
     assert(g_hash_table_size(server->fids) == 0);
 #ifdef CONFIG_SLIRP
+    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
     if (server->guestfwd) {
         QemuSlirpGuestFwd *guestfwd = server->guestfwd;
 
@@ -3280,6 +3283,7 @@ void plan9p1_server_begin_close(Plan9P1Server *server)
     server->closing = true;
     server_auth_session_clear(server);
 #ifdef CONFIG_SLIRP
+    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
     if (server->guestfwd) {
         QemuSlirpGuestFwd *guestfwd = server->guestfwd;
 
@@ -3448,9 +3452,10 @@ static const Plan9P1TransportOps plan9p1_server_transport_ops = {
 static void plan9p1_server_complete(UserCreatable *uc, Error **errp)
 {
     Plan9P1Server *server = PLAN9P1_SERVER(uc);
-    QemuSlirpPlan9BootpConfig bootp = { 0 };
-    QemuSlirpIPv4Config ipv4;
     struct in_addr guest_address;
+    struct in_addr no_auth = { 0 };
+    Error *local_err = NULL;
+    bool bootp_available;
 
     if (server->completed) {
         error_setg(errp, "9P1 server is already complete");
@@ -3483,14 +3488,15 @@ static void plan9p1_server_complete(UserCreatable *uc, Error **errp)
                                 server, &server->guestfwd, errp) < 0) {
         goto fail_backend;
     }
-    if (!qemu_slirp_guestfwd_get_ipv4_config(server->guestfwd, &ipv4, errp)) {
+    bootp_available = qemu_slirp_plan9_bootp_available(server->netdev_id,
+                                                       &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
         goto fail_guestfwd;
     }
-    bootp.netmask = ipv4.netmask;
-    bootp.file_server = guest_address;
-    bootp.gateway = ipv4.host;
-    if (!qemu_slirp_guestfwd_set_plan9_bootp(server->guestfwd, &bootp,
-                                             errp)) {
+    if (bootp_available &&
+        !qemu_slirp_plan9_bootp_claim(server->netdev_id, guest_address,
+                                      no_auth, &server->bootp_lease, errp)) {
         goto fail_guestfwd;
     }
     if (plan9p1_server_start(server, &plan9p1_server_transport_ops,
@@ -3501,6 +3507,7 @@ static void plan9p1_server_complete(UserCreatable *uc, Error **errp)
     return;
 
 fail_guestfwd:
+    qemu_slirp_plan9_bootp_release(&server->bootp_lease);
     qemu_slirp_guestfwd_remove(server->guestfwd);
     server->guestfwd = NULL;
 fail_backend:

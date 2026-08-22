@@ -135,11 +135,21 @@ static void test_validation_and_unwind(void)
                true);
     object_add(qts, "duplicate", "testfs", "nextnet", "10.0.2.100", 564,
                false);
+#ifdef CONFIG_SLIRP_PLAN9_BOOTP
     /* This adds a distinct endpoint, then fails because BOOTP is owned. */
     object_add(qts, "bootpfail", "testfs", "nextnet", "10.0.2.101", 565,
                false);
+#else
+    /*
+     * Older system libslirp lacks Plan 9 BOOTP. TCP remains usable without
+     * the vendor option, so there is no BOOTP resource to collide here.
+     */
+    object_add(qts, "bootpfail", "testfs", "nextnet", "10.0.2.101", 565,
+               true);
+    object_del(qts, "bootpfail", true);
+#endif
     object_del(qts, "owner", true);
-    /* The failed completion must have removed its endpoint. */
+    /* The failed or explicitly removed object must have freed its endpoint. */
     object_add(qts, "afterunwind", "testfs", "nextnet", "10.0.2.101", 565,
                true);
     object_del(qts, "afterunwind", true);

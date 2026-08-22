@@ -43,22 +43,6 @@ typedef struct QemuSlirpGuestFwdOps {
     void (*can_send)(void *opaque);
 } QemuSlirpGuestFwdOps;
 
-/* QEMU-owned equivalent of libslirp's Plan 9 BOOTP configuration. */
-typedef struct QemuSlirpPlan9BootpConfig {
-    struct in_addr netmask;
-    struct in_addr file_server;
-    struct in_addr auth_server;
-    struct in_addr gateway;
-} QemuSlirpPlan9BootpConfig;
-
-/* IPv4 addresses are stored in network byte order, as required by in_addr. */
-typedef struct QemuSlirpIPv4Config {
-    struct in_addr network;
-    struct in_addr netmask;
-    struct in_addr host;
-    struct in_addr dns;
-} QemuSlirpIPv4Config;
-
 int qemu_slirp_guestfwd_add(const char *netdev_id,
                             struct in_addr guest_addr,
                             uint16_t guest_port,
@@ -69,15 +53,6 @@ int qemu_slirp_guestfwd_add(const char *netdev_id,
 size_t qemu_slirp_guestfwd_can_send(QemuSlirpGuestFwd *handle);
 int qemu_slirp_guestfwd_send(QemuSlirpGuestFwd *handle,
                              const uint8_t *buf, size_t len);
-bool qemu_slirp_guestfwd_set_plan9_bootp(
-    QemuSlirpGuestFwd *handle,
-    const QemuSlirpPlan9BootpConfig *config,
-    Error **errp);
-/* Main-loop-only snapshot. On failure, config is left unchanged. */
-bool qemu_slirp_guestfwd_get_ipv4_config(QemuSlirpGuestFwd *handle,
-                                         QemuSlirpIPv4Config *config,
-                                         Error **errp);
-
 /* Consumes the caller-owned handle. Set the caller's pointer to NULL and do
  * not reuse it after this call. Passing NULL is safe. Removal from write
  * callbacks is supported and deferred until transport dispatch returns. */

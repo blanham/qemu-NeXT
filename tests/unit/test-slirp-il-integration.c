@@ -2,11 +2,15 @@
 #include "qemu/osdep.h"
 #include "net/net.h"
 #include "net/slirp-il.h"
+#include "net/slirp-plan9.h"
 #include "net/slirp.h"
 #include "qapi/error.h"
 #include <libslirp.h>
 
 static NetClientState *test_netdev;
+static uint8_t sent_packet[1024];
+static size_t sent_packet_len;
+static unsigned sent_packet_count;
 
 NetClientState *qemu_new_net_client(NetClientInfo *info,
                                     NetClientState *peer,
@@ -40,6 +44,10 @@ static void tracked_slirp_cleanup(Slirp *slirp);
 
 ssize_t qemu_send_packet(NetClientState *nc, const uint8_t *buf, int size)
 {
+    g_assert_cmpuint(size, <=, sizeof(sent_packet));
+    memcpy(sent_packet, buf, size);
+    sent_packet_len = size;
+    sent_packet_count++;
     return size;
 }
 
@@ -119,6 +127,76 @@ static struct in_addr test_addr(void)
     return (struct in_addr) { htonl(0x0a000204) };
 }
 
+#ifdef CONFIG_SLIRP_PLAN9_BOOTP
+#define ETHERNET_HEADER_LEN 14
+#define IPV4_HEADER_LEN 20
+#define UDP_HEADER_LEN 8
+#define BOOTP_FIXED_LEN 236
+#define BOOTP_VENDOR_LEN 64
+#define BOOTP_OFFSET (ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN)
+#define BOOTP_VENDOR_OFFSET 236
+#define BOOTP_REQUEST_LEN \
+    (BOOTP_OFFSET + BOOTP_FIXED_LEN + BOOTP_VENDOR_LEN)
+
+static void store_be16(uint8_t *p, uint16_t value)
+{
+    p[0] = value >> 8;
+    p[1] = value;
+}
+
+static uint16_t ipv4_checksum(const uint8_t *header, size_t length)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i < length; i += 2) {
+        sum += ((uint16_t)header[i] << 8) | header[i + 1];
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return ~sum;
+}
+
+static void send_plan9_bootp_request(SlirpState *s, const char *expected)
+{
+    static const uint8_t mac[] = { 0x00, 0x00, 0x0f, 0x12, 0x34, 0x56 };
+    uint8_t request[BOOTP_REQUEST_LEN] = { 0 };
+    uint8_t *ip_header = request + ETHERNET_HEADER_LEN;
+    uint8_t *udp = ip_header + IPV4_HEADER_LEN;
+    uint8_t *bootp = request + BOOTP_OFFSET;
+    uint8_t *vendor = bootp + BOOTP_VENDOR_OFFSET;
+
+    memset(request, 0xff, 6);
+    memcpy(request + 6, mac, sizeof(mac));
+    store_be16(request + 12, 0x0800);
+    ip_header[0] = 0x45;
+    store_be16(ip_header + 2, sizeof(request) - ETHERNET_HEADER_LEN);
+    ip_header[8] = 64;
+    ip_header[9] = 17;
+    memset(ip_header + 16, 0xff, sizeof(struct in_addr));
+    store_be16(ip_header + 10, ipv4_checksum(ip_header, IPV4_HEADER_LEN));
+    store_be16(udp, 68);
+    store_be16(udp + 2, 67);
+    store_be16(udp + 4, sizeof(request) - ETHERNET_HEADER_LEN -
+                             IPV4_HEADER_LEN);
+    bootp[0] = 1;
+    bootp[1] = 1;
+    bootp[2] = 6;
+    memcpy(bootp + 28, mac, sizeof(mac));
+    memcpy(vendor, "p9  ", 4);
+
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    s->nc.info->receive(&s->nc, request, sizeof(request));
+    g_assert_cmpuint(sent_packet_count, ==, 1);
+    g_assert_cmpuint(sent_packet_len, >=,
+                     BOOTP_OFFSET + BOOTP_VENDOR_OFFSET + strlen(expected));
+    g_assert_cmpmem(sent_packet + BOOTP_OFFSET + BOOTP_VENDOR_OFFSET,
+                    strlen(expected), expected, strlen(expected));
+}
+#endif
+
 static void *opened(QemuSlirpILConnection *connection, void *opaque)
 {
     return opaque;
@@ -151,6 +229,8 @@ static SlirpState *new_user_netdev(void)
         .vnetwork = net,
         .vnetmask = mask,
         .vhost = host,
+        .vdhcp_start = { .s_addr = htonl(0x0a00020f) },
+        .vnameserver = dns,
     };
     SlirpState *s = g_new0(SlirpState, 1);
 
@@ -164,6 +244,13 @@ static SlirpState *new_user_netdev(void)
     g_assert_nonnull(s->slirp);
     s->guestfwds = qemu_slirp_guestfwd_registry_new(
         true, net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
+#ifdef CONFIG_SLIRP_PLAN9_BOOTP
+    s->plan9 = qemu_slirp_plan9_registry_new(
+        true, net, mask, host, dns, &slirp_plan9_backend_ops, s);
+#else
+    s->plan9 = qemu_slirp_plan9_registry_new(
+        true, net, mask, host, dns, NULL, NULL);
+#endif
 #ifdef CONFIG_SLIRP_IL
     tracking = (TrackingState) {0};
     s->il_registry = qemu_slirp_il_registry_new(
@@ -188,6 +275,12 @@ static void test_named_netdev_facade(void)
     Error *err = NULL;
     QemuSlirpILListener *listener = NULL;
 
+    g_assert_false(qemu_slirp_plan9_bootp_available("missing", &err));
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err), "Unrecognized netdev"));
+    error_free(err);
+    err = NULL;
+
     g_assert_cmpint(qemu_slirp_il_listen("missing", test_addr(), 17008,
                                          NULL, NULL, &listener, &err), ==, -1);
 #ifdef CONFIG_SLIRP_IL
@@ -211,9 +304,39 @@ static void test_user_netdev_lifecycle_paths(void)
     Error *err = NULL;
     QemuSlirpILListener *listener = NULL;
     uint8_t packet[ETH_HLEN] = {0};
+    QemuSlirpPlan9BootpLease *bootp = NULL;
 
     s->nc.info->receive(&s->nc, packet, sizeof(packet));
     s->poll_notifier.notify(&s->poll_notifier, &poll);
+#ifdef CONFIG_SLIRP_PLAN9_BOOTP
+    g_assert_true(qemu_slirp_plan9_bootp_available("user0", &err));
+    g_assert_true(qemu_slirp_plan9_bootp_claim(
+        "user0", test_addr(), test_addr(), &bootp, &err));
+    g_assert_nonnull(bootp);
+    send_plan9_bootp_request(
+        s, "p9  255.255.255.0 10.0.2.4 10.0.2.4 10.0.2.2");
+    qemu_slirp_plan9_bootp_release(&bootp);
+    g_assert_true(qemu_slirp_plan9_bootp_claim(
+        "user0", test_addr(), (struct in_addr) { 0 }, &bootp, &err));
+    send_plan9_bootp_request(
+        s, "p9  255.255.255.0 10.0.2.4 0.0.0.0 10.0.2.2");
+#else
+    g_assert_false(qemu_slirp_plan9_bootp_available("user0", &err));
+    g_assert_null(err);
+#endif
+
+    {
+        NetClientInfo non_user = { .type = NET_CLIENT_DRIVER_NONE };
+        NetClientInfo *user_info = s->nc.info;
+
+        s->nc.info = &non_user;
+        g_assert_false(qemu_slirp_plan9_bootp_available("user0", &err));
+        g_assert_nonnull(err);
+        g_assert_nonnull(strstr(error_get_pretty(err), "not a user-mode"));
+        error_free(err);
+        err = NULL;
+        s->nc.info = user_info;
+    }
 #ifdef CONFIG_SLIRP_IL
     NetClientInfo non_user = { .type = NET_CLIENT_DRIVER_NONE };
     NetClientInfo *user_info = s->nc.info;
@@ -267,6 +390,9 @@ static void test_user_netdev_lifecycle_paths(void)
     /* Caller ref survives registry invalidation and remains removable. */
     qemu_slirp_il_listener_remove(listener);
 #endif
+    /* The lease remains safely releasable after its netdev is gone. */
+    qemu_slirp_plan9_bootp_release(&bootp);
+    g_assert_null(bootp);
 }
 
 int main(int argc, char **argv)

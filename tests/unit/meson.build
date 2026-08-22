@@ -188,12 +188,16 @@ if have_system
 
   if slirp.found()
   tests += {
+    'test-slirp-plan9': [
+      meson.project_source_root() / 'net/slirp-plan9.c',
+    ],
     'test-slirp-guestfwd': [
       meson.project_source_root() / 'net/slirp-guestfwd.c',
     ],
     'test-slirp-il-integration': [
       meson.project_source_root() / 'net/slirp-il.c',
       meson.project_source_root() / 'net/slirp-guestfwd.c',
+      meson.project_source_root() / 'net/slirp-plan9.c',
       slirp,
     ],
   }

@@ -39,7 +39,11 @@ if enable_passt
 endif
 
 system_ss.add(files('slirp-il.c'))
-system_ss.add(when: slirp, if_true: files('slirp.c', 'slirp-guestfwd.c'))
+system_ss.add(when: slirp, if_true: files(
+  'slirp.c',
+  'slirp-guestfwd.c',
+  'slirp-plan9.c',
+))
 system_ss.add(when: vde, if_true: files('vde.c'))
 if have_netmap
   system_ss.add(files('netmap.c'))

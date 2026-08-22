@@ -3780,6 +3780,9 @@ M: Samuel Thibault <samuel.thibault@ens-lyon.org>
 S: Maintained
 F: net/slirp.c
 F: include/net/slirp.h
+F: net/slirp-plan9*
+F: include/net/slirp-plan9.h
+F: tests/unit/test-slirp-plan9.c
 T: git https://people.debian.org/~sthibault/qemu.git slirp
 
 Stats

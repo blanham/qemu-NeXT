@@ -1289,6 +1289,7 @@ if not get_option('slirp').auto() or have_system
 endif
 
 slirp_il = false
+slirp_plan9_bootp = false
 if slirp.found()
   if slirp.type_name() == 'internal'
     # Internal dependencies cannot be linked by Meson compiler probes.  The
@@ -1328,6 +1329,28 @@ if slirp.found()
         void (*close_connection)(SlirpILConnection *) = slirp_il_connection_close;
         return !(listen && remove_listener && send_record && close_connection);
       }''', dependencies: slirp, name: 'libslirp IL public API')
+  endif
+  if slirp.type_name() == 'internal'
+    slirp_plan9_bootp = cc.compiles('''
+      #include <libslirp.h>
+      static void slirp_plan9_bootp_probe(void)
+      {
+        bool (*set_bootp)(Slirp *, const SlirpPlan9BootpConfig *) =
+          slirp_set_plan9_bootp;
+        (void)set_bootp;
+      }''',
+      include_directories: include_directories('subprojects/slirp',
+                                              'subprojects/slirp/src'),
+      name: 'internal libslirp Plan 9 BOOTP API')
+  else
+    slirp_plan9_bootp = cc.links('''
+      #include <libslirp.h>
+      int main(void)
+      {
+        bool (*set_bootp)(Slirp *, const SlirpPlan9BootpConfig *) =
+          slirp_set_plan9_bootp;
+        return !set_bootp;
+      }''', dependencies: slirp, name: 'libslirp Plan 9 BOOTP API')
   endif
 endif
 
@@ -2521,6 +2544,7 @@ config_host_data.set('CONFIG_PIXMAN', pixman.found())
 config_host_data.set('CONFIG_PASST', enable_passt)
 config_host_data.set('CONFIG_SLIRP', slirp.found())
 config_host_data.set('CONFIG_SLIRP_IL', slirp_il)
+config_host_data.set('CONFIG_SLIRP_PLAN9_BOOTP', slirp_plan9_bootp)
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
 config_host_data.set('CONFIG_SOLARIS', host_os == 'sunos')
 if have_tcg
