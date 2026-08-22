@@ -79,8 +79,8 @@ The new QOM properties are `transport=tcp|il`, `il-port=17008`, `auth-port=566`,
 
 **Files:** Modify `hw/9pfs/plan9-auth.[ch]`, `hw/9pfs/plan9-9p1-server.[ch]`, `tests/unit/test-plan9-auth.c`, `tests/unit/test-plan9-9p1-server.c`.
 
-- [ ] Add failing tests for one 141-byte `AuthTreq` record, one 145-byte `AuthOK+2 tickets` reply, challenge/key agreement, `hostid==uid`, speaks-for rejection to `none`, malformed request, privacy substitution, backpressure, and close-after-reply.
-- [ ] Implement independent short-lived auth connections. Generate a fresh seven-byte conversation key and encrypt client/server tickets with the appropriate principal/server keys.
+- [ ] Add failing tests for an exact 141-byte `AuthTreq` record, an exact 145-byte `AuthOK+2 tickets` reply, challenge/key agreement, `hostid==uid`, speaks-for rejection to `none`, malformed requests, privacy substitution, backpressure, and the historical boot's two sequential exchanges on one connection.
+- [ ] Implement independent bounded auth connections. Generate a fresh seven-byte conversation key for each exchange and encrypt client/server tickets with the appropriate principal/server keys. Accept the next request only after the prior reply is atomically sent; close on malformed input, a request while a reply is pending, fatal transport failure, peer close, or the bounded exchange limit.
 - [ ] On missing/disabled/expired client principals, use a fresh random substitute key and normal-size response. Never disclose which lookup failed over the wire.
 - [ ] Logs may contain only failure class and peer address; ban principals and all decrypted material from tracepoints.
 - [ ] Run auth/server tests; commit with `git commit -m "9pfs: serve Plan 9 authentication tickets over IL"`.

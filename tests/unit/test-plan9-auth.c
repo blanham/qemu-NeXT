@@ -1644,6 +1644,720 @@ static void test_decode_fixed_string_compatibility(void)
     assert_zeroed(&ticket, sizeof(ticket));
 }
 
+typedef struct TicketServiceTransport {
+    GByteArray *output;
+    GByteArray *last_attempt;
+    Plan9AuthTicketConnection **connection_slot;
+    const uint8_t *reentrant_record;
+    size_t reentrant_record_len;
+    Error *reentrant_error;
+    int reentrant_result;
+    unsigned int send_calls;
+    unsigned int close_calls;
+    bool would_block;
+    size_t short_send;
+    int fatal_result;
+    bool free_on_send;
+    bool free_on_close;
+    bool receive_on_send;
+} TicketServiceTransport;
+
+typedef struct TicketServiceRandom {
+    uint8_t next;
+    unsigned int calls;
+    bool fail;
+} TicketServiceRandom;
+
+static int ticket_service_random(void *buf, size_t len, void *opaque,
+                                 Error **errp)
+{
+    TicketServiceRandom *random = opaque;
+    uint8_t *bytes = buf;
+
+    random->calls++;
+    if (random->fail) {
+        error_setg(errp, "injected ticket random failure");
+        return -1;
+    }
+    for (size_t i = 0; i < len; i++) {
+        bytes[i] = random->next++;
+    }
+    return 0;
+}
+
+static uint32_t ticket_service_now(void *opaque)
+{
+    return *(uint32_t *)opaque;
+}
+
+static int ticket_service_send(const uint8_t *buf, size_t len, void *opaque)
+{
+    TicketServiceTransport *transport = opaque;
+    size_t sent = transport->short_send ? MIN(len, transport->short_send) :
+                                          len;
+
+    transport->send_calls++;
+    g_byte_array_set_size(transport->last_attempt, 0);
+    g_byte_array_append(transport->last_attempt, buf, len);
+    if (transport->would_block) {
+        return -EAGAIN;
+    }
+    if (transport->fatal_result) {
+        return transport->fatal_result;
+    }
+    g_byte_array_append(transport->output, buf, sent);
+    if (transport->receive_on_send) {
+        transport->receive_on_send = false;
+        transport->reentrant_result =
+            plan9_auth_ticket_connection_receive_record(
+                *transport->connection_slot, transport->reentrant_record,
+                transport->reentrant_record_len,
+                &transport->reentrant_error);
+    }
+    if (transport->free_on_send) {
+        plan9_auth_ticket_connection_free(*transport->connection_slot);
+        *transport->connection_slot = NULL;
+    }
+    return sent;
+}
+
+static void ticket_service_close(void *opaque)
+{
+    TicketServiceTransport *transport = opaque;
+
+    transport->close_calls++;
+    if (transport->free_on_close) {
+        plan9_auth_ticket_connection_free(*transport->connection_slot);
+        *transport->connection_slot = NULL;
+    }
+}
+
+static const Plan9AuthTicketTransportOps ticket_service_transport_ops = {
+    .send_record = ticket_service_send,
+    .close = ticket_service_close,
+};
+
+static void ticket_service_transport_init(TicketServiceTransport *transport)
+{
+    transport->output = g_byte_array_new();
+    transport->last_attempt = g_byte_array_new();
+}
+
+static void ticket_service_transport_clear(TicketServiceTransport *transport)
+{
+    g_byte_array_unref(transport->output);
+    g_byte_array_unref(transport->last_attempt);
+}
+
+static void test_ticket_service_success(void)
+{
+    static const KeydbFixtureRecord records[] = {
+        { "p9fs", { 1, 2, 3, 4, 5, 6, 7 }, 0, 0, 0 },
+        { "tor", { 7, 6, 5, 4, 3, 2, 1 }, 0, 0, 0 },
+    };
+    Plan9AuthTicketRequest request = {
+        .type = PLAN9_AUTH_TREQ,
+        .authid = "p9fs",
+        .authdom = "cs.bell-labs.com",
+        .challenge = { 0x10, 0x20, 0x30, 0x40,
+                       0x50, 0x60, 0x70, 0x80 },
+        .hostid = "tor",
+        .uid = "tor",
+    };
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *path = g_build_filename(dir, "keys", NULL);
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    uint8_t client_wire[PLAN9_AUTH_TICKET_LEN];
+    uint8_t server_wire[PLAN9_AUTH_TICKET_LEN];
+    TicketServiceTransport transport = { 0 };
+    TicketServiceRandom random = { .next = 0x20 };
+    uint32_t now = 100;
+    Plan9AuthTicketServiceConfig config;
+    Plan9AuthTicketService *service;
+    Plan9AuthTicketConnection *connection;
+    Plan9AuthTicket client, server;
+    uint8_t first_conversation[PLAN9_AUTH_DES_KEY_LEN];
+    Plan9AuthKeydb *keydb;
+
+    ticket_service_transport_init(&transport);
+    keydb_write(path, records, G_N_ELEMENTS(records));
+    keydb = keydb_load(path, "p9fs", 100);
+    config = (Plan9AuthTicketServiceConfig) {
+        .keydb = keydb,
+        .now_seconds = ticket_service_now,
+        .now_opaque = &now,
+        .random_bytes = ticket_service_random,
+        .random_opaque = &random,
+    };
+    service = plan9_auth_ticket_service_new(&config, &error_abort);
+    connection = plan9_auth_ticket_connection_new(
+        service, &ticket_service_transport_ops, &transport, &error_abort);
+    g_assert_cmpint(plan9_auth_ticket_request_encode(&request, wire,
+                                                      &error_abort), ==, 0);
+
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        connection, wire, sizeof(wire), &error_abort), ==, 0);
+    g_assert_cmpuint(transport.send_calls, ==, 1);
+    g_assert_cmpuint(transport.close_calls, ==, 0);
+    g_assert_cmpuint(transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_REPLY_LEN);
+    g_assert_cmpuint(transport.output->data[0], ==, PLAN9_AUTH_OK);
+
+    memcpy(client_wire, transport.output->data + 1, sizeof(client_wire));
+    memcpy(server_wire, transport.output->data + 1 + sizeof(client_wire),
+           sizeof(server_wire));
+    g_assert_cmpint(plan9_auth_decrypt(records[1].key, client_wire,
+                                        sizeof(client_wire), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_decrypt(records[0].key, server_wire,
+                                        sizeof(server_wire), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_decode(client_wire, sizeof(client_wire),
+                                              &client, &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_decode(server_wire, sizeof(server_wire),
+                                              &server, &error_abort), ==, 0);
+    g_assert_cmpuint(client.num, ==, PLAN9_AUTH_TC);
+    g_assert_cmpuint(server.num, ==, PLAN9_AUTH_TS);
+    g_assert_cmpmem(client.challenge, sizeof(client.challenge),
+                    request.challenge, sizeof(request.challenge));
+    g_assert_cmpmem(server.challenge, sizeof(server.challenge),
+                    request.challenge, sizeof(request.challenge));
+    g_assert_cmpstr(client.cuid, ==, "tor");
+    g_assert_cmpstr(client.suid, ==, "tor");
+    g_assert_cmpstr(server.cuid, ==, "tor");
+    g_assert_cmpstr(server.suid, ==, "tor");
+    g_assert_cmpmem(client.key, sizeof(client.key), server.key,
+                    sizeof(server.key));
+    g_assert_cmpuint(random.calls, ==, 3);
+    memcpy(first_conversation, client.key, sizeof(first_conversation));
+
+    request.challenge[0]++;
+    g_assert_cmpint(plan9_auth_ticket_request_encode(&request, wire,
+                                                      &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        connection, wire, sizeof(wire), &error_abort), ==, 0);
+    g_assert_cmpuint(transport.send_calls, ==, 2);
+    g_assert_cmpuint(transport.close_calls, ==, 0);
+    g_assert_cmpuint(transport.output->len, ==,
+                     2 * PLAN9_AUTH_TICKET_REPLY_LEN);
+    memcpy(client_wire,
+           transport.output->data + PLAN9_AUTH_TICKET_REPLY_LEN + 1,
+           sizeof(client_wire));
+    memcpy(server_wire,
+           transport.output->data + PLAN9_AUTH_TICKET_REPLY_LEN + 1 +
+               PLAN9_AUTH_TICKET_LEN,
+           sizeof(server_wire));
+    g_assert_cmpint(plan9_auth_decrypt(records[1].key, client_wire,
+                                        sizeof(client_wire), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_decrypt(records[0].key, server_wire,
+                                        sizeof(server_wire), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_decode(client_wire, sizeof(client_wire),
+                                              &client, &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_decode(server_wire, sizeof(server_wire),
+                                              &server, &error_abort), ==, 0);
+    g_assert_cmpmem(client.key, sizeof(client.key), server.key,
+                    sizeof(server.key));
+    g_assert_cmpmem(client.challenge, sizeof(client.challenge),
+                    request.challenge, sizeof(request.challenge));
+    g_assert_false(!memcmp(client.key, first_conversation,
+                           sizeof(first_conversation)));
+    g_assert_cmpuint(random.calls, ==, 6);
+
+    plan9_auth_ticket_clear(&client);
+    plan9_auth_ticket_clear(&server);
+    plan9_auth_clear(client_wire, sizeof(client_wire));
+    plan9_auth_clear(server_wire, sizeof(server_wire));
+    plan9_auth_clear(first_conversation, sizeof(first_conversation));
+    plan9_auth_ticket_connection_free(connection);
+    plan9_auth_ticket_service_free(service);
+    plan9_auth_keydb_free(keydb);
+    ticket_service_transport_clear(&transport);
+    keydb_remove_tree(dir);
+}
+
+static void test_ticket_service_rejects_speaks_for(void)
+{
+    static const KeydbFixtureRecord records[] = {
+        { "p9fs", { 1, 2, 3, 4, 5, 6, 7 }, 0, 0, 0 },
+        { "tor", { 7, 6, 5, 4, 3, 2, 1 }, 0, 0, 0 },
+    };
+    Plan9AuthTicketRequest request = {
+        .type = PLAN9_AUTH_TREQ,
+        .authid = "p9fs",
+        .hostid = "tor",
+        .uid = "alice",
+    };
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *path = g_build_filename(dir, "keys", NULL);
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN];
+    TicketServiceTransport transport = { 0 };
+    TicketServiceRandom random = { .next = 0x40 };
+    uint32_t now = 100;
+    Plan9AuthKeydb *keydb;
+    Plan9AuthTicketService *service;
+    Plan9AuthTicketConnection *connection;
+    Plan9AuthTicket ticket;
+
+    ticket_service_transport_init(&transport);
+    keydb_write(path, records, G_N_ELEMENTS(records));
+    keydb = keydb_load(path, "p9fs", 100);
+    service = plan9_auth_ticket_service_new(
+        &(Plan9AuthTicketServiceConfig) {
+            .keydb = keydb,
+            .now_seconds = ticket_service_now,
+            .now_opaque = &now,
+            .random_bytes = ticket_service_random,
+            .random_opaque = &random,
+        }, &error_abort);
+    connection = plan9_auth_ticket_connection_new(
+        service, &ticket_service_transport_ops, &transport, &error_abort);
+    g_assert_cmpint(plan9_auth_ticket_request_encode(&request, wire,
+                                                      &error_abort), ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        connection, wire, sizeof(wire), &error_abort), ==, 0);
+    memcpy(ticket_wire, transport.output->data + 1, sizeof(ticket_wire));
+    g_assert_cmpint(plan9_auth_decrypt(records[1].key, ticket_wire,
+                                        sizeof(ticket_wire), &error_abort),
+                    ==, 0);
+    g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire, sizeof(ticket_wire),
+                                              &ticket, &error_abort), ==, 0);
+    g_assert_cmpstr(ticket.cuid, ==, "alice");
+    g_assert_cmpstr(ticket.suid, ==, "none");
+
+    plan9_auth_ticket_clear(&ticket);
+    plan9_auth_clear(ticket_wire, sizeof(ticket_wire));
+    plan9_auth_ticket_connection_free(connection);
+    plan9_auth_ticket_service_free(service);
+    plan9_auth_keydb_free(keydb);
+    ticket_service_transport_clear(&transport);
+    keydb_remove_tree(dir);
+}
+
+static void test_ticket_service_privacy_substitution(void)
+{
+    static const KeydbFixtureRecord records[] = {
+        { "p9fs", { 1, 2, 3, 4, 5, 6, 7 }, 0, 0, 0 },
+        { "tor", { 7, 6, 5, 4, 3, 2, 1 }, 0, 0, 0 },
+        { "disabled", { 3, 3, 3, 3, 3, 3, 3 }, 1, 0, 0 },
+        { "old", { 4, 4, 4, 4, 4, 4, 4 }, 0, 0, 99 },
+    };
+    static const struct {
+        const char *authid;
+        const char *hostid;
+        bool client_substitute;
+        bool server_substitute;
+    } cases[] = {
+        { "p9fs", "missing", true, false },
+        { "p9fs", "disabled", true, false },
+        { "p9fs", "old", true, false },
+        { "missing", "tor", false, true },
+        { "disabled", "tor", false, true },
+        { "old", "tor", false, true },
+    };
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *path = g_build_filename(dir, "keys", NULL);
+    TicketServiceRandom random = { .next = 0x20 };
+    uint32_t now = 100;
+    Plan9AuthKeydb *keydb;
+    Plan9AuthTicketService *service;
+
+    keydb_write(path, records, G_N_ELEMENTS(records));
+    keydb = keydb_load(path, "p9fs", 100);
+    service = plan9_auth_ticket_service_new(
+        &(Plan9AuthTicketServiceConfig) {
+            .keydb = keydb,
+            .now_seconds = ticket_service_now,
+            .now_opaque = &now,
+            .random_bytes = ticket_service_random,
+            .random_opaque = &random,
+        }, &error_abort);
+
+    for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        Plan9AuthTicketRequest request = {
+            .type = PLAN9_AUTH_TREQ,
+            .uid = "tor",
+        };
+        TicketServiceTransport transport = { 0 };
+        Plan9AuthTicketConnection *connection;
+        uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+        uint8_t ticket_wire[PLAN9_AUTH_TICKET_LEN];
+        uint8_t client_key[PLAN9_AUTH_DES_KEY_LEN];
+        uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN];
+        Plan9AuthTicket ticket;
+        uint8_t first_random = random.next;
+        unsigned int calls = random.calls;
+
+        g_strlcpy(request.authid, cases[i].authid, sizeof(request.authid));
+        g_strlcpy(request.hostid, cases[i].hostid, sizeof(request.hostid));
+        for (size_t n = 0; n < sizeof(client_key); n++) {
+            client_key[n] = first_random + n;
+            server_key[n] = first_random + sizeof(client_key) + n;
+        }
+        if (!cases[i].client_substitute) {
+            memcpy(client_key, records[1].key, sizeof(client_key));
+        }
+        if (!cases[i].server_substitute) {
+            memcpy(server_key, records[0].key, sizeof(server_key));
+        }
+
+        ticket_service_transport_init(&transport);
+        connection = plan9_auth_ticket_connection_new(
+            service, &ticket_service_transport_ops, &transport,
+            &error_abort);
+        g_assert_cmpint(plan9_auth_ticket_request_encode(&request, wire,
+                                                          &error_abort),
+                        ==, 0);
+        g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                            connection, wire, sizeof(wire), &error_abort),
+                        ==, 0);
+        g_assert_cmpuint(random.calls, ==, calls + 3);
+        g_assert_cmpuint(transport.output->len, ==,
+                         PLAN9_AUTH_TICKET_REPLY_LEN);
+        g_assert_cmpuint(transport.output->data[0], ==, PLAN9_AUTH_OK);
+        g_assert_cmpuint(transport.close_calls, ==, 0);
+
+        memcpy(ticket_wire, transport.output->data + 1,
+               sizeof(ticket_wire));
+        g_assert_cmpint(plan9_auth_decrypt(client_key, ticket_wire,
+                                            sizeof(ticket_wire),
+                                            &error_abort), ==, 0);
+        g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire,
+                                                  sizeof(ticket_wire),
+                                                  &ticket, &error_abort),
+                        ==, 0);
+        g_assert_cmpuint(ticket.num, ==, PLAN9_AUTH_TC);
+        plan9_auth_ticket_clear(&ticket);
+
+        memcpy(ticket_wire,
+               transport.output->data + 1 + PLAN9_AUTH_TICKET_LEN,
+               sizeof(ticket_wire));
+        g_assert_cmpint(plan9_auth_decrypt(server_key, ticket_wire,
+                                            sizeof(ticket_wire),
+                                            &error_abort), ==, 0);
+        g_assert_cmpint(plan9_auth_ticket_decode(ticket_wire,
+                                                  sizeof(ticket_wire),
+                                                  &ticket, &error_abort),
+                        ==, 0);
+        g_assert_cmpuint(ticket.num, ==, PLAN9_AUTH_TS);
+
+        plan9_auth_ticket_clear(&ticket);
+        plan9_auth_clear(ticket_wire, sizeof(ticket_wire));
+        plan9_auth_clear(client_key, sizeof(client_key));
+        plan9_auth_clear(server_key, sizeof(server_key));
+        plan9_auth_ticket_connection_free(connection);
+        ticket_service_transport_clear(&transport);
+    }
+
+    plan9_auth_ticket_service_free(service);
+    plan9_auth_keydb_free(keydb);
+    keydb_remove_tree(dir);
+}
+
+static const KeydbFixtureRecord ticket_service_records[] = {
+    { "p9fs", { 1, 2, 3, 4, 5, 6, 7 }, 0, 0, 0 },
+    { "tor", { 7, 6, 5, 4, 3, 2, 1 }, 0, 0, 0 },
+    { "disabled", { 3, 3, 3, 3, 3, 3, 3 }, 1, 0, 0 },
+    { "old", { 4, 4, 4, 4, 4, 4, 4 }, 0, 0, 99 },
+};
+
+typedef struct TicketServiceHarness {
+    char *dir;
+    char *path;
+    Plan9AuthKeydb *keydb;
+    uint32_t now;
+    TicketServiceRandom random;
+    TicketServiceTransport transport;
+    Plan9AuthTicketService *service;
+    Plan9AuthTicketConnection *connection;
+} TicketServiceHarness;
+
+static void ticket_service_harness_init(TicketServiceHarness *harness)
+{
+    harness->dir = keydb_tempdir();
+    harness->path = g_build_filename(harness->dir, "keys", NULL);
+    harness->random.next = 0x20;
+    harness->now = 100;
+    ticket_service_transport_init(&harness->transport);
+    harness->transport.connection_slot = &harness->connection;
+    keydb_write(harness->path, ticket_service_records,
+                G_N_ELEMENTS(ticket_service_records));
+    harness->keydb = keydb_load(harness->path, "p9fs", 100);
+    harness->service = plan9_auth_ticket_service_new(
+        &(Plan9AuthTicketServiceConfig) {
+            .keydb = harness->keydb,
+            .now_seconds = ticket_service_now,
+            .now_opaque = &harness->now,
+            .random_bytes = ticket_service_random,
+            .random_opaque = &harness->random,
+        }, &error_abort);
+    harness->connection = plan9_auth_ticket_connection_new(
+        harness->service, &ticket_service_transport_ops,
+        &harness->transport, &error_abort);
+}
+
+static void ticket_service_harness_clear(TicketServiceHarness *harness)
+{
+    plan9_auth_ticket_connection_free(harness->connection);
+    plan9_auth_ticket_service_free(harness->service);
+    plan9_auth_keydb_free(harness->keydb);
+    ticket_service_transport_clear(&harness->transport);
+    keydb_remove_tree(harness->dir);
+    g_free(harness->path);
+    g_free(harness->dir);
+}
+
+static void ticket_service_request_wire(
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN], uint8_t challenge)
+{
+    Plan9AuthTicketRequest request = {
+        .type = PLAN9_AUTH_TREQ,
+        .authid = "p9fs",
+        .challenge = { challenge },
+        .hostid = "tor",
+        .uid = "tor",
+    };
+
+    g_assert_cmpint(plan9_auth_ticket_request_encode(&request, wire,
+                                                      &error_abort), ==, 0);
+}
+
+static void ticket_service_expect_bad_record(const uint8_t *wire, size_t len)
+{
+    TicketServiceHarness harness = { 0 };
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, len, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 0);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    g_assert_cmpuint(harness.transport.output->len, ==, 0);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_malformed_records(void)
+{
+    uint8_t wire[2 * PLAN9_AUTH_TICKET_REQUEST_LEN] = { 0 };
+
+    ticket_service_expect_bad_record(NULL, 0);
+    ticket_service_request_wire(wire, 1);
+    ticket_service_expect_bad_record(wire,
+                                     PLAN9_AUTH_TICKET_REQUEST_LEN - 1);
+    ticket_service_expect_bad_record(wire,
+                                     PLAN9_AUTH_TICKET_REQUEST_LEN + 1);
+    memcpy(wire + PLAN9_AUTH_TICKET_REQUEST_LEN, wire,
+           PLAN9_AUTH_TICKET_REQUEST_LEN);
+    ticket_service_expect_bad_record(wire, sizeof(wire));
+    wire[0] = PLAN9_AUTH_AC;
+    ticket_service_expect_bad_record(wire,
+                                     PLAN9_AUTH_TICKET_REQUEST_LEN);
+}
+
+static void test_ticket_service_backpressure(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    uint8_t first_attempt[PLAN9_AUTH_TICKET_REPLY_LEN];
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 1);
+    harness.transport.would_block = true;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire),
+                        &error_abort), ==, 0);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 1);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 0);
+    g_assert_cmpuint(harness.transport.output->len, ==, 0);
+    g_assert_cmpuint(harness.transport.last_attempt->len, ==,
+                     sizeof(first_attempt));
+    memcpy(first_attempt, harness.transport.last_attempt->data,
+           sizeof(first_attempt));
+
+    harness.transport.would_block = false;
+    plan9_auth_ticket_connection_can_send(harness.connection);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 2);
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_REPLY_LEN);
+    g_assert_cmpmem(harness.transport.output->data,
+                    harness.transport.output->len,
+                    first_attempt, sizeof(first_attempt));
+    g_assert_cmpuint(harness.transport.close_calls, ==, 0);
+
+    ticket_service_request_wire(wire, 2);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire),
+                        &error_abort), ==, 0);
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     2 * PLAN9_AUTH_TICKET_REPLY_LEN);
+    plan9_auth_clear(first_attempt, sizeof(first_attempt));
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_rejects_record_while_reply_pending(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 1);
+    harness.transport.would_block = true;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire),
+                        &error_abort), ==, 0);
+    ticket_service_request_wire(wire, 2);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    harness.transport.would_block = false;
+    plan9_auth_ticket_connection_can_send(harness.connection);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 1);
+    g_assert_cmpuint(harness.transport.output->len, ==, 0);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_request_bound(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    for (unsigned int i = 0; i < PLAN9_AUTH_TICKET_MAX_REQUESTS; i++) {
+        ticket_service_request_wire(wire, i);
+        g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                            harness.connection, wire, sizeof(wire),
+                            &error_abort), ==, 0);
+    }
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_MAX_REQUESTS *
+                         PLAN9_AUTH_TICKET_REPLY_LEN);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 0);
+    ticket_service_request_wire(wire, PLAN9_AUTH_TICKET_MAX_REQUESTS);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    g_assert_cmpuint(harness.random.calls, ==,
+                     3 * PLAN9_AUTH_TICKET_MAX_REQUESTS);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_transport_failures(void)
+{
+    for (unsigned int short_send = 0; short_send < 2; short_send++) {
+        TicketServiceHarness harness = { 0 };
+        uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+        Error *err = NULL;
+
+        ticket_service_harness_init(&harness);
+        ticket_service_request_wire(wire, 1);
+        if (short_send) {
+            harness.transport.short_send = PLAN9_AUTH_TICKET_REPLY_LEN - 1;
+        } else {
+            harness.transport.fatal_result = -EIO;
+        }
+        g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                            harness.connection, wire, sizeof(wire), &err),
+                        <, 0);
+        g_assert_nonnull(err);
+        error_free(err);
+        g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+        ticket_service_harness_clear(&harness);
+    }
+}
+
+static void test_ticket_service_random_failure(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 1);
+    harness.random.fail = true;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpuint(harness.transport.send_calls, ==, 0);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    g_assert_cmpuint(harness.transport.output->len, ==, 0);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_reentrant_cleanup(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t wire[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(wire, 1);
+    harness.transport.free_on_send = true;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, wire, sizeof(wire), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_null(harness.connection);
+    g_assert_cmpuint(harness.transport.output->len, ==,
+                     PLAN9_AUTH_TICKET_REPLY_LEN);
+    ticket_service_harness_clear(&harness);
+
+    memset(&harness, 0, sizeof(harness));
+    ticket_service_harness_init(&harness);
+    harness.transport.free_on_close = true;
+    err = NULL;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, NULL, 0, &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_null(harness.connection);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    ticket_service_harness_clear(&harness);
+}
+
+static void test_ticket_service_reentrant_record(void)
+{
+    TicketServiceHarness harness = { 0 };
+    uint8_t first[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    uint8_t second[PLAN9_AUTH_TICKET_REQUEST_LEN];
+    Error *err = NULL;
+
+    ticket_service_harness_init(&harness);
+    ticket_service_request_wire(first, 1);
+    ticket_service_request_wire(second, 2);
+    harness.transport.receive_on_send = true;
+    harness.transport.reentrant_record = second;
+    harness.transport.reentrant_record_len = sizeof(second);
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, first, sizeof(first), &err), <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpint(harness.transport.reentrant_result, <, 0);
+    g_assert_nonnull(harness.transport.reentrant_error);
+    error_free(harness.transport.reentrant_error);
+    harness.transport.reentrant_error = NULL;
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+
+    err = NULL;
+    g_assert_cmpint(plan9_auth_ticket_connection_receive_record(
+                        harness.connection, second, sizeof(second), &err),
+                    <, 0);
+    g_assert_nonnull(err);
+    error_free(err);
+    g_assert_cmpuint(harness.transport.close_calls, ==, 1);
+    ticket_service_harness_clear(&harness);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1704,5 +2418,27 @@ int main(int argc, char **argv)
     g_test_add_func("/plan9-auth/keydb-over-limit", test_keydb_over_limit);
     g_test_add_func("/plan9-auth/keydb-changed-during-read",
                     test_keydb_changed_during_read);
+    g_test_add_func("/plan9-auth/ticket-service/success",
+                    test_ticket_service_success);
+    g_test_add_func("/plan9-auth/ticket-service/speaks-for-none",
+                    test_ticket_service_rejects_speaks_for);
+    g_test_add_func("/plan9-auth/ticket-service/privacy-substitution",
+                    test_ticket_service_privacy_substitution);
+    g_test_add_func("/plan9-auth/ticket-service/malformed-records",
+                    test_ticket_service_malformed_records);
+    g_test_add_func("/plan9-auth/ticket-service/backpressure",
+                    test_ticket_service_backpressure);
+    g_test_add_func("/plan9-auth/ticket-service/pending-record",
+                    test_ticket_service_rejects_record_while_reply_pending);
+    g_test_add_func("/plan9-auth/ticket-service/request-bound",
+                    test_ticket_service_request_bound);
+    g_test_add_func("/plan9-auth/ticket-service/transport-failures",
+                    test_ticket_service_transport_failures);
+    g_test_add_func("/plan9-auth/ticket-service/random-failure",
+                    test_ticket_service_random_failure);
+    g_test_add_func("/plan9-auth/ticket-service/reentrant-cleanup",
+                    test_ticket_service_reentrant_cleanup);
+    g_test_add_func("/plan9-auth/ticket-service/reentrant-record",
+                    test_ticket_service_reentrant_record);
     return g_test_run();
 }

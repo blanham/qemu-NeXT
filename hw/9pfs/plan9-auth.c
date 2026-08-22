@@ -9,6 +9,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "crypto/cipher.h"
+#include "crypto/random.h"
 #include "hw/9pfs/plan9-auth.h"
 #include "qapi/error.h"
 
@@ -25,6 +26,31 @@ struct Plan9AuthKeydb {
     Plan9AuthKeydbEntry *entries;
 };
 
+struct Plan9AuthTicketService {
+    Plan9AuthTicketServiceConfig config;
+    unsigned int refs;
+    bool caller_ref;
+};
+
+struct Plan9AuthTicketConnection {
+    Plan9AuthTicketService *service;
+    Plan9AuthTicketTransportOps ops;
+    void *transport_opaque;
+    Plan9AuthTicketRequest request;
+    Plan9AuthTicket ticket;
+    uint8_t client_key[PLAN9_AUTH_DES_KEY_LEN];
+    uint8_t server_key[PLAN9_AUTH_DES_KEY_LEN];
+    uint8_t conversation_key[PLAN9_AUTH_DES_KEY_LEN];
+    uint8_t reply[PLAN9_AUTH_TICKET_REPLY_LEN];
+    unsigned int refs;
+    unsigned int completed_requests;
+    bool caller_ref;
+    bool request_seen;
+    bool reply_ready;
+    bool close_requested;
+    bool sending;
+};
+
 static Plan9AuthKeydbReadHook keydb_read_hook;
 static void *keydb_read_hook_opaque;
 
@@ -38,6 +64,325 @@ void plan9_auth_ticket_clear(Plan9AuthTicket *ticket)
     if (ticket) {
         plan9_auth_clear(ticket, sizeof(*ticket));
     }
+}
+
+static void plan9_auth_ticket_service_ref(Plan9AuthTicketService *service)
+{
+    assert(service->refs);
+    service->refs++;
+}
+
+static void plan9_auth_ticket_service_unref(Plan9AuthTicketService *service)
+{
+    assert(service->refs);
+    if (!--service->refs) {
+        plan9_auth_clear(service, sizeof(*service));
+        g_free(service);
+    }
+}
+
+Plan9AuthTicketService *plan9_auth_ticket_service_new(
+    const Plan9AuthTicketServiceConfig *config, Error **errp)
+{
+    Plan9AuthTicketService *service;
+
+    if (!config || !config->keydb) {
+        error_setg(errp, "Plan 9 ticket service requires a key database");
+        return NULL;
+    }
+    service = g_new0(Plan9AuthTicketService, 1);
+    service->config = *config;
+    service->refs = 1;
+    service->caller_ref = true;
+    return service;
+}
+
+void plan9_auth_ticket_service_free(Plan9AuthTicketService *service)
+{
+    if (!service || !service->caller_ref) {
+        return;
+    }
+    service->caller_ref = false;
+    plan9_auth_ticket_service_unref(service);
+}
+
+static void
+plan9_auth_ticket_connection_unref(Plan9AuthTicketConnection *connection)
+{
+    assert(connection->refs);
+    if (!--connection->refs) {
+        Plan9AuthTicketService *service = connection->service;
+
+        plan9_auth_clear(connection, sizeof(*connection));
+        g_free(connection);
+        plan9_auth_ticket_service_unref(service);
+    }
+}
+
+static void
+plan9_auth_ticket_connection_ref(Plan9AuthTicketConnection *connection)
+{
+    assert(connection->refs);
+    connection->refs++;
+}
+
+Plan9AuthTicketConnection *plan9_auth_ticket_connection_new(
+    Plan9AuthTicketService *service,
+    const Plan9AuthTicketTransportOps *ops, void *transport_opaque,
+    Error **errp)
+{
+    Plan9AuthTicketConnection *connection;
+
+    if (!service || !service->caller_ref || !ops || !ops->send_record ||
+        !ops->close) {
+        error_setg(errp, "Plan 9 ticket connection transport is incomplete");
+        return NULL;
+    }
+    connection = g_new0(Plan9AuthTicketConnection, 1);
+    connection->service = service;
+    connection->ops = *ops;
+    connection->transport_opaque = transport_opaque;
+    connection->refs = 1;
+    connection->caller_ref = true;
+    plan9_auth_ticket_service_ref(service);
+    return connection;
+}
+
+static void
+plan9_auth_ticket_connection_close(Plan9AuthTicketConnection *connection)
+{
+    if (connection->close_requested || !connection->caller_ref) {
+        return;
+    }
+    connection->close_requested = true;
+    connection->ops.close(connection->transport_opaque);
+}
+
+static int plan9_auth_ticket_random(Plan9AuthTicketService *service,
+                                    void *buf, size_t len, Error **errp)
+{
+    if (service->config.random_bytes) {
+        return service->config.random_bytes(buf, len,
+                                            service->config.random_opaque,
+                                            errp);
+    }
+    return qcrypto_random_bytes(buf, len, errp);
+}
+
+static int plan9_auth_ticket_now(Plan9AuthTicketService *service,
+                                 uint32_t *seconds, Error **errp)
+{
+    time_t now;
+
+    if (service->config.now_seconds) {
+        *seconds = service->config.now_seconds(service->config.now_opaque);
+        return 0;
+    }
+    now = time(NULL);
+    if (now == (time_t)-1) {
+        error_setg(errp, "cannot read time for Plan 9 ticket service");
+        return -1;
+    }
+    *seconds = MIN((uint64_t)now, UINT32_MAX);
+    return 0;
+}
+
+static int plan9_auth_ticket_connection_send(
+    Plan9AuthTicketConnection *connection, Error **errp)
+{
+    int sent;
+
+    if (!connection->reply_ready || connection->close_requested ||
+        !connection->caller_ref) {
+        return 0;
+    }
+    plan9_auth_ticket_connection_ref(connection);
+    connection->sending = true;
+    sent = connection->ops.send_record(connection->reply,
+                                       sizeof(connection->reply),
+                                       connection->transport_opaque);
+    connection->sending = false;
+    if (!connection->caller_ref) {
+        error_setg(errp, "Plan 9 ticket transport closed during send");
+        plan9_auth_ticket_connection_unref(connection);
+        return -1;
+    }
+    if (connection->close_requested) {
+        connection->reply_ready = false;
+        plan9_auth_clear(connection->reply, sizeof(connection->reply));
+        error_setg(errp, "Plan 9 ticket transport closed during send");
+        plan9_auth_ticket_connection_unref(connection);
+        return -1;
+    }
+    if (sent == sizeof(connection->reply)) {
+        connection->reply_ready = false;
+        plan9_auth_clear(connection->reply, sizeof(connection->reply));
+        connection->completed_requests++;
+        connection->request_seen = false;
+        plan9_auth_ticket_connection_unref(connection);
+        return 0;
+    }
+    if (sent == -EAGAIN) {
+        plan9_auth_ticket_connection_unref(connection);
+        return 0;
+    }
+    connection->reply_ready = false;
+    plan9_auth_clear(connection->reply, sizeof(connection->reply));
+    error_setg(errp, "Plan 9 ticket transport failed");
+    plan9_auth_ticket_connection_close(connection);
+    plan9_auth_ticket_connection_unref(connection);
+    return -1;
+}
+
+static int plan9_auth_ticket_connection_build_reply(
+    Plan9AuthTicketConnection *connection, Error **errp)
+{
+    Plan9AuthTicketService *service = connection->service;
+    uint8_t found_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    Plan9AuthKeyStatus status;
+    uint32_t now;
+    int ret = -1;
+
+    /* Always make both substitutes to keep lookup failures wire-private. */
+    if (plan9_auth_ticket_now(service, &now, errp) ||
+        plan9_auth_ticket_random(service, connection->client_key,
+                                 sizeof(connection->client_key), errp) ||
+        plan9_auth_ticket_random(service, connection->server_key,
+                                 sizeof(connection->server_key), errp) ||
+        plan9_auth_ticket_random(service, connection->conversation_key,
+                                 sizeof(connection->conversation_key), errp)) {
+        goto out;
+    }
+    status = plan9_auth_keydb_lookup(service->config.keydb,
+                                     connection->request.hostid,
+                                     now, found_key);
+    if (status == PLAN9_AUTH_KEY_AVAILABLE) {
+        memcpy(connection->client_key, found_key, sizeof(found_key));
+    }
+    plan9_auth_clear(found_key, sizeof(found_key));
+    status = plan9_auth_keydb_lookup(service->config.keydb,
+                                     connection->request.authid,
+                                     now, found_key);
+    if (status == PLAN9_AUTH_KEY_AVAILABLE) {
+        memcpy(connection->server_key, found_key, sizeof(found_key));
+    }
+
+    connection->reply[0] = PLAN9_AUTH_OK;
+    connection->ticket.num = PLAN9_AUTH_TC;
+    memcpy(connection->ticket.challenge, connection->request.challenge,
+           sizeof(connection->ticket.challenge));
+    g_strlcpy(connection->ticket.cuid, connection->request.uid,
+              sizeof(connection->ticket.cuid));
+    g_strlcpy(connection->ticket.suid,
+              !strcmp(connection->request.hostid, connection->request.uid) ?
+              connection->request.uid : "none",
+              sizeof(connection->ticket.suid));
+    memcpy(connection->ticket.key, connection->conversation_key,
+           sizeof(connection->ticket.key));
+    if (plan9_auth_ticket_encode(&connection->ticket, connection->reply + 1,
+                                  errp) ||
+        plan9_auth_encrypt(connection->client_key, connection->reply + 1,
+                           PLAN9_AUTH_TICKET_LEN, errp)) {
+        goto out;
+    }
+    connection->ticket.num = PLAN9_AUTH_TS;
+    if (plan9_auth_ticket_encode(&connection->ticket,
+                                  connection->reply + 1 +
+                                      PLAN9_AUTH_TICKET_LEN,
+                                  errp) ||
+        plan9_auth_encrypt(connection->server_key,
+                           connection->reply + 1 + PLAN9_AUTH_TICKET_LEN,
+                           PLAN9_AUTH_TICKET_LEN, errp)) {
+        goto out;
+    }
+    connection->reply_ready = true;
+    ret = 0;
+
+out:
+    plan9_auth_clear(found_key, sizeof(found_key));
+    plan9_auth_clear(&connection->request, sizeof(connection->request));
+    plan9_auth_ticket_clear(&connection->ticket);
+    plan9_auth_clear(connection->client_key, sizeof(connection->client_key));
+    plan9_auth_clear(connection->server_key, sizeof(connection->server_key));
+    plan9_auth_clear(connection->conversation_key,
+                     sizeof(connection->conversation_key));
+    if (ret) {
+        plan9_auth_clear(connection->reply, sizeof(connection->reply));
+    }
+    return ret;
+}
+
+int plan9_auth_ticket_connection_receive_record(
+    Plan9AuthTicketConnection *connection, const uint8_t *buf, size_t len,
+    Error **errp)
+{
+    int ret = -1;
+
+    if (!connection || !connection->caller_ref) {
+        error_setg(errp, "Plan 9 ticket connection is closed");
+        return -1;
+    }
+    if (connection->close_requested) {
+        error_setg(errp, "Plan 9 ticket connection is closing");
+        return -1;
+    }
+    plan9_auth_ticket_connection_ref(connection);
+    if (connection->request_seen) {
+        error_setg(errp, "Plan 9 ticket reply is still pending");
+        goto fail;
+    }
+    if (connection->completed_requests >= PLAN9_AUTH_TICKET_MAX_REQUESTS) {
+        error_setg(errp, "Plan 9 ticket connection request limit reached");
+        goto fail;
+    }
+    connection->request_seen = true;
+    if (plan9_auth_ticket_request_decode(buf, len, &connection->request,
+                                         errp)) {
+        goto fail;
+    }
+    if (connection->request.type != PLAN9_AUTH_TREQ) {
+        error_setg(errp, "Plan 9 ticket request type is invalid");
+        goto fail;
+    }
+    if (plan9_auth_ticket_connection_build_reply(connection, errp)) {
+        goto fail;
+    }
+    ret = plan9_auth_ticket_connection_send(connection, errp);
+    if (ret) {
+        goto out;
+    }
+    goto out;
+
+fail:
+    plan9_auth_clear(&connection->request, sizeof(connection->request));
+    if (!connection->sending) {
+        plan9_auth_clear(connection->reply, sizeof(connection->reply));
+    }
+    plan9_auth_ticket_connection_close(connection);
+out:
+    plan9_auth_ticket_connection_unref(connection);
+    return ret;
+}
+
+void plan9_auth_ticket_connection_can_send(
+    Plan9AuthTicketConnection *connection)
+{
+    if (!connection || !connection->caller_ref) {
+        return;
+    }
+    plan9_auth_ticket_connection_ref(connection);
+    plan9_auth_ticket_connection_send(connection, NULL);
+    plan9_auth_ticket_connection_unref(connection);
+}
+
+void plan9_auth_ticket_connection_free(
+    Plan9AuthTicketConnection *connection)
+{
+    if (!connection || !connection->caller_ref) {
+        return;
+    }
+    connection->caller_ref = false;
+    plan9_auth_ticket_connection_unref(connection);
 }
 
 void plan9_auth_keydb_set_read_hook(Plan9AuthKeydbReadHook hook,

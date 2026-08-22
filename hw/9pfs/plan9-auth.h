@@ -16,6 +16,9 @@ enum {
     PLAN9_AUTH_CHALLENGE_LEN = 8,
     PLAN9_AUTH_TICKET_REQUEST_LEN = 141,
     PLAN9_AUTH_TICKET_LEN = 72,
+    PLAN9_AUTH_TICKET_REPLY_LEN = 1 + 2 * PLAN9_AUTH_TICKET_LEN,
+    /* Enough for the boot checkkey + attach exchanges, with a DoS bound. */
+    PLAN9_AUTH_TICKET_MAX_REQUESTS = 4,
     PLAN9_AUTH_AUTHENTICATOR_LEN = 13,
     PLAN9_AUTH_MAX_CRYPT_LEN = 4096,
     /* A 168 KiB database is already far beyond the original 512-user keyfs. */
@@ -24,6 +27,8 @@ enum {
 };
 
 typedef struct Plan9AuthKeydb Plan9AuthKeydb;
+typedef struct Plan9AuthTicketService Plan9AuthTicketService;
+typedef struct Plan9AuthTicketConnection Plan9AuthTicketConnection;
 
 typedef enum Plan9AuthKeyStatus {
     PLAN9_AUTH_KEY_MISSING,
@@ -33,6 +38,28 @@ typedef enum Plan9AuthKeyStatus {
 } Plan9AuthKeyStatus;
 
 typedef void (*Plan9AuthKeydbReadHook)(const char *path, void *opaque);
+
+typedef int (*Plan9AuthRandomBytes)(void *buf, size_t len, void *opaque,
+                                    Error **errp);
+typedef uint32_t (*Plan9AuthNowSeconds)(void *opaque);
+
+typedef struct Plan9AuthTicketServiceConfig {
+    /* Immutable and caller-owned; it must outlive the service/connections. */
+    const Plan9AuthKeydb *keydb;
+    /* NULL selects the host wall clock for expiry checks on every request. */
+    Plan9AuthNowSeconds now_seconds;
+    void *now_opaque;
+    /* NULL selects qcrypto_random_bytes(). */
+    Plan9AuthRandomBytes random_bytes;
+    void *random_opaque;
+} Plan9AuthTicketServiceConfig;
+
+typedef struct Plan9AuthTicketTransportOps {
+    /* Return len for atomic acceptance, -EAGAIN, or another fatal result. */
+    int (*send_record)(const uint8_t *buf, size_t len, void *opaque);
+    /* Request asynchronous transport close; it may free the connection. */
+    void (*close)(void *opaque);
+} Plan9AuthTicketTransportOps;
 
 typedef enum Plan9AuthType {
     PLAN9_AUTH_TREQ = 1,
@@ -91,6 +118,29 @@ Plan9AuthKeyStatus plan9_auth_keydb_lookup(const Plan9AuthKeydb *keydb,
                                            const char *name, uint32_t now,
                                            uint8_t key[
                                                PLAN9_AUTH_DES_KEY_LEN]);
+
+/*
+ * Short-lived historical IL/566 ticket service.  Each connection accepts a
+ * bounded sequence of complete AuthTreq records and sends one atomic AuthOK
+ * reply for each.  Only one reply may be outstanding at a time.  Second
+ * Edition boot performs two exchanges on the same connection.
+ * Connection free consumes the caller reference and is safe from transport
+ * callbacks; the pointer must not be used afterward.
+ */
+Plan9AuthTicketService *plan9_auth_ticket_service_new(
+    const Plan9AuthTicketServiceConfig *config, Error **errp);
+void plan9_auth_ticket_service_free(Plan9AuthTicketService *service);
+Plan9AuthTicketConnection *plan9_auth_ticket_connection_new(
+    Plan9AuthTicketService *service,
+    const Plan9AuthTicketTransportOps *ops, void *transport_opaque,
+    Error **errp);
+int plan9_auth_ticket_connection_receive_record(
+    Plan9AuthTicketConnection *connection, const uint8_t *buf, size_t len,
+    Error **errp);
+void plan9_auth_ticket_connection_can_send(
+    Plan9AuthTicketConnection *connection);
+void plan9_auth_ticket_connection_free(
+    Plan9AuthTicketConnection *connection);
 
 /* Pack and encrypt one native 41-byte /adm/keys record. */
 int plan9_auth_keydb_record_encode(
