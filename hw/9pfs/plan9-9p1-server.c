@@ -170,6 +170,7 @@ typedef struct Plan9P1ILAuthConnection {
     Plan9AuthTicketConnection *auth;
     bool linked;
     bool migration_counted;
+    bool close_requested;
 } Plan9P1ILAuthConnection;
 #endif
 
@@ -254,6 +255,8 @@ struct Plan9P1Server {
     unsigned int il_connections;
     bool reset_registered;
     bool il_accepting;
+    bool il_reset_draining;
+    bool file_close_requested;
 #endif
     char *fsdev_id;
     char *netdev_id;
@@ -3656,11 +3659,14 @@ static void plan9p1_server_il_release(Plan9P1Server *server)
 
 static bool plan9p1_server_il_may_accept(Plan9P1Server *server)
 {
-    if (!server->il_accepting &&
-        plan9p1_server_record_connection_ready(server)) {
+    bool ready = plan9p1_server_record_connection_ready(server);
+
+    if (!server->il_accepting && ready &&
+        (!server->il_reset_draining || !server->il_connections)) {
+        server->il_reset_draining = false;
         server->il_accepting = true;
     }
-    return server->il_accepting && !server->closing;
+    return server->il_accepting && !server->closing && ready;
 }
 
 static size_t plan9p1_server_il_can_send(void *opaque)
@@ -3690,6 +3696,14 @@ static const Plan9P1TransportOps plan9p1_server_il_transport_ops = {
     .kind = PLAN9P1_TRANSPORT_RECORD,
 };
 
+static void plan9p1_server_file_request_close(Plan9P1Server *server)
+{
+    if (server->file_connection && !server->file_close_requested) {
+        server->file_close_requested = true;
+        qemu_slirp_il_connection_close(server->file_connection);
+    }
+}
+
 static void *plan9p1_server_file_open(QemuSlirpILConnection *connection,
                                       void *opaque)
 {
@@ -3701,6 +3715,7 @@ static void *plan9p1_server_file_open(QemuSlirpILConnection *connection,
         return NULL;
     }
     server->file_connection = connection;
+    server->file_close_requested = false;
     return server;
 }
 
@@ -3711,10 +3726,13 @@ static void plan9p1_server_file_record(QemuSlirpILConnection *connection,
     Plan9P1Server *server = opaque;
     Error *local_err = NULL;
 
-    if (!server || server->file_connection != connection ||
-        plan9p1_server_receive(server, data, len, &local_err) < 0) {
-        error_free(local_err);
+    if (!server || server->file_connection != connection) {
         qemu_slirp_il_connection_close(connection);
+        return;
+    }
+    if (plan9p1_server_receive(server, data, len, &local_err) < 0) {
+        error_free(local_err);
+        plan9p1_server_file_request_close(server);
     }
 }
 
@@ -3738,6 +3756,7 @@ static void plan9p1_server_file_close(QemuSlirpILConnection *connection,
         return;
     }
     server->file_connection = NULL;
+    server->file_close_requested = false;
     plan9p1_server_il_release(server);
     plan9p1_server_connection_closed(server);
 }
@@ -3766,7 +3785,8 @@ static void plan9p1_server_auth_request_close(void *opaque)
 {
     Plan9P1ILAuthConnection *state = opaque;
 
-    if (state->il) {
+    if (state->il && !state->close_requested) {
+        state->close_requested = true;
         qemu_slirp_il_connection_close(state->il);
     }
 }
@@ -3811,11 +3831,14 @@ static void plan9p1_server_auth_record(QemuSlirpILConnection *connection,
     Plan9P1ILAuthConnection *state = opaque;
     Error *local_err = NULL;
 
-    if (!state || state->il != connection ||
-        plan9_auth_ticket_connection_receive_record(state->auth, data, len,
+    if (!state || state->il != connection) {
+        qemu_slirp_il_connection_close(connection);
+        return;
+    }
+    if (plan9_auth_ticket_connection_receive_record(state->auth, data, len,
                                                      &local_err) < 0) {
         error_free(local_err);
-        qemu_slirp_il_connection_close(connection);
+        plan9p1_server_auth_request_close(state);
     }
 }
 
@@ -3840,6 +3863,7 @@ static void plan9p1_server_auth_close(QemuSlirpILConnection *connection,
     }
     server = state->server;
     state->il = NULL;
+    state->close_requested = false;
     if (state->linked) {
         QTAILQ_REMOVE(&server->auth_connections, state, entry);
         state->linked = false;
@@ -3912,17 +3936,17 @@ static void plan9p1_server_reset_hold(Object *obj, ResetType type)
 {
     Plan9P1Server *server = PLAN9P1_SERVER(obj);
     Plan9P1ILAuthConnection *state;
+    Plan9P1ILAuthConnection *next;
 
     if (!server->completed || server->closing) {
         return;
     }
     if (server->qom_transport == PLAN9_P1_SERVER_TRANSPORT_IL) {
         server->il_accepting = false;
-        if (server->file_connection) {
-            qemu_slirp_il_connection_close(server->file_connection);
-        }
-        while ((state = QTAILQ_FIRST(&server->auth_connections))) {
-            qemu_slirp_il_connection_close(state->il);
+        server->il_reset_draining = true;
+        plan9p1_server_file_request_close(server);
+        QTAILQ_FOREACH_SAFE(state, &server->auth_connections, entry, next) {
+            plan9p1_server_auth_request_close(state);
         }
     }
     plan9p1_server_reset(server);

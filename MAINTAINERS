@@ -2532,6 +2532,7 @@ F: tests/qtest/plan9-9p1-object-test.c
 F: tests/qtest/virtio-9p-test.c
 F: tests/qtest/libqos/virtio-9p*
 F: tests/unit/test-9p-backend.c
+F: tests/unit/plan9-9p1-slirp-stub.[ch]
 F: tests/unit/test-plan9-9p1-*
 F: tests/unit/test-plan9-auth.c
 F: tools/qemu-plan9-keydb.c

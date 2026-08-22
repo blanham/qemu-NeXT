@@ -23,6 +23,9 @@ struct QemuSlirpILListener {
 struct QemuSlirpILConnection {
     QemuSlirpILListener *listener;
     void *opaque;
+    GPtrArray *sent_records;
+    unsigned int close_requests;
+    bool close_requested;
     bool closed;
 };
 
@@ -38,6 +41,18 @@ static bool fake_enabled;
 static GPtrArray *fake_listeners;
 static struct in_addr fake_bootp_file;
 static struct in_addr fake_bootp_auth;
+static bool fake_deferred_close;
+static bool fake_duplicate_close;
+
+static void plan9p1_slirp_stub_deliver_close_internal(
+    QemuSlirpILConnection *connection)
+{
+    if (!connection || connection->closed) {
+        return;
+    }
+    connection->closed = true;
+    connection->listener->ops.close(connection, connection->opaque);
+}
 
 void plan9p1_slirp_stub_enable(void)
 {
@@ -46,6 +61,8 @@ void plan9p1_slirp_stub_enable(void)
     fake_listeners = g_ptr_array_new();
     fake_bootp_file.s_addr = 0;
     fake_bootp_auth.s_addr = 0;
+    fake_deferred_close = false;
+    fake_duplicate_close = false;
 }
 
 void plan9p1_slirp_stub_disable(void)
@@ -55,6 +72,16 @@ void plan9p1_slirp_stub_disable(void)
     g_ptr_array_unref(fake_listeners);
     fake_listeners = NULL;
     fake_enabled = false;
+}
+
+void plan9p1_slirp_stub_set_deferred_close(bool enabled)
+{
+    fake_deferred_close = enabled;
+}
+
+bool plan9p1_slirp_stub_had_duplicate_close(void)
+{
+    return fake_duplicate_close;
 }
 
 unsigned int plan9p1_slirp_stub_listener_count(void)
@@ -102,6 +129,8 @@ Plan9P1SlirpStubConnection *plan9p1_slirp_stub_open(uint16_t port)
     g_assert_nonnull(listener);
     stub = g_new0(Plan9P1SlirpStubConnection, 1);
     stub->il.listener = listener;
+    stub->il.sent_records = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)g_bytes_unref);
     g_ptr_array_add(listener->connections, stub);
     stub->il.opaque = listener->ops.open(&stub->il, listener->opaque);
     return stub;
@@ -119,9 +148,41 @@ bool plan9p1_slirp_stub_connection_closed(
     return connection->il.closed;
 }
 
+unsigned int plan9p1_slirp_stub_connection_close_requests(
+    const Plan9P1SlirpStubConnection *connection)
+{
+    return connection->il.close_requests;
+}
+
 void plan9p1_slirp_stub_close(Plan9P1SlirpStubConnection *connection)
 {
     qemu_slirp_il_connection_close(&connection->il);
+}
+
+void plan9p1_slirp_stub_deliver_close(Plan9P1SlirpStubConnection *connection)
+{
+    plan9p1_slirp_stub_deliver_close_internal(&connection->il);
+}
+
+void plan9p1_slirp_stub_deliver_record(Plan9P1SlirpStubConnection *connection,
+                                      const uint8_t *data, size_t len)
+{
+    if (!connection->il.closed) {
+        connection->il.listener->ops.record(&connection->il, data, len,
+                                             connection->il.opaque);
+    }
+}
+
+GBytes *plan9p1_slirp_stub_pop_sent_record(
+    Plan9P1SlirpStubConnection *connection)
+{
+    GBytes *record;
+
+    if (!connection->il.sent_records->len) {
+        return NULL;
+    }
+    record = g_ptr_array_steal_index(connection->il.sent_records, 0);
+    return record;
 }
 
 bool qemu_slirp_il_available(const char *netdev_id, Error **errp)
@@ -170,7 +231,11 @@ int qemu_slirp_il_listen(const char *netdev_id, struct in_addr guest_addr,
 int qemu_slirp_il_send_record(QemuSlirpILConnection *connection,
                               const uint8_t *data, size_t len)
 {
-    return connection && !connection->closed ? 0 : -ENOTCONN;
+    if (!connection || connection->closed || connection->close_requested) {
+        return -ENOTCONN;
+    }
+    g_ptr_array_add(connection->sent_records, g_bytes_new(data, len));
+    return 0;
 }
 
 void qemu_slirp_il_connection_close(QemuSlirpILConnection *connection)
@@ -178,8 +243,19 @@ void qemu_slirp_il_connection_close(QemuSlirpILConnection *connection)
     if (!connection || connection->closed) {
         return;
     }
-    connection->closed = true;
-    connection->listener->ops.close(connection, connection->opaque);
+    if (connection->close_requested) {
+        fake_duplicate_close = true;
+        if (fake_deferred_close) {
+            /* Break a buggy close-retry loop so its test fails, not hangs. */
+            plan9p1_slirp_stub_deliver_close_internal(connection);
+        }
+        return;
+    }
+    connection->close_requested = true;
+    connection->close_requests++;
+    if (!fake_deferred_close) {
+        plan9p1_slirp_stub_deliver_close_internal(connection);
+    }
 }
 
 void qemu_slirp_il_listener_remove(QemuSlirpILListener *listener)
@@ -193,7 +269,8 @@ void qemu_slirp_il_listener_remove(QemuSlirpILListener *listener)
             g_ptr_array_index(listener->connections, 0);
 
         g_ptr_array_remove_index(listener->connections, 0);
-        qemu_slirp_il_connection_close(&connection->il);
+        plan9p1_slirp_stub_deliver_close_internal(&connection->il);
+        g_ptr_array_unref(connection->il.sent_records);
         g_free(connection);
     }
     g_ptr_array_unref(listener->connections);
