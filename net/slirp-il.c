@@ -51,6 +51,7 @@ struct QemuSlirpILConnection {
 struct QemuSlirpILBackendBridge {
     const QemuSlirpILBackendCallbacks *callbacks;
     void *opaque;
+    unsigned refs;
 };
 
 typedef struct QemuSlirpILBackendConnection {
@@ -67,12 +68,16 @@ QemuSlirpILBackendBridge *qemu_slirp_il_backend_bridge_new(
     bridge = g_new(QemuSlirpILBackendBridge, 1);
     bridge->callbacks = callbacks;
     bridge->opaque = callbacks_opaque;
+    bridge->refs = 1;
     return bridge;
 }
 
 void qemu_slirp_il_backend_bridge_free(QemuSlirpILBackendBridge *bridge)
 {
-    g_free(bridge);
+    assert(bridge->refs);
+    if (!--bridge->refs) {
+        g_free(bridge);
+    }
 }
 
 void *qemu_slirp_il_backend_bridge_connected(
@@ -82,6 +87,7 @@ void *qemu_slirp_il_backend_bridge_connected(
 
     connection = g_new(QemuSlirpILBackendConnection, 1);
     connection->bridge = bridge;
+    bridge->refs++;
     bridge->callbacks->open(backend_connection, bridge->opaque);
     return connection;
 }
@@ -120,6 +126,7 @@ void qemu_slirp_il_backend_bridge_closed(void *backend_connection,
     void *opaque = connection->bridge->opaque;
 
     callbacks->close(backend_connection, opaque);
+    qemu_slirp_il_backend_bridge_free(connection->bridge);
     g_free(connection);
 }
 

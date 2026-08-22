@@ -1291,7 +1291,28 @@ endif
 slirp_il = false
 if slirp.found()
   if slirp.type_name() == 'internal'
-    slirp_il = true
+    # Internal dependencies cannot be linked by Meson compiler probes.  The
+    # immutable fallback still has to compile against the complete public API.
+    slirp_il = cc.compiles('''
+      #include <libslirp.h>
+      #ifndef SLIRP_HAVE_IL
+      #error libslirp was built without IL
+      #endif
+      static void slirp_il_probe(void)
+      {
+        SlirpILListener *(*listen)(Slirp *, struct in_addr, uint16_t,
+                                   const SlirpILCallbacks *, void *) = slirp_il_listen;
+        void (*remove_listener)(SlirpILListener *) = slirp_il_listener_remove;
+        int (*send_record)(SlirpILConnection *, const uint8_t *, size_t) = slirp_il_send_record;
+        void (*close_connection)(SlirpILConnection *) = slirp_il_connection_close;
+        (void)listen;
+        (void)remove_listener;
+        (void)send_record;
+        (void)close_connection;
+      }''',
+      include_directories: include_directories('subprojects/slirp',
+                                              'subprojects/slirp/src'),
+      name: 'internal libslirp IL public API')
   else
     slirp_il = cc.links('''
       #include <libslirp.h>

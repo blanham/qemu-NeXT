@@ -532,11 +532,13 @@ static void test_listen_failure_after_open(void)
 }
 
 typedef struct BridgeState {
+    QemuSlirpILBackendBridge *bridge;
     void *opened_raw;
     void *record_raw;
     void *ready_raw;
     void *closed_raw;
     unsigned opened, records, ready, closed;
+    bool drop_registration_from_open;
 } BridgeState;
 
 static void *bridge_open(void *backend_connection, void *opaque)
@@ -545,6 +547,9 @@ static void *bridge_open(void *backend_connection, void *opaque)
 
     state->opened_raw = backend_connection;
     state->opened++;
+    if (state->drop_registration_from_open) {
+        qemu_slirp_il_backend_bridge_free(state->bridge);
+    }
     return state;
 }
 
@@ -608,6 +613,32 @@ static void test_backend_bridge_raw_connection_identity(void)
     qemu_slirp_il_backend_bridge_free(bridge);
 }
 
+static void test_backend_bridge_open_remove_deferred_close(void)
+{
+    static const QemuSlirpILBackendCallbacks callbacks = {
+        .open = bridge_open,
+        .record = bridge_record,
+        .can_send = bridge_can_send,
+        .close = bridge_close,
+    };
+    BridgeState state = {.drop_registration_from_open = true};
+    uint8_t record_byte = 0x5a;
+    int raw_connection;
+    void *connection_opaque;
+
+    state.bridge = qemu_slirp_il_backend_bridge_new(&callbacks, &state);
+    connection_opaque = qemu_slirp_il_backend_bridge_connected(
+        state.bridge, &raw_connection);
+    qemu_slirp_il_backend_bridge_record(&raw_connection, &record_byte,
+                                        sizeof(record_byte), connection_opaque);
+    qemu_slirp_il_backend_bridge_can_send(&raw_connection, connection_opaque);
+    qemu_slirp_il_backend_bridge_closed(&raw_connection, connection_opaque);
+    g_assert_cmpuint(state.opened, ==, 1);
+    g_assert_cmpuint(state.records, ==, 1);
+    g_assert_cmpuint(state.ready, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+}
+
 typedef struct CleanupState {
     FakeBackend *backend;
     bool called;
@@ -638,6 +669,7 @@ static void test_registry_progress_and_cleanup_order(void)
     g_assert_cmpint(backend.listener_removes, ==, 0);
     qemu_slirp_il_registry_cleanup(registry, cleanup_after_registry, &cleanup);
     g_assert_true(cleanup.called);
+    qemu_slirp_il_listener_remove(listener);
     error_free(err);
 }
 
@@ -667,6 +699,8 @@ int main(int argc, char **argv)
                     test_listen_failure_after_open);
     g_test_add_func("/slirp-il/backend-bridge-raw-connection-identity",
                     test_backend_bridge_raw_connection_identity);
+    g_test_add_func("/slirp-il/backend-bridge-open-remove-deferred-close",
+                    test_backend_bridge_open_remove_deferred_close);
     g_test_add_func("/slirp-il/registry-progress-cleanup-order",
                     test_registry_progress_and_cleanup_order);
     return g_test_run();
