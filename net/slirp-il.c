@@ -464,6 +464,17 @@ void qemu_slirp_il_registry_flush_deferred(QemuSlirpILRegistry *registry)
     g_ptr_array_free(listeners, true);
 }
 
+int qemu_slirp_il_listen_unavailable(QemuSlirpILListener **listener,
+                                      Error **errp)
+{
+    if (listener) {
+        *listener = NULL;
+    }
+    error_setg(errp,
+               "SLiRP IL is unavailable: linked libslirp lacks the public IL API");
+    return -1;
+}
+
 int qemu_slirp_il_send_record(QemuSlirpILConnection *connection,
                               const uint8_t *data, size_t len)
 {

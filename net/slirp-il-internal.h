@@ -48,5 +48,7 @@ int qemu_slirp_il_registry_listen(QemuSlirpILRegistry *registry,
                                   QemuSlirpILListener **listener,
                                   Error **errp);
 void qemu_slirp_il_registry_flush_deferred(QemuSlirpILRegistry *registry);
+int qemu_slirp_il_listen_unavailable(QemuSlirpILListener **listener,
+                                      Error **errp);
 
 #endif /* QEMU_NET_SLIRP_IL_INTERNAL_H */

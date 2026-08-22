@@ -37,6 +37,39 @@ endif
 if enable_passt
   system_ss.add(files('passt.c'))
 endif
+
+# Do not infer IL support from a libslirp version: distributions can backport
+# or omit it.  The feature macro and every public entry point must be present
+# in the dependency we are about to link.
+slirp_il = false
+if slirp.found()
+  if slirp.type_name() == 'internal'
+    # The forced fallback is compiled from the pinned wrap below, whose
+    # SLIRP_HAVE_IL guard remains the authoritative compiler check.
+    slirp_il = true
+  else
+    slirp_il = cc.links('''
+      #include <libslirp.h>
+      #ifndef SLIRP_HAVE_IL
+      #error libslirp was built without IL
+      #endif
+      int main(void)
+      {
+        SlirpILListener *(*listen)(Slirp *, struct in_addr, uint16_t,
+                                   const SlirpILCallbacks *, void *) =
+            slirp_il_listen;
+        void (*remove_listener)(SlirpILListener *) = slirp_il_listener_remove;
+        int (*send_record)(SlirpILConnection *, const uint8_t *, size_t) =
+            slirp_il_send_record;
+        void (*close_connection)(SlirpILConnection *) =
+            slirp_il_connection_close;
+
+        return !(listen && remove_listener && send_record && close_connection);
+      }''', dependencies: slirp,
+      name: 'libslirp IL public API')
+  endif
+endif
+
 system_ss.add(files('slirp-il.c'))
 system_ss.add(when: slirp, if_true: files('slirp.c', 'slirp-guestfwd.c'))
 system_ss.add(when: vde, if_true: files('vde.c'))

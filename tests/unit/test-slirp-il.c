@@ -247,6 +247,18 @@ static void test_ipv4_disabled(void)
     qemu_slirp_il_registry_free(registry);
 }
 
+static void test_unavailable_feature(void)
+{
+    QemuSlirpILListener *listener = (void *)0x1;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_listen_unavailable(&listener, &err), ==, -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err), "IL is unavailable"));
+    error_free(err);
+}
+
 static void test_duplicate_tuple(void)
 {
     FakeBackend backend = {0};
@@ -524,6 +536,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/slirp-il/validation", test_validation);
     g_test_add_func("/slirp-il/ipv4-disabled", test_ipv4_disabled);
+    g_test_add_func("/slirp-il/unavailable-feature", test_unavailable_feature);
     g_test_add_func("/slirp-il/duplicate-tuple", test_duplicate_tuple);
     g_test_add_func("/slirp-il/independent-connections",
                     test_independent_connections);
