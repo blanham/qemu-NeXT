@@ -6,6 +6,8 @@
 
 typedef struct QemuSlirpILRegistry QemuSlirpILRegistry;
 
+/* The named-netdev facade is intentionally supplied by Task 2's net/slirp.c. */
+
 typedef struct QemuSlirpILBackendCallbacks {
     void *(*open)(void *backend_connection, void *opaque);
     void (*record)(void *backend_connection, const uint8_t *data, size_t len,
@@ -15,9 +17,10 @@ typedef struct QemuSlirpILBackendCallbacks {
 } QemuSlirpILBackendCallbacks;
 
 /*
- * The backend must make no callback after listener_remove returns.  Its close
- * operation eventually invokes callbacks.close exactly once for an accepted
- * connection; it may do so synchronously.
+ * The backend must make no callback after listener_remove returns.  listen()
+ * may invoke callbacks synchronously only after assigning backend_listener.
+ * Its close operation eventually invokes callbacks.close exactly once for an
+ * accepted connection; it may do so synchronously.
  */
 typedef struct QemuSlirpILBackendOps {
     int (*listen)(void *opaque, struct in_addr addr, uint16_t port,

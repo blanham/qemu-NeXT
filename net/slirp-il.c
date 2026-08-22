@@ -162,8 +162,10 @@ static void listener_finish_remove(QemuSlirpILListener *listener)
     }
     if (listener->registered) {
         listener->registered = false;
-        registry->backend->listener_remove(registry->backend_opaque,
-                                           listener->backend_listener);
+        if (listener->backend_listener) {
+            registry->backend->listener_remove(registry->backend_opaque,
+                                               listener->backend_listener);
+        }
     }
     while (!QTAILQ_EMPTY(&listener->connections)) {
         connection_finished(QTAILQ_FIRST(&listener->connections));
@@ -415,17 +417,28 @@ int qemu_slirp_il_registry_listen(QemuSlirpILRegistry *registry,
     listener->caller_ref = true;
     listener->valid = true;
     QTAILQ_INIT(&listener->connections);
+    QTAILQ_INSERT_TAIL(&registry->listeners, listener, entry);
+    listener->registered = true;
+    *listener_out = listener;
+    listener_ref(listener);
     if (registry->backend->listen(registry->backend_opaque, guest_addr,
                                   guest_port, &backend_callbacks, listener,
                                   &listener->backend_listener) < 0) {
-        error_setg(errp, "Conflicting SLiRP IL listener endpoint");
-        listener->refs = 1;
+        if (listener->valid && listener->caller_ref) {
+            listener_remove_internal(listener);
+        }
+        *listener_out = NULL;
+        error_setg(errp, "Failed to register SLiRP IL listener");
         listener_unref(listener);
         return -1;
     }
-    listener->registered = true;
-    QTAILQ_INSERT_TAIL(&registry->listeners, listener, entry);
-    *listener_out = listener;
+    if (!listener->valid || !listener->caller_ref || !listener->registered) {
+        *listener_out = NULL;
+        error_setg(errp, "SLiRP IL listener was removed during setup");
+        listener_unref(listener);
+        return -1;
+    }
+    listener_unref(listener);
     return 0;
 }
 
@@ -467,12 +480,19 @@ int qemu_slirp_il_send_record(QemuSlirpILConnection *connection,
     if (!data || !len) {
         return -EINVAL;
     }
+    listener_ref(listener);
+    connection_ref(connection);
     ret = listener->registry->backend->send_record(
         listener->registry->backend_opaque, connection->backend_connection,
         data, len);
-    if (ret == -EAGAIN) {
+    if (!connection->valid || connection->listener != listener ||
+        !listener->valid) {
+        ret = -ENOTCONN;
+    } else if (ret == -EAGAIN) {
         connection->send_ready = false;
     }
+    connection_unref(connection);
+    listener_unref(listener);
     return ret > 0 ? -EIO : ret;
 }
 

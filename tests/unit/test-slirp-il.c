@@ -11,8 +11,10 @@ typedef struct FakeBackend {
     uint16_t port;
     void *listener;
     int listens, listener_removes, closes, sends;
-    int send_result;
+    int listen_result, send_result;
     bool defer_close;
+    bool open_during_listen;
+    bool close_during_send;
     FakeConnection *connections[4];
     size_t nconnections;
 } FakeBackend;
@@ -23,6 +25,8 @@ struct FakeConnection {
     bool close_requested;
     bool close_reported;
 };
+
+static FakeConnection *fake_open(FakeBackend *backend);
 
 static int fake_listen(void *opaque, struct in_addr addr, uint16_t port,
                        const QemuSlirpILBackendCallbacks *callbacks,
@@ -41,7 +45,10 @@ static int fake_listen(void *opaque, struct in_addr addr, uint16_t port,
     backend->listener = backend;
     backend->listens++;
     *listener = backend;
-    return 0;
+    if (backend->open_during_listen) {
+        fake_open(backend);
+    }
+    return backend->listen_result;
 }
 
 static void fake_close_connection(FakeConnection *connection)
@@ -82,6 +89,9 @@ static int fake_send_record(void *opaque, void *backend_connection,
     g_assert_nonnull(data);
     g_assert_cmpuint(len, >, 0);
     backend->sends++;
+    if (backend->close_during_send) {
+        fake_close_connection(backend_connection);
+    }
     return backend->send_result;
 }
 
@@ -116,8 +126,10 @@ typedef struct CallbackState {
     unsigned opened, records, ready, closed;
     uint8_t last_record;
     bool remove_listener_from_record;
+    bool remove_listener_from_open;
     bool check_terminal_close;
     int terminal_send_result;
+    QemuSlirpILListener **listener_slot;
 } CallbackState;
 
 static void *opened(QemuSlirpILConnection *connection, void *opaque)
@@ -125,6 +137,14 @@ static void *opened(QemuSlirpILConnection *connection, void *opaque)
     CallbackState *state = opaque;
 
     state->connections[state->opened++] = connection;
+    if (state->remove_listener_from_open) {
+        g_assert_nonnull(state->listener_slot);
+        g_assert_nonnull(*state->listener_slot);
+        state->listener = *state->listener_slot;
+        qemu_slirp_il_listener_remove(state->listener);
+        *state->listener_slot = NULL;
+        state->listener = NULL;
+    }
     return state;
 }
 
@@ -342,6 +362,35 @@ static void test_send_ready_edges(void)
     g_free(connection);
 }
 
+static void test_send_close_reentrancy(void)
+{
+    FakeBackend backend = {
+        .send_result = -EAGAIN,
+        .close_during_send = true,
+    };
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    FakeConnection *connection;
+    Error *err = NULL;
+    uint8_t record_byte = 1;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, 0);
+    connection = fake_open(&backend);
+    g_assert_cmpint(qemu_slirp_il_send_record(state.connections[0],
+                                              &record_byte, 1), ==, -ENOTCONN);
+    g_assert_cmpuint(state.closed, ==, 1);
+    g_assert_null(state.connections[0]);
+    g_assert_null(connection->adapter_connection);
+    qemu_slirp_il_listener_remove(listener);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(connection);
+}
+
 static void test_remove_listener_from_callback(void)
 {
     FakeBackend backend = {0};
@@ -420,6 +469,56 @@ static void test_terminal_close_callback(void)
     g_free(connection);
 }
 
+static void test_listen_open_reentrancy(void)
+{
+    FakeBackend backend = {.open_during_listen = true};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    CallbackState state = {
+        .remove_listener_from_open = true,
+        .listener_slot = &listener,
+    };
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    g_assert_cmpuint(state.opened, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+    g_assert_cmpint(backend.listener_removes, ==, 1);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(backend.connections[0]);
+}
+
+static void test_listen_failure_after_open(void)
+{
+    FakeBackend backend = {
+        .listen_result = -EIO,
+        .open_during_listen = true,
+    };
+    CallbackState state = {0};
+    QemuSlirpILRegistry *registry = new_registry(&backend, true);
+    QemuSlirpILListener *listener = NULL;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_il_registry_listen(registry, ip(0x0a000204),
+                                                   17008, &listener_ops,
+                                                   &state, &listener, &err),
+                    ==, -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    g_assert_cmpuint(state.opened, ==, 1);
+    g_assert_cmpuint(state.closed, ==, 1);
+    g_assert_cmpint(backend.listener_removes, ==, 1);
+    error_free(err);
+    qemu_slirp_il_registry_free(registry);
+    g_free(backend.connections[0]);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -431,11 +530,17 @@ int main(int argc, char **argv)
     g_test_add_func("/slirp-il/atomic-send-errors",
                     test_atomic_send_and_errors);
     g_test_add_func("/slirp-il/send-ready-edges", test_send_ready_edges);
+    g_test_add_func("/slirp-il/send-close-reentrancy",
+                    test_send_close_reentrancy);
     g_test_add_func("/slirp-il/remove-from-callback",
                     test_remove_listener_from_callback);
     g_test_add_func("/slirp-il/repeated-close-invalidate",
                     test_repeated_close_and_invalidate);
     g_test_add_func("/slirp-il/terminal-close-callback",
                     test_terminal_close_callback);
+    g_test_add_func("/slirp-il/listen-open-reentrancy",
+                    test_listen_open_reentrancy);
+    g_test_add_func("/slirp-il/listen-failure-after-open",
+                    test_listen_failure_after_open);
     return g_test_run();
 }

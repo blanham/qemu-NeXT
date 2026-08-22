@@ -34,7 +34,8 @@ int qemu_slirp_il_listen(const char *netdev_id, struct in_addr guest_addr,
 
 /*
  * Atomic: returns zero only when the complete record was accepted.  It
- * returns -ENOTCONN during the terminal close callback.
+ * returns -ENOTCONN during the terminal close callback or if the backend
+ * closes the connection while accepting the record.
  */
 int qemu_slirp_il_send_record(QemuSlirpILConnection *connection,
                               const uint8_t *data, size_t len);
