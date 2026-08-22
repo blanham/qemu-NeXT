@@ -57,6 +57,10 @@ tests = {
   'test-nfs2-xdr': [
     meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
   ],
+  'test-nfs2-handle': [
+    meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+    crypto,
+  ],
 }
 
 if host_os != 'windows'
