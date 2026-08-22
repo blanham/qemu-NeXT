@@ -9,6 +9,8 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/cutils.h"
+#include "qemu/memfd.h"
 #include "crypto/cipher.h"
 #include "crypto/random.h"
 #include "hw/9pfs/plan9-auth.h"
@@ -456,7 +458,7 @@ void plan9_auth_keydb_set_lookup_hook(Plan9AuthKeydbLookupHook hook,
 }
 
 static bool plan9_auth_keydb_metadata_equal(const struct stat *a,
-                                            const struct stat *b)
+                                             const struct stat *b)
 {
     if (a->st_dev != b->st_dev || a->st_ino != b->st_ino ||
         a->st_mode != b->st_mode || a->st_size != b->st_size ||
@@ -608,6 +610,63 @@ out:
     return ret;
 }
 
+static int plan9_auth_keydb_open(const char *path, bool *inherited_fd,
+                                 Error **errp)
+{
+#ifdef CONFIG_LINUX
+    static const char proc_fd_prefix[] = "/proc/self/fd/";
+    const char *number;
+    const char *end;
+    int source_fd;
+    int seals;
+    int fd;
+
+    if (g_str_has_prefix(path, proc_fd_prefix)) {
+        *inherited_fd = true;
+        number = path + strlen(proc_fd_prefix);
+        if (!*number) {
+            error_setg(errp, "invalid inherited Plan 9 key database fd");
+            return -1;
+        }
+        for (end = number; *end; end++) {
+            if (!g_ascii_isdigit(*end)) {
+                error_setg(errp, "invalid inherited Plan 9 key database fd");
+                return -1;
+            }
+        }
+        if (qemu_strtoi(number, &end, 10, &source_fd) < 0 || *end) {
+            error_setg(errp, "invalid inherited Plan 9 key database fd");
+            return -1;
+        }
+        fd = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) {
+            error_setg_errno(errp, errno,
+                             "cannot duplicate Plan 9 key database fd");
+            return -1;
+        }
+        seals = fcntl(fd, F_GET_SEALS);
+        if (seals < 0 ||
+            (seals & (F_SEAL_SEAL | F_SEAL_SHRINK |
+                      F_SEAL_GROW | F_SEAL_WRITE)) !=
+            (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE)) {
+            error_setg(errp,
+                       "inherited Plan 9 key database fd is not sealed");
+            close(fd);
+            return -1;
+        }
+        if (lseek(fd, 0, SEEK_SET) < 0) {
+            error_setg_errno(errp, errno,
+                             "cannot seek Plan 9 key database fd");
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+#endif
+
+    return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+}
+
 Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
                                       const uint8_t master_key[
                                           PLAN9_AUTH_DES_KEY_LEN],
@@ -619,6 +678,7 @@ Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
     uint8_t *records = NULL;
     uint8_t eof;
     int fd = -1;
+    bool inherited_fd = false;
     size_t bytes = 0, count, offset = 0;
     ssize_t got;
 
@@ -628,9 +688,11 @@ Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
         return NULL;
     }
 
-    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    fd = plan9_auth_keydb_open(path, &inherited_fd, errp);
     if (fd < 0) {
-        error_setg_errno(errp, errno, "cannot open Plan 9 key database");
+        if (!inherited_fd) {
+            error_setg_errno(errp, errno, "cannot open Plan 9 key database");
+        }
         goto fail;
     }
     if (fstat(fd, &before) < 0) {
@@ -684,12 +746,14 @@ Plan9AuthKeydb *plan9_auth_keydb_load(const char *path,
         keydb_read_hook(path, keydb_read_hook_opaque);
     }
     if (fstat(fd, &after) < 0 ||
-        fstatat(AT_FDCWD, path, &pathname, AT_SYMLINK_NOFOLLOW) < 0) {
+        (!inherited_fd &&
+         fstatat(AT_FDCWD, path, &pathname, AT_SYMLINK_NOFOLLOW) < 0)) {
         error_setg_errno(errp, errno, "cannot revalidate Plan 9 key database");
         goto fail;
     }
     if (!plan9_auth_keydb_metadata_equal(&before, &after) ||
-        !plan9_auth_keydb_metadata_equal(&before, &pathname)) {
+        (!inherited_fd &&
+         !plan9_auth_keydb_metadata_equal(&before, &pathname))) {
         error_setg(errp, "Plan 9 key database changed during read");
         goto fail;
     }

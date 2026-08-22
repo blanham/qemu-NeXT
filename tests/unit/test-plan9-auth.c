@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/base64.h"
+#include "qemu/memfd.h"
 #include "hw/9pfs/plan9-auth.h"
 #include "qapi/error.h"
 
@@ -436,6 +437,79 @@ static void test_keydb_golden_and_lookup(void)
     plan9_auth_keydb_free(keydb);
     keydb_remove_tree(dir);
 }
+
+#ifdef CONFIG_LINUX
+static void test_keydb_sealed_inherited_fd(void)
+{
+    static const KeydbFixtureRecord records[] = {
+        { "p9fs", { 1, 2, 3, 4, 5, 6, 7 }, 0, 0, 0 },
+    };
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *path = g_build_filename(dir, "keys", NULL);
+    g_autofree char *contents = NULL;
+    g_autofree char *fd_path = NULL;
+    gsize len;
+    Plan9AuthKeydb *keydb;
+    uint8_t key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    int fd;
+
+    keydb_write(path, records, G_N_ELEMENTS(records));
+    g_assert_true(g_file_get_contents(path, &contents, &len, NULL));
+    fd = memfd_create("plan9-keydb-test", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0 && errno == ENOSYS) {
+        g_test_skip("memfd_create is unavailable");
+        keydb_remove_tree(dir);
+        return;
+    }
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, contents, len), ==, len);
+    g_assert_cmpint(fcntl(fd, F_ADD_SEALS,
+                         F_SEAL_SEAL | F_SEAL_SHRINK |
+                         F_SEAL_GROW | F_SEAL_WRITE), ==, 0);
+    g_assert_cmpint(lseek(fd, 0, SEEK_SET), ==, 0);
+    fd_path = g_strdup_printf("/proc/self/fd/%d", fd);
+
+    keydb = keydb_load(fd_path, "p9fs", 0);
+    g_assert_cmpint(plan9_auth_keydb_lookup(keydb, "p9fs", 0, key), ==,
+                    PLAN9_AUTH_KEY_AVAILABLE);
+    g_assert_cmpmem(key, sizeof(key), records[0].key, sizeof(key));
+
+    plan9_auth_clear(key, sizeof(key));
+    plan9_auth_keydb_free(keydb);
+    close(fd);
+    keydb_remove_tree(dir);
+}
+
+static void test_keydb_unsealed_inherited_fd_rejected(void)
+{
+    static const KeydbFixtureRecord records[] = {
+        { "p9fs", { 1, 2, 3, 4, 5, 6, 7 }, 0, 0, 0 },
+    };
+    g_autofree char *dir = keydb_tempdir();
+    g_autofree char *path = g_build_filename(dir, "keys", NULL);
+    g_autofree char *contents = NULL;
+    g_autofree char *fd_path = NULL;
+    gsize len;
+    int fd;
+
+    keydb_write(path, records, G_N_ELEMENTS(records));
+    g_assert_true(g_file_get_contents(path, &contents, &len, NULL));
+    fd = memfd_create("plan9-keydb-test", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0 && errno == ENOSYS) {
+        g_test_skip("memfd_create is unavailable");
+        keydb_remove_tree(dir);
+        return;
+    }
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, contents, len), ==, len);
+    fd_path = g_strdup_printf("/proc/self/fd/%d", fd);
+
+    keydb_expect_rejected(fd_path, "p9fs", 0);
+
+    close(fd);
+    keydb_remove_tree(dir);
+}
+#endif
 
 typedef struct KeydbLookupVisits {
     size_t visits;
@@ -2601,6 +2675,12 @@ int main(int argc, char **argv)
                     test_decode_fixed_string_compatibility);
     g_test_add_func("/plan9-auth/keydb-golden-and-lookup",
                     test_keydb_golden_and_lookup);
+#ifdef CONFIG_LINUX
+    g_test_add_func("/plan9-auth/keydb-sealed-inherited-fd",
+                    test_keydb_sealed_inherited_fd);
+    g_test_add_func("/plan9-auth/keydb-unsealed-inherited-fd-rejected",
+                    test_keydb_unsealed_inherited_fd_rejected);
+#endif
     g_test_add_func("/plan9-auth/keydb-lookup-full-scan",
                     test_keydb_lookup_full_scan);
     g_test_add_func("/plan9-auth/keydb-record-encoder",
