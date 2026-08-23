@@ -5,6 +5,7 @@
 #include "hw/nfs/nfs2-protocol.h"
 
 typedef struct Nfs2HandleTable Nfs2HandleTable;
+typedef struct Nfs2HandleAliasReservation Nfs2HandleAliasReservation;
 
 typedef struct Nfs2HandlePathState {
     uint64_t id;
@@ -22,6 +23,17 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(Nfs2HandleTable, nfs2_handle_table_free)
 bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
                         const char *path, Nfs2FileHandle *handle,
                         Error **errp);
+bool nfs2_handle_alias_reserve(Nfs2HandleTable *table,
+                               const Nfs2FileHandle *handle,
+                               const char *path,
+                               Nfs2HandleAliasReservation **reservation,
+                               Error **errp);
+void nfs2_handle_alias_cancel(Nfs2HandleAliasReservation *reservation);
+void nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation);
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(Nfs2HandleAliasReservation,
+                              nfs2_handle_alias_cancel)
+
 bool nfs2_handle_resolve(Nfs2HandleTable *table,
                          const Nfs2FileHandle *handle, V9fsPath *path);
 GPtrArray *nfs2_handle_paths_snapshot(Nfs2HandleTable *table,

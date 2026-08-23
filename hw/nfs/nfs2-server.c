@@ -2432,6 +2432,9 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
                 ret = -EEXIST;
             }
         }
+        if (ret >= 0) {
+            ret = sync_directory(server, dir);
+        }
         close_ret = co_simple_open(server, BACKEND_CLOSE, &open);
         return ret >= 0 && close_ret < 0 ? close_ret : ret;
     }
@@ -2902,6 +2905,8 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
     V9fsPath file_abs = { 0 }, file = { 0 };
     V9fsPath dir_abs = { 0 }, dir = { 0 };
     V9fsPath linked = { 0 };
+    g_autofree char *new_abs = NULL;
+    g_autoptr(Nfs2HandleAliasReservation) alias_reservation = NULL;
     struct stat file_st = { 0 }, file_after = { 0 }, linked_st = { 0 };
     struct stat dir_before = { 0 }, dir_after = { 0 };
     bool file_valid = false, file_after_valid = false;
@@ -2927,6 +2932,14 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         dir_before_valid = ret >= 0;
     }
     if (ret >= 0) {
+        new_abs = child_absolute(dir_abs.data, name);
+        if (!new_abs ||
+            !nfs2_handle_alias_reserve(server->handles, &file_handle,
+                                       new_abs, &alias_reservation, NULL)) {
+            ret = -ENOSPC;
+        }
+    }
+    if (ret >= 0) {
         ret = co_link(server, &file, &dir, name);
         linked_created = ret >= 0;
     }
@@ -2949,6 +2962,9 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         if (ret >= 0 && post_ret < 0) {
             ret = post_ret;
         }
+    }
+    if (ret >= 0) {
+        nfs2_handle_alias_commit(g_steal_pointer(&alias_reservation));
     }
     if (ret < 0 && linked_created) {
         if (file_valid) {

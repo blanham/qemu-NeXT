@@ -119,18 +119,32 @@ static void test_path_and_record_bounds(void)
 static void test_alias_bound(void)
 {
     g_autoptr(Nfs2HandleTable) table = new_table();
+    g_autoptr(Nfs2HandleAliasReservation) reservation = NULL;
     Nfs2FileHandle handle;
     Error *error = NULL;
+    unsigned int backend_mutations = 0;
 
-    for (uint64_t alias = 0; alias < NFS2_MAX_HANDLE_RECORDS; alias++) {
+    for (uint64_t alias = 0; alias < NFS2_MAX_HANDLE_RECORDS - 1; alias++) {
         g_autofree char *path = g_strdup_printf("/alias/%" PRIu64, alias);
 
         g_assert_true(nfs2_handle_create(table, 1, path, &handle,
                                          &error_abort));
     }
+    g_assert_true(nfs2_handle_alias_reserve(table, &handle, "/reserved",
+                                            &reservation, &error_abort));
     g_assert_cmpuint(nfs2_handle_table_record_count(table), ==, 1);
     g_assert_false(nfs2_handle_create(table, 1, "/alias/overflow", &handle,
                                       &error));
+    g_assert_nonnull(error);
+    error_free(error);
+    error = NULL;
+    nfs2_handle_alias_commit(g_steal_pointer(&reservation));
+    if (nfs2_handle_alias_reserve(table, &handle, "/reserved-overflow",
+                                  &reservation, &error)) {
+        backend_mutations++;
+    }
+    g_assert_cmpuint(backend_mutations, ==, 0);
+    g_assert_null(reservation);
     g_assert_nonnull(error);
     error_free(error);
 }
@@ -289,16 +303,16 @@ static void test_rename_same_record_is_noop(void)
 static void test_hard_link_alias_fallback(void)
 {
     g_autoptr(Nfs2HandleTable) table = new_table();
+    g_autoptr(Nfs2HandleAliasReservation) reservation = NULL;
     Nfs2FileHandle primary;
-    Nfs2FileHandle alias;
     V9fsPath path = { 0 };
 
     g_assert_true(nfs2_handle_create(table, 9, "/primary", &primary,
                                      &error_abort));
-    g_assert_true(nfs2_handle_create(table, 9, "/alias", &alias,
-                                     &error_abort));
-    g_assert_cmpmem(primary.bytes, sizeof(primary.bytes),
-                    alias.bytes, sizeof(alias.bytes));
+    g_assert_true(nfs2_handle_alias_reserve(table, &primary, "/alias",
+                                            &reservation, &error_abort));
+    assert_resolves(table, &primary, "/primary");
+    nfs2_handle_alias_commit(g_steal_pointer(&reservation));
 
     g_assert_true(nfs2_handle_remove(table, "/primary", &error_abort));
     assert_resolves(table, &primary, "/alias");

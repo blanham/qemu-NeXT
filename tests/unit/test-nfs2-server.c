@@ -87,6 +87,7 @@ typedef struct Fixture {
     unsigned int publish_order;
     unsigned int temp_unlink_order;
     unsigned int dir_fsync_order;
+    unsigned int dir_fsync_calls;
     unsigned int unlink_calls;
     int file_fsync_error;
     int dir_fsync_error;
@@ -395,6 +396,7 @@ static int fake_fsync(FsContext *ctx, int fid_type,
         unsigned int order = ++current->exclusive_order;
 
         if (fid_type == P9_FID_DIR) {
+            current->dir_fsync_calls++;
             current->dir_fsync_order = order;
             if (current->dir_fsync_error) {
                 errno = current->dir_fsync_error;
@@ -2607,8 +2609,12 @@ static void test_review_exclusive_fsync_and_rollback_failures(
     send_exclusive(f, &root, "dir-sync", verifier, 5);
     g_assert_true(f->linked_present);
     g_assert_true(f->linked_verifier_present);
+    g_assert_cmpuint(f->dir_fsync_calls, ==, 1);
+    send_exclusive(f, &root, "dir-sync", verifier, 5);
+    g_assert_cmpuint(f->dir_fsync_calls, ==, 2);
     f->dir_fsync_error = 0;
     send_exclusive(f, &root, "dir-sync", verifier, 0);
+    g_assert_cmpuint(f->dir_fsync_calls, ==, 3);
     f->linked_present = false;
     f->object_present = false;
     f->verifier_present = false;
@@ -2706,6 +2712,103 @@ static void test_review_link_postattrs_and_validation(Fixture *f,
     g_assert_cmpuint(reply_word(f, 10), ==, 2);
 }
 
+static void test_review_link_alias_lifecycle(Fixture *f,
+                                             gconstpointer opaque)
+{
+    Nfs2FileHandle roots[2], objects[2];
+    const uint32_t versions[2] = { 2, 3 };
+    uint8_t call[192], body[160];
+    Nfs2XdrWriter w;
+    size_t len;
+
+    make_writable(f);
+    roots[0] = mount_root(f, 1);
+    roots[1] = mount_root(f, 3);
+    for (unsigned int i = 0; i < G_N_ELEMENTS(versions); i++) {
+        const uint32_t version = versions[i];
+        const char *source = version == 2 ? "alias2-src" : "alias3-src";
+        const char *destination = version == 2 ? "alias2-dst" : "alias3-dst";
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        if (version == 2) {
+            put_name2(&w, &roots[i], source);
+            put_sattr2(&w, 0600);
+        } else {
+            put_name3(&w, &roots[i], source);
+            g_assert_true(nfs2_xdr_put_u32(&w, 1));
+            put_sattr3(&w, 0600);
+        }
+        send_nfs(f, version, version == 2 ? NFS2_NFSPROC_CREATE : 8,
+                 body, nfs2_xdr_writer_size(&w), 0);
+        memcpy(objects[i].bytes, f->reply->data + (version == 2 ? 28 : 36),
+               sizeof(objects[i].bytes));
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        if (version == 2) {
+            g_assert_true(nfs2_xdr_put_opaque(&w, objects[i].bytes, 32));
+            put_name2(&w, &roots[i], destination);
+        } else {
+            g_assert_true(nfs2_xdr_put_counted_opaque(&w, objects[i].bytes,
+                                                       32, 32));
+            put_name3(&w, &roots[i], destination);
+        }
+        send_nfs(f, version, version == 2 ? NFS2_NFSPROC_LINK : 15,
+                 body, nfs2_xdr_writer_size(&w), 0);
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        if (version == 2) {
+            put_name2(&w, &roots[i], source);
+        } else {
+            put_name3(&w, &roots[i], source);
+        }
+        send_nfs(f, version, version == 2 ? NFS2_NFSPROC_REMOVE : 12,
+                 body, nfs2_xdr_writer_size(&w), 0);
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        if (version == 2) {
+            g_assert_true(nfs2_xdr_put_opaque(&w, objects[i].bytes, 32));
+        } else {
+            g_assert_true(nfs2_xdr_put_counted_opaque(&w, objects[i].bytes,
+                                                       32, 32));
+        }
+        len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
+                       NFS2_NFSPROC_GETATTR, body,
+                       nfs2_xdr_writer_size(&w));
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(reply_word(f, 6), ==, 0);
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        if (version == 2) {
+            g_assert_true(nfs2_xdr_put_opaque(&w, objects[i].bytes, 32));
+            g_assert_true(nfs2_xdr_put_u32(&w, 0));
+            g_assert_true(nfs2_xdr_put_u32(&w, 6));
+            g_assert_true(nfs2_xdr_put_u32(&w, 6));
+        } else {
+            g_assert_true(nfs2_xdr_put_counted_opaque(&w, objects[i].bytes,
+                                                       32, 32));
+            g_assert_true(nfs2_xdr_put_u32(&w, 0));
+            g_assert_true(nfs2_xdr_put_u32(&w, 0));
+            g_assert_true(nfs2_xdr_put_u32(&w, 6));
+        }
+        len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
+                       NFS2_NFSPROC_READ, body,
+                       nfs2_xdr_writer_size(&w));
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(reply_word(f, 6), ==, 0);
+        g_assert_cmpmem(f->reply->data + f->reply->len - 8, 6,
+                        "NetBSD", 6);
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        if (version == 2) {
+            put_name2(&w, &roots[i], destination);
+        } else {
+            put_name3(&w, &roots[i], destination);
+        }
+        send_nfs(f, version, version == 2 ? NFS2_NFSPROC_REMOVE : 12,
+                 body, nfs2_xdr_writer_size(&w), 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -2773,5 +2876,7 @@ int main(int argc, char **argv)
                test_review_duplicate_setattr_write, teardown);
     g_test_add("/nfs/review/link-postattrs-validation", Fixture, NULL, setup,
                test_review_link_postattrs_and_validation, teardown);
+    g_test_add("/nfs/review/link-alias-lifecycle", Fixture, NULL, setup,
+               test_review_link_alias_lifecycle, teardown);
     return g_test_run();
 }
