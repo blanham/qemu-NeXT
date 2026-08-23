@@ -2964,7 +2964,10 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         }
     }
     if (ret >= 0) {
-        nfs2_handle_alias_commit(g_steal_pointer(&alias_reservation));
+        if (!nfs2_handle_alias_commit(
+                g_steal_pointer(&alias_reservation))) {
+            ret = -ESTALE;
+        }
     }
     if (ret < 0 && linked_created) {
         if (file_valid) {

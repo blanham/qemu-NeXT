@@ -26,9 +26,9 @@ typedef struct Nfs2RenameChange {
 
 struct Nfs2HandleAliasReservation {
     Nfs2HandleTable *table;
-    Nfs2HandleRecord *record;
+    uint64_t source_id;
+    uint32_t source_generation;
     V9fsPath *alias;
-    Nfs2HandlePathState path_state;
     bool consumes_slot;
 };
 
@@ -372,10 +372,10 @@ bool nfs2_handle_alias_reserve(Nfs2HandleTable *table,
 
     reserved = g_new0(Nfs2HandleAliasReservation, 1);
     reserved->table = table;
-    reserved->record = record;
+    reserved->source_id = record->id;
+    reserved->source_generation = record->generation;
     reserved->alias = path_new(path);
     reserved->consumes_slot = !path_record;
-    nfs2_handle_path_state(table, path, &reserved->path_state);
     if (reserved->consumes_slot) {
         table->reserved_alias_count++;
     }
@@ -388,34 +388,40 @@ void nfs2_handle_alias_cancel(Nfs2HandleAliasReservation *reservation)
     if (!reservation) {
         return;
     }
-    if (reservation->consumes_slot) {
-        g_assert(reservation->table->reserved_alias_count > 0);
+    if (reservation->consumes_slot && reservation->table &&
+        reservation->table->reserved_alias_count > 0) {
         reservation->table->reserved_alias_count--;
     }
     path_free(reservation->alias);
     g_free(reservation);
 }
 
-void nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation)
+bool nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation)
 {
     Nfs2HandleTable *table;
+    Nfs2HandleRecord *record;
     Nfs2HandleRecord *path_record;
+    bool removed = false;
 
-    g_assert(reservation);
+    if (!reservation) {
+        return false;
+    }
     table = reservation->table;
-    g_assert(table && table->active);
-    g_assert(g_hash_table_lookup(table->by_id, &reservation->record->id) ==
-             reservation->record);
+    if (!table || !table->active) {
+        nfs2_handle_alias_cancel(reservation);
+        return false;
+    }
+    record = g_hash_table_lookup(table->by_id, &reservation->source_id);
+    if (!record || record->generation != reservation->source_generation) {
+        nfs2_handle_alias_cancel(reservation);
+        return false;
+    }
     path_record = g_hash_table_lookup(table->by_path,
                                       reservation->alias->data);
-    if (path_record == reservation->record) {
+    if (path_record == record) {
         nfs2_handle_alias_cancel(reservation);
-        return;
+        return true;
     }
-    g_assert(nfs2_handle_path_state_allows(table,
-                                           reservation->alias->data,
-                                           &reservation->path_state,
-                                           reservation->record->id));
     if (path_record) {
         for (size_t i = 0; i < path_record->aliases->len; i++) {
             V9fsPath *alias = g_ptr_array_index(path_record->aliases, i);
@@ -424,19 +430,25 @@ void nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation)
                 g_hash_table_remove(table->by_path, alias->data);
                 g_ptr_array_remove_index(path_record->aliases, i);
                 table->alias_count--;
+                removed = true;
                 break;
             }
+        }
+        if (!removed) {
+            nfs2_handle_alias_cancel(reservation);
+            return false;
         }
         if (path_record->aliases->len == 0) {
             g_hash_table_remove(table->by_id, &path_record->id);
         }
     }
-    g_ptr_array_add(reservation->record->aliases, reservation->alias);
+    g_ptr_array_add(record->aliases, reservation->alias);
     g_hash_table_insert(table->by_path, reservation->alias->data,
-                        reservation->record);
+                        record);
     table->alias_count++;
     reservation->alias = NULL;
     nfs2_handle_alias_cancel(reservation);
+    return true;
 }
 
 bool nfs2_handle_resolve(Nfs2HandleTable *table,

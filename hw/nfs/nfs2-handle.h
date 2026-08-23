@@ -29,7 +29,7 @@ bool nfs2_handle_alias_reserve(Nfs2HandleTable *table,
                                Nfs2HandleAliasReservation **reservation,
                                Error **errp);
 void nfs2_handle_alias_cancel(Nfs2HandleAliasReservation *reservation);
-void nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation);
+bool nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(Nfs2HandleAliasReservation,
                               nfs2_handle_alias_cancel)

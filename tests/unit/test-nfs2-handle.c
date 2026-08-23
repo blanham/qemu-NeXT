@@ -138,7 +138,8 @@ static void test_alias_bound(void)
     g_assert_nonnull(error);
     error_free(error);
     error = NULL;
-    nfs2_handle_alias_commit(g_steal_pointer(&reservation));
+    g_assert_true(nfs2_handle_alias_commit(
+                      g_steal_pointer(&reservation)));
     if (nfs2_handle_alias_reserve(table, &handle, "/reserved-overflow",
                                   &reservation, &error)) {
         backend_mutations++;
@@ -300,11 +301,13 @@ static void test_rename_same_record_is_noop(void)
     assert_resolves(table, &handle, "/destination");
 }
 
-static void test_hard_link_alias_fallback(void)
+static void test_hard_link_alias_aba_reconcile(void)
 {
     g_autoptr(Nfs2HandleTable) table = new_table();
     g_autoptr(Nfs2HandleAliasReservation) reservation = NULL;
     Nfs2FileHandle primary;
+    Nfs2FileHandle replacement;
+    Nfs2FileHandle conflict;
     V9fsPath path = { 0 };
 
     g_assert_true(nfs2_handle_create(table, 9, "/primary", &primary,
@@ -312,10 +315,17 @@ static void test_hard_link_alias_fallback(void)
     g_assert_true(nfs2_handle_alias_reserve(table, &primary, "/alias",
                                             &reservation, &error_abort));
     assert_resolves(table, &primary, "/primary");
-    nfs2_handle_alias_commit(g_steal_pointer(&reservation));
+    g_assert_true(nfs2_handle_create(table, 10, "/replacement",
+                                     &replacement, &error_abort));
+    g_assert_true(nfs2_handle_create(table, 10, "/alias", &conflict,
+                                     &error_abort));
+    g_assert_true(nfs2_handle_alias_commit(
+                      g_steal_pointer(&reservation)));
 
     g_assert_true(nfs2_handle_remove(table, "/primary", &error_abort));
     assert_resolves(table, &primary, "/alias");
+    assert_resolves(table, &replacement, "/replacement");
+    assert_resolves(table, &conflict, "/replacement");
     g_assert_true(nfs2_handle_remove(table, "/alias", &error_abort));
     g_assert_false(nfs2_handle_resolve(table, &primary, &path));
 }
@@ -418,7 +428,8 @@ int main(int argc, char **argv)
                     test_rename_replaces_destination);
     g_test_add_func("/nfs2-handle/rename-same-record",
                     test_rename_same_record_is_noop);
-    g_test_add_func("/nfs2-handle/hard-link", test_hard_link_alias_fallback);
+    g_test_add_func("/nfs2-handle/hard-link-alias-aba",
+                    test_hard_link_alias_aba_reconcile);
     g_test_add_func("/nfs2-handle/external-replacement",
                     test_external_path_replacement);
     g_test_add_func("/nfs2-handle/alias-snapshot", test_alias_snapshot);
