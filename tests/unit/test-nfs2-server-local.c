@@ -19,6 +19,7 @@ typedef struct LocalFixture {
     GByteArray *reply;
     char *root;
     char *outside;
+    uint32_t xid;
 } LocalFixture;
 
 static LocalFixture *current;
@@ -127,7 +128,7 @@ static uint32_t word(LocalFixture *f, size_t index)
     return ldl_be_p(f->reply->data + index * 4);
 }
 
-static Nfs2FileHandle mount_root(LocalFixture *f)
+static Nfs2FileHandle mount_root_version(LocalFixture *f, uint32_t version)
 {
     uint8_t body[8] = { 0 }, call[128];
     Nfs2FileHandle handle;
@@ -135,17 +136,27 @@ static Nfs2FileHandle mount_root(LocalFixture *f)
 
     stl_be_p(body, 1);
     body[4] = '/';
-    len = rpc_call(call, sizeof(call), NFS2_MOUNT_PROGRAM, 3,
+    len = rpc_call(call, sizeof(call), NFS2_MOUNT_PROGRAM, version,
                    NFS2_MOUNT_MNT, body, sizeof(body));
     request(f, NFS2_SERVICE_MOUNT, call, len);
     g_assert_cmpuint(word(f, 6), ==, 0);
-    g_assert_cmpuint(word(f, 7), ==, 32);
-    memcpy(handle.bytes, f->reply->data + 32, 32);
+    if (version == 3) {
+        g_assert_cmpuint(word(f, 7), ==, 32);
+        memcpy(handle.bytes, f->reply->data + 32, 32);
+    } else {
+        memcpy(handle.bytes, f->reply->data + 28, 32);
+    }
     return handle;
 }
 
-static Nfs2FileHandle lookup(LocalFixture *f, const Nfs2FileHandle *dir,
-                             const char *name, uint32_t expected)
+static Nfs2FileHandle mount_root(LocalFixture *f)
+{
+    return mount_root_version(f, 3);
+}
+
+static Nfs2FileHandle lookup_version(LocalFixture *f, uint32_t version,
+                                     const Nfs2FileHandle *dir,
+                                     const char *name, uint32_t expected)
 {
     uint8_t body[80], call[180];
     Nfs2FileHandle handle = { 0 };
@@ -153,17 +164,32 @@ static Nfs2FileHandle lookup(LocalFixture *f, const Nfs2FileHandle *dir,
     size_t len;
 
     nfs2_xdr_writer_init(&w, body, sizeof(body));
-    g_assert_true(nfs2_xdr_put_counted_opaque(&w, dir->bytes, 32, 32));
+    if (version == 3) {
+        g_assert_true(nfs2_xdr_put_counted_opaque(&w, dir->bytes, 32, 32));
+    } else {
+        g_assert_true(nfs2_xdr_put_opaque(&w, dir->bytes, 32));
+    }
     g_assert_true(nfs2_xdr_put_counted_opaque(&w, name, strlen(name), 255));
-    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 3,
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
+                   version == 3 ? 3 : NFS2_NFSPROC_LOOKUP,
                    body, nfs2_xdr_writer_size(&w));
     request(f, NFS2_SERVICE_NFS, call, len);
     g_assert_cmpuint(word(f, 6), ==, expected);
     if (!expected) {
-        g_assert_cmpuint(word(f, 7), ==, 32);
-        memcpy(handle.bytes, f->reply->data + 32, 32);
+        if (version == 3) {
+            g_assert_cmpuint(word(f, 7), ==, 32);
+            memcpy(handle.bytes, f->reply->data + 32, 32);
+        } else {
+            memcpy(handle.bytes, f->reply->data + 28, 32);
+        }
     }
     return handle;
+}
+
+static Nfs2FileHandle lookup(LocalFixture *f, const Nfs2FileHandle *dir,
+                             const char *name, uint32_t expected)
+{
+    return lookup_version(f, 3, dir, name, expected);
 }
 
 static void set_mapped(const char *path, uid_t uid, gid_t gid, mode_t mode)
@@ -178,6 +204,57 @@ static void set_mapped(const char *path, uid_t uid, gid_t gid, mode_t mode)
                              sizeof(wire_gid), 0), ==, 0);
     g_assert_cmpint(setxattr(path, "user.virtfs.mode", &wire_mode,
                              sizeof(wire_mode), 0), ==, 0);
+}
+
+static void put_name(Nfs2XdrWriter *w, uint32_t version,
+                     const Nfs2FileHandle *dir, const char *name)
+{
+    if (version == 3) {
+        g_assert_true(nfs2_xdr_put_counted_opaque(w, dir->bytes, 32, 32));
+    } else {
+        g_assert_true(nfs2_xdr_put_opaque(w, dir->bytes, 32));
+    }
+    g_assert_true(nfs2_xdr_put_counted_opaque(w, name, strlen(name), 255));
+}
+
+static void put_sattr2(Nfs2XdrWriter *w, mode_t mode)
+{
+    g_assert_true(nfs2_xdr_put_u32(w, mode));
+    for (unsigned int i = 0; i < 7; i++) {
+        g_assert_true(nfs2_xdr_put_u32(w, UINT32_MAX));
+    }
+}
+
+static void put_sattr3(Nfs2XdrWriter *w, mode_t mode,
+                       bool large_size)
+{
+    g_assert_true(nfs2_xdr_put_u32(w, 1));
+    g_assert_true(nfs2_xdr_put_u32(w, mode));
+    g_assert_true(nfs2_xdr_put_u32(w, 1));
+    g_assert_true(nfs2_xdr_put_u32(w, 9999)); /* decoded, ignored uid */
+    g_assert_true(nfs2_xdr_put_u32(w, 1));
+    g_assert_true(nfs2_xdr_put_u32(w, 9998)); /* decoded, ignored gid */
+    g_assert_true(nfs2_xdr_put_u32(w, large_size));
+    if (large_size) {
+        uint64_t size = (uint64_t)INT32_MAX + 16384;
+
+        g_assert_true(nfs2_xdr_put_u32(w, size >> 32));
+        g_assert_true(nfs2_xdr_put_u32(w, size));
+    }
+    g_assert_true(nfs2_xdr_put_u32(w, 0));
+    g_assert_true(nfs2_xdr_put_u32(w, 0));
+}
+
+static void mutate(LocalFixture *f, uint32_t version, uint32_t proc,
+                   const uint8_t *body, size_t body_len, uint32_t expected)
+{
+    uint8_t call[512];
+    size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
+                          proc, body, body_len);
+
+    stl_be_p(call, ++f->xid);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, expected);
 }
 
 static void setup(LocalFixture *f, gconstpointer opaque)
@@ -212,12 +289,15 @@ static void setup(LocalFixture *f, gconstpointer opaque)
         g_assert_cmpint(close(fd), ==, 0);
     }
     set_mapped(sparse, 1, 2, S_IFREG | 0444);
+    set_mapped(f->root, 1001, 1002, S_IFDIR | 0755);
     f->fse = (FsDriverEntry) {
         .fsdev_id = (char *)"local-nfs",
         .path = f->root,
         .ops = &local_ops,
         .export_flags = V9FS_SM_MAPPED | V9FS_RDONLY,
         .max_xattr = V9FS_MAX_XATTR_DEFAULT,
+        .fmode = 0600,
+        .dmode = 0700,
     };
     f->reply = g_byte_array_new();
     f->server = nfs2_server_new("local-nfs", false, &transport, f,
@@ -334,11 +414,278 @@ static void test_mapped_and_confined(LocalFixture *f, gconstpointer opaque)
     }
 }
 
+static void test_local_writable(LocalFixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root2, root3, netbsd, sparse, object, directory, child;
+    uint8_t body[384], call[512];
+    Nfs2XdrWriter w;
+    g_autofree char *path1 = NULL;
+    g_autofree char *path2 = NULL;
+    struct stat st1, st2;
+    size_t len;
+
+    nfs2_server_free(f->server);
+    f->fse.export_flags = V9FS_SM_MAPPED;
+    f->server = nfs2_server_new("local-nfs", true, &transport, f,
+                                &error_abort);
+    root2 = mount_root_version(f, 1);
+    root3 = mount_root_version(f, 3);
+    netbsd = lookup_version(f, 2, &root2, "netbsd", 0);
+    sparse = lookup(f, &root3, "sparse", 0);
+
+    /* Complete NFSv2 write surface. */
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, netbsd.bytes, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0640));
+    g_assert_true(nfs2_xdr_put_u32(&w, 9999));
+    g_assert_true(nfs2_xdr_put_u32(&w, 9998));
+    g_assert_true(nfs2_xdr_put_u32(&w, 12));
+    for (unsigned int i = 0; i < 4; i++) {
+        g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    }
+    mutate(f, 2, NFS2_NFSPROC_SETATTR, body,
+           nfs2_xdr_writer_size(&w), 0);
+    g_assert_cmpuint(word(f, 10), ==, 4242);
+    g_assert_cmpuint(word(f, 11), ==, 4343);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, netbsd.bytes, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "V2", 2, 8192));
+    mutate(f, 2, NFS2_NFSPROC_WRITE, body,
+           nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2a");
+    put_sattr2(&w, 0600);
+    mutate(f, 2, NFS2_NFSPROC_CREATE, body,
+           nfs2_xdr_writer_size(&w), 0);
+    memcpy(object.bytes, f->reply->data + 28, 32);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, object.bytes, 32));
+    put_name(&w, 2, &root2, "v2hard");
+    mutate(f, 2, NFS2_NFSPROC_LINK, body, nfs2_xdr_writer_size(&w), 0);
+    path1 = g_build_filename(f->root, "v2a", NULL);
+    path2 = g_build_filename(f->root, "v2hard", NULL);
+    g_assert_cmpint(lstat(path1, &st1), ==, 0);
+    g_assert_cmpint(lstat(path2, &st2), ==, 0);
+    g_assert_cmpuint(st1.st_ino, ==, st2.st_ino);
+    g_clear_pointer(&path1, g_free);
+    g_clear_pointer(&path2, g_free);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2dst");
+    put_sattr2(&w, 0600);
+    mutate(f, 2, NFS2_NFSPROC_CREATE, body,
+           nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2a");
+    put_name(&w, 2, &root2, "v2dst");
+    mutate(f, 2, NFS2_NFSPROC_RENAME, body,
+           nfs2_xdr_writer_size(&w), 0);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_GETATTR, object.bytes, 32);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, 0);
+    for (const char *name = "v2hard"; name;
+         name = !strcmp(name, "v2hard") ? "v2dst" : NULL) {
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name(&w, 2, &root2, name);
+        mutate(f, 2, NFS2_NFSPROC_REMOVE, body,
+               nfs2_xdr_writer_size(&w), 0);
+    }
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2sym");
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, f->outside,
+                                               strlen(f->outside), 1024));
+    put_sattr2(&w, 0777);
+    mutate(f, 2, NFS2_NFSPROC_SYMLINK, body,
+           nfs2_xdr_writer_size(&w), 0);
+    object = lookup_version(f, 2, &root2, "v2sym", 0);
+    memcpy(body, object.bytes, 32);
+    stl_be_p(body + 32, 0); stl_be_p(body + 36, 32);
+    stl_be_p(body + 40, 32);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_READ, body, 44);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), !=, 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2sym");
+    mutate(f, 2, NFS2_NFSPROC_REMOVE, body,
+           nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2dir");
+    put_sattr2(&w, 0750);
+    mutate(f, 2, NFS2_NFSPROC_MKDIR, body,
+           nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 2, &root2, "v2dir");
+    mutate(f, 2, NFS2_NFSPROC_RMDIR, body,
+           nfs2_xdr_writer_size(&w), 0);
+
+    /* NFSv3 64-bit SETATTR/WRITE/COMMIT and ignored asserted ownership. */
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, sparse.bytes, 32, 32));
+    put_sattr3(&w, 0644, true);
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    mutate(f, 3, 2, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, sparse.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, (uint32_t)INT32_MAX + 20000));
+    g_assert_true(nfs2_xdr_put_u32(&w, 5));
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "large", 5, 8192));
+    mutate(f, 3, 7, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, sparse.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    mutate(f, 3, 21, body, nfs2_xdr_writer_size(&w), 0);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1,
+                   body, 36);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 12), ==, 0);
+    g_assert_cmpuint(word(f, 13), >, INT32_MAX);
+    g_assert_cmpuint(word(f, 10), ==, 1);
+    g_assert_cmpuint(word(f, 11), ==, 2);
+
+    for (uint32_t mode = 0; mode < 3; mode++) {
+        const char *name = mode == 0 ? "unchecked" :
+                           mode == 1 ? "guarded" : "exclusive";
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name(&w, 3, &root3, name);
+        g_assert_true(nfs2_xdr_put_u32(&w, mode));
+        if (mode == 2) {
+            g_assert_true(nfs2_xdr_put_opaque(&w, "verifier", 8));
+        } else {
+            put_sattr3(&w, 0600, false);
+        }
+        mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+        if (mode == 1) {
+            mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 17);
+        } else if (mode == 2) {
+            mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+            memcpy(body + nfs2_xdr_writer_size(&w) - 8, "different", 8);
+            mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 17);
+        }
+        object = lookup(f, &root3, name, 0);
+        g_assert_cmpuint(word(f, 20), ==, 1001);
+        g_assert_cmpuint(word(f, 21), ==, 1002);
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name(&w, 3, &root3, name);
+        mutate(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+    }
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 3, &root3, "v3dir"); put_sattr3(&w, 0750, false);
+    mutate(f, 3, 9, body, nfs2_xdr_writer_size(&w), 0);
+    memcpy(directory.bytes, f->reply->data + 36, 32);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 3, &directory, "child");
+    g_assert_true(nfs2_xdr_put_u32(&w, 1)); put_sattr3(&w, 0600, false);
+    mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+    memcpy(child.bytes, f->reply->data + 36, 32);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 3, &root3, "v3dir");
+    put_name(&w, 3, &root3, "v3new");
+    mutate(f, 3, 14, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, child.bytes, 32, 32));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1, body,
+                   nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 3, &directory, "child");
+    mutate(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body)); put_name(&w, 3, &root3,
+                                                          "v3new");
+    mutate(f, 3, 13, body, nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 3, &root3, "v3sym"); put_sattr3(&w, 0777, false);
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, f->outside,
+                                               strlen(f->outside), 1024));
+    mutate(f, 3, 10, body, nfs2_xdr_writer_size(&w), 0);
+    object = lookup(f, &root3, "v3sym", 0);
+    g_assert_cmpuint(word(f, 17), ==, NFS2_NFLNK);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, object.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 32));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 6, body,
+                   nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, 22);
+    nfs2_xdr_writer_init(&w, body, sizeof(body)); put_name(&w, 3, &root3,
+                                                          "v3sym");
+    mutate(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+
+    for (uint32_t type = 3; type <= 7; type++) {
+        if (type == 5) {
+            continue;
+        }
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name(&w, 3, &root3, "special");
+        g_assert_true(nfs2_xdr_put_u32(&w, type));
+        put_sattr3(&w, 0600, false);
+        if (type == 3 || type == 4) {
+            g_assert_true(nfs2_xdr_put_u32(&w, 1));
+            g_assert_true(nfs2_xdr_put_u32(&w, 2));
+        }
+        mutate(f, 3, 11, body, nfs2_xdr_writer_size(&w), 0);
+        nfs2_xdr_writer_init(&w, body, sizeof(body)); put_name(&w, 3,
+                                                               &root3,
+                                                               "special");
+        mutate(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+    }
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, sparse.bytes, 32, 32));
+    put_name(&w, 3, &root3, "v3hard");
+    mutate(f, 3, 15, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body)); put_name(&w, 3, &root3,
+                                                          "v3hard");
+    mutate(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+
+    for (const char *name = "r1"; name;
+         name = !strcmp(name, "r1") ? "r2" : NULL) {
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name(&w, 3, &root3, name);
+        g_assert_true(nfs2_xdr_put_u32(&w, 1)); put_sattr3(&w, 0600, false);
+        mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+        if (!strcmp(name, "r1")) {
+            memcpy(object.bytes, f->reply->data + 36, 32);
+        }
+    }
+    nfs2_xdr_writer_init(&w, body, sizeof(body)); put_name(&w, 3, &root3,
+                                                          "r1");
+    put_name(&w, 3, &root3, "r2");
+    mutate(f, 3, 14, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, object.bytes, 32, 32));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1, body,
+                   nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body)); put_name(&w, 3, &root3,
+                                                          "r2");
+    mutate(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qemu_init_main_loop(&error_abort);
     g_test_add("/nfs/server/local-mapped-confined", LocalFixture, NULL,
                setup, test_mapped_and_confined, teardown);
+    g_test_add("/nfs2/local-writable", LocalFixture, NULL,
+               setup, test_local_writable, teardown);
     return g_test_run();
 }

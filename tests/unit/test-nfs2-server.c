@@ -46,6 +46,18 @@ typedef struct Fixture {
     uint64_t backend_cookie;
     uint64_t last_seek_cookie;
     bool zero_cookie_continuation;
+    unsigned int mutation_calls;
+    unsigned int setuid_calls;
+    mode_t kernel_mode;
+    off_t kernel_size;
+    char object_name[NFS2_MAX_NAME + 1];
+    mode_t object_mode;
+    uint64_t object_ino;
+    bool object_present;
+    uint32_t mutation_xid;
+    unsigned int send_count;
+    int64_t clock_ms;
+    int mutation_error;
 } Fixture;
 
 static Fixture *current;
@@ -93,7 +105,9 @@ static int fake_name_to_path(FsContext *ctx, V9fsPath *dir,
     }
     if (!strcmp(dir->data, "/") &&
         (!strcmp(name, "kernel") || !strcmp(name, "link") ||
-         !strcmp(name, "collision") || !strcmp(name, "hardlink"))) {
+         !strcmp(name, "collision") || !strcmp(name, "hardlink") ||
+         (current->object_present && !strcmp(name,
+                                              current->object_name)))) {
         g_autofree char *joined = g_strconcat("/", name, NULL);
 
         if (!strcmp(name, "kernel") && current->kernel_resolution_notdir) {
@@ -142,10 +156,10 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
             return -1;
         }
         st->st_dev = current->kernel_dev;
-        st->st_mode = S_IFREG | 0555;
+        st->st_mode = current->kernel_mode;
         st->st_nlink = 1;
         st->st_ino = current->kernel_ino;
-        st->st_size = 6;
+        st->st_size = current->kernel_size;
         st->st_blocks = 1;
         if (current->replace_child_after_lstat) {
             current->kernel_ino++;
@@ -181,6 +195,14 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
         st->st_size = 6;
         return 0;
     }
+    if (current->object_present && path->data[0] == '/' &&
+        !strcmp(path->data + 1, current->object_name)) {
+        st->st_mode = current->object_mode;
+        st->st_nlink = 1;
+        st->st_ino = current->object_ino;
+        st->st_size = 0;
+        return 0;
+    }
     errno = ENOENT;
     return -1;
 }
@@ -213,7 +235,9 @@ static int fake_open(FsContext *ctx, V9fsPath *path, int flags,
                      V9fsFidOpenState *state)
 {
     note_backend();
-    if (strcmp(path->data, "/kernel")) {
+    if (strcmp(path->data, "/kernel") &&
+        !(current->object_present && path->data[0] == '/' &&
+          !strcmp(path->data + 1, current->object_name))) {
         errno = EISDIR;
         return -1;
     }
@@ -229,7 +253,9 @@ static int fake_open(FsContext *ctx, V9fsPath *path, int flags,
         current->kernel_ino++;
         current->replace_on_open = false;
     }
-    ((FakeOpen *)state->private)->ino = current->kernel_ino;
+    ((FakeOpen *)state->private)->ino = !strcmp(path->data, "/kernel") ?
+                                        current->kernel_ino :
+                                        current->object_ino;
     return 0;
 }
 
@@ -254,6 +280,152 @@ static ssize_t fake_preadv(FsContext *ctx, V9fsFidOpenState *state,
     length = MIN(iov[0].iov_len, sizeof(data) - 1 - offset);
     memcpy(iov[0].iov_base, data + offset, length);
     return length;
+}
+
+static ssize_t fake_pwritev(FsContext *ctx, V9fsFidOpenState *state,
+                            const struct iovec *iov, int iovcnt, off_t offset)
+{
+    note_backend();
+    current->mutation_calls++;
+    current->kernel_size = MAX(current->kernel_size,
+                               offset + (off_t)iov[0].iov_len);
+    return iov[0].iov_len;
+}
+
+static int fake_fsync(FsContext *ctx, int fid_type,
+                      V9fsFidOpenState *state, int datasync)
+{
+    note_backend();
+    current->mutation_calls++;
+    if (current->mutation_error) {
+        errno = current->mutation_error;
+        return -1;
+    }
+    return 0;
+}
+
+static int fake_chmod(FsContext *ctx, V9fsPath *path, FsCred *cred)
+{
+    note_backend();
+    current->mutation_calls++;
+    current->kernel_mode = (current->kernel_mode & S_IFMT) |
+                           (cred->fc_mode & 07777);
+    return 0;
+}
+
+static int fake_truncate(FsContext *ctx, V9fsPath *path, off_t size)
+{
+    note_backend();
+    current->mutation_calls++;
+    current->kernel_size = size;
+    return 0;
+}
+
+static int fake_utimensat(FsContext *ctx, V9fsPath *path,
+                          const struct timespec *times)
+{
+    note_backend();
+    current->mutation_calls++;
+    return 0;
+}
+
+static int fake_open2(FsContext *ctx, V9fsPath *dir, const char *name,
+                      int flags, FsCred *cred, V9fsFidOpenState *state)
+{
+    note_backend();
+    current->mutation_calls++;
+    if (current->object_present && (flags & O_EXCL)) {
+        errno = EEXIST;
+        return -1;
+    }
+    g_strlcpy(current->object_name, name, sizeof(current->object_name));
+    current->object_mode = S_IFREG | (cred->fc_mode & 07777);
+    current->object_ino++;
+    current->object_present = true;
+    state->private = g_new0(FakeOpen, 1);
+    ((FakeOpen *)state->private)->ino = current->object_ino;
+    return 0;
+}
+
+static int fake_mkdir(FsContext *ctx, V9fsPath *dir, const char *name,
+                      FsCred *cred)
+{
+    note_backend();
+    current->mutation_calls++;
+    g_strlcpy(current->object_name, name, sizeof(current->object_name));
+    current->object_mode = S_IFDIR | (cred->fc_mode & 07777);
+    current->object_ino++;
+    current->object_present = true;
+    return 0;
+}
+
+static int fake_mknod(FsContext *ctx, V9fsPath *dir, const char *name,
+                      FsCred *cred)
+{
+    note_backend();
+    current->mutation_calls++;
+    g_strlcpy(current->object_name, name, sizeof(current->object_name));
+    current->object_mode = cred->fc_mode;
+    current->object_ino++;
+    current->object_present = true;
+    return 0;
+}
+
+static int fake_symlink(FsContext *ctx, const char *target, V9fsPath *dir,
+                        const char *name, FsCred *cred)
+{
+    note_backend();
+    current->mutation_calls++;
+    g_strlcpy(current->object_name, name, sizeof(current->object_name));
+    current->object_mode = S_IFLNK | 0777;
+    current->object_ino++;
+    current->object_present = true;
+    return 0;
+}
+
+static int fake_unlinkat(FsContext *ctx, V9fsPath *dir, const char *name,
+                         int flags)
+{
+    note_backend();
+    current->mutation_calls++;
+    if (!current->object_present || strcmp(name, current->object_name)) {
+        errno = ENOENT;
+        return -1;
+    }
+    current->object_present = false;
+    return 0;
+}
+
+static int fake_renameat(FsContext *ctx, V9fsPath *olddir,
+                         const char *oldname, V9fsPath *newdir,
+                         const char *newname)
+{
+    note_backend();
+    current->mutation_calls++;
+    if (!current->object_present || strcmp(oldname, current->object_name)) {
+        errno = ENOENT;
+        return -1;
+    }
+    g_strlcpy(current->object_name, newname, sizeof(current->object_name));
+    return 0;
+}
+
+static int fake_link(FsContext *ctx, V9fsPath *oldpath, V9fsPath *newdir,
+                     const char *name)
+{
+    note_backend();
+    current->mutation_calls++;
+    g_strlcpy(current->object_name, name, sizeof(current->object_name));
+    current->object_mode = current->kernel_mode;
+    current->object_ino = current->kernel_ino;
+    current->object_present = true;
+    return 0;
+}
+
+static int fake_setuid(FsContext *ctx, uid_t uid)
+{
+    current->setuid_calls++;
+    return 0;
 }
 
 static int fake_opendir(FsContext *ctx, V9fsPath *path,
@@ -358,8 +530,10 @@ static FileOperations fake_ops = {
     .lstat = fake_lstat,
     .readlink = fake_readlink,
     .open = fake_open,
+    .open2 = fake_open2,
     .close = fake_close,
     .preadv = fake_preadv,
+    .pwritev = fake_pwritev,
     .fstat = fake_fstat,
     .opendir = fake_opendir,
     .readdir = fake_readdir,
@@ -367,6 +541,17 @@ static FileOperations fake_ops = {
     .seekdir = fake_seekdir,
     .closedir = fake_close,
     .statfs = fake_statfs,
+    .fsync = fake_fsync,
+    .chmod = fake_chmod,
+    .truncate = fake_truncate,
+    .utimensat = fake_utimensat,
+    .mkdir = fake_mkdir,
+    .mknod = fake_mknod,
+    .symlink = fake_symlink,
+    .unlinkat = fake_unlinkat,
+    .renameat = fake_renameat,
+    .link = fake_link,
+    .setuid = fake_setuid,
 };
 
 static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
@@ -376,10 +561,19 @@ static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
 
     g_byte_array_set_size(f->reply, 0);
     g_byte_array_append(f->reply, data, len);
+    f->send_count++;
     return 0;
 }
 
-static const Nfs2TransportOps transport = { .send = send_reply };
+static int64_t fake_clock_ms(void *opaque)
+{
+    return ((Fixture *)opaque)->clock_ms;
+}
+
+static const Nfs2TransportOps transport = {
+    .send = send_reply,
+    .clock_ms = fake_clock_ms,
+};
 
 static void setup(Fixture *f, gconstpointer opaque)
 {
@@ -397,6 +591,9 @@ static void setup(Fixture *f, gconstpointer opaque)
     f->root_ino = 1;
     f->link_ino = 3;
     f->backend_cookie = 1;
+    f->kernel_mode = S_IFREG | 0555;
+    f->kernel_size = 6;
+    f->object_ino = 100;
     f->server = nfs2_server_new("fake-nfs", false, &transport, f,
                                 &error_abort);
     f->backend_on_main = false;
@@ -430,12 +627,45 @@ static size_t rpc_call(uint8_t *buf, size_t capacity, uint32_t program,
     return nfs2_xdr_writer_size(&w);
 }
 
-static void request(Fixture *f, Nfs2Service service, const void *data,
-                    size_t len)
+static size_t rpc_call_auth_sys(uint8_t *buf, size_t capacity,
+                                uint32_t version, uint32_t procedure,
+                                const void *body, size_t body_len)
+{
+    uint8_t credential[128];
+    Nfs2XdrWriter cred, w;
+
+    nfs2_xdr_writer_init(&cred, credential, sizeof(credential));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 1));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&cred, "untrusted", 9, 255));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 0));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 0));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 3));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 1));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 2));
+    g_assert_true(nfs2_xdr_put_u32(&cred, 3));
+    nfs2_xdr_writer_init(&w, buf, capacity);
+    g_assert_true(nfs2_xdr_put_u32(&w, 0x41555448));
+    g_assert_true(nfs2_xdr_put_u32(&w, NFS2_RPC_CALL));
+    g_assert_true(nfs2_xdr_put_u32(&w, NFS2_RPC_VERSION));
+    g_assert_true(nfs2_xdr_put_u32(&w, NFS2_NFS_PROGRAM));
+    g_assert_true(nfs2_xdr_put_u32(&w, version));
+    g_assert_true(nfs2_xdr_put_u32(&w, procedure));
+    g_assert_true(nfs2_xdr_put_u32(&w, NFS2_AUTH_SYS));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, credential,
+                                               nfs2_xdr_writer_size(&cred),
+                                               sizeof(credential)));
+    g_assert_true(nfs2_xdr_put_u32(&w, NFS2_AUTH_NULL));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_opaque(&w, body, body_len));
+    return nfs2_xdr_writer_size(&w);
+}
+
+static void request_peer(Fixture *f, Nfs2Service service, const void *data,
+                         size_t len, uint16_t port)
 {
     const struct sockaddr_in peer = {
         .sin_family = AF_INET,
-        .sin_port = htons(900),
+        .sin_port = htons(port),
         .sin_addr.s_addr = htonl(0x0a00020f),
     };
     unsigned int polls = 0;
@@ -448,6 +678,12 @@ static void request(Fixture *f, Nfs2Service service, const void *data,
         aio_poll(qemu_get_aio_context(), true);
     }
     g_assert_cmpuint(f->reply->len, >=, 24);
+}
+
+static void request(Fixture *f, Nfs2Service service, const void *data,
+                    size_t len)
+{
+    request_peer(f, service, data, len, 900);
 }
 
 static uint32_t reply_word(Fixture *f, size_t word)
@@ -1159,6 +1395,504 @@ static void test_v3_wire_semantics(Fixture *f, gconstpointer opaque)
     g_assert_cmpuint(reply_word(f, 6), ==, 22);
 }
 
+static void make_writable(Fixture *f)
+{
+    nfs2_server_free(f->server);
+    f->fse.export_flags = V9FS_SM_MAPPED;
+    f->server = nfs2_server_new("fake-nfs", true, &transport, f,
+                                &error_abort);
+}
+
+static void test_mutations(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root, file;
+    uint8_t call[256], body[160];
+    Nfs2XdrWriter w;
+    uint8_t verifier[8];
+    size_t len;
+
+    /* Read-only rejection precedes even a missing procedure body. */
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_SETATTR, NULL, 0);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_ROFS);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3,
+                   7, NULL, 0);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 30);
+    g_assert_cmpuint(f->mutation_calls, ==, 0);
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    file = lookup(f, 3, &root, "kernel");
+
+    /* A literal NFSv2 SETATTR: mode, ignored uid/gid, size, atime, mtime. */
+    memcpy(body, file.bytes, 32);
+    stl_be_p(body + 32, 0640);
+    stl_be_p(body + 36, 12345);
+    stl_be_p(body + 40, 23456);
+    stl_be_p(body + 44, 9);
+    stl_be_p(body + 48, 10);
+    stl_be_p(body + 52, 11);
+    stl_be_p(body + 56, 12);
+    stl_be_p(body + 60, 13);
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_SETATTR, body, 64);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFS_OK);
+    g_assert_cmpuint(f->kernel_mode & 07777, ==, 0640);
+    g_assert_cmpint(f->kernel_size, ==, 9);
+
+    /* A literal NFSv3 FILE_SYNC WRITE at a 64-bit offset. */
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, file.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 16));
+    g_assert_true(nfs2_xdr_put_u32(&w, 4));
+    g_assert_true(nfs2_xdr_put_u32(&w, 2)); /* FILE_SYNC */
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "data", 4,
+                                               NFS2_MAX_DATA));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 7,
+                   body, nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    g_assert_cmpuint(reply_word(f, 7), ==, 1);  /* pre-op WCC */
+    g_assert_cmpuint(reply_word(f, 14), ==, 1); /* post-op attrs */
+    g_assert_cmpuint(reply_word(f, 36), ==, 4);
+    g_assert_cmpuint(reply_word(f, 37), ==, 2); /* FILE_SYNC */
+    memcpy(verifier, f->reply->data + f->reply->len - 8, 8);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, file.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 21,
+                   body, nfs2_xdr_writer_size(&w));
+    stl_be_p(call, 0x434f4d4d);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    g_assert_cmpmem(f->reply->data + f->reply->len - 8, 8,
+                    verifier, sizeof(verifier));
+    g_assert_cmpuint(f->setuid_calls, ==, 0);
+}
+
+static void put_name2(Nfs2XdrWriter *w, const Nfs2FileHandle *dir,
+                      const char *name)
+{
+    g_assert_true(nfs2_xdr_put_opaque(w, dir->bytes, 32));
+    g_assert_true(nfs2_xdr_put_counted_opaque(w, name, strlen(name), 255));
+}
+
+static void put_name3(Nfs2XdrWriter *w, const Nfs2FileHandle *dir,
+                      const char *name)
+{
+    g_assert_true(nfs2_xdr_put_counted_opaque(w, dir->bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_counted_opaque(w, name, strlen(name), 255));
+}
+
+static void put_sattr2(Nfs2XdrWriter *w, mode_t mode)
+{
+    g_assert_true(nfs2_xdr_put_u32(w, mode));
+    for (unsigned int i = 0; i < 7; i++) {
+        g_assert_true(nfs2_xdr_put_u32(w, UINT32_MAX));
+    }
+}
+
+static void put_sattr3(Nfs2XdrWriter *w, mode_t mode)
+{
+    g_assert_true(nfs2_xdr_put_u32(w, 1));
+    g_assert_true(nfs2_xdr_put_u32(w, mode));
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* uid */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* gid */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* size */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* atime */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* mtime */
+}
+
+static void send_nfs(Fixture *f, uint32_t version, uint32_t proc,
+                     const uint8_t *body, size_t body_len, uint32_t expected)
+{
+    uint8_t call[512];
+    g_autoptr(GByteArray) first_reply = g_byte_array_new();
+    unsigned int calls;
+    size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
+                          proc, body, body_len);
+
+    stl_be_p(call, ++f->mutation_xid);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, expected);
+    g_byte_array_append(first_reply, f->reply->data, f->reply->len);
+    calls = f->mutation_calls;
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(f->mutation_calls, ==, calls);
+    g_assert_cmpmem(f->reply->data, f->reply->len,
+                    first_reply->data, first_reply->len);
+}
+
+static void test_v2_mutation_procedures(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root, object;
+    uint8_t body[384];
+    Nfs2XdrWriter w;
+
+    make_writable(f);
+    root = mount_root(f, 1);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "v2file");
+    put_sattr2(&w, 0600);
+    send_nfs(f, 2, NFS2_NFSPROC_CREATE, body,
+             nfs2_xdr_writer_size(&w), 0);
+    memcpy(object.bytes, f->reply->data + 28, 32);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, object.bytes, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 3));
+    g_assert_true(nfs2_xdr_put_u32(&w, 3));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "v2!", 3, 8192));
+    send_nfs(f, 2, NFS2_NFSPROC_WRITE, body,
+             nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, object.bytes, 32));
+    put_name2(&w, &root, "v2link");
+    send_nfs(f, 2, NFS2_NFSPROC_LINK, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "v2link");
+    send_nfs(f, 2, NFS2_NFSPROC_REMOVE, body,
+             nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "v2sym");
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "kernel", 6, 1024));
+    put_sattr2(&w, 0777);
+    send_nfs(f, 2, NFS2_NFSPROC_SYMLINK, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "v2sym");
+    send_nfs(f, 2, NFS2_NFSPROC_REMOVE, body,
+             nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "v2dir");
+    put_sattr2(&w, 0750);
+    send_nfs(f, 2, NFS2_NFSPROC_MKDIR, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "v2dir");
+    send_nfs(f, 2, NFS2_NFSPROC_RMDIR, body,
+             nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "old");
+    put_sattr2(&w, 0600);
+    send_nfs(f, 2, NFS2_NFSPROC_CREATE, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "old");
+    put_name2(&w, &root, "new");
+    send_nfs(f, 2, NFS2_NFSPROC_RENAME, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name2(&w, &root, "new");
+    send_nfs(f, 2, NFS2_NFSPROC_REMOVE, body,
+             nfs2_xdr_writer_size(&w), 0);
+    g_assert_cmpuint(f->setuid_calls, ==, 0);
+}
+
+static void test_v3_mutation_procedures(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root, kernel;
+    uint8_t body[384];
+    Nfs2XdrWriter w;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    kernel = lookup(f, 3, &root, "kernel");
+
+    /* UNCHECKED, GUARDED, and EXCLUSIVE create modes. */
+    for (uint32_t mode = 0; mode < 3; mode++) {
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name3(&w, &root, mode == 0 ? "unchecked" :
+                             mode == 1 ? "guarded" : "exclusive");
+        g_assert_true(nfs2_xdr_put_u32(&w, mode));
+        if (mode == 2) {
+            g_assert_true(nfs2_xdr_put_opaque(&w, "verifier", 8));
+        } else {
+            put_sattr3(&w, 0600);
+        }
+        send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+        if (mode == 1) {
+            send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 17);
+        }
+        if (mode == 2) {
+            send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+            memcpy(body + nfs2_xdr_writer_size(&w) - 8, "different", 8);
+            send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 17);
+        }
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name3(&w, &root, mode == 0 ? "unchecked" :
+                             mode == 1 ? "guarded" : "exclusive");
+        send_nfs(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+    }
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "v3dir");
+    put_sattr3(&w, 0750);
+    send_nfs(f, 3, 9, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "v3dir");
+    send_nfs(f, 3, 13, body, nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "v3sym");
+    put_sattr3(&w, 0777);
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "kernel", 6, 1024));
+    send_nfs(f, 3, 10, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "v3sym");
+    send_nfs(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+
+    for (uint32_t type = 3; type <= 7; type++) {
+        if (type == 5) {
+            continue;
+        }
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name3(&w, &root, "special");
+        g_assert_true(nfs2_xdr_put_u32(&w, type));
+        put_sattr3(&w, 0600);
+        if (type == 3 || type == 4) {
+            g_assert_true(nfs2_xdr_put_u32(&w, 1));
+            g_assert_true(nfs2_xdr_put_u32(&w, 2));
+        }
+        send_nfs(f, 3, 11, body, nfs2_xdr_writer_size(&w), 0);
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name3(&w, &root, "special");
+        send_nfs(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+    }
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "badtype");
+    g_assert_true(nfs2_xdr_put_u32(&w, 1));
+    send_nfs(f, 3, 11, body, nfs2_xdr_writer_size(&w), 10007);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
+    put_name3(&w, &root, "v3link");
+    send_nfs(f, 3, 15, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "v3link");
+    send_nfs(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "old3");
+    g_assert_true(nfs2_xdr_put_u32(&w, 1));
+    put_sattr3(&w, 0600);
+    send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "old3");
+    put_name3(&w, &root, "new3");
+    send_nfs(f, 3, 14, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "new3");
+    send_nfs(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    send_nfs(f, 3, 21, body, nfs2_xdr_writer_size(&w), 0);
+    g_assert_cmpuint(f->setuid_calls, ==, 0);
+}
+
+static size_t commit_call(uint8_t *call, size_t capacity,
+                          const Nfs2FileHandle *file, uint32_t xid,
+                          uint32_t count)
+{
+    uint8_t body[64];
+    Nfs2XdrWriter w;
+    size_t len;
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, file->bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, count));
+    len = rpc_call(call, capacity, NFS2_NFS_PROGRAM, 3, 21,
+                   body, nfs2_xdr_writer_size(&w));
+    stl_be_p(call, xid);
+    return len;
+}
+
+static void receive_async(Fixture *f, const uint8_t *call, size_t len,
+                          uint16_t port)
+{
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET, .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(0x0a00020f),
+    };
+
+    g_assert_cmpint(nfs2_server_receive(f->server, NFS2_SERVICE_NFS,
+                                        &peer, call, len, &error_abort), ==,
+                    0);
+}
+
+static void drain(Fixture *f)
+{
+    unsigned int polls = 0;
+
+    while (nfs2_server_busy(f->server)) {
+        g_assert_cmpuint(polls++, <, 100000);
+        aio_poll(qemu_get_aio_context(), true);
+    }
+}
+
+static void test_duplicate_cache(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root, kernel;
+    uint8_t call[160], changed[160], first[160];
+    g_autoptr(GByteArray) first_reply = g_byte_array_new();
+    size_t len;
+    unsigned int calls, sends;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    kernel = lookup(f, 3, &root, "kernel");
+    len = commit_call(call, sizeof(call), &kernel, 0xabc, 0);
+
+    request_peer(f, NFS2_SERVICE_NFS, call, len, 900);
+    calls = f->mutation_calls;
+    g_byte_array_append(first_reply, f->reply->data, f->reply->len);
+    request_peer(f, NFS2_SERVICE_NFS, call, len, 900);
+    g_assert_cmpuint(f->mutation_calls, ==, calls);
+    g_assert_cmpmem(f->reply->data, f->reply->len,
+                    first_reply->data, first_reply->len);
+
+    memcpy(changed, call, len);
+    stl_be_p(changed + len - 4, 1);
+    request_peer(f, NFS2_SERVICE_NFS, changed, len, 900);
+    g_assert_cmpuint(f->mutation_calls, ==, ++calls);
+    request_peer(f, NFS2_SERVICE_NFS, call, len, 901);
+    g_assert_cmpuint(f->mutation_calls, ==, ++calls);
+
+    f->clock_ms = 60000;
+    request_peer(f, NFS2_SERVICE_NFS, call, len, 900);
+    g_assert_cmpuint(f->mutation_calls, ==, ++calls);
+
+    len = commit_call(call, sizeof(call), &kernel, 0xabd, 0);
+    f->mutation_error = EIO;
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 5);
+    calls = f->mutation_calls;
+    g_byte_array_set_size(first_reply, 0);
+    g_byte_array_append(first_reply, f->reply->data, f->reply->len);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(f->mutation_calls, ==, calls);
+    g_assert_cmpmem(f->reply->data, f->reply->len,
+                    first_reply->data, first_reply->len);
+    f->mutation_error = 0;
+
+    nfs2_server_reset(f->server);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(f->mutation_calls, ==, calls + 1);
+
+    /* Completed-only LRU: the 257th key evicts the oldest completed key. */
+    nfs2_server_reset(f->server);
+    calls = f->mutation_calls;
+    for (uint32_t xid = 1; xid <= 256; xid++) {
+        len = commit_call(call, sizeof(call), &kernel, xid, 0);
+        if (xid == 1) {
+            memcpy(first, call, len);
+        }
+        request(f, NFS2_SERVICE_NFS, call, len);
+    }
+    len = commit_call(call, sizeof(call), &kernel, 257, 0);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, NFS2_SERVICE_NFS, first, len);
+    g_assert_cmpuint(f->mutation_calls, ==, calls + 258);
+
+    /* All entries in flight: refuse the 257th without executing it. */
+    nfs2_server_reset(f->server);
+    calls = f->mutation_calls;
+    sends = f->send_count;
+    for (uint32_t xid = 1; xid <= 256; xid++) {
+        len = commit_call(call, sizeof(call), &kernel, xid, 0);
+        if (xid == 1) {
+            memcpy(first, call, len);
+        }
+        receive_async(f, call, len, 900);
+    }
+    len = commit_call(call, sizeof(call), &kernel, 257, 0);
+    receive_async(f, call, len, 900);
+    g_assert_cmpuint(f->send_count, ==, sends + 1);
+    g_assert_cmpuint(reply_word(f, 5), ==, NFS2_RPC_SYSTEM_ERR);
+    receive_async(f, first, len, 900);
+    g_assert_cmpuint(f->send_count, ==, sends + 1);
+    drain(f);
+    g_assert_cmpuint(f->mutation_calls, ==, calls + 256);
+}
+
+static void test_auth_sys_and_readonly_fsdev(Fixture *f,
+                                             gconstpointer opaque)
+{
+    Nfs2Server *rejected;
+    Error *error = NULL;
+    Nfs2FileHandle root, kernel;
+    uint8_t call[256], body[64];
+    Nfs2XdrWriter w;
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    size_t len;
+
+    rejected = nfs2_server_new("fake-nfs", true, &transport, f, &error);
+    g_assert_null(rejected);
+    g_assert_nonnull(error);
+    error_free(error);
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    kernel = lookup(f, 3, &root, "kernel");
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    len = rpc_call_auth_sys(call, sizeof(call), 3, 21, body,
+                            nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+    g_assert_cmpuint(getuid(), ==, uid);
+    g_assert_cmpuint(getgid(), ==, gid);
+    g_assert_cmpuint(f->setuid_calls, ==, 0);
+}
+
+static void test_mutation_lifetime(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root, kernel;
+    uint8_t call[160];
+    size_t len;
+    unsigned int sends;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    kernel = lookup(f, 3, &root, "kernel");
+    sends = f->send_count;
+    len = commit_call(call, sizeof(call), &kernel, 0x1001, 0);
+    receive_async(f, call, len, 900);
+    len = commit_call(call, sizeof(call), &kernel, 0x1002, 0);
+    receive_async(f, call, len, 900);
+    g_assert_true(nfs2_server_busy(f->server));
+    nfs2_server_reset(f->server);
+    nfs2_server_begin_close(f->server);
+    drain(f);
+    g_assert_cmpuint(f->send_count, ==, sends);
+    nfs2_server_free(f->server);
+    f->server = NULL;
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1189,5 +1923,17 @@ int main(int argc, char **argv)
                test_identity_and_v2_mappings, teardown);
     g_test_add("/nfs/server/v3-wire-semantics", Fixture, NULL, setup,
                test_v3_wire_semantics, teardown);
+    g_test_add("/nfs2/mutations", Fixture, NULL, setup,
+               test_mutations, teardown);
+    g_test_add("/nfs2/v2-mutation-procedures", Fixture, NULL, setup,
+               test_v2_mutation_procedures, teardown);
+    g_test_add("/nfs3/mutation-procedures", Fixture, NULL, setup,
+               test_v3_mutation_procedures, teardown);
+    g_test_add("/nfs/cache/exact-peer-body-expiry-lru-inflight", Fixture,
+               NULL, setup, test_duplicate_cache, teardown);
+    g_test_add("/nfs/security/auth-sys-readonly-fsdev", Fixture, NULL,
+               setup, test_auth_sys_and_readonly_fsdev, teardown);
+    g_test_add("/nfs/cache/reset-close-inflight-lifetime", Fixture, NULL,
+               setup, test_mutation_lifetime, teardown);
     return g_test_run();
 }
