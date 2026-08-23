@@ -85,6 +85,7 @@ typedef enum BackendOp {
     BACKEND_CLOSEDIR,
     BACKEND_STATFS,
     BACKEND_OPEN2,
+    BACKEND_OPEN_TMPFILE,
     BACKEND_PWRITEV,
     BACKEND_FSYNC,
     BACKEND_CHMOD,
@@ -166,7 +167,6 @@ struct Nfs2Server {
     uint8_t write_verifier[8];
     GPtrArray *duplicates;
     uint64_t duplicate_sequence;
-    uint64_t exclusive_sequence;
     CoMutex mutation_mutex;
 };
 
@@ -339,6 +339,14 @@ static int backend_worker(void *opaque)
                                       work->flags, &work->cred,
                                       work->open) : -1;
         if (!ops->open2) {
+            errno = EOPNOTSUPP;
+        }
+        break;
+    case BACKEND_OPEN_TMPFILE:
+        ret = ops->open_tmpfile ?
+              ops->open_tmpfile(ctx, work->dir, &work->cred,
+                                work->open) : -1;
+        if (!ops->open_tmpfile) {
             errno = EOPNOTSUPP;
         }
         break;
@@ -663,6 +671,26 @@ static int coroutine_fn co_create_open(Nfs2Server *server, V9fsPath *dir,
     BackendWork work = {
         .op = BACKEND_OPEN2, .backend = &server->backend, .name = name,
         .flags = flags, .open = state,
+        .cred = { .fc_uid = uid, .fc_gid = gid, .fc_mode = mode,
+                  .fc_rdev = -1 },
+    };
+    int ret;
+
+    path_copy(&copy, dir);
+    work.dir = &copy;
+    ret = run_backend(&work);
+    path_clear(&copy);
+    return ret;
+}
+
+static int coroutine_fn co_open_tmpfile(Nfs2Server *server, V9fsPath *dir,
+                                        mode_t mode, uid_t uid, gid_t gid,
+                                        V9fsFidOpenState *state)
+{
+    V9fsPath copy = { 0 };
+    BackendWork work = {
+        .op = BACKEND_OPEN_TMPFILE, .backend = &server->backend,
+        .open = state,
         .cred = { .fc_uid = uid, .fc_gid = gid, .fc_mode = mode,
                   .fc_rdev = -1 },
     };
@@ -2353,22 +2381,6 @@ static int coroutine_fn sync_directory(Nfs2Server *server, V9fsPath *dir)
     return ret;
 }
 
-static int coroutine_fn cleanup_exclusive_temp(Nfs2Server *server,
-                                                V9fsPath *dir,
-                                                const char *name,
-                                                V9fsPath *path,
-                                                const struct stat *opened)
-{
-    struct stat current;
-
-    if ((!path->data && co_name_to_path(server, dir, name, path) < 0) ||
-        co_lstat(server, path, &current) < 0 ||
-        !same_object(&current, opened)) {
-        return 0;
-    }
-    return co_unlink(server, dir, name, false);
-}
-
 static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
                                           const char *name,
                                           const uint8_t verifier[8],
@@ -2378,17 +2390,14 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
 {
     FileOperations *ops = server->backend.ops;
     V9fsFidOpenState open = { 0 };
-    V9fsPath temp = { 0 };
     struct stat opened_st, current;
     uint8_t stored[8];
-    char temp_name[NFS2_MAX_NAME + 1];
-    bool opened = false, created = false, published = false;
-    bool opened_st_valid = false;
+    bool opened = false;
     int ret, close_ret;
 
-    if (!ops->open || !ops->open2 || !ops->fstat || !ops->close ||
+    if (!ops->open || !ops->open_tmpfile || !ops->fstat || !ops->close ||
         !ops->fgetxattr || !ops->fsetxattr || !ops->fsync ||
-        !ops->opendir || !ops->closedir || !ops->flinkat || !ops->unlinkat) {
+        !ops->opendir || !ops->closedir || !ops->flinkat) {
         return -EOPNOTSUPP;
     }
 
@@ -2432,23 +2441,12 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
     }
     path_clear(child);
 
-    for (unsigned int attempt = 0; attempt < 16; attempt++) {
-        snprintf(temp_name, sizeof(temp_name),
-                 ".qemu-nfs3-exclusive-%016" PRIx64,
-                 ++server->exclusive_sequence);
-        ret = co_create_open(server, dir, temp_name,
-                             O_CREAT | O_EXCL | O_WRONLY, mode,
-                             uid, gid, &open);
-        if (ret != -EEXIST) {
-            break;
-        }
-    }
+    ret = co_open_tmpfile(server, dir, mode, uid, gid, &open);
     if (ret < 0) {
-        return ret == -EEXIST ? -EIO : ret;
+        return ret;
     }
-    opened = created = true;
+    opened = true;
     ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
-    opened_st_valid = ret >= 0;
     if (ret >= 0) {
         ret = co_fsetxattr(server, &open, NFS3_CREATE_VERIFIER_XATTR,
                            (void *)verifier, sizeof(stored), XATTR_CREATE);
@@ -2457,41 +2455,24 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
         ret = co_fsync(server, &open);
     }
     if (ret >= 0) {
-        ret = co_name_to_path(server, dir, temp_name, &temp);
+        ret = co_flinkat(server, &open, dir, name);
     }
     if (ret >= 0) {
-        ret = co_lstat(server, &temp, &current);
-        if (ret >= 0 && !same_object(&opened_st, &current)) {
+        ret = co_name_to_path(server, dir, name, child);
+    }
+    if (ret >= 0) {
+        ret = co_lstat(server, child, after);
+        if (ret >= 0 && !same_object(&opened_st, after)) {
             ret = -ESTALE;
         }
     }
     if (ret >= 0) {
-        ret = co_flinkat(server, &open, dir, name);
-        published = ret >= 0;
-    }
-    if (published) {
-        int unlink_ret = cleanup_exclusive_temp(server, dir, temp_name,
-                                                &temp, &opened_st);
-        int identity_ret = co_name_to_path(server, dir, name, child);
-        int sync_ret;
-
-        if (identity_ret >= 0) {
-            identity_ret = co_lstat(server, child, after);
-            if (identity_ret >= 0 && !same_object(&opened_st, after)) {
-                identity_ret = -ESTALE;
-            }
-        }
-        sync_ret = sync_directory(server, dir);
-        ret = unlink_ret < 0 ? unlink_ret :
-              identity_ret < 0 ? identity_ret : sync_ret;
-    } else if (created && opened_st_valid) {
-        cleanup_exclusive_temp(server, dir, temp_name, &temp, &opened_st);
+        ret = sync_directory(server, dir);
     }
     close_ret = opened ? co_simple_open(server, BACKEND_CLOSE, &open) : 0;
     if (ret >= 0 && close_ret < 0) {
         ret = close_ret;
     }
-    path_clear(&temp);
     return ret;
 }
 
@@ -2921,10 +2902,8 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
     V9fsPath file_abs = { 0 }, file = { 0 };
     V9fsPath dir_abs = { 0 }, dir = { 0 };
     V9fsPath linked = { 0 };
-    g_autofree char *new_abs = NULL;
     struct stat file_st = { 0 }, file_after = { 0 }, linked_st = { 0 };
     struct stat dir_before = { 0 }, dir_after = { 0 };
-    Nfs2FileHandle ignored_handle;
     bool file_valid = false, file_after_valid = false;
     bool dir_before_valid = false, dir_after_valid = false;
     bool linked_created = false;
@@ -2948,8 +2927,7 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         dir_before_valid = ret >= 0;
     }
     if (ret >= 0) {
-        new_abs = child_absolute(dir_abs.data, name);
-        ret = new_abs ? co_link(server, &file, &dir, name) : -EIO;
+        ret = co_link(server, &file, &dir, name);
         linked_created = ret >= 0;
     }
     if (ret >= 0) {
@@ -2972,25 +2950,7 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
             ret = post_ret;
         }
     }
-    if (ret >= 0) {
-        uint32_t identity;
-
-        if (!identity_id(server, &file_after, false, &identity) ||
-            !nfs2_handle_create(server->handles, identity, new_abs,
-                                &ignored_handle, NULL)) {
-            ret = -EIO;
-        }
-    }
     if (ret < 0 && linked_created) {
-        struct stat rollback_st;
-
-        if (!linked.data) {
-            co_name_to_path(server, &dir, name, &linked);
-        }
-        if (linked.data && co_lstat(server, &linked, &rollback_st) >= 0 &&
-            same_object(&rollback_st, &file_st)) {
-            co_unlink(server, &dir, name, false);
-        }
         if (file_valid) {
             file_after_valid =
                 validate_handle_identity(server, &file_handle, &file,

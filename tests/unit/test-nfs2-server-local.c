@@ -732,6 +732,16 @@ static void test_local_review_regressions(LocalFixture *f,
     g_assert_true(nfs2_xdr_put_u32(&w, 2));
     g_assert_true(nfs2_xdr_put_opaque(&w, "persist!", 8));
     mutate(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+    {
+        g_autoptr(GDir) dir = g_dir_open(f->root, 0, NULL);
+        const char *entry;
+
+        g_assert_nonnull(dir);
+        while ((entry = g_dir_read_name(dir))) {
+            g_assert_false(g_str_has_prefix(entry,
+                                             ".qemu-nfs3-exclusive-"));
+        }
+    }
     nfs2_server_free(f->server);
     f->server = nfs2_server_new("local-nfs", true, &transport, f,
                                 &error_abort);

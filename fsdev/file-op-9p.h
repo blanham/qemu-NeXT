@@ -155,6 +155,8 @@ struct FileOperations {
     int (*open)(FsContext *, V9fsPath *, int, V9fsFidOpenState *);
     int (*open2)(FsContext *, V9fsPath *, const char *,
                  int, FsCred *, V9fsFidOpenState *);
+    int (*open_tmpfile)(FsContext *, V9fsPath *, FsCred *,
+                        V9fsFidOpenState *);
     void (*rewinddir)(FsContext *, V9fsFidOpenState *);
     off_t (*telldir)(FsContext *, V9fsFidOpenState *);
     struct dirent * (*readdir)(FsContext *, V9fsFidOpenState *);
