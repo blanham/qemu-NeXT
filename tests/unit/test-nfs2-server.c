@@ -9,6 +9,7 @@
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/main-loop.h"
+#include "qemu/xattr.h"
 
 typedef struct FakeOpen {
     bool directory;
@@ -51,13 +52,28 @@ typedef struct Fixture {
     mode_t kernel_mode;
     off_t kernel_size;
     char object_name[NFS2_MAX_NAME + 1];
+    char linked_name[NFS2_MAX_NAME + 1];
     mode_t object_mode;
     uint64_t object_ino;
     bool object_present;
+    bool linked_present;
+    mode_t linked_mode;
+    uint64_t linked_ino;
     uint32_t mutation_xid;
     unsigned int send_count;
+    unsigned int clock_calls;
     int64_t clock_ms;
     int mutation_error;
+    bool reset_on_send;
+    bool verifier_present;
+    bool fail_verifier_set;
+    uint8_t verifier[8];
+    GMutex fake_lock;
+    gint race_active;
+    gint race_max;
+    bool race_delay;
+    int link_error;
+    bool replace_link_result;
 } Fixture;
 
 static Fixture *current;
@@ -74,6 +90,23 @@ void fsdev_throttle_cleanup(FsThrottle *fst) { }
 static void note_backend(void)
 {
     current->backend_on_main |= g_thread_self() == current->main_thread;
+}
+
+static void fake_race_window(void)
+{
+    gint active, observed;
+
+    if (!current->race_delay) {
+        return;
+    }
+    active = g_atomic_int_add(&current->race_active, 1) + 1;
+    do {
+        observed = g_atomic_int_get(&current->race_max);
+    } while (active > observed &&
+             !g_atomic_int_compare_and_exchange(&current->race_max,
+                                                observed, active));
+    g_usleep(30000);
+    g_atomic_int_add(&current->race_active, -1);
 }
 
 static int fake_init(FsContext *ctx, Error **errp) { return 0; }
@@ -106,6 +139,8 @@ static int fake_name_to_path(FsContext *ctx, V9fsPath *dir,
     if (!strcmp(dir->data, "/") &&
         (!strcmp(name, "kernel") || !strcmp(name, "link") ||
          !strcmp(name, "collision") || !strcmp(name, "hardlink") ||
+         (current->linked_present && !strcmp(name,
+                                              current->linked_name)) ||
          (current->object_present && !strcmp(name,
                                               current->object_name)))) {
         g_autofree char *joined = g_strconcat("/", name, NULL);
@@ -157,7 +192,8 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
         }
         st->st_dev = current->kernel_dev;
         st->st_mode = current->kernel_mode;
-        st->st_nlink = 1;
+        st->st_nlink = current->linked_present &&
+                       current->linked_ino == current->kernel_ino ? 2 : 1;
         st->st_ino = current->kernel_ino;
         st->st_size = current->kernel_size;
         st->st_blocks = 1;
@@ -195,10 +231,18 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
         st->st_size = 6;
         return 0;
     }
+    if (current->linked_present && path->data[0] == '/' &&
+        !strcmp(path->data + 1, current->linked_name)) {
+        st->st_mode = current->linked_mode;
+        st->st_nlink = 2;
+        st->st_ino = current->linked_ino;
+        return 0;
+    }
     if (current->object_present && path->data[0] == '/' &&
         !strcmp(path->data + 1, current->object_name)) {
         st->st_mode = current->object_mode;
-        st->st_nlink = 1;
+        st->st_nlink = current->linked_present &&
+                       current->linked_ino == current->object_ino ? 2 : 1;
         st->st_ino = current->object_ino;
         st->st_size = 0;
         return 0;
@@ -342,6 +386,7 @@ static int fake_open2(FsContext *ctx, V9fsPath *dir, const char *name,
     current->object_mode = S_IFREG | (cred->fc_mode & 07777);
     current->object_ino++;
     current->object_present = true;
+    current->verifier_present = false;
     state->private = g_new0(FakeOpen, 1);
     ((FakeOpen *)state->private)->ino = current->object_ino;
     return 0;
@@ -388,11 +433,21 @@ static int fake_unlinkat(FsContext *ctx, V9fsPath *dir, const char *name,
 {
     note_backend();
     current->mutation_calls++;
+    fake_race_window();
+    g_mutex_lock(&current->fake_lock);
+    if (current->linked_present && !strcmp(name, current->linked_name)) {
+        current->linked_present = false;
+        g_mutex_unlock(&current->fake_lock);
+        return 0;
+    }
     if (!current->object_present || strcmp(name, current->object_name)) {
+        g_mutex_unlock(&current->fake_lock);
         errno = ENOENT;
         return -1;
     }
     current->object_present = false;
+    current->verifier_present = false;
+    g_mutex_unlock(&current->fake_lock);
     return 0;
 }
 
@@ -402,11 +457,15 @@ static int fake_renameat(FsContext *ctx, V9fsPath *olddir,
 {
     note_backend();
     current->mutation_calls++;
+    fake_race_window();
+    g_mutex_lock(&current->fake_lock);
     if (!current->object_present || strcmp(oldname, current->object_name)) {
+        g_mutex_unlock(&current->fake_lock);
         errno = ENOENT;
         return -1;
     }
     g_strlcpy(current->object_name, newname, sizeof(current->object_name));
+    g_mutex_unlock(&current->fake_lock);
     return 0;
 }
 
@@ -415,16 +474,65 @@ static int fake_link(FsContext *ctx, V9fsPath *oldpath, V9fsPath *newdir,
 {
     note_backend();
     current->mutation_calls++;
-    g_strlcpy(current->object_name, name, sizeof(current->object_name));
-    current->object_mode = current->kernel_mode;
-    current->object_ino = current->kernel_ino;
-    current->object_present = true;
+    if (current->link_error) {
+        errno = current->link_error;
+        return -1;
+    }
+    g_strlcpy(current->linked_name, name, sizeof(current->linked_name));
+    current->linked_mode = !strcmp(oldpath->data, "/kernel") ?
+                           current->kernel_mode : current->object_mode;
+    current->linked_ino = !strcmp(oldpath->data, "/kernel") ?
+                          current->kernel_ino : current->object_ino;
+    if (current->replace_link_result) {
+        current->linked_ino++;
+        current->replace_link_result = false;
+    }
+    current->linked_present = true;
     return 0;
 }
 
 static int fake_setuid(FsContext *ctx, uid_t uid)
 {
     current->setuid_calls++;
+    return 0;
+}
+
+static ssize_t fake_lgetxattr(FsContext *ctx, V9fsPath *path,
+                              const char *name, void *value, size_t size)
+{
+    note_backend();
+    if (strcmp(name, "user.qemu.nfs3.createverf") ||
+        !current->object_present || !current->verifier_present) {
+        errno = ENODATA;
+        return -1;
+    }
+    if (size < sizeof(current->verifier)) {
+        errno = ERANGE;
+        return -1;
+    }
+    memcpy(value, current->verifier, sizeof(current->verifier));
+    return sizeof(current->verifier);
+}
+
+static int fake_lsetxattr(FsContext *ctx, V9fsPath *path, const char *name,
+                          void *value, size_t size, int flags)
+{
+    note_backend();
+    if (current->fail_verifier_set) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    if (strcmp(name, "user.qemu.nfs3.createverf") ||
+        size != sizeof(current->verifier)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((flags & XATTR_CREATE) && current->verifier_present) {
+        errno = EEXIST;
+        return -1;
+    }
+    memcpy(current->verifier, value, sizeof(current->verifier));
+    current->verifier_present = true;
     return 0;
 }
 
@@ -552,6 +660,8 @@ static FileOperations fake_ops = {
     .renameat = fake_renameat,
     .link = fake_link,
     .setuid = fake_setuid,
+    .lgetxattr = fake_lgetxattr,
+    .lsetxattr = fake_lsetxattr,
 };
 
 static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
@@ -562,12 +672,19 @@ static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
     g_byte_array_set_size(f->reply, 0);
     g_byte_array_append(f->reply, data, len);
     f->send_count++;
+    if (f->reset_on_send) {
+        f->reset_on_send = false;
+        nfs2_server_reset(f->server);
+    }
     return 0;
 }
 
 static int64_t fake_clock_ms(void *opaque)
 {
-    return ((Fixture *)opaque)->clock_ms;
+    Fixture *f = opaque;
+
+    f->clock_calls++;
+    return f->clock_ms;
 }
 
 static const Nfs2TransportOps transport = {
@@ -578,6 +695,7 @@ static const Nfs2TransportOps transport = {
 static void setup(Fixture *f, gconstpointer opaque)
 {
     current = f;
+    g_mutex_init(&f->fake_lock);
     f->main_thread = g_thread_self();
     f->reply = g_byte_array_new();
     f->fse = (FsDriverEntry) {
@@ -603,6 +721,7 @@ static void teardown(Fixture *f, gconstpointer opaque)
 {
     nfs2_server_free(f->server);
     g_byte_array_unref(f->reply);
+    g_mutex_clear(&f->fake_lock);
     current = NULL;
 }
 
@@ -1893,6 +2012,304 @@ static void test_mutation_lifetime(Fixture *f, gconstpointer opaque)
     f->server = NULL;
 }
 
+static void test_review_commit_vector(Fixture *f, gconstpointer opaque)
+{
+    Nfs2FileHandle root3, kernel3;
+    uint8_t call[256], body[128];
+    Nfs2XdrWriter w;
+    size_t len;
+
+    make_writable(f);
+    root3 = mount_root(f, 3);
+    kernel3 = lookup(f, 3, &root3, "kernel");
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel3.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 21,
+                   body, nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, 0);
+}
+
+static void test_review_v2_write_totalcount(Fixture *f,
+                                            gconstpointer opaque)
+{
+    Nfs2FileHandle root2, kernel2;
+    uint8_t call[256], body[128];
+    Nfs2XdrWriter w;
+    size_t len;
+
+    make_writable(f);
+    root2 = mount_root(f, 1);
+    kernel2 = lookup(f, 2, &root2, "kernel");
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, kernel2.bytes, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "x", 1, 8192));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                   NFS2_NFSPROC_WRITE, body, nfs2_xdr_writer_size(&w));
+    stl_be_p(call, 0x56454354);
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFS_OK);
+}
+
+static void test_review_unregistered_remove_inode_zero(Fixture *f,
+                                                       gconstpointer opaque)
+{
+    Nfs2FileHandle root;
+    uint8_t body[80];
+    Nfs2XdrWriter w;
+
+    nfs2_server_free(f->server);
+    f->server = NULL;
+    f->root_ino = 0;
+    f->object_present = true;
+    f->object_ino = 333;
+    f->object_mode = S_IFREG | 0600;
+    g_strlcpy(f->object_name, "preexisting", sizeof(f->object_name));
+    f->fse.export_flags = V9FS_SM_MAPPED;
+    f->server = nfs2_server_new("fake-nfs", true, &transport, f,
+                                &error_abort);
+    root = mount_root(f, 3);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "preexisting");
+    send_nfs(f, 3, 12, body, nfs2_xdr_writer_size(&w), 0);
+    g_assert_cmpuint(reply_word(f, 7), ==, 1);
+}
+
+static void test_review_readonly_mutation_cache(Fixture *f,
+                                                gconstpointer opaque)
+{
+    static const uint32_t v2_procs[] = {
+        NFS2_NFSPROC_SETATTR, NFS2_NFSPROC_WRITE, NFS2_NFSPROC_CREATE,
+        NFS2_NFSPROC_REMOVE, NFS2_NFSPROC_RENAME, NFS2_NFSPROC_LINK,
+        NFS2_NFSPROC_SYMLINK, NFS2_NFSPROC_MKDIR, NFS2_NFSPROC_RMDIR,
+    };
+    static const uint32_t v3_procs[] = {
+        2, 7, 8, 9, 10, 11, 12, 13, 14, 15, 21,
+    };
+    uint8_t call[96];
+    g_autoptr(GByteArray) first = g_byte_array_new();
+    unsigned int expected_clock_calls = f->clock_calls;
+
+    for (size_t i = 0; i < G_N_ELEMENTS(v2_procs); i++) {
+        size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
+                              v2_procs[i], NULL, 0);
+
+        stl_be_p(call, 0x2000 + i);
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_ROFS);
+        g_byte_array_set_size(first, 0);
+        g_byte_array_append(first, f->reply->data, f->reply->len);
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpmem(f->reply->data, f->reply->len,
+                        first->data, first->len);
+        expected_clock_calls += 3;
+        g_assert_cmpuint(f->clock_calls, ==, expected_clock_calls);
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(v3_procs); i++) {
+        size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3,
+                              v3_procs[i], NULL, 0);
+
+        stl_be_p(call, 0x3000 + i);
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpuint(reply_word(f, 6), ==, 30);
+        g_byte_array_set_size(first, 0);
+        g_byte_array_append(first, f->reply->data, f->reply->len);
+        request(f, NFS2_SERVICE_NFS, call, len);
+        g_assert_cmpmem(f->reply->data, f->reply->len,
+                        first->data, first->len);
+        expected_clock_calls += 3;
+        g_assert_cmpuint(f->clock_calls, ==, expected_clock_calls);
+    }
+}
+
+static void test_review_reset_suppresses_and_reentrant(Fixture *f,
+                                                       gconstpointer opaque)
+{
+    Nfs2FileHandle root, kernel;
+    uint8_t call[160];
+    unsigned int sends;
+    size_t len;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    kernel = lookup(f, 3, &root, "kernel");
+    len = commit_call(call, sizeof(call), &kernel, 0x52535431, 0);
+    sends = f->send_count;
+    receive_async(f, call, len, 900);
+    nfs2_server_reset(f->server);
+    drain(f);
+    g_assert_cmpuint(f->send_count, ==, sends);
+
+    stl_be_p(call, 0x52535432);
+    f->reset_on_send = true;
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_false(f->reset_on_send);
+    g_assert_false(nfs2_server_busy(f->server));
+}
+
+static void test_review_concurrent_rename_remove(Fixture *f,
+                                                 gconstpointer opaque)
+{
+    Nfs2FileHandle root;
+    uint8_t create_body[128], rename_body[160], remove_body[96];
+    uint8_t rename_call[256], remove_call[192];
+    Nfs2XdrWriter w;
+    size_t rename_len, remove_len;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+
+    nfs2_xdr_writer_init(&w, create_body, sizeof(create_body));
+    put_name3(&w, &root, "race-old");
+    g_assert_true(nfs2_xdr_put_u32(&w, 1));
+    put_sattr3(&w, 0600);
+    send_nfs(f, 3, 8, create_body, nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, rename_body, sizeof(rename_body));
+    put_name3(&w, &root, "race-old");
+    put_name3(&w, &root, "race-new");
+    rename_len = rpc_call(rename_call, sizeof(rename_call), NFS2_NFS_PROGRAM,
+                          3, 14, rename_body, nfs2_xdr_writer_size(&w));
+    stl_be_p(rename_call, 0x52414331);
+    nfs2_xdr_writer_init(&w, remove_body, sizeof(remove_body));
+    put_name3(&w, &root, "race-old");
+    remove_len = rpc_call(remove_call, sizeof(remove_call), NFS2_NFS_PROGRAM,
+                          3, 12, remove_body, nfs2_xdr_writer_size(&w));
+    stl_be_p(remove_call, 0x52414332);
+    f->race_delay = true;
+    receive_async(f, rename_call, rename_len, 900);
+    receive_async(f, remove_call, remove_len, 900);
+    drain(f);
+    g_assert_cmpint(g_atomic_int_get(&f->race_max), ==, 1);
+    g_assert_true(f->object_present);
+    g_assert_cmpstr(f->object_name, ==, "race-new");
+
+    nfs2_xdr_writer_init(&w, remove_body, sizeof(remove_body));
+    put_name3(&w, &root, "race-new");
+    send_nfs(f, 3, 12, remove_body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, create_body, sizeof(create_body));
+    put_name3(&w, &root, "race-old");
+    g_assert_true(nfs2_xdr_put_u32(&w, 1));
+    put_sattr3(&w, 0600);
+    send_nfs(f, 3, 8, create_body, nfs2_xdr_writer_size(&w), 0);
+    g_atomic_int_set(&f->race_max, 0);
+    stl_be_p(remove_call, 0x52414333);
+    stl_be_p(rename_call, 0x52414334);
+    receive_async(f, remove_call, remove_len, 900);
+    receive_async(f, rename_call, rename_len, 900);
+    drain(f);
+    g_assert_cmpint(g_atomic_int_get(&f->race_max), ==, 1);
+    g_assert_false(f->object_present);
+}
+
+static void test_review_exclusive_xattr_failures(Fixture *f,
+                                                 gconstpointer opaque)
+{
+    Nfs2FileHandle root;
+    uint8_t body[128];
+    Nfs2XdrWriter w;
+    unsigned int calls;
+
+    fake_ops.lsetxattr = NULL;
+    make_writable(f);
+    root = mount_root(f, 3);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "unsupported");
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_opaque(&w, "verify01", 8));
+    calls = f->mutation_calls;
+    send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 10004);
+    g_assert_cmpuint(f->mutation_calls, ==, calls);
+    g_assert_false(f->object_present);
+    fake_ops.lsetxattr = fake_lsetxattr;
+
+    f->fail_verifier_set = true;
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "rollback");
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_opaque(&w, "verify02", 8));
+    send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 10004);
+    g_assert_false(f->object_present);
+    g_assert_false(f->verifier_present);
+    f->fail_verifier_set = false;
+}
+
+static void test_review_duplicate_setattr_write(Fixture *f,
+                                                gconstpointer opaque)
+{
+    Nfs2FileHandle root2, root3, file2, file3;
+    uint8_t body[160];
+    Nfs2XdrWriter w;
+
+    make_writable(f);
+    root2 = mount_root(f, 1);
+    root3 = mount_root(f, 3);
+    file2 = lookup(f, 2, &root2, "kernel");
+    file3 = lookup(f, 3, &root3, "kernel");
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, file2.bytes, 32));
+    put_sattr2(&w, 0644);
+    send_nfs(f, 2, NFS2_NFSPROC_SETATTR, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, file3.bytes, 32, 32));
+    put_sattr3(&w, 0600);
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    send_nfs(f, 3, 2, body, nfs2_xdr_writer_size(&w), 0);
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_opaque(&w, file2.bytes, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, UINT32_MAX));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "2", 1, 8192));
+    send_nfs(f, 2, NFS2_NFSPROC_WRITE, body,
+             nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, file3.bytes, 32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 1));
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, "3", 1, 8192));
+    send_nfs(f, 3, 7, body, nfs2_xdr_writer_size(&w), 0);
+}
+
+static void test_review_link_postattrs_and_validation(Fixture *f,
+                                                      gconstpointer opaque)
+{
+    Nfs2FileHandle root, kernel;
+    uint8_t body[128];
+    Nfs2XdrWriter w;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    kernel = lookup(f, 3, &root, "kernel");
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
+    put_name3(&w, &root, "failed-link");
+    f->link_error = EIO;
+    send_nfs(f, 3, 15, body, nfs2_xdr_writer_size(&w), 5);
+    g_assert_cmpuint(reply_word(f, 7), ==, 1);
+    f->link_error = 0;
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
+    put_name3(&w, &root, "replaced-link");
+    f->replace_link_result = true;
+    send_nfs(f, 3, 15, body, nfs2_xdr_writer_size(&w), 70);
+    g_assert_false(f->linked_present);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1935,5 +2352,23 @@ int main(int argc, char **argv)
                setup, test_auth_sys_and_readonly_fsdev, teardown);
     g_test_add("/nfs/cache/reset-close-inflight-lifetime", Fixture, NULL,
                setup, test_mutation_lifetime, teardown);
+    g_test_add("/nfs/review/commit-vector", Fixture, NULL, setup,
+               test_review_commit_vector, teardown);
+    g_test_add("/nfs/review/v2-write-totalcount", Fixture, NULL, setup,
+               test_review_v2_write_totalcount, teardown);
+    g_test_add("/nfs/review/unregistered-remove-inode-zero", Fixture, NULL,
+               setup, test_review_unregistered_remove_inode_zero, teardown);
+    g_test_add("/nfs/review/readonly-mutation-cache", Fixture, NULL, setup,
+               test_review_readonly_mutation_cache, teardown);
+    g_test_add("/nfs/review/reset-suppresses-reentrant", Fixture, NULL, setup,
+               test_review_reset_suppresses_and_reentrant, teardown);
+    g_test_add("/nfs/review/concurrent-rename-remove", Fixture, NULL, setup,
+               test_review_concurrent_rename_remove, teardown);
+    g_test_add("/nfs/review/exclusive-xattr-failures", Fixture, NULL, setup,
+               test_review_exclusive_xattr_failures, teardown);
+    g_test_add("/nfs/review/duplicate-setattr-write", Fixture, NULL, setup,
+               test_review_duplicate_setattr_write, teardown);
+    g_test_add("/nfs/review/link-postattrs-validation", Fixture, NULL, setup,
+               test_review_link_postattrs_and_validation, teardown);
     return g_test_run();
 }

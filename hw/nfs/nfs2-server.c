@@ -17,6 +17,7 @@
 #include "qemu/coroutine.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#include "qemu/xattr.h"
 
 #define NFS3_VERSION 3U
 #define MOUNT3_VERSION 3U
@@ -26,6 +27,7 @@
 #define NFS2_MAX_COOKIES 65536U
 #define NFS_DUP_CACHE_MAX 256U
 #define NFS_DUP_CACHE_TTL_MS 60000
+#define NFS3_CREATE_VERIFIER_XATTR "user.qemu.nfs3.createverf"
 
 static bool is_v2_mutator(uint32_t proc);
 static bool is_v3_mutator(uint32_t proc);
@@ -40,6 +42,7 @@ typedef struct NfsDuplicateEntry {
     GByteArray *reply;
     bool in_flight;
     bool abandoned;
+    bool sending;
 } NfsDuplicateEntry;
 
 enum {
@@ -93,6 +96,8 @@ typedef enum BackendOp {
     BACKEND_UNLINKAT,
     BACKEND_RENAMEAT,
     BACKEND_LINK,
+    BACKEND_LGETXATTR,
+    BACKEND_LSETXATTR,
 } BackendOp;
 
 typedef struct BackendWork {
@@ -119,6 +124,9 @@ typedef struct BackendWork {
     int flags;
     FsCred cred;
     struct timespec times[2];
+    const char *xattr_name;
+    void *xattr_value;
+    int xattr_flags;
 } BackendWork;
 
 typedef struct Nfs2Request {
@@ -146,7 +154,6 @@ struct Nfs2Server {
     GHashTable *identities;
     GHashTable *cookies_by_backend;
     GHashTable *cookies_by_wire;
-    GHashTable *exclusive_verifiers;
     uint32_t next_identity;
     uint32_t next_cookie;
     Nfs2FileHandle root_handle;
@@ -158,6 +165,7 @@ struct Nfs2Server {
     uint8_t write_verifier[8];
     GPtrArray *duplicates;
     uint64_t duplicate_sequence;
+    CoMutex mutation_mutex;
 };
 
 static void duplicate_free(gpointer opaque)
@@ -190,7 +198,8 @@ static void duplicate_expire(Nfs2Server *server, int64_t now)
         NfsDuplicateEntry *entry =
             g_ptr_array_index(server->duplicates, i - 1);
 
-        if (!entry->in_flight && now >= entry->completed_at &&
+        if (!entry->in_flight && !entry->sending &&
+            now >= entry->completed_at &&
             now - entry->completed_at >= NFS_DUP_CACHE_TTL_MS) {
             g_ptr_array_remove_index(server->duplicates, i - 1);
         }
@@ -203,7 +212,7 @@ static bool request_is_mutation(Nfs2Server *server, Nfs2Service service,
 {
     Nfs2RpcCall call;
 
-    if (!server->writable || service != NFS2_SERVICE_NFS ||
+    if (service != NFS2_SERVICE_NFS ||
         nfs2_rpc_decode_call(data, len, &call) != NFS2_RPC_DECODE_OK ||
         call.program != NFS2_NFS_PROGRAM) {
         return false;
@@ -404,6 +413,23 @@ static int backend_worker(void *opaque)
         ret = ops->link ? ops->link(ctx, work->path, work->dir,
                                     work->name) : -1;
         if (!ops->link) {
+            errno = EOPNOTSUPP;
+        }
+        break;
+    case BACKEND_LGETXATTR:
+        ret = ops->lgetxattr ?
+              ops->lgetxattr(ctx, work->path, work->xattr_name,
+                             work->xattr_value, work->length) : -1;
+        if (!ops->lgetxattr) {
+            errno = EOPNOTSUPP;
+        }
+        break;
+    case BACKEND_LSETXATTR:
+        ret = ops->lsetxattr ?
+              ops->lsetxattr(ctx, work->path, work->xattr_name,
+                             work->xattr_value, work->length,
+                             work->xattr_flags) : -1;
+        if (!ops->lsetxattr) {
             errno = EOPNOTSUPP;
         }
         break;
@@ -692,6 +718,43 @@ static int coroutine_fn co_link(Nfs2Server *server, V9fsPath *old_path,
     ret = run_backend(&work);
     path_clear(&old_copy);
     path_clear(&dir_copy);
+    return ret;
+}
+
+static int coroutine_fn co_lgetxattr(Nfs2Server *server, V9fsPath *path,
+                                     const char *name, void *value,
+                                     size_t length)
+{
+    V9fsPath copy = { 0 };
+    BackendWork work = {
+        .op = BACKEND_LGETXATTR, .backend = &server->backend,
+        .xattr_name = name, .xattr_value = value, .length = length,
+    };
+    int ret;
+
+    path_copy(&copy, path);
+    work.path = &copy;
+    ret = run_backend(&work);
+    path_clear(&copy);
+    return ret;
+}
+
+static int coroutine_fn co_lsetxattr(Nfs2Server *server, V9fsPath *path,
+                                     const char *name, void *value,
+                                     size_t length, int flags)
+{
+    V9fsPath copy = { 0 };
+    BackendWork work = {
+        .op = BACKEND_LSETXATTR, .backend = &server->backend,
+        .xattr_name = name, .xattr_value = value, .length = length,
+        .xattr_flags = flags,
+    };
+    int ret;
+
+    path_copy(&copy, path);
+    work.path = &copy;
+    ret = run_backend(&work);
+    path_clear(&copy);
     return ret;
 }
 
@@ -2240,7 +2303,8 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
     struct stat before = { 0 }, after = { 0 };
     V9fsFidOpenState open = { 0 };
     uint32_t create_mode = 0, type = NFS2_NFREG, major_no = 0, minor_no = 0;
-    bool opened = false, exclusive_existing = false;
+    bool opened = false, existing_object = false;
+    bool exclusive_existing = false, before_valid = false;
     int ret;
     bool ok;
 
@@ -2304,10 +2368,14 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
         }
         type = NFS2_NFDIR;
     }
+    if (type == NFS2_NFLNK) {
+        attr.size_set = false;
+    }
     if (!nfs2_xdr_reader_empty(&call->body)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_directory(server, &dir_handle, &absolute, &dir, &before);
+    before_valid = ret >= 0;
     if (ret >= 0) {
         child_abs = child_absolute(absolute.data, name);
         if (!child_abs) {
@@ -2317,22 +2385,59 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
         }
     }
     if (ret >= 0 && v3 && kind == NFS3PROC_CREATE && create_mode == 2) {
-        GBytes *stored = g_hash_table_lookup(server->exclusive_verifiers,
-                                              child_abs);
+        if (!server->backend.ops->lgetxattr ||
+            !server->backend.ops->lsetxattr) {
+            ret = -EOPNOTSUPP;
+        } else {
+            ret = co_name_to_path(server, &dir, name, &child);
+            if (ret >= 0) {
+                uint8_t stored[sizeof(verifier)];
 
-        if (stored) {
-            gsize length;
-            const void *bytes = g_bytes_get_data(stored, &length);
-
-            if (length != sizeof(verifier) ||
-                memcmp(bytes, verifier, sizeof(verifier))) {
-                ret = -EEXIST;
-            } else {
-                exclusive_existing = true;
+                ret = co_lstat(server, &child, &after);
+                if (ret >= 0) {
+                    ret = co_lgetxattr(server, &child,
+                                       NFS3_CREATE_VERIFIER_XATTR,
+                                       stored, sizeof(stored));
+                }
+                if (ret == -ENOENT) {
+                    ret = 0;
+                    path_clear(&child);
+                } else if (ret == sizeof(stored) &&
+                    !memcmp(stored, verifier, sizeof(stored))) {
+                    ret = 0;
+                    exclusive_existing = true;
+                } else if (ret == -EOPNOTSUPP || ret == -ENOSYS) {
+                    ret = -EOPNOTSUPP;
+                } else if (ret == -ENODATA || ret == -ENOATTR ||
+                           ret == -ERANGE || ret >= 0) {
+                    ret = -EEXIST;
+                } else {
+                    /* Preserve real backend errors such as EACCES or EIO. */
+                }
+            } else if (ret == -ENOENT) {
+                ret = 0;
+                path_clear(&child);
             }
         }
     }
-    if (ret >= 0 && !exclusive_existing) {
+    if (ret >= 0 && type == NFS2_NFREG &&
+        (!v3 || (kind == NFS3PROC_CREATE && create_mode == 0))) {
+        ret = co_name_to_path(server, &dir, name, &child);
+        if (ret >= 0) {
+            ret = co_lstat(server, &child, &after);
+            existing_object = ret >= 0;
+            if (ret >= 0 && !S_ISREG(after.st_mode)) {
+                ret = S_ISDIR(after.st_mode) ? -EISDIR : -EINVAL;
+            }
+            if (ret == -ENOENT) {
+                ret = 0;
+                path_clear(&child);
+            }
+        } else if (ret == -ENOENT) {
+            ret = 0;
+        }
+    }
+    if (ret >= 0 && !exclusive_existing && !existing_object) {
         if (type == NFS2_NFREG) {
             int flags = O_CREAT | O_WRONLY;
 
@@ -2369,7 +2474,7 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
             ret = close_ret;
         }
     }
-    if (ret >= 0) {
+    if (ret >= 0 && !existing_object) {
         ret = co_name_to_path(server, &dir, name, &child);
     }
     if (ret >= 0 && !(v3 && kind == NFS3PROC_CREATE && create_mode == 2)) {
@@ -2378,22 +2483,41 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
     if (ret >= 0) {
         ret = co_lstat(server, &child, &after);
     }
+    if (ret >= 0 && v3 && kind == NFS3PROC_CREATE && create_mode == 2 &&
+        !exclusive_existing) {
+        struct stat verified;
+
+        ret = co_lsetxattr(server, &child, NFS3_CREATE_VERIFIER_XATTR,
+                           verifier, sizeof(verifier), XATTR_CREATE);
+        if (ret >= 0) {
+            ret = co_lstat(server, &child, &verified);
+            if (ret >= 0 &&
+                (verified.st_dev != after.st_dev ||
+                 verified.st_ino != after.st_ino)) {
+                ret = -ESTALE;
+            }
+            if (ret >= 0) {
+                after = verified;
+            }
+        }
+        if (ret < 0) {
+            int metadata_error = ret;
+
+            co_unlink(server, &dir, name, false);
+            ret = metadata_error;
+        }
+    }
     if (ret >= 0) {
         ret = make_handle(server, child_abs, &after, &path_state,
                           &result_handle);
-    }
-    if (ret >= 0 && v3 && kind == NFS3PROC_CREATE && create_mode == 2 &&
-        !exclusive_existing) {
-        g_hash_table_replace(server->exclusive_verifiers, g_strdup(child_abs),
-                             g_bytes_new(verifier, sizeof(verifier)));
     }
     {
         struct stat dir_after = { 0 };
         bool dir_after_valid = false;
 
-        if (before.st_ino && validate_handle_identity(server, &dir_handle,
-                                                       &dir,
-                                                       &dir_after) >= 0) {
+        if (before_valid && validate_handle_identity(server, &dir_handle,
+                                                      &dir,
+                                                      &dir_after) >= 0) {
             dir_after_valid = true;
         }
         ok = nfs2_rpc_reply_success(w, call->xid) &&
@@ -2404,14 +2528,14 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
                      nfs2_xdr_put_counted_opaque(w, result_handle.bytes, 32,
                                                  32) &&
                      put_post_attr(w, &after, true) &&
-                     put_wcc(w, &before, before.st_ino != 0, &dir_after,
+                     put_wcc(w, &before, before_valid, &dir_after,
                              dir_after_valid);
             } else if (kind != NFS2_NFSPROC_SYMLINK) {
                 ok = nfs2_xdr_put_opaque(w, result_handle.bytes, 32) &&
                      put_v2_attr(server, w, &after);
             }
         } else if (ok && v3) {
-            ok = put_wcc(w, &before, before.st_ino != 0, &dir_after,
+            ok = put_wcc(w, &before, before_valid, &dir_after,
                          dir_after_valid);
         }
     }
@@ -2459,7 +2583,6 @@ static bool coroutine_fn reply_write(Nfs2Server *server,
         offset = write_offset;
         if (!nfs2_xdr_counted_opaque(&call->body, &data, &data_len,
                                      NFS2_MAX_DATA) ||
-            total_count > NFS2_MAX_DATA ||
             !nfs2_xdr_reader_empty(&call->body)) {
             return nfs2_rpc_reply_garbage_args(w, call->xid);
         }
@@ -2535,7 +2658,7 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
     V9fsPath absolute = { 0 }, dir = { 0 };
     g_autofree char *child_abs = NULL;
     struct stat before = { 0 }, after = { 0 };
-    bool after_valid = false;
+    bool before_valid, after_valid = false;
     int ret;
     bool ok;
 
@@ -2544,6 +2667,7 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_directory(server, &dir_handle, &absolute, &dir, &before);
+    before_valid = ret >= 0;
     if (ret >= 0) {
         child_abs = child_absolute(absolute.data, name);
         ret = child_abs ? 0 : -EIO;
@@ -2551,21 +2675,17 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
     if (ret >= 0) {
         ret = co_unlink(server, &dir, name, directory);
     }
-    if (ret >= 0 &&
-        !nfs2_handle_remove(server->handles, child_abs, NULL)) {
-        ret = -EIO;
-    }
     if (ret >= 0) {
-        g_hash_table_remove(server->exclusive_verifiers, child_abs);
+        nfs2_handle_remove(server->handles, child_abs, NULL);
     }
-    if (before.st_ino && validate_handle_identity(server, &dir_handle, &dir,
-                                                   &after) >= 0) {
+    if (before_valid && validate_handle_identity(server, &dir_handle, &dir,
+                                                  &after) >= 0) {
         after_valid = true;
     }
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
-        ok = put_wcc(w, &before, before.st_ino != 0, &after, after_valid);
+        ok = put_wcc(w, &before, before_valid, &after, after_valid);
     }
     path_clear(&absolute);
     path_clear(&dir);
@@ -2583,6 +2703,7 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
     g_autofree char *old_child = NULL, *new_child = NULL;
     struct stat old_before = { 0 }, new_before = { 0 };
     struct stat old_after = { 0 }, new_after = { 0 };
+    bool old_before_valid = false, new_before_valid = false;
     bool old_after_valid = false, new_after_valid = false;
     int ret;
     bool ok;
@@ -2594,9 +2715,11 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
     }
     ret = resolve_directory(server, &old_handle, &old_abs, &old_dir,
                             &old_before);
+    old_before_valid = ret >= 0;
     if (ret >= 0) {
         ret = resolve_directory(server, &new_handle, &new_abs, &new_dir,
                                 &new_before);
+        new_before_valid = ret >= 0;
     }
     if (ret >= 0) {
         old_child = child_absolute(old_abs.data, old_name);
@@ -2612,23 +2735,12 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
         !nfs2_handle_rename(server->handles, old_child, new_child, NULL)) {
         ret = -EIO;
     }
-    if (ret >= 0) {
-        GBytes *verifier = g_hash_table_lookup(server->exclusive_verifiers,
-                                                old_child);
-        if (verifier) {
-            g_hash_table_replace(server->exclusive_verifiers,
-                                 g_strdup(new_child), g_bytes_ref(verifier));
-            g_hash_table_remove(server->exclusive_verifiers, old_child);
-        } else {
-            g_hash_table_remove(server->exclusive_verifiers, new_child);
-        }
-    }
-    if (old_before.st_ino &&
+    if (old_before_valid &&
         validate_handle_identity(server, &old_handle, &old_dir,
                                  &old_after) >= 0) {
         old_after_valid = true;
     }
-    if (new_before.st_ino &&
+    if (new_before_valid &&
         validate_handle_identity(server, &new_handle, &new_dir,
                                  &new_after) >= 0) {
         new_after_valid = true;
@@ -2636,9 +2748,9 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
-        ok = put_wcc(w, &old_before, old_before.st_ino != 0,
+        ok = put_wcc(w, &old_before, old_before_valid,
                      &old_after, old_after_valid) &&
-             put_wcc(w, &new_before, new_before.st_ino != 0,
+             put_wcc(w, &new_before, new_before_valid,
                      &new_after, new_after_valid);
     }
     path_clear(&old_abs);
@@ -2655,10 +2767,14 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
     char name[NFS2_MAX_NAME + 1];
     V9fsPath file_abs = { 0 }, file = { 0 };
     V9fsPath dir_abs = { 0 }, dir = { 0 };
+    V9fsPath linked = { 0 };
     g_autofree char *new_abs = NULL;
-    struct stat file_st = { 0 }, dir_before = { 0 }, dir_after = { 0 };
+    struct stat file_st = { 0 }, file_after = { 0 }, linked_st = { 0 };
+    struct stat dir_before = { 0 }, dir_after = { 0 };
     Nfs2FileHandle ignored_handle;
-    bool dir_after_valid = false;
+    bool file_valid = false, file_after_valid = false;
+    bool dir_before_valid = false, dir_after_valid = false;
+    bool linked_created = false;
     int ret;
     bool ok;
 
@@ -2669,27 +2785,53 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &file_handle, &file_abs, &file, &file_st);
+    file_valid = ret >= 0;
     if (ret >= 0 && S_ISDIR(file_st.st_mode)) {
         ret = -EPERM;
     }
     if (ret >= 0) {
         ret = resolve_directory(server, &dir_handle, &dir_abs, &dir,
                                 &dir_before);
+        dir_before_valid = ret >= 0;
     }
     if (ret >= 0) {
         new_abs = child_absolute(dir_abs.data, name);
         ret = new_abs ? co_link(server, &file, &dir, name) : -EIO;
+        linked_created = ret >= 0;
+    }
+    if (ret >= 0) {
+        ret = co_name_to_path(server, &dir, name, &linked);
+    }
+    if (ret >= 0) {
+        ret = co_lstat(server, &linked, &linked_st);
+        if (ret >= 0 &&
+            (linked_st.st_dev != file_st.st_dev ||
+             linked_st.st_ino != file_st.st_ino)) {
+            ret = -ESTALE;
+        }
+    }
+    if (file_valid) {
+        int post_ret = validate_handle_identity(server, &file_handle, &file,
+                                                &file_after);
+
+        file_after_valid = post_ret >= 0;
+        if (ret >= 0 && post_ret < 0) {
+            ret = post_ret;
+        }
     }
     if (ret >= 0) {
         uint32_t identity;
 
-        if (!identity_id(server, &file_st, false, &identity) ||
+        if (!identity_id(server, &file_after, false, &identity) ||
             !nfs2_handle_create(server->handles, identity, new_abs,
                                 &ignored_handle, NULL)) {
             ret = -EIO;
         }
     }
-    if (dir_before.st_ino &&
+    if (ret < 0 && linked_created) {
+        co_unlink(server, &dir, name, false);
+    }
+    if (dir_before_valid &&
         validate_handle_identity(server, &dir_handle, &dir,
                                  &dir_after) >= 0) {
         dir_after_valid = true;
@@ -2697,14 +2839,15 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
     ok = nfs2_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
-        ok = put_post_attr(w, &file_st, ret >= 0) &&
-             put_wcc(w, &dir_before, dir_before.st_ino != 0,
+        ok = put_post_attr(w, &file_after, file_after_valid) &&
+             put_wcc(w, &dir_before, dir_before_valid,
                      &dir_after, dir_after_valid);
     }
     path_clear(&file_abs);
     path_clear(&file);
     path_clear(&dir_abs);
     path_clear(&dir);
+    path_clear(&linked);
     return ok;
 }
 
@@ -2724,10 +2867,11 @@ static bool coroutine_fn reply_commit(Nfs2Server *server,
     if (!decode_v3_handle(&call->body, &handle, false) ||
         !get_u64(&call->body, &offset) ||
         !nfs2_xdr_u32(&call->body, &count) ||
-        !nfs2_xdr_reader_empty(&call->body) ||
-        offset > INT64_MAX || count > INT64_MAX - offset) {
+        !nfs2_xdr_reader_empty(&call->body)) {
         return nfs2_rpc_reply_garbage_args(w, call->xid);
     }
+    (void)offset;
+    (void)count;
     ret = resolve_handle(server, &handle, &absolute, &path, &before);
     before_valid = ret >= 0;
     if (ret >= 0 && !S_ISREG(before.st_mode)) {
@@ -2815,6 +2959,78 @@ static bool reply_v3_rofs(Nfs2XdrWriter *w, uint32_t xid, uint32_t proc)
     return true;
 }
 
+static bool coroutine_fn dispatch_nfs_mutation(Nfs2Server *server,
+                                               Nfs2RpcCall *call,
+                                               Nfs2XdrWriter *w, bool v3)
+{
+    bool ok;
+
+    qemu_co_mutex_lock(&server->mutation_mutex);
+    if (!v3) {
+        switch (call->procedure) {
+        case NFS2_NFSPROC_SETATTR:
+            ok = reply_setattr(server, call, w, false);
+            break;
+        case NFS2_NFSPROC_WRITE:
+            ok = reply_write(server, call, w, false);
+            break;
+        case NFS2_NFSPROC_CREATE:
+        case NFS2_NFSPROC_MKDIR:
+        case NFS2_NFSPROC_SYMLINK:
+            ok = reply_create(server, call, w, false, call->procedure);
+            break;
+        case NFS2_NFSPROC_REMOVE:
+            ok = reply_remove(server, call, w, false, false);
+            break;
+        case NFS2_NFSPROC_RMDIR:
+            ok = reply_remove(server, call, w, false, true);
+            break;
+        case NFS2_NFSPROC_RENAME:
+            ok = reply_rename(server, call, w, false);
+            break;
+        case NFS2_NFSPROC_LINK:
+            ok = reply_link(server, call, w, false);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    } else {
+        switch (call->procedure) {
+        case NFS3PROC_SETATTR:
+            ok = reply_setattr(server, call, w, true);
+            break;
+        case NFS3PROC_WRITE:
+            ok = reply_write(server, call, w, true);
+            break;
+        case NFS3PROC_CREATE:
+        case NFS3PROC_MKDIR:
+        case NFS3PROC_SYMLINK:
+        case NFS3PROC_MKNOD:
+            ok = reply_create(server, call, w, true, call->procedure);
+            break;
+        case NFS3PROC_REMOVE:
+            ok = reply_remove(server, call, w, true, false);
+            break;
+        case NFS3PROC_RMDIR:
+            ok = reply_remove(server, call, w, true, true);
+            break;
+        case NFS3PROC_RENAME:
+            ok = reply_rename(server, call, w, true);
+            break;
+        case NFS3PROC_LINK:
+            ok = reply_link(server, call, w, true);
+            break;
+        case NFS3PROC_COMMIT:
+            ok = reply_commit(server, call, w);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+    qemu_co_mutex_unlock(&server->mutation_mutex);
+    return ok;
+}
+
 static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
                                       Nfs2XdrWriter *w)
 {
@@ -2829,6 +3045,7 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
             return nfs2_rpc_reply_success(w, call->xid) &&
                    write_nfs_status(w, NFS2_NFSERR_ROFS);
         }
+        return dispatch_nfs_mutation(server, call, w, v3);
     }
     if (call->procedure == 0) {
         return body_empty(call) ? nfs2_rpc_reply_success(w, call->xid) :
@@ -2836,22 +3053,6 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
     }
     if (!v3) {
         switch (call->procedure) {
-        case NFS2_NFSPROC_SETATTR:
-            return reply_setattr(server, call, w, false);
-        case NFS2_NFSPROC_WRITE:
-            return reply_write(server, call, w, false);
-        case NFS2_NFSPROC_CREATE:
-        case NFS2_NFSPROC_MKDIR:
-        case NFS2_NFSPROC_SYMLINK:
-            return reply_create(server, call, w, false, call->procedure);
-        case NFS2_NFSPROC_REMOVE:
-            return reply_remove(server, call, w, false, false);
-        case NFS2_NFSPROC_RMDIR:
-            return reply_remove(server, call, w, false, true);
-        case NFS2_NFSPROC_RENAME:
-            return reply_rename(server, call, w, false);
-        case NFS2_NFSPROC_LINK:
-            return reply_link(server, call, w, false);
         case NFS2_NFSPROC_GETATTR:
             return reply_getattr(server, call, w, false);
         case NFS2_NFSPROC_ROOT:
@@ -2873,23 +3074,6 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
         }
     }
     switch (call->procedure) {
-    case NFS3PROC_SETATTR:
-        return reply_setattr(server, call, w, true);
-    case NFS3PROC_WRITE:
-        return reply_write(server, call, w, true);
-    case NFS3PROC_CREATE:
-    case NFS3PROC_MKDIR:
-    case NFS3PROC_SYMLINK:
-    case NFS3PROC_MKNOD:
-        return reply_create(server, call, w, true, call->procedure);
-    case NFS3PROC_REMOVE:
-        return reply_remove(server, call, w, true, false);
-    case NFS3PROC_RMDIR:
-        return reply_remove(server, call, w, true, true);
-    case NFS3PROC_RENAME:
-        return reply_rename(server, call, w, true);
-    case NFS3PROC_LINK:
-        return reply_link(server, call, w, true);
     case NFS3PROC_GETATTR:
         return reply_getattr(server, call, w, true);
     case NFS3PROC_LOOKUP:
@@ -2910,8 +3094,6 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
         return reply_fsinfo(server, call, w);
     case NFS3PROC_PATHCONF:
         return reply_pathconf(server, call, w);
-    case NFS3PROC_COMMIT:
-        return reply_commit(server, call, w);
     default:
         return nfs2_rpc_reply_proc_unavail(w, call->xid);
     }
@@ -2981,10 +3163,17 @@ static void coroutine_fn request_entry(void *opaque)
         entry->completed_at = server_now_ms(server);
         entry->last_used = ++server->duplicate_sequence;
     }
-    if (!server->closing) {
+    if (!server->closing &&
+        (!request->duplicate || !request->duplicate->abandoned)) {
+        if (request->duplicate) {
+            request->duplicate->sending = true;
+        }
         server->transport.send(request->service, &request->peer, reply,
                                nfs2_xdr_writer_size(&writer),
                                server->transport_opaque);
+        if (request->duplicate) {
+            request->duplicate->sending = false;
+        }
     }
     if (request->duplicate && request->duplicate->abandoned) {
         g_ptr_array_remove(server->duplicates, request->duplicate);
@@ -3021,9 +3210,6 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
                                                         cookie_equal,
                                                         g_free, NULL);
     server->cookies_by_wire = g_hash_table_new(g_direct_hash, g_direct_equal);
-    server->exclusive_verifiers =
-        g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
-                              (GDestroyNotify)g_bytes_unref);
     server->next_identity = 1;
     server->next_cookie = 1;
     server->duplicates = g_ptr_array_new_with_free_func(duplicate_free);
@@ -3035,7 +3221,6 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
         nfs2_handle_table_free(server->handles);
         g_ptr_array_unref(server->duplicates);
         g_hash_table_destroy(server->cookies_by_wire);
-        g_hash_table_destroy(server->exclusive_verifiers);
         g_hash_table_destroy(server->cookies_by_backend);
         g_hash_table_destroy(server->identities);
         v9fs_backend_cleanup(&server->backend);
@@ -3045,6 +3230,7 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
     server->transport = *transport;
     server->transport_opaque = transport_opaque;
     server->writable = writable;
+    qemu_co_mutex_init(&server->mutation_mutex);
     if (qcrypto_random_bytes(server->write_verifier,
                              sizeof(server->write_verifier), errp) < 0) {
         nfs2_server_free(server);
@@ -3095,14 +3281,19 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
                     continue;
                 }
                 entry->last_used = ++server->duplicate_sequence;
-                if (entry->in_flight) {
+                if (entry->in_flight || entry->sending) {
                     return 0;
                 }
                 if (!server->closing) {
+                    entry->sending = true;
                     server->transport.send(service, peer,
                                            entry->reply->data,
                                            entry->reply->len,
                                            server->transport_opaque);
+                    entry->sending = false;
+                    if (entry->abandoned) {
+                        g_ptr_array_remove(server->duplicates, entry);
+                    }
                 }
                 return 0;
             }
@@ -3114,7 +3305,8 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
                     NfsDuplicateEntry *entry =
                         g_ptr_array_index(server->duplicates, i);
 
-                    if (!entry->in_flight && entry->last_used < oldest) {
+                    if (!entry->in_flight && !entry->sending &&
+                        entry->last_used < oldest) {
                         oldest = entry->last_used;
                         oldest_index = i;
                     }
@@ -3177,7 +3369,7 @@ void nfs2_server_reset(Nfs2Server *server)
         NfsDuplicateEntry *entry =
             g_ptr_array_index(server->duplicates, i - 1);
 
-        if (entry->in_flight) {
+        if (entry->in_flight || entry->sending) {
             entry->abandoned = true;
         } else {
             g_ptr_array_remove_index(server->duplicates, i - 1);
@@ -3195,7 +3387,6 @@ void nfs2_server_free(Nfs2Server *server)
     g_ptr_array_unref(server->duplicates);
     nfs2_handle_table_free(server->handles);
     g_hash_table_destroy(server->cookies_by_wire);
-    g_hash_table_destroy(server->exclusive_verifiers);
     g_hash_table_destroy(server->cookies_by_backend);
     g_hash_table_destroy(server->identities);
     v9fs_backend_cleanup(&server->backend);
