@@ -170,6 +170,10 @@ struct FileOperations {
     int (*ftruncate)(FsContext *ctx, int fid_type, V9fsFidOpenState *fs,
                      off_t size);
     int (*fsync)(FsContext *, int, V9fsFidOpenState *, int);
+    ssize_t (*fgetxattr)(FsContext *, int, V9fsFidOpenState *,
+                         const char *, void *, size_t);
+    int (*fsetxattr)(FsContext *, int, V9fsFidOpenState *,
+                     const char *, void *, size_t, int);
     int (*statfs)(FsContext *s, V9fsPath *path, struct statfs *stbuf);
     ssize_t (*lgetxattr)(FsContext *, V9fsPath *,
                          const char *, void *, size_t);

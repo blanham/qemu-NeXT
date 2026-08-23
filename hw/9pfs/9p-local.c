@@ -1203,6 +1203,24 @@ static int local_fsync(FsContext *ctx, int fid_type,
     }
 }
 
+static ssize_t local_fgetxattr(FsContext *ctx, int fid_type,
+                               V9fsFidOpenState *fs, const char *name,
+                               void *value, size_t size)
+{
+    int fd = local_fid_fd(fid_type, fs);
+
+    return fd < 0 ? -1 : qemu_fgetxattr(fd, name, value, size);
+}
+
+static int local_fsetxattr(FsContext *ctx, int fid_type,
+                           V9fsFidOpenState *fs, const char *name,
+                           void *value, size_t size, int flags)
+{
+    int fd = local_fid_fd(fid_type, fs);
+
+    return fd < 0 ? -1 : qemu_fsetxattr(fd, name, value, size, flags);
+}
+
 static int local_statfs(FsContext *s, V9fsPath *fs_path, struct statfs *stbuf)
 {
     int fd, ret;
@@ -1650,6 +1668,8 @@ FileOperations local_ops = {
     .utimensat = local_utimensat,
     .remove = local_remove,
     .fsync = local_fsync,
+    .fgetxattr = local_fgetxattr,
+    .fsetxattr = local_fsetxattr,
     .statfs = local_statfs,
     .lgetxattr = local_lgetxattr,
     .llistxattr = local_llistxattr,

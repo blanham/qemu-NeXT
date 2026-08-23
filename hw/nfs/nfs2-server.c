@@ -96,8 +96,8 @@ typedef enum BackendOp {
     BACKEND_UNLINKAT,
     BACKEND_RENAMEAT,
     BACKEND_LINK,
-    BACKEND_LGETXATTR,
-    BACKEND_LSETXATTR,
+    BACKEND_FGETXATTR,
+    BACKEND_FSETXATTR,
 } BackendOp;
 
 typedef struct BackendWork {
@@ -165,6 +165,7 @@ struct Nfs2Server {
     uint8_t write_verifier[8];
     GPtrArray *duplicates;
     uint64_t duplicate_sequence;
+    uint64_t exclusive_sequence;
     CoMutex mutation_mutex;
 };
 
@@ -416,20 +417,21 @@ static int backend_worker(void *opaque)
             errno = EOPNOTSUPP;
         }
         break;
-    case BACKEND_LGETXATTR:
-        ret = ops->lgetxattr ?
-              ops->lgetxattr(ctx, work->path, work->xattr_name,
-                             work->xattr_value, work->length) : -1;
-        if (!ops->lgetxattr) {
+    case BACKEND_FGETXATTR:
+        ret = ops->fgetxattr ?
+              ops->fgetxattr(ctx, work->fid_type, work->open,
+                             work->xattr_name, work->xattr_value,
+                             work->length) : -1;
+        if (!ops->fgetxattr) {
             errno = EOPNOTSUPP;
         }
         break;
-    case BACKEND_LSETXATTR:
-        ret = ops->lsetxattr ?
-              ops->lsetxattr(ctx, work->path, work->xattr_name,
-                             work->xattr_value, work->length,
-                             work->xattr_flags) : -1;
-        if (!ops->lsetxattr) {
+    case BACKEND_FSETXATTR:
+        ret = ops->fsetxattr ?
+              ops->fsetxattr(ctx, work->fid_type, work->open,
+                             work->xattr_name, work->xattr_value,
+                             work->length, work->xattr_flags) : -1;
+        if (!ops->fsetxattr) {
             errno = EOPNOTSUPP;
         }
         break;
@@ -584,15 +586,37 @@ static int coroutine_fn co_pwrite(Nfs2Server *server,
     return run_backend(&work);
 }
 
-static int coroutine_fn co_fsync(Nfs2Server *server,
-                                 V9fsFidOpenState *state)
+static int coroutine_fn co_fsync_type(Nfs2Server *server, int fid_type,
+                                      V9fsFidOpenState *state)
 {
     BackendWork work = {
         .op = BACKEND_FSYNC, .backend = &server->backend, .open = state,
-        .fid_type = P9_FID_FILE,
+        .fid_type = fid_type,
     };
 
     return run_backend(&work);
+}
+
+static int coroutine_fn co_fsync(Nfs2Server *server,
+                                 V9fsFidOpenState *state)
+{
+    return co_fsync_type(server, P9_FID_FILE, state);
+}
+
+static int coroutine_fn co_opendir(Nfs2Server *server, V9fsPath *path,
+                                   V9fsFidOpenState *state)
+{
+    V9fsPath copy = { 0 };
+    BackendWork work = {
+        .op = BACKEND_OPENDIR, .backend = &server->backend, .open = state,
+    };
+    int ret;
+
+    path_copy(&copy, path);
+    work.path = &copy;
+    ret = run_backend(&work);
+    path_clear(&copy);
+    return ret;
 }
 
 static int coroutine_fn co_path_change(Nfs2Server *server, BackendOp op,
@@ -721,41 +745,33 @@ static int coroutine_fn co_link(Nfs2Server *server, V9fsPath *old_path,
     return ret;
 }
 
-static int coroutine_fn co_lgetxattr(Nfs2Server *server, V9fsPath *path,
+static int coroutine_fn co_fgetxattr(Nfs2Server *server,
+                                     V9fsFidOpenState *state,
                                      const char *name, void *value,
                                      size_t length)
 {
-    V9fsPath copy = { 0 };
     BackendWork work = {
-        .op = BACKEND_LGETXATTR, .backend = &server->backend,
+        .op = BACKEND_FGETXATTR, .backend = &server->backend,
+        .open = state, .fid_type = P9_FID_FILE,
         .xattr_name = name, .xattr_value = value, .length = length,
     };
-    int ret;
 
-    path_copy(&copy, path);
-    work.path = &copy;
-    ret = run_backend(&work);
-    path_clear(&copy);
-    return ret;
+    return run_backend(&work);
 }
 
-static int coroutine_fn co_lsetxattr(Nfs2Server *server, V9fsPath *path,
+static int coroutine_fn co_fsetxattr(Nfs2Server *server,
+                                     V9fsFidOpenState *state,
                                      const char *name, void *value,
                                      size_t length, int flags)
 {
-    V9fsPath copy = { 0 };
     BackendWork work = {
-        .op = BACKEND_LSETXATTR, .backend = &server->backend,
+        .op = BACKEND_FSETXATTR, .backend = &server->backend,
+        .open = state, .fid_type = P9_FID_FILE,
         .xattr_name = name, .xattr_value = value, .length = length,
         .xattr_flags = flags,
     };
-    int ret;
 
-    path_copy(&copy, path);
-    work.path = &copy;
-    ret = run_backend(&work);
-    path_clear(&copy);
-    return ret;
+    return run_backend(&work);
 }
 
 static uint32_t clamp_u32(uint64_t value)
@@ -2288,6 +2304,169 @@ static int coroutine_fn resolve_directory(Nfs2Server *server,
     return ret;
 }
 
+static bool same_object(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static int coroutine_fn sync_directory(Nfs2Server *server, V9fsPath *dir)
+{
+    V9fsFidOpenState open = { 0 };
+    int ret = co_opendir(server, dir, &open);
+
+    if (ret >= 0) {
+        int close_ret;
+
+        ret = co_fsync_type(server, P9_FID_DIR, &open);
+        close_ret = co_simple_open(server, BACKEND_CLOSEDIR, &open);
+        if (ret >= 0 && close_ret < 0) {
+            ret = close_ret;
+        }
+    }
+    return ret;
+}
+
+static void coroutine_fn cleanup_exclusive_temp(Nfs2Server *server,
+                                                 V9fsPath *dir,
+                                                 const char *name,
+                                                 V9fsPath *path,
+                                                 const struct stat *opened)
+{
+    struct stat current;
+
+    if ((!path->data && co_name_to_path(server, dir, name, path) < 0) ||
+        co_lstat(server, path, &current) < 0 ||
+        !same_object(&current, opened)) {
+        return;
+    }
+    co_unlink(server, dir, name, false);
+}
+
+static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
+                                          const char *name,
+                                          const uint8_t verifier[8],
+                                          mode_t mode, uid_t uid, gid_t gid,
+                                          V9fsPath *child,
+                                          struct stat *after)
+{
+    FileOperations *ops = server->backend.ops;
+    V9fsFidOpenState open = { 0 };
+    V9fsPath temp = { 0 };
+    struct stat opened_st, current;
+    uint8_t stored[8];
+    char temp_name[NFS2_MAX_NAME + 1];
+    bool opened = false, created = false, published = false;
+    bool opened_st_valid = false;
+    int ret, close_ret;
+
+    if (!ops->open || !ops->open2 || !ops->fstat || !ops->close ||
+        !ops->fgetxattr || !ops->fsetxattr || !ops->fsync ||
+        !ops->opendir || !ops->closedir || !ops->link || !ops->unlinkat) {
+        return -EOPNOTSUPP;
+    }
+
+    ret = co_name_to_path(server, dir, name, child);
+    if (ret >= 0) {
+        ret = co_lstat(server, child, &current);
+    }
+    if (ret >= 0) {
+        ret = co_open_flags(server, child, O_RDONLY, &open);
+        if (ret == -EISDIR || ret == -ELOOP || ret == -EINVAL) {
+            return -EEXIST;
+        }
+        opened = ret >= 0;
+    }
+    if (opened) {
+        ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
+        if (ret >= 0) {
+            ret = co_fgetxattr(server, &open, NFS3_CREATE_VERIFIER_XATTR,
+                               stored, sizeof(stored));
+        }
+        if (ret == sizeof(stored)) {
+            ret = memcmp(stored, verifier, sizeof(stored)) ? -EEXIST : 0;
+        } else if (ret == -ENODATA || ret == -ENOATTR || ret == -ERANGE ||
+                   ret >= 0) {
+            ret = -EEXIST;
+        } else if (ret == -EOPNOTSUPP || ret == -ENOSYS) {
+            ret = -EOPNOTSUPP;
+        }
+        if (ret >= 0) {
+            ret = co_lstat(server, child, after);
+            if (ret >= 0 && !same_object(&opened_st, after)) {
+                ret = -EEXIST;
+            }
+        }
+        close_ret = co_simple_open(server, BACKEND_CLOSE, &open);
+        return ret >= 0 && close_ret < 0 ? close_ret : ret;
+    }
+    if (ret != -ENOENT) {
+        path_clear(child);
+        return ret;
+    }
+    path_clear(child);
+
+    for (unsigned int attempt = 0; attempt < 16; attempt++) {
+        snprintf(temp_name, sizeof(temp_name),
+                 ".qemu-nfs3-exclusive-%016" PRIx64,
+                 ++server->exclusive_sequence);
+        ret = co_create_open(server, dir, temp_name,
+                             O_CREAT | O_EXCL | O_WRONLY, mode,
+                             uid, gid, &open);
+        if (ret != -EEXIST) {
+            break;
+        }
+    }
+    if (ret < 0) {
+        return ret == -EEXIST ? -EIO : ret;
+    }
+    opened = created = true;
+    ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
+    opened_st_valid = ret >= 0;
+    if (ret >= 0) {
+        ret = co_fsetxattr(server, &open, NFS3_CREATE_VERIFIER_XATTR,
+                           (void *)verifier, sizeof(stored), XATTR_CREATE);
+    }
+    if (ret >= 0) {
+        ret = co_fsync(server, &open);
+    }
+    if (ret >= 0) {
+        ret = co_name_to_path(server, dir, temp_name, &temp);
+    }
+    if (ret >= 0) {
+        ret = co_lstat(server, &temp, &current);
+        if (ret >= 0 && !same_object(&opened_st, &current)) {
+            ret = -ESTALE;
+        }
+    }
+    if (ret >= 0) {
+        ret = co_link(server, &temp, dir, name);
+        published = ret >= 0;
+    }
+    if (published) {
+        int unlink_ret = co_unlink(server, dir, temp_name, false);
+        int identity_ret = co_name_to_path(server, dir, name, child);
+        int sync_ret;
+
+        if (identity_ret >= 0) {
+            identity_ret = co_lstat(server, child, after);
+            if (identity_ret >= 0 && !same_object(&opened_st, after)) {
+                identity_ret = -ESTALE;
+            }
+        }
+        sync_ret = sync_directory(server, dir);
+        ret = unlink_ret < 0 ? unlink_ret :
+              identity_ret < 0 ? identity_ret : sync_ret;
+    } else if (created && opened_st_valid) {
+        cleanup_exclusive_temp(server, dir, temp_name, &temp, &opened_st);
+    }
+    close_ret = opened ? co_simple_open(server, BACKEND_CLOSE, &open) : 0;
+    if (ret >= 0 && close_ret < 0) {
+        ret = close_ret;
+    }
+    path_clear(&temp);
+    return ret;
+}
+
 static bool coroutine_fn reply_create(Nfs2Server *server,
                                       Nfs2RpcCall *call,
                                       Nfs2XdrWriter *w, bool v3,
@@ -2385,40 +2564,10 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
         }
     }
     if (ret >= 0 && v3 && kind == NFS3PROC_CREATE && create_mode == 2) {
-        if (!server->backend.ops->lgetxattr ||
-            !server->backend.ops->lsetxattr) {
-            ret = -EOPNOTSUPP;
-        } else {
-            ret = co_name_to_path(server, &dir, name, &child);
-            if (ret >= 0) {
-                uint8_t stored[sizeof(verifier)];
-
-                ret = co_lstat(server, &child, &after);
-                if (ret >= 0) {
-                    ret = co_lgetxattr(server, &child,
-                                       NFS3_CREATE_VERIFIER_XATTR,
-                                       stored, sizeof(stored));
-                }
-                if (ret == -ENOENT) {
-                    ret = 0;
-                    path_clear(&child);
-                } else if (ret == sizeof(stored) &&
-                    !memcmp(stored, verifier, sizeof(stored))) {
-                    ret = 0;
-                    exclusive_existing = true;
-                } else if (ret == -EOPNOTSUPP || ret == -ENOSYS) {
-                    ret = -EOPNOTSUPP;
-                } else if (ret == -ENODATA || ret == -ENOATTR ||
-                           ret == -ERANGE || ret >= 0) {
-                    ret = -EEXIST;
-                } else {
-                    /* Preserve real backend errors such as EACCES or EIO. */
-                }
-            } else if (ret == -ENOENT) {
-                ret = 0;
-                path_clear(&child);
-            }
-        }
+        ret = exclusive_create(server, &dir, name, verifier, 0600,
+                               before.st_uid, before.st_gid,
+                               &child, &after);
+        exclusive_existing = ret >= 0;
     }
     if (ret >= 0 && type == NFS2_NFREG &&
         (!v3 || (kind == NFS3PROC_CREATE && create_mode == 0))) {
@@ -2474,7 +2623,7 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
             ret = close_ret;
         }
     }
-    if (ret >= 0 && !existing_object) {
+    if (ret >= 0 && !existing_object && !exclusive_existing) {
         ret = co_name_to_path(server, &dir, name, &child);
     }
     if (ret >= 0 && !(v3 && kind == NFS3PROC_CREATE && create_mode == 2)) {
@@ -2482,30 +2631,6 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
     }
     if (ret >= 0) {
         ret = co_lstat(server, &child, &after);
-    }
-    if (ret >= 0 && v3 && kind == NFS3PROC_CREATE && create_mode == 2 &&
-        !exclusive_existing) {
-        struct stat verified;
-
-        ret = co_lsetxattr(server, &child, NFS3_CREATE_VERIFIER_XATTR,
-                           verifier, sizeof(verifier), XATTR_CREATE);
-        if (ret >= 0) {
-            ret = co_lstat(server, &child, &verified);
-            if (ret >= 0 &&
-                (verified.st_dev != after.st_dev ||
-                 verified.st_ino != after.st_ino)) {
-                ret = -ESTALE;
-            }
-            if (ret >= 0) {
-                after = verified;
-            }
-        }
-        if (ret < 0) {
-            int metadata_error = ret;
-
-            co_unlink(server, &dir, name, false);
-            ret = metadata_error;
-        }
     }
     if (ret >= 0) {
         ret = make_handle(server, child_abs, &after, &path_state,
@@ -2830,6 +2955,11 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
     }
     if (ret < 0 && linked_created) {
         co_unlink(server, &dir, name, false);
+        if (file_valid) {
+            file_after_valid =
+                validate_handle_identity(server, &file_handle, &file,
+                                         &file_after) >= 0;
+        }
     }
     if (dir_before_valid &&
         validate_handle_identity(server, &dir_handle, &dir,

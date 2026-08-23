@@ -15,6 +15,8 @@ typedef struct FakeOpen {
     bool directory;
     bool emitted;
     uint64_t ino;
+    bool verifier_present;
+    uint8_t verifier[8];
     struct dirent entry;
 } FakeOpen;
 
@@ -74,6 +76,21 @@ typedef struct Fixture {
     bool race_delay;
     int link_error;
     bool replace_link_result;
+    bool wrong_link_lstat_once;
+    bool track_exclusive;
+    unsigned int exclusive_order;
+    unsigned int verifier_set_order;
+    unsigned int file_fsync_order;
+    unsigned int publish_order;
+    unsigned int temp_unlink_order;
+    unsigned int dir_fsync_order;
+    unsigned int unlink_calls;
+    int file_fsync_error;
+    int dir_fsync_error;
+    int unlink_error;
+    bool replace_after_fget;
+    bool replace_after_fset;
+    bool exclusive_publish_collision;
 } Fixture;
 
 static Fixture *current;
@@ -235,7 +252,8 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
         !strcmp(path->data + 1, current->linked_name)) {
         st->st_mode = current->linked_mode;
         st->st_nlink = 2;
-        st->st_ino = current->linked_ino;
+        st->st_ino = current->linked_ino + current->wrong_link_lstat_once;
+        current->wrong_link_lstat_once = false;
         return 0;
     }
     if (current->object_present && path->data[0] == '/' &&
@@ -300,6 +318,12 @@ static int fake_open(FsContext *ctx, V9fsPath *path, int flags,
     ((FakeOpen *)state->private)->ino = !strcmp(path->data, "/kernel") ?
                                         current->kernel_ino :
                                         current->object_ino;
+    if (strcmp(path->data, "/kernel")) {
+        ((FakeOpen *)state->private)->verifier_present =
+            current->verifier_present;
+        memcpy(((FakeOpen *)state->private)->verifier, current->verifier,
+               sizeof(current->verifier));
+    }
     return 0;
 }
 
@@ -341,6 +365,23 @@ static int fake_fsync(FsContext *ctx, int fid_type,
 {
     note_backend();
     current->mutation_calls++;
+    if (current->track_exclusive) {
+        unsigned int order = ++current->exclusive_order;
+
+        if (fid_type == P9_FID_DIR) {
+            current->dir_fsync_order = order;
+            if (current->dir_fsync_error) {
+                errno = current->dir_fsync_error;
+                return -1;
+            }
+        } else {
+            current->file_fsync_order = order;
+            if (current->file_fsync_error) {
+                errno = current->file_fsync_error;
+                return -1;
+            }
+        }
+    }
     if (current->mutation_error) {
         errno = current->mutation_error;
         return -1;
@@ -378,7 +419,8 @@ static int fake_open2(FsContext *ctx, V9fsPath *dir, const char *name,
 {
     note_backend();
     current->mutation_calls++;
-    if (current->object_present && (flags & O_EXCL)) {
+    if (current->object_present && !strcmp(name, current->object_name) &&
+        (flags & O_EXCL)) {
         errno = EEXIST;
         return -1;
     }
@@ -433,6 +475,16 @@ static int fake_unlinkat(FsContext *ctx, V9fsPath *dir, const char *name,
 {
     note_backend();
     current->mutation_calls++;
+    if (current->track_exclusive) {
+        current->unlink_calls++;
+        if (g_str_has_prefix(name, ".qemu-nfs3-exclusive-")) {
+            current->temp_unlink_order = ++current->exclusive_order;
+        }
+        if (current->unlink_error) {
+            errno = current->unlink_error;
+            return -1;
+        }
+    }
     fake_race_window();
     g_mutex_lock(&current->fake_lock);
     if (current->linked_present && !strcmp(name, current->linked_name)) {
@@ -445,8 +497,15 @@ static int fake_unlinkat(FsContext *ctx, V9fsPath *dir, const char *name,
         errno = ENOENT;
         return -1;
     }
-    current->object_present = false;
-    current->verifier_present = false;
+    if (current->linked_present &&
+        current->linked_ino == current->object_ino) {
+        g_strlcpy(current->object_name, current->linked_name,
+                  sizeof(current->object_name));
+        current->linked_present = false;
+    } else {
+        current->object_present = false;
+        current->verifier_present = false;
+    }
     g_mutex_unlock(&current->fake_lock);
     return 0;
 }
@@ -478,13 +537,27 @@ static int fake_link(FsContext *ctx, V9fsPath *oldpath, V9fsPath *newdir,
         errno = current->link_error;
         return -1;
     }
+    if (current->exclusive_publish_collision) {
+        current->exclusive_publish_collision = false;
+        g_strlcpy(current->linked_name, name,
+                  sizeof(current->linked_name));
+        current->linked_mode = S_IFREG | 0600;
+        current->linked_ino = current->object_ino + 100;
+        current->linked_present = true;
+        errno = EEXIST;
+        return -1;
+    }
+    if (current->track_exclusive &&
+        g_str_has_prefix(oldpath->data, "/.qemu-nfs3-exclusive-")) {
+        current->publish_order = ++current->exclusive_order;
+    }
     g_strlcpy(current->linked_name, name, sizeof(current->linked_name));
     current->linked_mode = !strcmp(oldpath->data, "/kernel") ?
                            current->kernel_mode : current->object_mode;
     current->linked_ino = !strcmp(oldpath->data, "/kernel") ?
                           current->kernel_ino : current->object_ino;
     if (current->replace_link_result) {
-        current->linked_ino++;
+        current->wrong_link_lstat_once = true;
         current->replace_link_result = false;
     }
     current->linked_present = true;
@@ -533,6 +606,70 @@ static int fake_lsetxattr(FsContext *ctx, V9fsPath *path, const char *name,
     }
     memcpy(current->verifier, value, sizeof(current->verifier));
     current->verifier_present = true;
+    return 0;
+}
+
+static ssize_t fake_fgetxattr(FsContext *ctx, int fid_type,
+                              V9fsFidOpenState *state, const char *name,
+                              void *value, size_t size)
+{
+    FakeOpen *open = state->private;
+
+    note_backend();
+    if (fid_type != P9_FID_FILE ||
+        strcmp(name, "user.qemu.nfs3.createverf") ||
+        !open->verifier_present) {
+        errno = ENODATA;
+        return -1;
+    }
+    if (size < sizeof(open->verifier)) {
+        errno = ERANGE;
+        return -1;
+    }
+    memcpy(value, open->verifier, sizeof(open->verifier));
+    if (current->replace_after_fget) {
+        current->replace_after_fget = false;
+        current->object_ino++;
+        current->verifier_present = false;
+    }
+    return sizeof(open->verifier);
+}
+
+static int fake_fsetxattr(FsContext *ctx, int fid_type,
+                          V9fsFidOpenState *state, const char *name,
+                          void *value, size_t size, int flags)
+{
+    FakeOpen *open = state->private;
+
+    note_backend();
+    if (current->track_exclusive) {
+        current->verifier_set_order = ++current->exclusive_order;
+    }
+    if (current->fail_verifier_set) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    if (fid_type != P9_FID_FILE ||
+        strcmp(name, "user.qemu.nfs3.createverf") ||
+        size != sizeof(open->verifier)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((flags & XATTR_CREATE) && open->verifier_present) {
+        errno = EEXIST;
+        return -1;
+    }
+    memcpy(open->verifier, value, sizeof(open->verifier));
+    open->verifier_present = true;
+    if (current->object_present && current->object_ino == open->ino) {
+        memcpy(current->verifier, value, sizeof(current->verifier));
+        current->verifier_present = true;
+    }
+    if (current->replace_after_fset) {
+        current->replace_after_fset = false;
+        current->object_ino++;
+        current->verifier_present = false;
+    }
     return 0;
 }
 
@@ -662,6 +799,8 @@ static FileOperations fake_ops = {
     .setuid = fake_setuid,
     .lgetxattr = fake_lgetxattr,
     .lsetxattr = fake_lsetxattr,
+    .fgetxattr = fake_fgetxattr,
+    .fsetxattr = fake_fsetxattr,
 };
 
 static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
@@ -2218,7 +2357,7 @@ static void test_review_exclusive_xattr_failures(Fixture *f,
     Nfs2XdrWriter w;
     unsigned int calls;
 
-    fake_ops.lsetxattr = NULL;
+    fake_ops.fgetxattr = NULL;
     make_writable(f);
     root = mount_root(f, 3);
     nfs2_xdr_writer_init(&w, body, sizeof(body));
@@ -2229,7 +2368,17 @@ static void test_review_exclusive_xattr_failures(Fixture *f,
     send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 10004);
     g_assert_cmpuint(f->mutation_calls, ==, calls);
     g_assert_false(f->object_present);
-    fake_ops.lsetxattr = fake_lsetxattr;
+    fake_ops.fgetxattr = fake_fgetxattr;
+
+    fake_ops.fsetxattr = NULL;
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "unsupported-set");
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_opaque(&w, "verify00", 8));
+    send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 10004);
+    g_assert_cmpuint(f->mutation_calls, ==, calls);
+    g_assert_false(f->object_present);
+    fake_ops.fsetxattr = fake_fsetxattr;
 
     f->fail_verifier_set = true;
     nfs2_xdr_writer_init(&w, body, sizeof(body));
@@ -2240,6 +2389,105 @@ static void test_review_exclusive_xattr_failures(Fixture *f,
     g_assert_false(f->object_present);
     g_assert_false(f->verifier_present);
     f->fail_verifier_set = false;
+}
+
+static void send_exclusive(Fixture *f, const Nfs2FileHandle *root,
+                           const char *name, const uint8_t verifier[8],
+                           uint32_t expected)
+{
+    uint8_t body[128];
+    Nfs2XdrWriter w;
+
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, root, name);
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_opaque(&w, verifier, 8));
+    send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), expected);
+}
+
+static void test_review_exclusive_durability_order(Fixture *f,
+                                                   gconstpointer opaque)
+{
+    static const uint8_t verifier[8] = "durable";
+    Nfs2FileHandle root;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    f->track_exclusive = true;
+    send_exclusive(f, &root, "durable", verifier, 0);
+    g_assert_cmpuint(f->verifier_set_order, >, 0);
+    g_assert_cmpuint(f->file_fsync_order, >, f->verifier_set_order);
+    g_assert_cmpuint(f->publish_order, >, f->file_fsync_order);
+    g_assert_cmpuint(f->temp_unlink_order, >, f->publish_order);
+    g_assert_cmpuint(f->dir_fsync_order, >, f->temp_unlink_order);
+}
+
+static void test_review_exclusive_replacement_binding(Fixture *f,
+                                                      gconstpointer opaque)
+{
+    static const uint8_t verifier[8] = "binding";
+    Nfs2FileHandle root;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    f->track_exclusive = true;
+    send_exclusive(f, &root, "retry-bind", verifier, 0);
+    f->unlink_calls = 0;
+    f->replace_after_fget = true;
+    send_exclusive(f, &root, "retry-bind", verifier, 17);
+    g_assert_true(f->object_present);
+    g_assert_cmpuint(f->unlink_calls, ==, 0);
+
+    f->object_present = false;
+    f->verifier_present = false;
+    f->replace_after_fset = true;
+    f->unlink_calls = 0;
+    send_exclusive(f, &root, "new-bind", verifier, 70);
+    g_assert_true(f->object_present);
+    g_assert_false(f->verifier_present);
+    g_assert_cmpstr(f->object_name, !=, "new-bind");
+    g_assert_cmpuint(f->unlink_calls, ==, 0);
+
+    f->object_present = false;
+    f->exclusive_publish_collision = true;
+    send_exclusive(f, &root, "publish-collision", verifier, 17);
+    g_assert_false(f->object_present);
+    g_assert_true(f->linked_present);
+    g_assert_cmpstr(f->linked_name, ==, "publish-collision");
+}
+
+static void test_review_exclusive_fsync_and_rollback_failures(
+    Fixture *f, gconstpointer opaque)
+{
+    static const uint8_t verifier[8] = "failure";
+    Nfs2FileHandle root;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    f->track_exclusive = true;
+
+    f->file_fsync_error = EIO;
+    send_exclusive(f, &root, "file-sync", verifier, 5);
+    g_assert_false(f->object_present);
+    f->file_fsync_error = 0;
+
+    f->dir_fsync_error = EIO;
+    send_exclusive(f, &root, "dir-sync", verifier, 5);
+    g_assert_true(f->object_present);
+    g_assert_true(f->verifier_present);
+    f->dir_fsync_error = 0;
+    send_exclusive(f, &root, "dir-sync", verifier, 0);
+    f->object_present = false;
+    f->verifier_present = false;
+
+    f->fail_verifier_set = true;
+    f->unlink_error = EIO;
+    f->unlink_calls = 0;
+    send_exclusive(f, &root, "unlink-fail", verifier, 10004);
+    g_assert_cmpuint(f->unlink_calls, ==, 1);
+    g_assert_true(f->object_present);
+    g_assert_false(f->verifier_present);
+    g_assert_cmpstr(f->object_name, !=, "unlink-fail");
 }
 
 static void test_review_duplicate_setattr_write(Fixture *f,
@@ -2308,6 +2556,8 @@ static void test_review_link_postattrs_and_validation(Fixture *f,
     f->replace_link_result = true;
     send_nfs(f, 3, 15, body, nfs2_xdr_writer_size(&w), 70);
     g_assert_false(f->linked_present);
+    g_assert_cmpuint(reply_word(f, 7), ==, 1);
+    g_assert_cmpuint(reply_word(f, 10), ==, 1);
 }
 
 int main(int argc, char **argv)
@@ -2366,6 +2616,13 @@ int main(int argc, char **argv)
                test_review_concurrent_rename_remove, teardown);
     g_test_add("/nfs/review/exclusive-xattr-failures", Fixture, NULL, setup,
                test_review_exclusive_xattr_failures, teardown);
+    g_test_add("/nfs/review/exclusive-durability-order", Fixture, NULL,
+               setup, test_review_exclusive_durability_order, teardown);
+    g_test_add("/nfs/review/exclusive-replacement-binding", Fixture, NULL,
+               setup, test_review_exclusive_replacement_binding, teardown);
+    g_test_add("/nfs/review/exclusive-fsync-rollback-failures", Fixture, NULL,
+               setup, test_review_exclusive_fsync_and_rollback_failures,
+               teardown);
     g_test_add("/nfs/review/duplicate-setattr-write", Fixture, NULL, setup,
                test_review_duplicate_setattr_write, teardown);
     g_test_add("/nfs/review/link-postattrs-validation", Fixture, NULL, setup,
