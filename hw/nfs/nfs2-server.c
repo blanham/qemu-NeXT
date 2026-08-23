@@ -96,6 +96,7 @@ typedef enum BackendOp {
     BACKEND_UNLINKAT,
     BACKEND_RENAMEAT,
     BACKEND_LINK,
+    BACKEND_FLINKAT,
     BACKEND_FGETXATTR,
     BACKEND_FSETXATTR,
 } BackendOp;
@@ -414,6 +415,13 @@ static int backend_worker(void *opaque)
         ret = ops->link ? ops->link(ctx, work->path, work->dir,
                                     work->name) : -1;
         if (!ops->link) {
+            errno = EOPNOTSUPP;
+        }
+        break;
+    case BACKEND_FLINKAT:
+        ret = ops->flinkat ? ops->flinkat(ctx, work->fid_type, work->open,
+                                          work->dir, work->name) : -1;
+        if (!ops->flinkat) {
             errno = EOPNOTSUPP;
         }
         break;
@@ -741,6 +749,25 @@ static int coroutine_fn co_link(Nfs2Server *server, V9fsPath *old_path,
     work.dir = &dir_copy;
     ret = run_backend(&work);
     path_clear(&old_copy);
+    path_clear(&dir_copy);
+    return ret;
+}
+
+static int coroutine_fn co_flinkat(Nfs2Server *server,
+                                    V9fsFidOpenState *state,
+                                    V9fsPath *new_dir,
+                                    const char *new_name)
+{
+    V9fsPath dir_copy = { 0 };
+    BackendWork work = {
+        .op = BACKEND_FLINKAT, .backend = &server->backend,
+        .open = state, .fid_type = P9_FID_FILE, .name = new_name,
+    };
+    int ret;
+
+    path_copy(&dir_copy, new_dir);
+    work.dir = &dir_copy;
+    ret = run_backend(&work);
     path_clear(&dir_copy);
     return ret;
 }
@@ -2326,20 +2353,20 @@ static int coroutine_fn sync_directory(Nfs2Server *server, V9fsPath *dir)
     return ret;
 }
 
-static void coroutine_fn cleanup_exclusive_temp(Nfs2Server *server,
-                                                 V9fsPath *dir,
-                                                 const char *name,
-                                                 V9fsPath *path,
-                                                 const struct stat *opened)
+static int coroutine_fn cleanup_exclusive_temp(Nfs2Server *server,
+                                                V9fsPath *dir,
+                                                const char *name,
+                                                V9fsPath *path,
+                                                const struct stat *opened)
 {
     struct stat current;
 
     if ((!path->data && co_name_to_path(server, dir, name, path) < 0) ||
         co_lstat(server, path, &current) < 0 ||
         !same_object(&current, opened)) {
-        return;
+        return 0;
     }
-    co_unlink(server, dir, name, false);
+    return co_unlink(server, dir, name, false);
 }
 
 static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
@@ -2361,7 +2388,7 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
 
     if (!ops->open || !ops->open2 || !ops->fstat || !ops->close ||
         !ops->fgetxattr || !ops->fsetxattr || !ops->fsync ||
-        !ops->opendir || !ops->closedir || !ops->link || !ops->unlinkat) {
+        !ops->opendir || !ops->closedir || !ops->flinkat || !ops->unlinkat) {
         return -EOPNOTSUPP;
     }
 
@@ -2439,11 +2466,12 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
         }
     }
     if (ret >= 0) {
-        ret = co_link(server, &temp, dir, name);
+        ret = co_flinkat(server, &open, dir, name);
         published = ret >= 0;
     }
     if (published) {
-        int unlink_ret = co_unlink(server, dir, temp_name, false);
+        int unlink_ret = cleanup_exclusive_temp(server, dir, temp_name,
+                                                &temp, &opened_st);
         int identity_ret = co_name_to_path(server, dir, name, child);
         int sync_ret;
 
@@ -2954,7 +2982,15 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         }
     }
     if (ret < 0 && linked_created) {
-        co_unlink(server, &dir, name, false);
+        struct stat rollback_st;
+
+        if (!linked.data) {
+            co_name_to_path(server, &dir, name, &linked);
+        }
+        if (linked.data && co_lstat(server, &linked, &rollback_st) >= 0 &&
+            same_object(&rollback_st, &file_st)) {
+            co_unlink(server, &dir, name, false);
+        }
         if (file_valid) {
             file_after_valid =
                 validate_handle_identity(server, &file_handle, &file,

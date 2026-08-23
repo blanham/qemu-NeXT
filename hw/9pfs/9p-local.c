@@ -1221,6 +1221,39 @@ static int local_fsetxattr(FsContext *ctx, int fid_type,
     return fd < 0 ? -1 : qemu_fsetxattr(fd, name, value, size, flags);
 }
 
+#ifdef CONFIG_LINUX
+static int local_flinkat(FsContext *ctx, int fid_type,
+                         V9fsFidOpenState *fs, V9fsPath *dirpath,
+                         const char *name)
+{
+    int fd = local_fid_fd(fid_type, fs);
+    int dirfd, ret;
+    char proc_path[64];
+
+    if (fd < 0) {
+        return -1;
+    }
+    if (ctx->export_flags & V9FS_SM_MAPPED_FILE) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    dirfd = local_opendir_nofollow(ctx, dirpath->data);
+    if (dirfd < 0) {
+        return -1;
+    }
+    ret = linkat(fd, "", dirfd, name, AT_EMPTY_PATH);
+    if (ret < 0 && (errno == EINVAL || errno == ENOENT || errno == EPERM)) {
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+        ret = linkat(AT_FDCWD, proc_path, dirfd, name, AT_SYMLINK_FOLLOW);
+        if (ret < 0 && (errno == EINVAL || errno == ENOENT)) {
+            errno = EOPNOTSUPP;
+        }
+    }
+    close_preserve_errno(dirfd);
+    return ret;
+}
+#endif
+
 static int local_statfs(FsContext *s, V9fsPath *fs_path, struct statfs *stbuf)
 {
     int fd, ret;
@@ -1670,6 +1703,9 @@ FileOperations local_ops = {
     .fsync = local_fsync,
     .fgetxattr = local_fgetxattr,
     .fsetxattr = local_fsetxattr,
+#ifdef CONFIG_LINUX
+    .flinkat = local_flinkat,
+#endif
     .statfs = local_statfs,
     .lgetxattr = local_lgetxattr,
     .llistxattr = local_llistxattr,

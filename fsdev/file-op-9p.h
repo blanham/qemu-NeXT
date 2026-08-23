@@ -174,6 +174,8 @@ struct FileOperations {
                          const char *, void *, size_t);
     int (*fsetxattr)(FsContext *, int, V9fsFidOpenState *,
                      const char *, void *, size_t, int);
+    int (*flinkat)(FsContext *, int, V9fsFidOpenState *, V9fsPath *,
+                   const char *);
     int (*statfs)(FsContext *s, V9fsPath *path, struct statfs *stbuf);
     ssize_t (*lgetxattr)(FsContext *, V9fsPath *,
                          const char *, void *, size_t);

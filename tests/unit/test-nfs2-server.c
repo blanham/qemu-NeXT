@@ -15,6 +15,7 @@ typedef struct FakeOpen {
     bool directory;
     bool emitted;
     uint64_t ino;
+    mode_t mode;
     bool verifier_present;
     uint8_t verifier[8];
     struct dirent entry;
@@ -61,6 +62,8 @@ typedef struct Fixture {
     bool linked_present;
     mode_t linked_mode;
     uint64_t linked_ino;
+    bool linked_verifier_present;
+    uint8_t linked_verifier[8];
     uint32_t mutation_xid;
     unsigned int send_count;
     unsigned int clock_calls;
@@ -76,7 +79,6 @@ typedef struct Fixture {
     bool race_delay;
     int link_error;
     bool replace_link_result;
-    bool wrong_link_lstat_once;
     bool track_exclusive;
     unsigned int exclusive_order;
     unsigned int verifier_set_order;
@@ -91,6 +93,8 @@ typedef struct Fixture {
     bool replace_after_fget;
     bool replace_after_fset;
     bool exclusive_publish_collision;
+    bool replace_temp_before_publish;
+    uint64_t created_open_ino;
 } Fixture;
 
 static Fixture *current;
@@ -250,10 +254,16 @@ static int fake_lstat(FsContext *ctx, V9fsPath *path, struct stat *st)
     }
     if (current->linked_present && path->data[0] == '/' &&
         !strcmp(path->data + 1, current->linked_name)) {
+        if (current->replace_link_result) {
+            current->linked_ino++;
+            current->linked_verifier_present = false;
+            current->replace_link_result = false;
+        }
         st->st_mode = current->linked_mode;
-        st->st_nlink = 2;
-        st->st_ino = current->linked_ino + current->wrong_link_lstat_once;
-        current->wrong_link_lstat_once = false;
+        st->st_nlink = current->linked_ino == current->kernel_ino ||
+                       (current->object_present &&
+                        current->linked_ino == current->object_ino) ? 2 : 1;
+        st->st_ino = current->linked_ino;
         return 0;
     }
     if (current->object_present && path->data[0] == '/' &&
@@ -318,6 +328,9 @@ static int fake_open(FsContext *ctx, V9fsPath *path, int flags,
     ((FakeOpen *)state->private)->ino = !strcmp(path->data, "/kernel") ?
                                         current->kernel_ino :
                                         current->object_ino;
+    ((FakeOpen *)state->private)->mode = !strcmp(path->data, "/kernel") ?
+                                         current->kernel_mode :
+                                         current->object_mode;
     if (strcmp(path->data, "/kernel")) {
         ((FakeOpen *)state->private)->verifier_present =
             current->verifier_present;
@@ -431,6 +444,8 @@ static int fake_open2(FsContext *ctx, V9fsPath *dir, const char *name,
     current->verifier_present = false;
     state->private = g_new0(FakeOpen, 1);
     ((FakeOpen *)state->private)->ino = current->object_ino;
+    ((FakeOpen *)state->private)->mode = current->object_mode;
+    current->created_open_ino = current->object_ino;
     return 0;
 }
 
@@ -547,6 +562,12 @@ static int fake_link(FsContext *ctx, V9fsPath *oldpath, V9fsPath *newdir,
         errno = EEXIST;
         return -1;
     }
+    if (current->replace_temp_before_publish &&
+        g_str_has_prefix(oldpath->data, "/.qemu-nfs3-exclusive-")) {
+        current->replace_temp_before_publish = false;
+        current->object_ino++;
+        current->verifier_present = false;
+    }
     if (current->track_exclusive &&
         g_str_has_prefix(oldpath->data, "/.qemu-nfs3-exclusive-")) {
         current->publish_order = ++current->exclusive_order;
@@ -556,10 +577,50 @@ static int fake_link(FsContext *ctx, V9fsPath *oldpath, V9fsPath *newdir,
                            current->kernel_mode : current->object_mode;
     current->linked_ino = !strcmp(oldpath->data, "/kernel") ?
                           current->kernel_ino : current->object_ino;
-    if (current->replace_link_result) {
-        current->wrong_link_lstat_once = true;
-        current->replace_link_result = false;
+    current->linked_verifier_present = current->verifier_present;
+    memcpy(current->linked_verifier, current->verifier,
+           sizeof(current->linked_verifier));
+    current->linked_present = true;
+    return 0;
+}
+
+static int fake_flinkat(FsContext *ctx, int fid_type,
+                        V9fsFidOpenState *state, V9fsPath *newdir,
+                        const char *name)
+{
+    FakeOpen *open = state->private;
+
+    note_backend();
+    current->mutation_calls++;
+    if (fid_type != P9_FID_FILE) {
+        errno = EBADF;
+        return -1;
     }
+    if (current->exclusive_publish_collision) {
+        current->exclusive_publish_collision = false;
+        g_strlcpy(current->linked_name, name,
+                  sizeof(current->linked_name));
+        current->linked_mode = S_IFREG | 0600;
+        current->linked_ino = current->object_ino + 100;
+        current->linked_verifier_present = false;
+        current->linked_present = true;
+        errno = EEXIST;
+        return -1;
+    }
+    if (current->replace_temp_before_publish) {
+        current->replace_temp_before_publish = false;
+        current->object_ino++;
+        current->verifier_present = false;
+    }
+    if (current->track_exclusive) {
+        current->publish_order = ++current->exclusive_order;
+    }
+    g_strlcpy(current->linked_name, name, sizeof(current->linked_name));
+    current->linked_mode = open->mode;
+    current->linked_ino = open->ino;
+    current->linked_verifier_present = open->verifier_present;
+    memcpy(current->linked_verifier, open->verifier,
+           sizeof(current->linked_verifier));
     current->linked_present = true;
     return 0;
 }
@@ -762,7 +823,7 @@ static int fake_fstat(FsContext *ctx, int fid_type,
     memset(st, 0, sizeof(*st));
     st->st_dev = 9;
     st->st_ino = open->ino;
-    st->st_mode = open->directory ? S_IFDIR | 0755 : S_IFREG | 0555;
+    st->st_mode = open->directory ? S_IFDIR | 0755 : open->mode;
     st->st_nlink = open->directory ? 2 : 1;
     st->st_size = open->directory ? 0 : 6;
     return 0;
@@ -801,6 +862,7 @@ static FileOperations fake_ops = {
     .lsetxattr = fake_lsetxattr,
     .fgetxattr = fake_fgetxattr,
     .fsetxattr = fake_fsetxattr,
+    .flinkat = fake_flinkat,
 };
 
 static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
@@ -2380,6 +2442,16 @@ static void test_review_exclusive_xattr_failures(Fixture *f,
     g_assert_false(f->object_present);
     fake_ops.fsetxattr = fake_fsetxattr;
 
+    fake_ops.flinkat = NULL;
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name3(&w, &root, "unsupported-link");
+    g_assert_true(nfs2_xdr_put_u32(&w, 2));
+    g_assert_true(nfs2_xdr_put_opaque(&w, "verify09", 8));
+    send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 10004);
+    g_assert_cmpuint(f->mutation_calls, ==, calls);
+    g_assert_false(f->object_present);
+    fake_ops.flinkat = fake_flinkat;
+
     f->fail_verifier_set = true;
     nfs2_xdr_writer_init(&w, body, sizeof(body));
     put_name3(&w, &root, "rollback");
@@ -2454,6 +2526,16 @@ static void test_review_exclusive_replacement_binding(Fixture *f,
     g_assert_false(f->object_present);
     g_assert_true(f->linked_present);
     g_assert_cmpstr(f->linked_name, ==, "publish-collision");
+
+    f->linked_present = false;
+    f->replace_temp_before_publish = true;
+    send_exclusive(f, &root, "fd-publish", verifier, 0);
+    g_assert_true(f->linked_present);
+    g_assert_cmpstr(f->linked_name, ==, "fd-publish");
+    g_assert_cmpuint(f->linked_ino, ==, f->created_open_ino);
+    g_assert_true(f->linked_verifier_present);
+    g_assert_true(f->object_present);
+    g_assert_cmpstr(f->object_name, !=, "fd-publish");
 }
 
 static void test_review_exclusive_fsync_and_rollback_failures(
@@ -2555,7 +2637,9 @@ static void test_review_link_postattrs_and_validation(Fixture *f,
     put_name3(&w, &root, "replaced-link");
     f->replace_link_result = true;
     send_nfs(f, 3, 15, body, nfs2_xdr_writer_size(&w), 70);
-    g_assert_false(f->linked_present);
+    g_assert_true(f->linked_present);
+    g_assert_cmpstr(f->linked_name, ==, "replaced-link");
+    g_assert_cmpuint(f->linked_ino, !=, f->kernel_ino);
     g_assert_cmpuint(reply_word(f, 7), ==, 1);
     g_assert_cmpuint(reply_word(f, 10), ==, 1);
 }
