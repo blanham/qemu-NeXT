@@ -64,6 +64,7 @@
 #define NEXT_MB8795_RESET_MODE   0x80
 #define NEXT_MB8795_MAX_FRAME    1514
 #define NEXT_MB8795_FCS_SIZE     4
+#define NEXT_MB8795_RX_TURNAROUND_NS (1 * SCALE_MS)
 
 #define NEXT_MB8795_RXMODE_TEST        0x80
 #define NEXT_MB8795_RXMODE_ADDRSIZE    0x10
@@ -78,6 +79,7 @@ struct NextMB8795State {
     NICConf conf;
     NextDMAState *dma;
     QEMUTimer tx_timer;
+    QEMUTimer rx_turnaround_timer;
     qemu_irq tx_irq;
     qemu_irq rx_irq;
     uint8_t tx_status;
@@ -88,6 +90,7 @@ struct NextMB8795State {
     uint8_t rx_mode;
     uint8_t station[6];
     bool reset;
+    bool rx_turnaround;
 };
 
 static void next_mb8795_update_tx_irq(NextMB8795State *s)
@@ -109,6 +112,7 @@ static void next_mb8795_update_irqs(NextMB8795State *s)
 static void next_mb8795_enter_reset(NextMB8795State *s)
 {
     timer_del(&s->tx_timer);
+    timer_del(&s->rx_turnaround_timer);
     s->tx_status = 0;
     s->tx_mask = 0;
     s->rx_status = 0;
@@ -116,6 +120,7 @@ static void next_mb8795_enter_reset(NextMB8795State *s)
     s->tx_mode = 0;
     s->rx_mode = 0;
     s->reset = true;
+    s->rx_turnaround = false;
     qemu_irq_lower(s->tx_irq);
     qemu_irq_lower(s->rx_irq);
 }
@@ -234,7 +239,8 @@ static bool next_mb8795_can_receive(NetClientState *nc)
 {
     NextMB8795State *s = qemu_get_nic_opaque(nc);
 
-    return !s->reset && next_dma_enet_rx_ready(s->dma);
+    return !s->reset && !s->rx_turnaround &&
+           next_dma_enet_rx_ready(s->dma);
 }
 
 static bool next_mb8795_station_match(NextMB8795State *s,
@@ -317,12 +323,13 @@ static bool next_mb8795_receive_frame(NextMB8795State *s,
                                         size + NEXT_MB8795_FCS_SIZE);
     }
 
-    next_dma_enet_rx_complete(s->dma, result);
     if (result == NEXT_DMA_OK) {
         s->rx_status |= NEXT_MB8795_RXSTAT_OK;
     } else {
         s->rx_status |= NEXT_MB8795_RXSTAT_OVERFLOW;
     }
+    /* The receive status must be visible before DMA completion raises IRQ. */
+    next_dma_enet_rx_complete(s->dma, result);
     next_mb8795_update_rx_irq(s);
     trace_next_mb8795_rx_complete(result, size, s->rx_status);
     return result == NEXT_DMA_OK;
@@ -352,6 +359,16 @@ static NetClientInfo next_mb8795_net_info = {
     .receive = next_mb8795_receive,
 };
 
+static void next_mb8795_rx_turnaround_expired(void *opaque)
+{
+    NextMB8795State *s = opaque;
+
+    s->rx_turnaround = false;
+    if (s->nic && next_mb8795_can_receive(qemu_get_queue(s->nic))) {
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
+    }
+}
+
 static void next_mb8795_tx_timer(void *opaque)
 {
     NextMB8795State *s = NEXT_MB8795(opaque);
@@ -363,6 +380,17 @@ static void next_mb8795_tx_timer(void *opaque)
     result = next_dma_enet_tx_read(s->dma, frame, sizeof(frame), &length);
     if (result == NEXT_DMA_OK) {
         if (s->tx_mode & NEXT_MB8795_TXMODE_NO_LBC) {
+            /*
+             * A reply cannot reach a half-duplex 10 Mb/s Ethernet MAC in
+             * the same instant that transmission completes.  In-process
+             * backends such as slirp can reply reentrantly, so hold those
+             * packets in NetQueue until the guest has had time to re-arm
+             * receive DMA.
+             */
+            s->rx_turnaround = true;
+            timer_mod(&s->rx_turnaround_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      NEXT_MB8795_RX_TURNAROUND_NS);
             qemu_send_packet(qemu_get_queue(s->nic), frame, length);
         } else {
             loopback_received = next_mb8795_receive_frame(s, frame, length);
@@ -422,8 +450,16 @@ static int next_mb8795_post_load(void *opaque, int version_id)
 {
     NextMB8795State *s = opaque;
 
+    if (version_id < 2) {
+        s->rx_turnaround = false;
+        timer_del(&s->rx_turnaround_timer);
+    }
     if (s->reset &&
-        (s->tx_status || s->rx_status || timer_pending(&s->tx_timer))) {
+        (s->tx_status || s->rx_status || timer_pending(&s->tx_timer) ||
+         s->rx_turnaround || timer_pending(&s->rx_turnaround_timer))) {
+        return -EINVAL;
+    }
+    if (s->rx_turnaround != timer_pending(&s->rx_turnaround_timer)) {
         return -EINVAL;
     }
 
@@ -434,7 +470,7 @@ static int next_mb8795_post_load(void *opaque, int version_id)
 static const VMStateDescription vmstate_next_mb8795 = {
     .name = "next-mb8795",
     .priority = MIG_PRI_LOW,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = next_mb8795_post_load,
     .fields = (const VMStateField[]) {
@@ -448,6 +484,8 @@ static const VMStateDescription vmstate_next_mb8795 = {
                             NEXT_MB8795_ADDR_SIZE),
         VMSTATE_BOOL(reset, NextMB8795State),
         VMSTATE_TIMER(tx_timer, NextMB8795State),
+        VMSTATE_BOOL_V(rx_turnaround, NextMB8795State, 2),
+        VMSTATE_TIMER_V(rx_turnaround_timer, NextMB8795State, 2),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -474,6 +512,7 @@ static void next_mb8795_unrealize(DeviceState *dev)
     NextMB8795State *s = NEXT_MB8795(dev);
 
     timer_del(&s->tx_timer);
+    timer_del(&s->rx_turnaround_timer);
     next_dma_set_ethernet_notify(s->dma, NULL, NULL);
     qemu_del_nic(s->nic);
     s->nic = NULL;
@@ -491,6 +530,8 @@ static void next_mb8795_init(Object *obj)
     sysbus_init_mmio(sbd, &s->mmio);
     timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL,
                   next_mb8795_tx_timer, s);
+    timer_init_ns(&s->rx_turnaround_timer, QEMU_CLOCK_VIRTUAL,
+                  next_mb8795_rx_turnaround_expired, s);
 }
 
 static const Property next_mb8795_properties[] = {

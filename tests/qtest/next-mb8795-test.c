@@ -48,6 +48,8 @@
 #define NEXT_ENRX_CSR         (NEXT_DMA_BASE + 0x0150)
 #define NEXT_ENRX_SAVED_NEXT  (NEXT_ENRX_CSR + 0x3ff0)
 #define NEXT_ENRX_SAVED_LIMIT (NEXT_ENRX_CSR + 0x3ff4)
+#define NEXT_ENRX_SAVED_START (NEXT_ENRX_CSR + 0x3ff8)
+#define NEXT_ENRX_SAVED_STOP  (NEXT_ENRX_CSR + 0x3ffc)
 #define NEXT_ENRX_NEXT        (NEXT_ENRX_CSR + 0x4000)
 #define NEXT_ENRX_LIMIT       (NEXT_ENRX_CSR + 0x4004)
 #define NEXT_ENRX_START       (NEXT_ENRX_CSR + 0x4008)
@@ -57,6 +59,7 @@
 #define NEXT_ROM_SIZE    (128 * 1024)
 #define NEXT_TX_BUFFER   0x04010000
 #define NEXT_RX_BUFFER   0x04012000
+#define NEXT_RX_BUFFER_2 0x04014000
 #define NEXT_ENRX_IRQ    (1U << 9)
 #define NEXT_ENTX_IRQ    (1U << 10)
 #define NEXT_ENRX_DMA_IRQ (1U << 27)
@@ -74,8 +77,6 @@
 #define ENTX_EOP           0x80000000
 #define ENTX_ADDR_MASK     0x0fffffff
 #define ENTX_END_BIAS      15
-#define ENRX_BOP            0x40000000
-#define ENRX_EOP            0x80000000
 
 enum {
     EN_TXSTAT = 0x00,
@@ -111,6 +112,17 @@ static const uint8_t rx_frame[60] = {
 };
 
 static const uint8_t rx_fcs[4] = { 0xd5, 0xbd, 0x90, 0xc3 };
+
+static const uint8_t arp_request[60] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    0x08, 0x06,
+    0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+    0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    0x0a, 0x00, 0x02, 0x0f,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0a, 0x00, 0x02, 0x02,
+};
 #endif
 
 typedef struct TestROM {
@@ -583,6 +595,29 @@ static void test_status_w1c(void)
     en_writeb(qts, EN_RXSTAT, 0);
     en_writeb(qts, EN_RXSTAT, EN_RXSTAT_OK | EN_RXSTAT_OVERFLOW);
     g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_dma_next_init_read_alias(void)
+{
+    QTestState *qts = next_mb8795_start();
+
+    qtest_writel(qts, NEXT_ENRX_CSR, DMA_RESET);
+    qtest_writel(qts, NEXT_ENRX_NEXT, 0x04012000);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT_INIT), ==,
+                    0x04012000);
+    qtest_writel(qts, NEXT_ENRX_SAVED_START, 0x04014000);
+    qtest_writel(qts, NEXT_ENRX_SAVED_STOP, 0x04015000);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_START), ==,
+                    0x04014000);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_STOP), ==,
+                    0x04015000);
+
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_RESET);
+    qtest_writel(qts, NEXT_ENTX_NEXT_INIT, 0x04010000);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENTX_NEXT), ==,
+                    0x04010000);
 
     qtest_quit(qts);
 }
@@ -1075,6 +1110,60 @@ static void test_tx_ack_isolation(void)
     tx_harness_stop(&harness);
 }
 
+static void test_tx_reply_waits_for_rearmed_rx(void)
+{
+    QTestState *qts = next_mb8795_start_with_args(
+        "-netdev user,id=nextnet "
+        "-net nic,model=next-mb8795,netdev=nextnet,"
+        "macaddr=52:54:00:12:34:56");
+    uint8_t stale_before[sizeof(arp_request) + sizeof(rx_fcs)];
+    uint8_t stale_after[sizeof(stale_before)];
+    uint8_t reply[sizeof(stale_before)];
+
+    memset(stale_before, 0xa5, sizeof(stale_before));
+    memset(reply, 0xa5, sizeof(reply));
+    qtest_memwrite(qts, NEXT_RX_BUFFER,
+                   stale_before, sizeof(stale_before));
+    qtest_memwrite(qts, NEXT_RX_BUFFER_2, reply, sizeof(reply));
+    qtest_memwrite(qts, NEXT_TX_BUFFER,
+                   arp_request, sizeof(arp_request));
+
+    rx_prepare_controller(qts, 3);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000,
+               0, 0, false);
+    tx_prepare_controller(qts);
+    qtest_writel(qts, NEXT_ENTX_NEXT, NEXT_TX_BUFFER);
+    qtest_writel(qts, NEXT_ENTX_LIMIT,
+                 ENTX_EOP | (NEXT_TX_BUFFER + sizeof(arp_request) +
+                             ENTX_END_BIAS));
+
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
+    qtest_clock_step(qts, 1);
+
+    qtest_memread(qts, NEXT_RX_BUFFER,
+                  stale_after, sizeof(stale_after));
+    g_assert_cmpmem(stale_after, sizeof(stale_after),
+                    stale_before, sizeof(stale_before));
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE), ==, DMA_ENABLE);
+
+    rx_program(qts, NEXT_RX_BUFFER_2, NEXT_RX_BUFFER_2 + 0x1000,
+               0, 0, false);
+    qtest_clock_step(qts, 2 * 1000 * 1000);
+
+    qtest_memread(qts, NEXT_RX_BUFFER_2, reply, sizeof(reply));
+    g_assert_cmphex(reply[12], ==, 0x08);
+    g_assert_cmphex(reply[13], ==, 0x06);
+    g_assert_cmphex(reply[20], ==, 0x00);
+    g_assert_cmphex(reply[21], ==, 0x02);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
+                    NEXT_RX_BUFFER_2);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE), ==, DMA_COMPLETE);
+
+    qtest_quit(qts);
+}
+
 static void test_rx_fcs_single_buffer(void)
 {
     TxHarness harness = tx_harness_start();
@@ -1096,11 +1185,11 @@ static void test_rx_fcs_single_buffer(void)
     g_assert_cmpmem(received + sizeof(rx_frame), sizeof(rx_fcs),
                     rx_fcs, sizeof(rx_fcs));
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
-                    NEXT_RX_BUFFER | ENRX_BOP);
+                    NEXT_RX_BUFFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT), ==,
-                    (NEXT_RX_BUFFER + sizeof(received)) | ENRX_EOP);
+                    NEXT_RX_BUFFER + sizeof(received));
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT), ==,
-                    (NEXT_RX_BUFFER + sizeof(received)) | ENRX_EOP);
+                    NEXT_RX_BUFFER + sizeof(received));
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
                     (DMA_ENABLE | DMA_SUPDATE |
                      DMA_COMPLETE | DMA_BUSEXC),
@@ -1233,11 +1322,11 @@ static void test_rx_crosses_chain(void)
     g_assert_cmpmem(second_data, sizeof(second_data),
                     expected + sizeof(first), sizeof(second_data));
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
-                    NEXT_RX_BUFFER | ENRX_BOP);
+                    NEXT_RX_BUFFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT), ==,
                     NEXT_RX_BUFFER + FIRST_LENGTH);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT), ==,
-                    (second + wire_length - FIRST_LENGTH) | ENRX_EOP);
+                    second + wire_length - FIRST_LENGTH);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_LIMIT), ==,
                     second + 0x100);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
@@ -1268,9 +1357,9 @@ static void test_rx_first_buffer_supdate(void)
     g_assert_cmpmem(received + sizeof(rx_frame), sizeof(rx_fcs),
                     rx_fcs, sizeof(rx_fcs));
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_NEXT), ==,
-                    NEXT_RX_BUFFER | ENRX_BOP);
+                    NEXT_RX_BUFFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_SAVED_LIMIT), ==,
-                    (NEXT_RX_BUFFER + wire_length) | ENRX_EOP);
+                    NEXT_RX_BUFFER + wire_length);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_NEXT), ==, second);
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_LIMIT), ==,
                     second + 0x100);
@@ -1624,6 +1713,8 @@ int main(int argc, char **argv)
                    test_access_widths);
     qtest_add_func("/next-cube/mb8795/status-w1c",
                    test_status_w1c);
+    qtest_add_func("/next-cube/mb8795/dma-next-init-read-alias",
+                   test_dma_next_init_read_alias);
     qtest_add_func("/next-cube/mb8795/mask-status-irqs",
                    test_mask_status_irqs);
     qtest_add_func("/next-cube/mb8795/mtree-window",
@@ -1645,6 +1736,8 @@ int main(int argc, char **argv)
                    test_tx_async);
     qtest_add_func("/next-cube/mb8795/tx-ack-isolation",
                    test_tx_ack_isolation);
+    qtest_add_func("/next-cube/mb8795/tx-reply-waits-for-rearmed-rx",
+                   test_tx_reply_waits_for_rearmed_rx);
     qtest_add_func("/next-cube/mb8795/rx-filter-modes",
                    test_rx_filter_modes);
     qtest_add_func("/next-cube/mb8795/rx-addrsize",
@@ -1677,6 +1770,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/mb8795/tx-async",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/tx-ack-isolation",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-cube/mb8795/tx-reply-waits-for-rearmed-rx",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/rx-filter-modes",
                    test_tx_transport_unavailable);

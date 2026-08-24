@@ -143,7 +143,9 @@ static void test_reader_rejections(void)
 {
     static const uint8_t short_word[] = { 0, 0, 0 };
     static const uint8_t huge_count[] = { 0xff, 0xff, 0xff, 0xff };
-    static const uint8_t bad_padding[] = { 0, 0, 0, 1, 'x', 1, 0, 0 };
+    static const uint8_t nonzero_padding[] = {
+        0, 0, 0, 1, 'x', 0xad, 0xbe, 0xef,
+    };
     Nfs2XdrReader r;
     const uint8_t *start;
     uint32_t value;
@@ -162,10 +164,10 @@ static void test_reader_rejections(void)
                                            UINT32_MAX));
     g_assert_true(r.cursor == start);
 
-    nfs2_xdr_reader_init(&r, bad_padding, sizeof(bad_padding));
-    start = r.cursor;
-    g_assert_false(nfs2_xdr_string(&r, string, sizeof(string), 7));
-    g_assert_true(r.cursor == start);
+    nfs2_xdr_reader_init(&r, nonzero_padding, sizeof(nonzero_padding));
+    g_assert_true(nfs2_xdr_string(&r, string, sizeof(string), 7));
+    g_assert_cmpstr(string, ==, "x");
+    g_assert_true(nfs2_xdr_reader_empty(&r));
 
     nfs2_xdr_reader_init(&r, short_word, sizeof(short_word));
     start = r.cursor;
