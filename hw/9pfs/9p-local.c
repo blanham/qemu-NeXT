@@ -441,6 +441,30 @@ static int local_set_xattrat(int dirfd, const char *path, FsCred *credp)
     return 0;
 }
 
+static int local_set_xattr_fd(int fd, FsCred *credp)
+{
+    uint32_t tmp_uid = cpu_to_le32(credp->fc_uid);
+    uint32_t tmp_gid = cpu_to_le32(credp->fc_gid);
+    uint32_t tmp_mode = cpu_to_le32(credp->fc_mode);
+    uint64_t tmp_rdev = cpu_to_le64(credp->fc_rdev);
+
+    if ((credp->fc_uid != -1 &&
+         qemu_fsetxattr(fd, "user.virtfs.uid", &tmp_uid,
+                        sizeof(uid_t), 0) < 0) ||
+        (credp->fc_gid != -1 &&
+         qemu_fsetxattr(fd, "user.virtfs.gid", &tmp_gid,
+                        sizeof(gid_t), 0) < 0) ||
+        (credp->fc_mode != (mode_t)-1 &&
+         qemu_fsetxattr(fd, "user.virtfs.mode", &tmp_mode,
+                        sizeof(mode_t), 0) < 0) ||
+        (credp->fc_rdev != -1 &&
+         qemu_fsetxattr(fd, "user.virtfs.rdev", &tmp_rdev,
+                        sizeof(dev_t), 0) < 0)) {
+        return -1;
+    }
+    return 0;
+}
+
 static int local_set_cred_passthrough(FsContext *fs_ctx, int dirfd,
                                       const char *name, FsCred *credp)
 {
@@ -886,6 +910,55 @@ out:
     return err;
 }
 
+#ifdef CONFIG_LINUX
+static int local_open_tmpfile(FsContext *fs_ctx, V9fsPath *dir_path,
+                              FsCred *credp, V9fsFidOpenState *fs)
+{
+    int dirfd, fd = -1;
+
+    if (fs_ctx->export_flags & V9FS_SM_MAPPED_FILE) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    dirfd = local_opendir_nofollow(fs_ctx, dir_path->data);
+    if (dirfd < 0) {
+        return -1;
+    }
+    if (fs_ctx->export_flags & V9FS_SM_MAPPED) {
+        fd = openat_file(dirfd, ".", O_TMPFILE | O_RDWR, fs_ctx->fmode);
+        if (fd >= 0) {
+            credp->fc_mode |= S_IFREG;
+            if (local_set_xattr_fd(fd, credp) < 0) {
+                close_preserve_errno(fd);
+                fd = -1;
+            }
+        }
+    } else if ((fs_ctx->export_flags & V9FS_SM_PASSTHROUGH) ||
+               (fs_ctx->export_flags & V9FS_SM_NONE)) {
+        fd = openat_file(dirfd, ".", O_TMPFILE | O_RDWR,
+                         credp->fc_mode);
+        if (fd >= 0 &&
+            ((fchown(fd, credp->fc_uid, credp->fc_gid) < 0 &&
+              (fs_ctx->export_flags & V9FS_SEC_MASK) != V9FS_SM_NONE) ||
+             fchmod(fd, credp->fc_mode & 07777) < 0)) {
+            close_preserve_errno(fd);
+            fd = -1;
+        }
+    } else {
+        errno = EOPNOTSUPP;
+    }
+    if (fd < 0 && (errno == EINVAL || errno == EISDIR ||
+                   errno == ENOSYS)) {
+        errno = EOPNOTSUPP;
+    }
+    close_preserve_errno(dirfd);
+    if (fd >= 0) {
+        fs->fd = fd;
+    }
+    return fd;
+}
+#endif
+
 
 static int local_symlink(FsContext *fs_ctx, const char *oldpath,
                          V9fsPath *dir_path, const char *name, FsCred *credp)
@@ -1202,6 +1275,57 @@ static int local_fsync(FsContext *ctx, int fid_type,
         return fsync(fd);
     }
 }
+
+static ssize_t local_fgetxattr(FsContext *ctx, int fid_type,
+                               V9fsFidOpenState *fs, const char *name,
+                               void *value, size_t size)
+{
+    int fd = local_fid_fd(fid_type, fs);
+
+    return fd < 0 ? -1 : qemu_fgetxattr(fd, name, value, size);
+}
+
+static int local_fsetxattr(FsContext *ctx, int fid_type,
+                           V9fsFidOpenState *fs, const char *name,
+                           void *value, size_t size, int flags)
+{
+    int fd = local_fid_fd(fid_type, fs);
+
+    return fd < 0 ? -1 : qemu_fsetxattr(fd, name, value, size, flags);
+}
+
+#ifdef CONFIG_LINUX
+static int local_flinkat(FsContext *ctx, int fid_type,
+                         V9fsFidOpenState *fs, V9fsPath *dirpath,
+                         const char *name)
+{
+    int fd = local_fid_fd(fid_type, fs);
+    int dirfd, ret;
+    char proc_path[64];
+
+    if (fd < 0) {
+        return -1;
+    }
+    if (ctx->export_flags & V9FS_SM_MAPPED_FILE) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    dirfd = local_opendir_nofollow(ctx, dirpath->data);
+    if (dirfd < 0) {
+        return -1;
+    }
+    ret = linkat(fd, "", dirfd, name, AT_EMPTY_PATH);
+    if (ret < 0 && (errno == EINVAL || errno == ENOENT || errno == EPERM)) {
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+        ret = linkat(AT_FDCWD, proc_path, dirfd, name, AT_SYMLINK_FOLLOW);
+        if (ret < 0 && (errno == EINVAL || errno == ENOENT)) {
+            errno = EOPNOTSUPP;
+        }
+    }
+    close_preserve_errno(dirfd);
+    return ret;
+}
+#endif
 
 static int local_statfs(FsContext *s, V9fsPath *fs_path, struct statfs *stbuf)
 {
@@ -1642,6 +1766,9 @@ FileOperations local_ops = {
     .mkdir = local_mkdir,
     .fstat = local_fstat,
     .open2 = local_open2,
+#ifdef CONFIG_LINUX
+    .open_tmpfile = local_open_tmpfile,
+#endif
     .symlink = local_symlink,
     .link = local_link,
     .truncate = local_truncate,
@@ -1650,6 +1777,11 @@ FileOperations local_ops = {
     .utimensat = local_utimensat,
     .remove = local_remove,
     .fsync = local_fsync,
+    .fgetxattr = local_fgetxattr,
+    .fsetxattr = local_fsetxattr,
+#ifdef CONFIG_LINUX
+    .flinkat = local_flinkat,
+#endif
     .statfs = local_statfs,
     .lgetxattr = local_lgetxattr,
     .llistxattr = local_llistxattr,

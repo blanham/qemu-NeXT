@@ -1,5 +1,8 @@
 
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
+nfs2_handle_testing = declare_dependency(
+  compile_args: ['-DNFS2_HANDLE_TESTING'],
+)
 
 tests = {
   'check-block-qdict': [],
@@ -53,6 +56,22 @@ tests = {
   'test-icount-period': [],
   'test-plan9-9p1-codec': [
     meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
+  ],
+  'test-nfs2-xdr': [
+    meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+  ],
+  'test-nfs2-handle': [
+    meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+    crypto,
+    nfs2_handle_testing,
+  ],
+  'test-nfs2-server': [
+    meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+    meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+    meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+    meson.project_source_root() / 'hw/nfs/nfs2-server.c',
+    crypto,
+    testblock,
   ],
 }
 
@@ -187,11 +206,29 @@ if have_system
         testblock,
         hwcore,
       ],
+      'test-nfs2-server-local': [
+        meson.project_source_root() / 'hw/9pfs/9p-backend.c',
+        meson.project_source_root() / 'hw/9pfs/9p-local.c',
+        meson.project_source_root() / 'hw/9pfs/9p-posix-acl.c',
+        meson.project_source_root() / 'hw/9pfs/9p-xattr.c',
+        meson.project_source_root() / 'hw/9pfs/9p-xattr-user.c',
+        meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+        meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+        meson.project_source_root() / 'hw/nfs/nfs2-server.c',
+        plan9p1_local_test_sources,
+        crypto,
+        testblock,
+        hwcore,
+      ],
     }
   endif
 
   if slirp.found()
   tests += {
+    'test-slirp-udp': [
+      meson.project_source_root() / 'net/slirp-bootp.c',
+      meson.project_source_root() / 'net/slirp-udp.c',
+    ],
     'test-slirp-plan9': [
       meson.project_source_root() / 'net/slirp-plan9.c',
     ],
@@ -199,9 +236,11 @@ if have_system
       meson.project_source_root() / 'net/slirp-guestfwd.c',
     ],
     'test-slirp-il-integration': [
+      meson.project_source_root() / 'net/slirp-bootp.c',
       meson.project_source_root() / 'net/slirp-il.c',
       meson.project_source_root() / 'net/slirp-guestfwd.c',
       meson.project_source_root() / 'net/slirp-plan9.c',
+      meson.project_source_root() / 'net/slirp-udp.c',
       slirp,
     ],
   }
@@ -307,3 +346,19 @@ foreach test_name, extra: tests
        priority: slow_tests.get(test_name, 30),
        suite: ['unit'])
 endforeach
+
+if have_system
+  nfs2_handle_nm = find_program('nm')
+  nfs2_handle_production_check = static_library(
+    'nfs2-handle-production-check',
+    meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
+    genh,
+    build_by_default: false,
+    dependencies: [glib],
+  )
+  test('test-nfs2-handle-production-symbols', python,
+       args: [files('test-nfs2-handle-production-symbols.py'),
+              nfs2_handle_nm.full_path(), nfs2_handle_production_check],
+       depends: nfs2_handle_production_check,
+       suite: ['unit'])
+endif

@@ -25,11 +25,15 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "net/slirp.h"
+#include "net/slirp-bootp.h"
+#include "net/slirp-bootp-internal.h"
 #include "net/slirp-guestfwd.h"
 #include "net/slirp-guestfwd-internal.h"
 #include "net/slirp-plan9.h"
 #include "net/slirp-plan9-internal.h"
 #include "net/slirp-il-internal.h"
+#include "net/slirp-udp.h"
+#include "net/slirp-udp-internal.h"
 
 
 #if defined(CONFIG_SMBD_COMMAND)
@@ -102,6 +106,8 @@ typedef struct SlirpState {
     struct in_addr vnetmask;
     struct in_addr vhost;
     struct in_addr vnameserver;
+    QemuSlirpUdpRegistry *udp_registry;
+    QemuSlirpBootpRegistry *bootp_registry;
     QemuSlirpGuestFwdRegistry *guestfwds;
     QemuSlirpPlan9Registry *plan9;
 #ifdef CONFIG_SLIRP_IL
@@ -120,6 +126,12 @@ static QTAILQ_HEAD(, SlirpState) slirp_stacks =
 static int slirp_hostfwd(SlirpState *s, const char *redir_str, Error **errp);
 static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp);
 static const QemuSlirpGuestFwdBackendOps slirp_guestfwd_backend_ops;
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+static const QemuSlirpUdpBackendOps slirp_udp_backend_ops;
+#endif
+#ifdef CONFIG_SLIRP_BOOTP_ROOT
+static const QemuSlirpBootpBackendOps slirp_bootp_backend_ops;
+#endif
 #ifdef CONFIG_SLIRP_PLAN9_BOOTP
 static const QemuSlirpPlan9BackendOps slirp_plan9_backend_ops;
 #endif
@@ -226,6 +238,101 @@ static const QemuSlirpILBackendOps slirp_il_backend_ops = {
 };
 #endif
 
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+#ifndef SLIRP_HAVE_UDP_SERVICE
+#error "CONFIG_SLIRP_UDP_SERVICE requires libslirp's guest UDP API"
+#endif
+typedef struct SlirpUdpBackendListener {
+    SlirpUdpListener *listener;
+    const QemuSlirpUdpBackendCallbacks *callbacks;
+    void *callbacks_opaque;
+} SlirpUdpBackendListener;
+
+static void slirp_udp_backend_datagram(SlirpUdpListener *listener,
+                                       const struct sockaddr_in *peer,
+                                       const uint8_t *data, size_t len,
+                                       void *opaque)
+{
+    SlirpUdpBackendListener *backend_listener = opaque;
+
+    backend_listener->callbacks->datagram(peer, data, len,
+                                           backend_listener->callbacks_opaque);
+}
+
+static const SlirpUdpCallbacks slirp_udp_callbacks = {
+    .receive = slirp_udp_backend_datagram,
+};
+
+static int slirp_udp_backend_listen(
+    void *opaque, struct in_addr address, uint16_t port,
+    const QemuSlirpUdpBackendCallbacks *callbacks, void *callbacks_opaque,
+    void **backend_listener_out)
+{
+    SlirpState *s = opaque;
+    SlirpUdpBackendListener *backend_listener;
+
+    backend_listener = g_new0(SlirpUdpBackendListener, 1);
+    backend_listener->callbacks = callbacks;
+    backend_listener->callbacks_opaque = callbacks_opaque;
+    backend_listener->listener = slirp_udp_listen(
+        s->slirp, address, port, &slirp_udp_callbacks, backend_listener);
+    if (!backend_listener->listener) {
+        g_free(backend_listener);
+        return -1;
+    }
+    *backend_listener_out = backend_listener;
+    return 0;
+}
+
+static void slirp_udp_backend_listener_remove(void *opaque,
+                                              void *backend_listener_opaque)
+{
+    SlirpUdpBackendListener *backend_listener = backend_listener_opaque;
+
+    slirp_udp_listener_remove(backend_listener->listener);
+    g_free(backend_listener);
+}
+
+static int slirp_udp_backend_send(void *opaque, void *backend_listener_opaque,
+                                  const struct sockaddr_in *peer,
+                                  const uint8_t *data, size_t len)
+{
+    SlirpUdpBackendListener *backend_listener = backend_listener_opaque;
+
+    return slirp_udp_listener_send(backend_listener->listener, peer,
+                                   data, len);
+}
+
+static const QemuSlirpUdpBackendOps slirp_udp_backend_ops = {
+    .listen = slirp_udp_backend_listen,
+    .listener_remove = slirp_udp_backend_listener_remove,
+    .send = slirp_udp_backend_send,
+};
+#endif
+
+#ifdef CONFIG_SLIRP_BOOTP_ROOT
+#ifndef SLIRP_HAVE_BOOTP_ROOT
+#error "CONFIG_SLIRP_BOOTP_ROOT requires libslirp's BOOTP root API"
+#endif
+static bool slirp_bootp_backend_set(void *opaque,
+                                    const QemuSlirpBootpRootConfig *config)
+{
+    SlirpState *s = opaque;
+    SlirpBootpRootConfig slirp_config;
+
+    if (!config) {
+        return slirp_set_bootp_root(s->slirp, NULL);
+    }
+    slirp_config.server = config->server;
+    slirp_config.path = config->path;
+    return slirp_set_bootp_root(s->slirp, &slirp_config);
+}
+
+static const QemuSlirpBootpBackendOps slirp_bootp_backend_ops = {
+    .set_root = slirp_bootp_backend_set,
+};
+#endif
+
 #if defined(CONFIG_SMBD_COMMAND)
 static int slirp_smb(SlirpState *s, const char *exported_dir,
                      struct in_addr vserver_addr, Error **errp);
@@ -283,12 +390,16 @@ static void net_slirp_cleanup(NetClientState *nc)
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
     qemu_slirp_guestfwd_registry_invalidate(s->guestfwds);
+    qemu_slirp_udp_registry_invalidate(s->udp_registry);
+    qemu_slirp_bootp_registry_invalidate(s->bootp_registry);
     qemu_slirp_plan9_registry_invalidate(s->plan9);
 
     g_slist_free_full(s->fwd, slirp_free_fwd);
     main_loop_poll_remove_notifier(&s->poll_notifier);
     unregister_savevm(NULL, "slirp", s->slirp);
     qemu_slirp_guestfwd_registry_free(s->guestfwds);
+    qemu_slirp_udp_registry_free(s->udp_registry);
+    qemu_slirp_bootp_registry_free(s->bootp_registry);
     qemu_slirp_plan9_registry_free(s->plan9);
 #ifdef CONFIG_SLIRP_IL
     qemu_slirp_il_registry_cleanup(s->il_registry, slirp_il_cleanup, s->slirp);
@@ -812,6 +923,19 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
     s->guestfwds = qemu_slirp_guestfwd_registry_new(
         ipv4, net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
+#ifdef CONFIG_SLIRP_UDP_SERVICE
+    s->udp_registry = qemu_slirp_udp_registry_new(
+        ipv4, host, &slirp_udp_backend_ops, s);
+#else
+    s->udp_registry = qemu_slirp_udp_registry_new(ipv4, host, NULL, NULL);
+#endif
+#ifdef CONFIG_SLIRP_BOOTP_ROOT
+    s->bootp_registry = qemu_slirp_bootp_registry_new(
+        ipv4, host, &slirp_bootp_backend_ops, s);
+#else
+    s->bootp_registry = qemu_slirp_bootp_registry_new(
+        ipv4, host, NULL, NULL);
+#endif
 #ifdef CONFIG_SLIRP_PLAN9_BOOTP
     s->plan9 = qemu_slirp_plan9_registry_new(
         ipv4, net, mask, host, dns, &slirp_plan9_backend_ops, s);
@@ -1462,6 +1586,65 @@ int qemu_slirp_guestfwd_send(QemuSlirpGuestFwd *handle, const uint8_t *buf,
 void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle)
 {
     qemu_slirp_guestfwd_registry_remove(handle);
+}
+
+#if defined(CONFIG_SLIRP_UDP_SERVICE) || defined(CONFIG_SLIRP_BOOTP_ROOT)
+static SlirpState *qemu_slirp_named_find(const char *netdev_id, Error **errp)
+{
+    NetClientState *nc = netdev_id ? qemu_find_netdev(netdev_id) : NULL;
+
+    if (!nc) {
+        error_setg(errp, "Unrecognized netdev id '%s'", netdev_id ?: "");
+        return NULL;
+    }
+    if (nc->info->type != NET_CLIENT_DRIVER_USER) {
+        error_setg(errp, "Netdev '%s' is not a user-mode network stack",
+                   netdev_id);
+        return NULL;
+    }
+    return DO_UPCAST(SlirpState, nc, nc);
+}
+#endif
+
+int qemu_slirp_udp_listen(const char *netdev_id, uint16_t port,
+                          const QemuSlirpUdpListenerOps *ops, void *opaque,
+                          QemuSlirpUdpListener **listener, Error **errp)
+{
+    if (listener) {
+        *listener = NULL;
+    }
+#ifndef CONFIG_SLIRP_UDP_SERVICE
+    (void)netdev_id;
+    (void)port;
+    (void)ops;
+    (void)opaque;
+    return qemu_slirp_udp_listen_unavailable(listener, errp);
+#else
+    SlirpState *s = qemu_slirp_named_find(netdev_id, errp);
+
+    return s ? qemu_slirp_udp_registry_listen(s->udp_registry, port, ops,
+                                               opaque, listener, errp) : -1;
+#endif
+}
+
+bool qemu_slirp_bootp_root_claim(const char *netdev_id, const char *root_path,
+                                 QemuSlirpBootpRootLease **lease,
+                                 Error **errp)
+{
+    if (lease) {
+        *lease = NULL;
+    }
+#ifndef CONFIG_SLIRP_BOOTP_ROOT
+    (void)netdev_id;
+    (void)root_path;
+    error_setg(errp, "SLiRP BOOTP root is unavailable in this libslirp");
+    return false;
+#else
+    SlirpState *s = qemu_slirp_named_find(netdev_id, errp);
+
+    return s && qemu_slirp_bootp_registry_claim(s->bootp_registry, root_path,
+                                                 lease, errp);
+#endif
 }
 
 static SlirpState *qemu_slirp_plan9_find(const char *netdev_id, Error **errp)

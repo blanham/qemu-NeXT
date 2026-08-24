@@ -164,6 +164,9 @@ qtests_m68k = ['boot-serial-test'] + \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_FSDEV_9P') and slirp.found() ?
    ['plan9-9p1-object-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_FSDEV_9P') and
+   slirp_udp_service and slirp_bootp_root ?
+   ['nfs-server-object-test'] : []) + \
   (config_all_devices.has_key('CONFIG_NEXTCUBE') ?
    ['next-machine-test',
     'next-color-video-test',

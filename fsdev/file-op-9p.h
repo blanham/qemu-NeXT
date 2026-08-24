@@ -155,6 +155,8 @@ struct FileOperations {
     int (*open)(FsContext *, V9fsPath *, int, V9fsFidOpenState *);
     int (*open2)(FsContext *, V9fsPath *, const char *,
                  int, FsCred *, V9fsFidOpenState *);
+    int (*open_tmpfile)(FsContext *, V9fsPath *, FsCred *,
+                        V9fsFidOpenState *);
     void (*rewinddir)(FsContext *, V9fsFidOpenState *);
     off_t (*telldir)(FsContext *, V9fsFidOpenState *);
     struct dirent * (*readdir)(FsContext *, V9fsFidOpenState *);
@@ -170,6 +172,12 @@ struct FileOperations {
     int (*ftruncate)(FsContext *ctx, int fid_type, V9fsFidOpenState *fs,
                      off_t size);
     int (*fsync)(FsContext *, int, V9fsFidOpenState *, int);
+    ssize_t (*fgetxattr)(FsContext *, int, V9fsFidOpenState *,
+                         const char *, void *, size_t);
+    int (*fsetxattr)(FsContext *, int, V9fsFidOpenState *,
+                     const char *, void *, size_t, int);
+    int (*flinkat)(FsContext *, int, V9fsFidOpenState *, V9fsPath *,
+                   const char *);
     int (*statfs)(FsContext *s, V9fsPath *path, struct statfs *stbuf);
     ssize_t (*lgetxattr)(FsContext *, V9fsPath *,
                          const char *, void *, size_t);

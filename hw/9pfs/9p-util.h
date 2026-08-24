@@ -101,8 +101,11 @@ static inline int errno_to_dotl(int err) {
 
 #ifdef CONFIG_DARWIN
 #define qemu_fgetxattr(...) fgetxattr(__VA_ARGS__, 0, 0)
+#define qemu_fsetxattr(fd, name, value, size, flags) \
+    fsetxattr(fd, name, value, size, 0, flags)
 #else
 #define qemu_fgetxattr fgetxattr
+#define qemu_fsetxattr fsetxattr
 #endif
 
 #define qemu_openat     openat
