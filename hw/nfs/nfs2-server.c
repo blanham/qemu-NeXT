@@ -3406,6 +3406,8 @@ static void coroutine_fn request_entry(void *opaque)
 {
     Nfs2Request *request = opaque;
     Nfs2Server *server = request->server;
+    void (*request_unref)(void *opaque) = server->transport.request_unref;
+    void *transport_opaque = server->transport_opaque;
     uint8_t reply[NFS2_MAX_RPC_DATAGRAM];
     Nfs2XdrWriter writer;
 
@@ -3443,6 +3445,9 @@ static void coroutine_fn request_entry(void *opaque)
     }
     server->pending--;
     g_free(request);
+    if (request_unref) {
+        request_unref(transport_opaque);
+    }
 }
 
 Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
@@ -3452,7 +3457,8 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
     Nfs2Server *server;
     uint32_t root_identity;
 
-    if (!fsdev_id || !fsdev_id[0] || !transport || !transport->send) {
+    if (!fsdev_id || !fsdev_id[0] || !transport || !transport->send ||
+        (!!transport->request_ref != !!transport->request_unref)) {
         error_setg(errp, "NFS server configuration is incomplete");
         return NULL;
     }
@@ -3605,6 +3611,9 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
     request->length = len;
     request->duplicate = duplicate;
     memcpy(request->data, data, len);
+    if (server->transport.request_ref) {
+        server->transport.request_ref(server->transport_opaque);
+    }
     server->pending++;
     co = qemu_coroutine_create(request_entry, request);
     aio_co_schedule(qemu_get_aio_context(), co);

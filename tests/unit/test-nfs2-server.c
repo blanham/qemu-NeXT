@@ -70,6 +70,8 @@ typedef struct Fixture {
     uint32_t mutation_xid;
     unsigned int send_count;
     unsigned int clock_calls;
+    unsigned int request_refs;
+    unsigned int request_unrefs;
     int64_t clock_ms;
     int mutation_error;
     bool reset_on_send;
@@ -951,9 +953,25 @@ static int64_t fake_clock_ms(void *opaque)
     return f->clock_ms;
 }
 
+static void fake_request_ref(void *opaque)
+{
+    Fixture *f = opaque;
+
+    f->request_refs++;
+}
+
+static void fake_request_unref(void *opaque)
+{
+    Fixture *f = opaque;
+
+    f->request_unrefs++;
+}
+
 static const Nfs2TransportOps transport = {
     .send = send_reply,
     .clock_ms = fake_clock_ms,
+    .request_ref = fake_request_ref,
+    .request_unref = fake_request_unref,
 };
 
 static void setup(Fixture *f, gconstpointer opaque)
@@ -2316,20 +2334,27 @@ static void test_mutation_lifetime(Fixture *f, gconstpointer opaque)
     uint8_t call[160];
     size_t len;
     unsigned int sends;
+    unsigned int refs;
+    unsigned int unrefs;
 
     make_writable(f);
     root = mount_root(f, 3);
     kernel = lookup(f, 3, &root, "kernel");
     sends = f->send_count;
+    refs = f->request_refs;
+    unrefs = f->request_unrefs;
     len = commit_call(call, sizeof(call), &kernel, 0x1001, 0);
     receive_async(f, call, len, 900);
     len = commit_call(call, sizeof(call), &kernel, 0x1002, 0);
     receive_async(f, call, len, 900);
     g_assert_true(nfs2_server_busy(f->server));
+    g_assert_cmpuint(f->request_refs, ==, refs + 2);
+    g_assert_cmpuint(f->request_unrefs, ==, unrefs);
     nfs2_server_reset(f->server);
     nfs2_server_begin_close(f->server);
     drain(f);
     g_assert_cmpuint(f->send_count, ==, sends);
+    g_assert_cmpuint(f->request_unrefs, ==, unrefs + 2);
     nfs2_server_free(f->server);
     f->server = NULL;
 }

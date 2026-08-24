@@ -1984,7 +1984,8 @@ static bool object_create_early(const char *type)
     }
 
     /* Reason: properties "fsdev" and "netdev". */
-    if (g_str_equal(type, "plan9-9p1-server")) {
+    if (g_str_equal(type, "plan9-9p1-server") ||
+        g_str_equal(type, "nfs-server")) {
         return false;
     }
 

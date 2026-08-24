@@ -16,6 +16,8 @@ typedef struct Nfs2TransportOps {
     int (*send)(Nfs2Service service, const struct sockaddr_in *peer,
                 const uint8_t *data, size_t len, void *opaque);
     int64_t (*clock_ms)(void *opaque);
+    void (*request_ref)(void *opaque);
+    void (*request_unref)(void *opaque);
 } Nfs2TransportOps;
 
 typedef struct Nfs2Server Nfs2Server;

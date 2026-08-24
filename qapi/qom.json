@@ -1301,6 +1301,28 @@
   'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } }
 
 ##
+# @NfsServerProperties:
+#
+# @fsdev: ID of the filesystem export to serve.
+#
+# @netdev: ID of the user-mode network stack that owns the guest-only
+#     endpoints.
+#
+# @root-path: BOOTP root path (default: /).
+#
+# @writable: allow NFS mutations when the fsdev is writable (default:
+#     false).
+#
+# Since: 11.1
+##
+{ 'struct': 'NfsServerProperties',
+  'data': { 'fsdev': 'str', 'netdev': 'str',
+            '*root-path': 'str', '*writable': 'bool' },
+  'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP',
+                    'CONFIG_SLIRP_UDP_SERVICE',
+                    'CONFIG_SLIRP_BOOTP_ROOT' ] } }
+
+##
 # @ObjectType:
 #
 # Features:
@@ -1352,6 +1374,10 @@
       'if': 'CONFIG_POSIX' },
     'monitor-hmp',
     'monitor-qmp',
+    { 'name': 'nfs-server',
+      'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP',
+                        'CONFIG_SLIRP_UDP_SERVICE',
+                        'CONFIG_SLIRP_BOOTP_ROOT' ] } },
     { 'name': 'plan9-9p1-server',
       'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } },
     'pef-guest',
@@ -1434,6 +1460,11 @@
                                       'if': 'CONFIG_POSIX' },
       'monitor-hmp':                'MonitorHMPProperties',
       'monitor-qmp':                'MonitorQMPProperties',
+      'nfs-server':                 {
+          'type': 'NfsServerProperties',
+          'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP',
+                            'CONFIG_SLIRP_UDP_SERVICE',
+                            'CONFIG_SLIRP_BOOTP_ROOT' ] } },
       'plan9-9p1-server':           {
           'type': 'Plan9P1ServerProperties',
           'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } },
