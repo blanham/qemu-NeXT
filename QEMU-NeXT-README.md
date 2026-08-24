@@ -35,6 +35,48 @@ vendor format rather than a normal DHCP reply.
 These problems are fixed well enough to boot an unmodified NeXTSTEP system to
 the desktop. The model is not a claim of complete hardware fidelity.
 
+![NeXTSTEP 3.1 booting to Workspace Manager in QEMU](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/nextstep.gif)
+
+## NetBSD/next68k NFS-root boot
+
+NetBSD 1.5/next68k now boots through the NeXT v66 ROM and its standalone
+`boot` program. The loader obtains `netbsd` with MOUNT v1 and NFSv2; the
+kernel then mounts its writable root with MOUNT v3 and NFSv3. All RPC services
+remain inside QEMU's user-mode network and do not open host NFS ports.
+
+The shorter recording begins when the standalone loader switches to the
+network. The full recording includes the ROM and TFTP bootstrap. Both end at
+the root shell:
+
+![NetBSD loading its kernel and NFS root over the network](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/netbsd-network.gif)
+
+![NetBSD booting from the NeXT ROM to an NFS-root shell](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/netbsd-full.gif)
+
+Stage the next68k standalone program as `$TFTP/boot`, and extract a disposable
+NetBSD root tree at `$ROOT` with `netbsd` at its top level. Launch it with:
+
+```sh
+QEMU=$PWD/build-next/qemu-system-m68k
+ROM=/path/to/Rev_2.5_v66.BIN
+TFTP=/path/to/tftp
+ROOT=/path/to/netbsd-root
+
+"$QEMU" -M next-station \
+  -global next-pc.system-timer-frequency=4456448 \
+  -bios "$ROM" -m 64M -display gtk \
+  -fsdev "local,id=netbsdroot,path=$ROOT,security_model=mapped-xattr" \
+  -netdev "user,id=nextnet,ipv6=off,tftp=$TFTP,bootfile=boot" \
+  -object "nfs-server,id=netbsdnfs,fsdev=netbsdroot,netdev=nextnet,writable=on" \
+  -net "nic,model=next-mb8795,netdev=nextnet" \
+  -no-reboot
+```
+
+At the ROM prompt enter `ben() boot`. At the standalone `boot:` prompt enter
+`en()netbsd`; plain `netbsd` selects SCSI instead of the mounted network
+device. The archived root deliberately has `rc_configured=NO`, so press Return
+at its shell-path and terminal-type prompts to reach `/bin/sh`. The complete
+NFS object contract is in `docs/system/devices/nfs-root.rst`.
+
 ## Plan 9
 
 Native Plan 9 Second Edition support now boots the unmodified
@@ -46,6 +88,14 @@ service on IL port 566 and the file service on IL port 17008. I verified the
 path with the v66 ROM and `plan9-2e.tar.bz2` in a visible GTK run, through the
 Plan 9 terminal. The archive uses `tor` as its user and contains `/usr/tor`;
 `aux/mouse` may time out while the terminal itself is usable.
+
+TCP compatibility boot to the Plan 9 8½ desktop:
+
+![Plan 9 Second Edition booting over TCP to 8½](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/plan9-tcp.gif)
+
+Authenticated IL boot to the same desktop with `tor` / `password`:
+
+![Plan 9 Second Edition booting over authenticated IL to 8½](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/plan9-il.gif)
 
 The historical archives are mirrored by the Oregon State University Open
 Source Lab at:
