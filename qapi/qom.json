@@ -1308,7 +1308,7 @@
 # @netdev: ID of the user-mode network stack that owns the guest-only
 #     endpoints.
 #
-# @root-path: BOOTP root path (default: /).
+# @root-path: BOOTP root path; currently must be / (default: /).
 #
 # @writable: allow NFS mutations when the fsdev is writable (default:
 #     false).

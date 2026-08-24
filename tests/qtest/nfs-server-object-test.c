@@ -137,10 +137,12 @@ static void test_validation_and_unwind(void)
     response = object_add_response(qts, "too-long", "root", "nextnet",
                                    too_long_root, false);
     assert_qmp_error_contains(response, "1-255");
+    response = object_add_response(qts, "unsupported-root", "root", "nextnet",
+                                   "/export", false);
+    assert_qmp_error_contains(response, "must be /");
     response = object_add_response(qts, "max-root", "root", "nextnet",
                                    max_root, false);
-    assert_qmp_success(response);
-    object_del(qts, "max-root");
+    assert_qmp_error_contains(response, "must be /");
 
     object_add(qts, "owner", true);
     response = object_add_response(qts, "collision", "root", "nextnet", "/",

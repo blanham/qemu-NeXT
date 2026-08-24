@@ -242,6 +242,10 @@ static void nfs_server_complete(UserCreatable *uc, Error **errp)
         error_setg(errp, "NFS root-path must be an absolute 1-255 byte path");
         return;
     }
+    if (strcmp(object->root_path, "/")) {
+        error_setg(errp, "NFS root-path must be /");
+        return;
+    }
 
     object->server = nfs2_server_new(object->fsdev_id, object->writable,
                                      &nfs_server_transport_ops, object, errp);
