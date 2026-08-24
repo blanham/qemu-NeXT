@@ -54,11 +54,7 @@ bool nfs2_xdr_opaque(Nfs2XdrReader *r, uint8_t *out, size_t exact)
         xdr_reader_remaining(r) < padded) {
         return false;
     }
-    for (size_t i = exact; i < padded; i++) {
-        if (p[i] != 0) {
-            return false;
-        }
-    }
+    /* Padding carries no value; old clients may leave it uninitialized. */
     if (out && exact) {
         memcpy(out, p, exact);
     }
@@ -78,11 +74,7 @@ bool nfs2_xdr_counted_opaque(Nfs2XdrReader *r, const uint8_t **out,
         xdr_reader_remaining(&tmp) < padded) {
         return false;
     }
-    for (size_t i = wire_length; i < padded; i++) {
-        if (tmp.cursor[i] != 0) {
-            return false;
-        }
-    }
+    /* Padding carries no value; old clients may leave it uninitialized. */
     if (out) {
         *out = tmp.cursor;
     }

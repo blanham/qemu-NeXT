@@ -79,8 +79,6 @@
 #define NEXT_DMA_ENTX_END_BIAS    15
 #define NEXT_DMA_ENTX_MIN_FRAME   60
 #define NEXT_DMA_ENTX_MAX_FRAME   1514
-#define NEXT_DMA_ENRX_BOP         0x40000000
-#define NEXT_DMA_ENRX_EOP         0x80000000
 #define NEXT_DMA_ENRX_MAX_FRAME   1518
 
 typedef enum NextDMASavedCapability {
@@ -133,7 +131,7 @@ static const NextDMAChannelDesc next_dma_channels[NEXT_DMA_CHANNEL_COUNT] = {
         "entx", 0x110, 28, NEXT_DMA_SAVED_FOUR, NEXT_DMA_TRANSFER_ENTX,
     },
     [NEXT_DMA_ENRX] = {
-        "enrx", 0x150, 27, NEXT_DMA_SAVED_TWO, NEXT_DMA_TRANSFER_ENRX,
+        "enrx", 0x150, 27, NEXT_DMA_SAVED_FOUR, NEXT_DMA_TRANSFER_ENRX,
     },
     [NEXT_DMA_VIDEO] = {
         "video", 0x180, 5, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
@@ -642,7 +640,19 @@ static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
     if (!next_dma_resolve_register(s, addr, &resolved)) {
         return 0;
     }
-    value = *resolved.value;
+    /*
+     * NEXT_INIT is a write latch for the next buffer, but both address
+     * windows read back the effective current pointer.  NetBSD probes this
+     * hardware alias after programming either window.
+     */
+    if (resolved.reg == NEXT_DMA_REGISTER_NEXT ||
+        resolved.reg == NEXT_DMA_REGISTER_NEXT_INIT) {
+        NextDMAChannelState *c = &s->channel[resolved.channel];
+
+        value = c->next_initbuf_valid ? c->next_initbuf : c->next;
+    } else {
+        value = *resolved.value;
+    }
 
     if (resolved.channel == NEXT_DMA_SCSI &&
         trace_event_get_state_backends(TRACE_NEXT_SCSI_DMA_REG_READ)) {
@@ -1441,21 +1451,21 @@ NextDMAResult next_dma_enet_rx_write(NextDMAState *s,
         return NEXT_DMA_RANGE_ERROR;
     }
 
-    c->saved_next = range.first_start | NEXT_DMA_ENRX_BOP;
+    c->saved_next = range.first_start;
     if (second_length) {
         c->saved_limit = range.first_limit;
-        c->next = final_end | NEXT_DMA_ENRX_EOP;
+        c->next = final_end;
         c->limit = range.second_limit;
         c->csr &= ~NEXT_DMA_CSR_SUPDATE;
     } else {
-        c->saved_limit = first_end | NEXT_DMA_ENRX_EOP;
+        c->saved_limit = first_end;
         if (range.chained) {
             c->next = range.second_start;
             c->limit = range.second_limit;
             c->csr &= ~NEXT_DMA_CSR_SUPDATE;
             s->rx_keep_enabled = true;
         } else {
-            c->next = first_end | NEXT_DMA_ENRX_EOP;
+            c->next = first_end;
         }
     }
     if (range.consume_next_initbuf) {
