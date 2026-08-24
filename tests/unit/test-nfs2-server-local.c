@@ -689,8 +689,8 @@ static void put_sattr3_unset(Nfs2XdrWriter *w)
 static void test_local_review_regressions(LocalFixture *f,
                                           gconstpointer opaque)
 {
-    Nfs2FileHandle root, sparse;
-    uint8_t body[384];
+    Nfs2FileHandle root, sparse, symlink_handle, hardlink_handle;
+    uint8_t body[384], call[512];
     Nfs2XdrWriter w;
     g_autofree char *netbsd_path = g_build_filename(f->root, "netbsd", NULL);
     g_autofree char *exclusive_path = g_build_filename(f->root, "persist",
@@ -699,9 +699,14 @@ static void test_local_review_regressions(LocalFixture *f,
                                                       NULL);
     g_autofree char *hardlink_path = g_build_filename(f->root, "post-link",
                                                        NULL);
+    g_autofree char *rename_source = g_build_filename(f->root,
+                                                       "rename-source", NULL);
+    g_autofree char *rename_destination = g_build_filename(
+        f->root, "rename-destination", NULL);
     g_autofree char *outside_contents = NULL;
     gsize outside_length;
     uint32_t uid, gid, mode;
+    size_t len;
 
     nfs2_server_free(f->server);
     f->fse.export_flags = V9FS_SM_MAPPED;
@@ -784,6 +789,8 @@ static void test_local_review_regressions(LocalFixture *f,
     g_assert_true(nfs2_xdr_put_counted_opaque(&w, f->outside,
                                                strlen(f->outside), 1024));
     mutate(f, 3, 10, body, nfs2_xdr_writer_size(&w), 0);
+    memcpy(symlink_handle.bytes, f->reply->data + 36,
+           sizeof(symlink_handle.bytes));
     {
         g_autofree char *after = NULL, *placeholder = NULL;
         gsize after_length, placeholder_length;
@@ -796,7 +803,54 @@ static void test_local_review_regressions(LocalFixture *f,
         g_assert_cmpmem(placeholder, placeholder_length,
                         f->outside, strlen(f->outside));
     }
+
+    /* SETATTR size must not truncate a mapped symlink placeholder. */
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, symlink_handle.bytes,
+                                               32, 32));
+    g_assert_true(nfs2_xdr_put_u32(&w, 1)); /* mode */
+    g_assert_true(nfs2_xdr_put_u32(&w, 0600));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* uid */
+    g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* gid */
+    g_assert_true(nfs2_xdr_put_u32(&w, 1)); /* size */
+    g_assert_true(nfs2_xdr_put_u32(&w, 0));
+    g_assert_true(nfs2_xdr_put_u32(&w, 1));
+    g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* atime */
+    g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* mtime */
+    g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* guard */
+    mutate(f, 3, 2, body, nfs2_xdr_writer_size(&w), 22);
+    {
+        g_autofree char *placeholder = NULL;
+        gsize placeholder_length;
+
+        g_assert_true(g_file_get_contents(symlink_path, &placeholder,
+                                          &placeholder_length, NULL));
+        g_assert_cmpmem(placeholder, placeholder_length,
+                        f->outside, strlen(f->outside));
+        g_assert_cmpint(getxattr(symlink_path, "user.virtfs.mode", &mode,
+                                 sizeof(mode)), ==, sizeof(mode));
+        g_assert_cmpuint(le32_to_cpu(mode) & 07777, ==, 0777);
+    }
     g_assert_cmpint(g_remove(symlink_path), ==, 0);
+
+    /* A same-inode RENAME no-op preserves a destination-only handle. */
+    g_assert_true(g_file_set_contents(rename_source, "same inode", -1, NULL));
+    set_mapped(rename_source, 1001, 1002, S_IFREG | 0600);
+    g_assert_cmpint(link(rename_source, rename_destination), ==, 0);
+    hardlink_handle = lookup(f, &root, "rename-destination", 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    put_name(&w, 3, &root, "rename-source");
+    put_name(&w, 3, &root, "rename-destination");
+    mutate(f, 3, 14, body, nfs2_xdr_writer_size(&w), 0);
+    nfs2_xdr_writer_init(&w, body, sizeof(body));
+    g_assert_true(nfs2_xdr_put_counted_opaque(&w, hardlink_handle.bytes,
+                                               32, 32));
+    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1, body,
+                   nfs2_xdr_writer_size(&w));
+    request(f, NFS2_SERVICE_NFS, call, len);
+    g_assert_cmpuint(word(f, 6), ==, 0);
+    g_assert_cmpint(g_remove(rename_source), ==, 0);
+    g_assert_cmpint(g_remove(rename_destination), ==, 0);
 
     /* LINK3 returns the source's true post-link nlink. */
     nfs2_xdr_writer_init(&w, body, sizeof(body));

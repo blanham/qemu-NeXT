@@ -6,6 +6,7 @@
 
 typedef struct Nfs2HandleTable Nfs2HandleTable;
 typedef struct Nfs2HandleAliasReservation Nfs2HandleAliasReservation;
+typedef struct Nfs2HandleRenameReservation Nfs2HandleRenameReservation;
 
 typedef struct Nfs2HandlePathState {
     uint64_t id;
@@ -43,8 +44,22 @@ void nfs2_handle_path_state(Nfs2HandleTable *table, const char *path,
 bool nfs2_handle_path_state_allows(Nfs2HandleTable *table, const char *path,
                                    const Nfs2HandlePathState *state,
                                    uint64_t new_id);
+bool nfs2_handle_rename_preflight(Nfs2HandleTable *table,
+                                  const char *old_path,
+                                  const char *new_path, Error **errp);
 bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
                         const char *new_path, Error **errp);
+bool nfs2_handle_rename_reserve(Nfs2HandleTable *table,
+                                const char *old_path, const char *new_path,
+                                Nfs2HandleRenameReservation **reservation,
+                                Error **errp);
+void nfs2_handle_rename_cancel(Nfs2HandleRenameReservation *reservation);
+bool nfs2_handle_rename_commit(Nfs2HandleRenameReservation *reservation,
+                               bool backend_same_object_noop,
+                               Error **errp);
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(Nfs2HandleRenameReservation,
+                              nfs2_handle_rename_cancel)
 bool nfs2_handle_remove(Nfs2HandleTable *table, const char *path,
                         Error **errp);
 size_t nfs2_handle_table_record_count(const Nfs2HandleTable *table);

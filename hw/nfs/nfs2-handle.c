@@ -32,12 +32,20 @@ struct Nfs2HandleAliasReservation {
     bool consumes_slot;
 };
 
+struct Nfs2HandleRenameReservation {
+    Nfs2HandleTable *table;
+    char *old_path;
+    char *new_path;
+    bool same_record_noop;
+};
+
 struct Nfs2HandleTable {
     uint8_t key[NFS2_HANDLE_KEY_SIZE];
     GHashTable *by_id;
     GHashTable *by_path;
     size_t alias_count;
     size_t reserved_alias_count;
+    Nfs2HandleRenameReservation *active_rename;
     uint32_t next_generation;
     bool generation_exhausted;
 #ifdef NFS2_HANDLE_TESTING
@@ -45,6 +53,16 @@ struct Nfs2HandleTable {
 #endif
     bool active;
 };
+
+static bool path_has_prefix(const char *path, const char *prefix);
+
+static bool path_is_rename_locked(const Nfs2HandleTable *table,
+                                  const char *path)
+{
+    return table->active_rename &&
+           (path_has_prefix(path, table->active_rename->old_path) ||
+            path_has_prefix(path, table->active_rename->new_path));
+}
 
 static void secure_clear(void *data, size_t length)
 {
@@ -208,6 +226,10 @@ void nfs2_handle_table_clear(Nfs2HandleTable *table)
     if (!table) {
         return;
     }
+    if (table->active_rename) {
+        table->active_rename->table = NULL;
+        table->active_rename = NULL;
+    }
     g_hash_table_remove_all(table->by_path);
     g_hash_table_remove_all(table->by_id);
     table->alias_count = 0;
@@ -252,6 +274,10 @@ bool nfs2_handle_create(Nfs2HandleTable *table, uint64_t id,
         }
         *handle = encoded;
         return true;
+    }
+    if (path_is_rename_locked(table, path)) {
+        error_setg(errp, "NFS handle path is locked by rename");
+        return false;
     }
     if (!path_record &&
         table->alias_count + table->reserved_alias_count >=
@@ -357,6 +383,10 @@ bool nfs2_handle_alias_reserve(Nfs2HandleTable *table,
     if (!table || !table->active || !path_valid(path, errp)) {
         return false;
     }
+    if (path_is_rename_locked(table, path)) {
+        error_setg(errp, "NFS handle path is locked by rename");
+        return false;
+    }
     record = resolve_record(table, handle);
     if (!record) {
         error_setg(errp, "NFS alias source handle is stale");
@@ -408,6 +438,10 @@ bool nfs2_handle_alias_commit(Nfs2HandleAliasReservation *reservation)
     }
     table = reservation->table;
     if (!table || !table->active) {
+        nfs2_handle_alias_cancel(reservation);
+        return false;
+    }
+    if (path_is_rename_locked(table, reservation->alias->data)) {
         nfs2_handle_alias_cancel(reservation);
         return false;
     }
@@ -538,8 +572,11 @@ static bool path_has_prefix(const char *path, const char *prefix)
            path[prefix_length] == '/';
 }
 
-bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
-                        const char *new_path, Error **errp)
+static bool nfs2_handle_rename_internal(Nfs2HandleTable *table,
+                                        const char *old_path,
+                                        const char *new_path, bool apply,
+                                        bool reconcile_late_same_record,
+                                        Error **errp)
 {
     g_autoptr(GPtrArray) changes =
         g_ptr_array_new_with_free_func(rename_change_free);
@@ -566,7 +603,8 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
     }
     old_record = g_hash_table_lookup(table->by_path, old_path);
     new_record = g_hash_table_lookup(table->by_path, new_path);
-    if (old_record && old_record == new_record) {
+    if (old_record && old_record == new_record &&
+        !reconcile_late_same_record) {
         return true;
     }
 
@@ -654,6 +692,10 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
         }
     }
 
+    if (!apply) {
+        return true;
+    }
+
     for (size_t i = 0; i < changes->len; i++) {
         Nfs2RenameChange *change = g_ptr_array_index(changes, i);
 
@@ -686,12 +728,109 @@ bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
     return true;
 }
 
+bool nfs2_handle_rename_preflight(Nfs2HandleTable *table,
+                                  const char *old_path,
+                                  const char *new_path, Error **errp)
+{
+    return nfs2_handle_rename_internal(table, old_path, new_path, false,
+                                       false, errp);
+}
+
+bool nfs2_handle_rename(Nfs2HandleTable *table, const char *old_path,
+                        const char *new_path, Error **errp)
+{
+    if (table && table->active_rename) {
+        error_setg(errp, "another NFS handle rename is active");
+        return false;
+    }
+    return nfs2_handle_rename_internal(table, old_path, new_path, true,
+                                       false, errp);
+}
+
+bool nfs2_handle_rename_reserve(Nfs2HandleTable *table,
+                                const char *old_path, const char *new_path,
+                                Nfs2HandleRenameReservation **reservation,
+                                Error **errp)
+{
+    Nfs2HandleRenameReservation *reserved;
+    Nfs2HandleRecord *old_record;
+    Nfs2HandleRecord *new_record;
+
+    if (!reservation) {
+        error_setg(errp, "NFS rename reservation output is NULL");
+        return false;
+    }
+    *reservation = NULL;
+    if (!table || !table->active) {
+        error_setg(errp, "NFS handle table is not active");
+        return false;
+    }
+    if (table->active_rename) {
+        error_setg(errp, "another NFS handle rename is active");
+        return false;
+    }
+    if (!nfs2_handle_rename_internal(table, old_path, new_path, false,
+                                     false, errp)) {
+        return false;
+    }
+    old_record = g_hash_table_lookup(table->by_path, old_path);
+    new_record = g_hash_table_lookup(table->by_path, new_path);
+    reserved = g_new0(Nfs2HandleRenameReservation, 1);
+    reserved->table = table;
+    reserved->old_path = g_strdup(old_path);
+    reserved->new_path = g_strdup(new_path);
+    reserved->same_record_noop = old_record && old_record == new_record;
+    table->active_rename = reserved;
+    *reservation = reserved;
+    return true;
+}
+
+void nfs2_handle_rename_cancel(Nfs2HandleRenameReservation *reservation)
+{
+    if (!reservation) {
+        return;
+    }
+    if (reservation->table &&
+        reservation->table->active_rename == reservation) {
+        reservation->table->active_rename = NULL;
+    }
+    g_free(reservation->old_path);
+    g_free(reservation->new_path);
+    g_free(reservation);
+}
+
+bool nfs2_handle_rename_commit(Nfs2HandleRenameReservation *reservation,
+                               bool backend_same_object_noop,
+                               Error **errp)
+{
+    bool ret;
+
+    if (!reservation || !reservation->table ||
+        !reservation->table->active ||
+        reservation->table->active_rename != reservation) {
+        error_setg(errp, "NFS rename reservation is not active");
+        nfs2_handle_rename_cancel(reservation);
+        return false;
+    }
+    ret = reservation->same_record_noop || backend_same_object_noop ||
+          nfs2_handle_rename_internal(reservation->table,
+                                      reservation->old_path,
+                                      reservation->new_path, true, false,
+                                      errp);
+    nfs2_handle_rename_cancel(reservation);
+    return ret;
+}
+
 bool nfs2_handle_remove(Nfs2HandleTable *table, const char *path,
                         Error **errp)
 {
     Nfs2HandleRecord *record;
 
     if (!table || !table->active || !path_valid(path, errp)) {
+        return false;
+    }
+    if (path_is_rename_locked(table, path)) {
+        error_setg(errp, "NFS handle path is locked by rename");
         return false;
     }
     record = g_hash_table_lookup(table->by_path, path);

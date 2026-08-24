@@ -240,6 +240,10 @@ static void test_rename_prefix_is_atomic(void)
     g_assert_true(nfs2_handle_create(table, 3, "/older", &other,
                                      &error_abort));
 
+    g_assert_true(nfs2_handle_rename_preflight(table, "/old", "/new",
+                                               &error_abort));
+    assert_resolves(table, &top, "/old");
+    assert_resolves(table, &child, "/old/child");
     g_assert_true(nfs2_handle_rename(table, "/old", "/new", &error_abort));
     assert_resolves(table, &top, "/new");
     assert_resolves(table, &child, "/new/child");
@@ -250,7 +254,8 @@ static void test_rename_prefix_is_atomic(void)
     long_prefix[NFS2_MAX_PATH] = 0;
     g_assert_true(nfs2_handle_create(table, 4, long_prefix, &destination,
                                      &error_abort));
-    g_assert_false(nfs2_handle_rename(table, "/new", long_prefix, &error));
+    g_assert_false(nfs2_handle_rename_preflight(table, "/new", long_prefix,
+                                                &error));
     g_assert_nonnull(error);
     error_free(error);
     assert_resolves(table, &top, "/new");
@@ -299,6 +304,85 @@ static void test_rename_same_record_is_noop(void)
                                      &error_abort));
     g_assert_true(nfs2_handle_remove(table, "/source", &error_abort));
     assert_resolves(table, &handle, "/destination");
+}
+
+static void test_rename_blocks_late_destination_publication(void)
+{
+    g_autoptr(Nfs2HandleTable) table = new_table();
+    g_autoptr(Nfs2HandleRenameReservation) reservation = NULL;
+    Error *error = NULL;
+    Nfs2FileHandle source;
+    Nfs2FileHandle child;
+    Nfs2FileHandle late;
+
+    g_assert_true(nfs2_handle_create(table, 1, "/source", &source,
+                                     &error_abort));
+    g_assert_true(nfs2_handle_create(table, 2, "/source/child", &child,
+                                     &error_abort));
+    g_assert_true(nfs2_handle_rename_reserve(table, "/source",
+                                             "/destination", &reservation,
+                                             &error_abort));
+
+    /* LOOKUP must not publish the post-rename root before commit. */
+    g_assert_false(nfs2_handle_create(table, 1, "/destination", &late,
+                                      &error));
+    g_assert_nonnull(error);
+    error_free(error);
+    g_assert_true(nfs2_handle_rename_commit(
+                      g_steal_pointer(&reservation), false, &error_abort));
+    assert_resolves(table, &source, "/destination");
+    assert_resolves(table, &child, "/destination/child");
+
+    g_assert_true(nfs2_handle_create(table, 1, "/destination", &late,
+                                     &error_abort));
+    assert_resolves(table, &late, "/destination");
+}
+
+static void test_rename_blocks_publication_without_source_handle(void)
+{
+    g_autoptr(Nfs2HandleTable) table = new_table();
+    g_autoptr(Nfs2HandleRenameReservation) reservation = NULL;
+    Error *error = NULL;
+    Nfs2FileHandle late;
+
+    g_assert_true(nfs2_handle_rename_reserve(table, "/source",
+                                             "/destination", &reservation,
+                                             &error_abort));
+    g_assert_false(nfs2_handle_create(table, 1, "/destination", &late,
+                                      &error));
+    g_assert_nonnull(error);
+    error_free(error);
+    g_assert_true(nfs2_handle_rename_commit(
+                      g_steal_pointer(&reservation), false, &error_abort));
+
+    g_assert_true(nfs2_handle_create(table, 1, "/destination", &late,
+                                     &error_abort));
+    assert_resolves(table, &late, "/destination");
+}
+
+static void test_rename_blocks_late_source_overflow(void)
+{
+    g_autoptr(Nfs2HandleTable) table = new_table();
+    g_autoptr(Nfs2HandleRenameReservation) reservation = NULL;
+    g_autofree char *destination = g_malloc0(NFS2_MAX_PATH + 1);
+    Error *error = NULL;
+    Nfs2FileHandle source;
+    Nfs2FileHandle late;
+
+    destination[0] = '/';
+    memset(destination + 1, 'd', NFS2_MAX_PATH - 1);
+    g_assert_true(nfs2_handle_create(table, 1, "/source", &source,
+                                     &error_abort));
+    g_assert_true(nfs2_handle_rename_reserve(table, "/source", destination,
+                                             &reservation, &error_abort));
+
+    g_assert_false(nfs2_handle_create(table, 2, "/source/child", &late,
+                                      &error));
+    g_assert_nonnull(error);
+    error_free(error);
+    g_assert_true(nfs2_handle_rename_commit(
+                      g_steal_pointer(&reservation), false, &error_abort));
+    assert_resolves(table, &source, destination);
 }
 
 static void test_hard_link_alias_aba_reconcile(void)
@@ -428,6 +512,12 @@ int main(int argc, char **argv)
                     test_rename_replaces_destination);
     g_test_add_func("/nfs2-handle/rename-same-record",
                     test_rename_same_record_is_noop);
+    g_test_add_func("/nfs2-handle/rename-late-publication",
+                    test_rename_blocks_late_destination_publication);
+    g_test_add_func("/nfs2-handle/rename-no-source-publication",
+                    test_rename_blocks_publication_without_source_handle);
+    g_test_add_func("/nfs2-handle/rename-late-source-overflow",
+                    test_rename_blocks_late_source_overflow);
     g_test_add_func("/nfs2-handle/hard-link-alias-aba",
                     test_hard_link_alias_aba_reconcile);
     g_test_add_func("/nfs2-handle/external-replacement",

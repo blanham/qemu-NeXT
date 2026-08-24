@@ -47,6 +47,9 @@ typedef struct Fixture {
     bool kernel_resolution_notdir;
     bool postvalidate_notdir;
     unsigned int name_to_path_calls;
+    unsigned int open_calls;
+    unsigned int path_truncate_calls;
+    unsigned int ftruncate_calls;
     uint64_t backend_cookie;
     uint64_t last_seek_cookie;
     bool zero_cookie_continuation;
@@ -321,6 +324,7 @@ static int fake_open(FsContext *ctx, V9fsPath *path, int flags,
                   !strcmp(path->data + 1, current->linked_name);
 
     note_backend();
+    current->open_calls++;
     if (!kernel && !object && !linked) {
         errno = EISDIR;
         return -1;
@@ -430,7 +434,26 @@ static int fake_truncate(FsContext *ctx, V9fsPath *path, off_t size)
 {
     note_backend();
     current->mutation_calls++;
+    current->path_truncate_calls++;
     current->kernel_size = size;
+    return 0;
+}
+
+static int fake_ftruncate(FsContext *ctx, int fid_type,
+                          V9fsFidOpenState *state, off_t size)
+{
+    FakeOpen *open = state->private;
+
+    note_backend();
+    current->mutation_calls++;
+    current->ftruncate_calls++;
+    if (fid_type != P9_FID_FILE || !open || !S_ISREG(open->mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (open->ino == current->kernel_ino) {
+        current->kernel_size = size;
+    }
     return 0;
 }
 
@@ -889,6 +912,7 @@ static FileOperations fake_ops = {
     .fsync = fake_fsync,
     .chmod = fake_chmod,
     .truncate = fake_truncate,
+    .ftruncate = fake_ftruncate,
     .utimensat = fake_utimensat,
     .mkdir = fake_mkdir,
     .mknod = fake_mknod,
@@ -1858,6 +1882,17 @@ static void put_sattr2(Nfs2XdrWriter *w, mode_t mode)
     }
 }
 
+static void put_sattr2_size(Nfs2XdrWriter *w, mode_t mode, uint32_t size)
+{
+    g_assert_true(nfs2_xdr_put_u32(w, mode));
+    g_assert_true(nfs2_xdr_put_u32(w, UINT32_MAX)); /* uid */
+    g_assert_true(nfs2_xdr_put_u32(w, UINT32_MAX)); /* gid */
+    g_assert_true(nfs2_xdr_put_u32(w, size));
+    for (unsigned int i = 0; i < 4; i++) {
+        g_assert_true(nfs2_xdr_put_u32(w, UINT32_MAX));
+    }
+}
+
 static void put_sattr3(Nfs2XdrWriter *w, mode_t mode)
 {
     g_assert_true(nfs2_xdr_put_u32(w, 1));
@@ -1865,6 +1900,19 @@ static void put_sattr3(Nfs2XdrWriter *w, mode_t mode)
     g_assert_true(nfs2_xdr_put_u32(w, 0)); /* uid */
     g_assert_true(nfs2_xdr_put_u32(w, 0)); /* gid */
     g_assert_true(nfs2_xdr_put_u32(w, 0)); /* size */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* atime */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* mtime */
+}
+
+static void put_sattr3_size(Nfs2XdrWriter *w, mode_t mode, uint64_t size)
+{
+    g_assert_true(nfs2_xdr_put_u32(w, 1));
+    g_assert_true(nfs2_xdr_put_u32(w, mode));
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* uid */
+    g_assert_true(nfs2_xdr_put_u32(w, 0)); /* gid */
+    g_assert_true(nfs2_xdr_put_u32(w, 1));
+    g_assert_true(nfs2_xdr_put_u32(w, size >> 32));
+    g_assert_true(nfs2_xdr_put_u32(w, size));
     g_assert_true(nfs2_xdr_put_u32(w, 0)); /* atime */
     g_assert_true(nfs2_xdr_put_u32(w, 0)); /* mtime */
 }
@@ -1900,9 +1948,11 @@ static void test_v2_mutation_procedures(Fixture *f, gconstpointer opaque)
 
     nfs2_xdr_writer_init(&w, body, sizeof(body));
     put_name2(&w, &root, "v2file");
-    put_sattr2(&w, 0600);
+    put_sattr2_size(&w, 0600, 17);
     send_nfs(f, 2, NFS2_NFSPROC_CREATE, body,
              nfs2_xdr_writer_size(&w), 0);
+    g_assert_cmpuint(f->path_truncate_calls, ==, 0);
+    g_assert_cmpuint(f->ftruncate_calls, ==, 1);
     memcpy(object.bytes, f->reply->data + 28, 32);
 
     nfs2_xdr_writer_init(&w, body, sizeof(body));
@@ -1980,10 +2030,19 @@ static void test_v3_mutation_procedures(Fixture *f, gconstpointer opaque)
         g_assert_true(nfs2_xdr_put_u32(&w, mode));
         if (mode == 2) {
             g_assert_true(nfs2_xdr_put_opaque(&w, "verifier", 8));
+        } else if (mode == 0) {
+            put_sattr3_size(&w, 0600, 23);
         } else {
             put_sattr3(&w, 0600);
         }
         send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+        if (mode == 0) {
+            g_assert_cmpuint(f->path_truncate_calls, ==, 0);
+            g_assert_cmpuint(f->ftruncate_calls, ==, 1);
+            send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 0);
+            g_assert_cmpuint(f->path_truncate_calls, ==, 0);
+            g_assert_cmpuint(f->ftruncate_calls, ==, 2);
+        }
         if (mode == 1) {
             send_nfs(f, 3, 8, body, nfs2_xdr_writer_size(&w), 17);
         }
@@ -2036,6 +2095,29 @@ static void test_v3_mutation_procedures(Fixture *f, gconstpointer opaque)
     put_name3(&w, &root, "badtype");
     g_assert_true(nfs2_xdr_put_u32(&w, 1));
     send_nfs(f, 3, 11, body, nfs2_xdr_writer_size(&w), 10007);
+
+    /* A nonregular MKNOD size is ignored and must never trigger truncate. */
+    {
+        unsigned int path_truncate_calls = f->path_truncate_calls;
+        unsigned int ftruncate_calls = f->ftruncate_calls;
+
+        nfs2_xdr_writer_init(&w, body, sizeof(body));
+        put_name3(&w, &root, "sized-fifo");
+        g_assert_true(nfs2_xdr_put_u32(&w, 7)); /* NF3FIFO */
+        g_assert_true(nfs2_xdr_put_u32(&w, 1));
+        g_assert_true(nfs2_xdr_put_u32(&w, 0600));
+        g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* uid */
+        g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* gid */
+        g_assert_true(nfs2_xdr_put_u32(&w, 1)); /* size */
+        g_assert_true(nfs2_xdr_put_u32(&w, 0));
+        g_assert_true(nfs2_xdr_put_u32(&w, 1));
+        g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* atime */
+        g_assert_true(nfs2_xdr_put_u32(&w, 0)); /* mtime */
+        send_nfs(f, 3, 11, body, nfs2_xdr_writer_size(&w), 0);
+        g_assert_cmpuint(f->path_truncate_calls, ==, path_truncate_calls);
+        g_assert_cmpuint(f->ftruncate_calls, ==, ftruncate_calls);
+        g_assert_true(f->object_present);
+    }
 
     nfs2_xdr_writer_init(&w, body, sizeof(body));
     g_assert_true(nfs2_xdr_put_counted_opaque(&w, kernel.bytes, 32, 32));
@@ -2514,6 +2596,28 @@ static void test_review_exclusive_xattr_failures(Fixture *f,
 
 static void send_exclusive(Fixture *f, const Nfs2FileHandle *root,
                            const char *name, const uint8_t verifier[8],
+                           uint32_t expected);
+
+static void test_review_exclusive_existing_fifo(Fixture *f,
+                                                gconstpointer opaque)
+{
+    static const uint8_t verifier[8] = "fifo-ver";
+    Nfs2FileHandle root;
+    unsigned int open_calls;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    f->object_present = true;
+    g_strlcpy(f->object_name, "existing-fifo", sizeof(f->object_name));
+    f->object_mode = S_IFIFO | 0600;
+    open_calls = f->open_calls;
+
+    send_exclusive(f, &root, "existing-fifo", verifier, 17);
+    g_assert_cmpuint(f->open_calls, ==, open_calls);
+}
+
+static void send_exclusive(Fixture *f, const Nfs2FileHandle *root,
+                           const char *name, const uint8_t verifier[8],
                            uint32_t expected)
 {
     uint8_t body[128];
@@ -2865,6 +2969,8 @@ int main(int argc, char **argv)
                test_review_concurrent_rename_remove, teardown);
     g_test_add("/nfs/review/exclusive-xattr-failures", Fixture, NULL, setup,
                test_review_exclusive_xattr_failures, teardown);
+    g_test_add("/nfs/review/exclusive-existing-fifo", Fixture, NULL, setup,
+               test_review_exclusive_existing_fifo, teardown);
     g_test_add("/nfs/review/exclusive-durability-order", Fixture, NULL,
                setup, test_review_exclusive_durability_order, teardown);
     g_test_add("/nfs/review/exclusive-replacement-binding", Fixture, NULL,

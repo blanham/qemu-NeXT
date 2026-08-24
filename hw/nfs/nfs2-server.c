@@ -31,6 +31,9 @@
 
 static bool is_v2_mutator(uint32_t proc);
 static bool is_v3_mutator(uint32_t proc);
+static bool stat_matches_handle(Nfs2Server *server,
+                                const Nfs2FileHandle *handle,
+                                const struct stat *st);
 
 typedef struct NfsDuplicateEntry {
     uint32_t address;
@@ -90,6 +93,7 @@ typedef enum BackendOp {
     BACKEND_FSYNC,
     BACKEND_CHMOD,
     BACKEND_TRUNCATE,
+    BACKEND_FTRUNCATE,
     BACKEND_UTIMENSAT,
     BACKEND_MKDIR,
     BACKEND_MKNOD,
@@ -376,6 +380,14 @@ static int backend_worker(void *opaque)
             errno = EOPNOTSUPP;
         }
         break;
+    case BACKEND_FTRUNCATE:
+        ret = ops->ftruncate ?
+              ops->ftruncate(ctx, work->fid_type, work->open,
+                             work->offset) : -1;
+        if (!ops->ftruncate) {
+            errno = EOPNOTSUPP;
+        }
+        break;
     case BACKEND_UTIMENSAT:
         ret = ops->utimensat ? ops->utimensat(ctx, work->path,
                                               work->times) : -1;
@@ -617,6 +629,21 @@ static int coroutine_fn co_fsync(Nfs2Server *server,
                                  V9fsFidOpenState *state)
 {
     return co_fsync_type(server, P9_FID_FILE, state);
+}
+
+static int coroutine_fn co_ftruncate(Nfs2Server *server,
+                                     V9fsFidOpenState *state,
+                                     uint64_t size)
+{
+    BackendWork work = {
+        .op = BACKEND_FTRUNCATE, .backend = &server->backend,
+        .open = state, .fid_type = P9_FID_FILE, .offset = size,
+    };
+
+    if (size > INT64_MAX) {
+        return -EFBIG;
+    }
+    return run_backend(&work);
 }
 
 static int coroutine_fn co_opendir(Nfs2Server *server, V9fsPath *path,
@@ -1230,11 +1257,16 @@ static bool decode_v2_sattr(Nfs2XdrReader *r, NfsSetAttr *attr)
     return true;
 }
 
-static int coroutine_fn apply_sattr(Nfs2Server *server, V9fsPath *path,
-                                    const NfsSetAttr *attr)
+static int coroutine_fn apply_sattr(Nfs2Server *server,
+                                    const Nfs2FileHandle *handle,
+                                    const struct stat *before,
+                                    V9fsPath *path, const NfsSetAttr *attr)
 {
     int ret = 0;
 
+    if (attr->size_set && before && !S_ISREG(before->st_mode)) {
+        return -EINVAL;
+    }
     if (attr->mode_set) {
         struct stat current;
 
@@ -1246,8 +1278,37 @@ static int coroutine_fn apply_sattr(Nfs2Server *server, V9fsPath *path,
         }
     }
     if (ret >= 0 && attr->size_set) {
-        ret = co_path_change(server, BACKEND_TRUNCATE, path, 0, attr->size,
-                             NULL);
+        if (handle) {
+            V9fsFidOpenState open = { 0 };
+            bool opened = false;
+
+            ret = co_open_flags(server, path, O_WRONLY, &open);
+            opened = ret >= 0;
+            if (ret >= 0) {
+                struct stat opened_st;
+
+                ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
+                if (ret >= 0 && !S_ISREG(opened_st.st_mode)) {
+                    ret = -EINVAL;
+                }
+                if (ret >= 0 &&
+                    !stat_matches_handle(server, handle, &opened_st)) {
+                    ret = -ESTALE;
+                }
+            }
+            if (ret >= 0) {
+                ret = co_ftruncate(server, &open, attr->size);
+            }
+            if (opened) {
+                int close_ret = co_simple_open(server, BACKEND_CLOSE, &open);
+
+                if (ret >= 0 && close_ret < 0) {
+                    ret = close_ret;
+                }
+            }
+        } else {
+            ret = -EINVAL;
+        }
     }
     if (ret >= 0 && attr->times_set) {
         ret = co_path_change(server, BACKEND_UTIMENSAT, path, 0, 0,
@@ -1364,7 +1425,8 @@ static char *child_absolute(const char *dir, const char *name)
     g_autofree char *joined = g_build_filename(dir, name, NULL);
     char *canonical = g_canonicalize_filename(joined, "/");
 
-    if (canonical[0] != '/') {
+    if (canonical[0] != '/' || strlen(canonical) > NFS2_MAX_PATH) {
+        errno = canonical[0] == '/' ? ENAMETOOLONG : EINVAL;
         g_free(canonical);
         return NULL;
     }
@@ -1588,7 +1650,7 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     if (ret >= 0) {
         child_path = child_absolute(absolute.data, name);
         if (!child_path) {
-            ret = -EIO;
+            ret = -errno;
         } else {
             nfs2_handle_path_state(server->handles, child_path,
                                    &child_path_state);
@@ -2025,7 +2087,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         if (plus) {
             child_abs = child_absolute(absolute.data, work.dirent_name);
             if (!child_abs) {
-                ret = -EIO;
+                ret = -errno;
                 break;
             }
             nfs2_handle_path_state(server->handles, child_abs,
@@ -2311,7 +2373,7 @@ static bool coroutine_fn reply_setattr(Nfs2Server *server,
         ret = -EAGAIN;
     }
     if (ret >= 0) {
-        ret = apply_sattr(server, &path, &attr);
+        ret = apply_sattr(server, &handle, &before, &path, &attr);
     }
     if (before_valid) {
         int post_ret = validate_handle_identity(server, &handle, &path,
@@ -2405,8 +2467,11 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
     if (ret >= 0) {
         ret = co_lstat(server, child, &current);
     }
+    if (ret >= 0 && !S_ISREG(current.st_mode)) {
+        return -EEXIST;
+    }
     if (ret >= 0) {
-        ret = co_open_flags(server, child, O_RDONLY, &open);
+        ret = co_open_flags(server, child, O_RDONLY | O_NONBLOCK, &open);
         if (ret == -EISDIR || ret == -ELOOP || ret == -EINVAL) {
             return -EEXIST;
         }
@@ -2559,7 +2624,7 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
         }
         type = NFS2_NFDIR;
     }
-    if (type == NFS2_NFLNK) {
+    if (type != NFS2_NFREG) {
         attr.size_set = false;
     }
     if (!nfs2_xdr_reader_empty(&call->body)) {
@@ -2570,7 +2635,7 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
     if (ret >= 0) {
         child_abs = child_absolute(absolute.data, name);
         if (!child_abs) {
-            ret = -EIO;
+            ret = -errno;
         } else {
             nfs2_handle_path_state(server->handles, child_abs, &path_state);
         }
@@ -2596,6 +2661,19 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
             }
         } else if (ret == -ENOENT) {
             ret = 0;
+        }
+    }
+    if (ret >= 0 && existing_object && attr.size_set) {
+        struct stat opened_st;
+
+        ret = co_open_flags(server, &child, O_WRONLY, &open);
+        opened = ret >= 0;
+        if (ret >= 0) {
+            ret = co_fstat(server, P9_FID_FILE, &open, &opened_st);
+        }
+        if (ret >= 0 && (!S_ISREG(opened_st.st_mode) ||
+                         !same_object(&after, &opened_st))) {
+            ret = -ESTALE;
         }
     }
     if (ret >= 0 && !exclusive_existing && !existing_object) {
@@ -2629,6 +2707,12 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
                                  before.st_uid, before.st_gid);
         }
     }
+    if (opened && attr.size_set) {
+        if (ret >= 0) {
+            ret = co_ftruncate(server, &open, attr.size);
+        }
+        attr.size_set = false;
+    }
     if (opened) {
         int close_ret = co_simple_open(server, BACKEND_CLOSE, &open);
         if (ret >= 0 && close_ret < 0) {
@@ -2639,7 +2723,7 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
         ret = co_name_to_path(server, &dir, name, &child);
     }
     if (ret >= 0 && !(v3 && kind == NFS3PROC_CREATE && create_mode == 2)) {
-        ret = apply_sattr(server, &child, &attr);
+        ret = apply_sattr(server, NULL, NULL, &child, &attr);
     }
     if (ret >= 0) {
         ret = co_lstat(server, &child, &after);
@@ -2807,7 +2891,7 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
     before_valid = ret >= 0;
     if (ret >= 0) {
         child_abs = child_absolute(absolute.data, name);
-        ret = child_abs ? 0 : -EIO;
+        ret = child_abs ? 0 : -errno;
     }
     if (ret >= 0) {
         ret = co_unlink(server, &dir, name, directory);
@@ -2837,11 +2921,16 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
     char old_name[NFS2_MAX_NAME + 1], new_name[NFS2_MAX_NAME + 1];
     V9fsPath old_abs = { 0 }, old_dir = { 0 };
     V9fsPath new_abs = { 0 }, new_dir = { 0 };
+    V9fsPath source_path = { 0 }, destination_path = { 0 };
     g_autofree char *old_child = NULL, *new_child = NULL;
+    g_autoptr(Nfs2HandleRenameReservation) rename_reservation = NULL;
     struct stat old_before = { 0 }, new_before = { 0 };
     struct stat old_after = { 0 }, new_after = { 0 };
+    struct stat source_before = { 0 }, destination_before = { 0 };
+    struct stat destination_after = { 0 };
     bool old_before_valid = false, new_before_valid = false;
     bool old_after_valid = false, new_after_valid = false;
+    bool destination_before_valid = false, backend_same_object_noop = false;
     int ret;
     bool ok;
 
@@ -2862,14 +2951,41 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
         old_child = child_absolute(old_abs.data, old_name);
         new_child = child_absolute(new_abs.data, new_name);
         if (!old_child || !new_child) {
-            ret = -EIO;
+            ret = -errno;
         }
+    }
+    if (ret >= 0) {
+        ret = co_name_to_path(server, &old_dir, old_name, &source_path);
+    }
+    if (ret >= 0) {
+        ret = co_lstat(server, &source_path, &source_before);
+    }
+    if (ret >= 0 &&
+        co_name_to_path(server, &new_dir, new_name, &destination_path) >= 0 &&
+        co_lstat(server, &destination_path, &destination_before) >= 0) {
+        destination_before_valid = true;
+    }
+    if (ret >= 0 &&
+        !nfs2_handle_rename_reserve(server->handles, old_child, new_child,
+                                    &rename_reservation, NULL)) {
+        ret = -ENAMETOOLONG;
     }
     if (ret >= 0) {
         ret = co_rename(server, &old_dir, old_name, &new_dir, new_name);
     }
+    if (ret >= 0 && destination_before_valid &&
+        same_object(&source_before, &destination_before)) {
+        path_clear(&destination_path);
+        if (co_name_to_path(server, &new_dir, new_name,
+                            &destination_path) >= 0 &&
+            co_lstat(server, &destination_path, &destination_after) >= 0 &&
+            same_object(&source_before, &destination_after)) {
+            backend_same_object_noop = true;
+        }
+    }
     if (ret >= 0 &&
-        !nfs2_handle_rename(server->handles, old_child, new_child, NULL)) {
+        !nfs2_handle_rename_commit(g_steal_pointer(&rename_reservation),
+                                   backend_same_object_noop, NULL)) {
         ret = -EIO;
     }
     if (old_before_valid &&
@@ -2894,6 +3010,8 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
     path_clear(&old_dir);
     path_clear(&new_abs);
     path_clear(&new_dir);
+    path_clear(&source_path);
+    path_clear(&destination_path);
     return ok;
 }
 
@@ -2936,7 +3054,7 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
         if (!new_abs ||
             !nfs2_handle_alias_reserve(server->handles, &file_handle,
                                        new_abs, &alias_reservation, NULL)) {
-            ret = -ENOSPC;
+            ret = new_abs ? -ENOSPC : -errno;
         }
     }
     if (ret >= 0) {
