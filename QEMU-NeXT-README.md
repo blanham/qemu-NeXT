@@ -113,7 +113,7 @@ The verified Second Edition tar archive has SHA-256
 From a clean checkout of the public branch:
 
 ```sh
-git clone -b metachicken git@github.com:blanham/qemu-NeXT.git qemu-NeXT
+git clone -b metachicken https://github.com/blanham/qemu-NeXT.git qemu-NeXT
 cd qemu-NeXT
 mkdir build-next
 cd build-next
