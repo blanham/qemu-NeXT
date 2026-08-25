@@ -37,6 +37,45 @@ the desktop. The model is not a claim of complete hardware fidelity.
 
 ![NeXTSTEP 3.1 booting to Workspace Manager in QEMU](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/nextstep.gif)
 
+<!-- next-rom-matrix:start -->
+### Non-Turbo MC68040 ROM compatibility
+
+Pass means the guest reached a usable Workspace Manager desktop after `bsd mach_kernel` from the shared authenticated NeXTSTEP disk. Earlier gates are diagnostic evidence, not a pass.
+
+| ROM | `next-cube` | `next-station` | `next-station-color` |
+| --- | --- | --- | --- |
+| v58 | inconclusive | inconclusive | inconclusive |
+| v59 | inconclusive | inconclusive | inconclusive |
+| v65 | inconclusive | inconclusive | inconclusive |
+| v66 | inconclusive | inconclusive | inconclusive |
+
+#### Evidence and primary citations
+
+- <code>v58--next-cube</code>: none
+- <code>v58--next-station</code>: none
+- <code>v58--next-station-color</code>: none
+- <code>v59--next-cube</code>: none
+- <code>v59--next-station</code>: none
+- <code>v59--next-station-color</code>: none
+- <code>v65--next-cube</code>: none
+- <code>v65--next-station</code>: none
+- <code>v65--next-station-color</code>: none
+- <code>v66--next-cube</code>: none
+- <code>v66--next-station</code>: none
+- <code>v66--next-station-color</code>: none
+
+Authenticated ROM catalog SHA-256: `fd0a97bab109833dc2e58771c4ea985445514ad2658e9a901746bba2464a24da`.
+
+The table is generated from the verified lab campaign. Firmware and disk images are external inputs; Git contains their identities and reproduction procedure, not their bytes.
+<!-- next-rom-matrix:end -->
+
+The campaign tooling lives in the companion `lab` repository. Place the four files at
+the relative paths recorded by `catalog/next-roms.json`, keep the canonical NeXTSTEP
+disk at `assets/disks/next-old.img`, build a clean registered QEMU worktree through
+`nextcube_lab.baseline_cli build`, and run the `verify` subcommand shown in the lab ROM
+matrix documentation with the same explicit source, build, catalog, and ROM-root inputs. The
+aggregate JSON is authoritative; the table above is generated from it.
+
 ## NetBSD/next68k NFS-root boot
 
 NetBSD 1.5/next68k now boots through the NeXT v66 ROM and its standalone
