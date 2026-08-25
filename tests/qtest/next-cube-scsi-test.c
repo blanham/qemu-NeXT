@@ -256,6 +256,14 @@ static void assert_scsi_dma_completed(QTestState *qts)
                     ==, NEXT_SCSI_DMA_IRQ | NEXT_SCSI_IRQ);
 }
 
+static void assert_scsi_dma_next_read_alias(QTestState *qts,
+                                             uint32_t expected)
+{
+    /* NEXT and NEXT_INIT both read the effective current pointer. */
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, expected);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==, expected);
+}
+
 static void test_scsi_dma_control_does_not_raise_interrupt(void)
 {
     QTestState *qts = next_cube_scsi_start();
@@ -874,9 +882,8 @@ static void test_scsi_dma_reset_clears_next_init_valid(void)
     qtest_writel(qts, NEXT_DMA_NEXT_INIT, NEXT_DMA_BUFFER2);
 
     qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
-                    NEXT_DMA_BUFFER2);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER);
+    /* RESET invalidates the latch, so readback falls back to live NEXT. */
+    assert_scsi_dma_next_read_alias(qts, NEXT_DMA_BUFFER);
     qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
 
     issue_inquiry_dma(qts, TRANSFER_LENGTH);
@@ -889,10 +896,8 @@ static void test_scsi_dma_reset_clears_next_init_valid(void)
         g_assert_cmphex(init[i], ==, 0x5a);
     }
     g_assert_true(current_changed);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
-                    NEXT_DMA_BUFFER + TRANSFER_LENGTH);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
-                    NEXT_DMA_BUFFER2);
+    assert_scsi_dma_next_read_alias(qts,
+                                    NEXT_DMA_BUFFER + TRANSFER_LENGTH);
 
     qtest_quit(qts);
     cleanup_test_disk(disk);
@@ -944,17 +949,15 @@ static void test_scsi_dma_initbuf_preserves_next_init(void)
     qtest_writel(qts, NEXT_DMA_LIMIT,
                  NEXT_DMA_BUFFER2 + TRANSFER_LENGTH);
     qtest_writel(qts, NEXT_DMA_CSR, DMA_INITBUF | DMA_DEV2M);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
-                    NEXT_DMA_BUFFER2);
+    /* INITBUF preserves the valid latch and its effective readback. */
+    assert_scsi_dma_next_read_alias(qts, NEXT_DMA_BUFFER2);
 
     issue_inquiry_dma(qts, TRANSFER_LENGTH);
     finish_scsi_command(qts);
     qtest_memread(qts, NEXT_DMA_BUFFER2, actual, sizeof(actual));
     g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
-                    NEXT_DMA_BUFFER2 + TRANSFER_LENGTH);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==,
-                    NEXT_DMA_BUFFER2);
+    assert_scsi_dma_next_read_alias(qts,
+                                    NEXT_DMA_BUFFER2 + TRANSFER_LENGTH);
 
     qtest_quit(qts);
     cleanup_test_disk(disk);

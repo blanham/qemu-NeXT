@@ -104,6 +104,7 @@ static void test_dma_register_roundtrip(void)
     size_t channel;
     size_t reg;
 
+    /* Both Ethernet channels expose saved NEXT/LIMIT/START/STOP words. */
     for (channel = 0; channel < ARRAY_SIZE(channel_bases); channel++) {
         for (reg = 0; reg < ARRAY_SIZE(register_offsets); reg++) {
             uint32_t value = 0x04001000 + channel * 0x1000 + reg * 0x10;
@@ -111,13 +112,7 @@ static void test_dma_register_roundtrip(void)
                                register_offsets[reg];
 
             qtest_writel(qts, address, value);
-            if (channel == 1 &&
-                (register_offsets[reg] == NEXT_DMA_SAVED_START ||
-                 register_offsets[reg] == NEXT_DMA_SAVED_STOP)) {
-                g_assert_cmphex(qtest_readl(qts, address), ==, 0);
-            } else {
-                g_assert_cmphex(qtest_readl(qts, address), ==, value);
-            }
+            g_assert_cmphex(qtest_readl(qts, address), ==, value);
         }
     }
 

@@ -130,7 +130,8 @@ static const TestChannel channels[] = {
     { "scc",      0x0c0, 21, 0, false },
     { "dsp",      0x0d0, 20, 0, false },
     { "entx",     0x110, 28, 4, true  },
-    { "enrx",     0x150, 27, 2, true  },
+    /* ENRX exposes the complete saved NEXT/LIMIT/START/STOP bank. */
+    { "enrx",     0x150, 27, 4, true  },
     { "video",    0x180,  5, 0, true  },
     { "r2m",      0x1c0, 18, 0, false },
     { "m2r",      0x1d0, 19, 0, false },
@@ -365,9 +366,16 @@ static void test_all_channel_current_registers(void)
         qtest_writel(qts, channel_address(&channels[channel], 0x4200), 0);
         qtest_writel(qts, NEXT_DMA_BASE + channels[channel].csr,
                      DMA_RESET | DMA_SETENABLE | DMA_READ_CMD);
+        /*
+         * RESET invalidates the NEXT_INIT write latch without changing the
+         * current pointer.  Both windows must then read the retained NEXT.
+         */
+        g_assert_cmphex(qtest_readl(qts,
+                                   channel_address(&channels[channel], 0x4000)),
+                        ==, 0x10000000 | channel << 12 | 1);
         g_assert_cmphex(qtest_readl(qts,
                                    channel_address(&channels[channel], 0x4200)),
-                        ==, 0);
+                        ==, 0x10000000 | channel << 12 | 1);
     }
 
     qtest_quit(qts);
@@ -1425,6 +1433,11 @@ static void test_migration_idle_all_channels(void)
             uint32_t expected =
                 0x04100000 | channel << 12 | reg << 8 | 0x10;
 
+            /* A valid NEXT_INIT latch is the effective NEXT readback. */
+            if (reg == 0) {
+                expected =
+                    0x04100000 | channel << 12 | 4 << 8 | 0x10;
+            }
             g_assert_cmphex(qtest_readl(
                                 destination,
                                 channel_address(&channels[channel],
@@ -1470,14 +1483,17 @@ static void test_migration_idle_all_channels(void)
                             destination,
                             channel_address(&channels[0], 0x4000)),
                         ==, init + TRANSFER_LENGTH);
+        g_assert_cmphex(qtest_readl(
+                            destination,
+                            channel_address(&channels[0], 0x4200)),
+                        ==, init + TRANSFER_LENGTH);
         qtest_memread(destination, init, received, sizeof(received));
         g_assert_cmpmem(&received[8], 4, "QEMU", 4);
         g_assert_false(qtest_get_irq(destination, dma_board_inputs[0]));
 
         /*
          * The latch was one-shot.  Poison its old target and a distinct
-         * live buffer, then prove the next transfer follows live NEXT
-         * without changing the guest-visible NEXT_INIT register.
+         * live buffer, then prove both read windows follow live NEXT.
          */
         qtest_memset(destination, init, 0x5a, sizeof(old_init));
         qtest_memset(destination, live, 0xa5, sizeof(received));
@@ -1489,7 +1505,7 @@ static void test_migration_idle_all_channels(void)
         g_assert_cmphex(qtest_readl(
                             destination,
                             channel_address(&channels[0], 0x4200)),
-                        ==, init);
+                        ==, live);
 
         issue_inquiry_dma(destination, TRANSFER_LENGTH);
         finish_scsi_command(destination);
@@ -1501,7 +1517,7 @@ static void test_migration_idle_all_channels(void)
         g_assert_cmphex(qtest_readl(
                             destination,
                             channel_address(&channels[0], 0x4200)),
-                        ==, init);
+                        ==, live + TRANSFER_LENGTH);
         qtest_memread(destination, live, received, sizeof(received));
         g_assert_cmpmem(&received[8], 4, "QEMU", 4);
         qtest_memread(destination, init, old_init, sizeof(old_init));

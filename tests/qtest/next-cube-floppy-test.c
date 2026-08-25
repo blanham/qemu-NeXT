@@ -345,6 +345,13 @@ static void program_dma(QTestState *qts, uint32_t buffer, uint32_t limit,
     qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | command);
 }
 
+static void assert_dma_next_read_alias(QTestState *qts, uint32_t expected)
+{
+    /* NEXT and NEXT_INIT both read the effective current pointer. */
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, expected);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT_INIT), ==, expected);
+}
+
 static void assert_relevant_interrupts(QTestState *qts, uint32_t expected)
 {
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
@@ -548,7 +555,7 @@ static void test_media_to_ram_dma(void)
     for (i = 0; i < sizeof(received); i++) {
         g_assert_cmphex(received[i], ==, NEXT_MEMORY_SENTINEL);
     }
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(qts, NEXT_DMA_BUFFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE, ==, 0);
 
     qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x18);
@@ -602,7 +609,7 @@ static void test_ram_to_media_dma(void)
     program_dma(qts, NEXT_DMA_BUFFER,
                 NEXT_DMA_BUFFER + NEXT_SECTOR_SIZE + 16, 0);
     fdc_send_command(qts, write_command, sizeof(write_command));
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(qts, NEXT_DMA_BUFFER);
 
     qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x10);
     wait_interrupts(qts, NEXT_FLOPPY_IRQ, NEXT_FLOPPY_IRQ,
@@ -648,13 +655,13 @@ static void test_reset_cancels_gated_dma_request(void)
     fdc_send_command(qts, read_command, sizeof(read_command));
 
     assert_guest_memory_filled(qts, NEXT_MEMORY_SENTINEL);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(qts, NEXT_DMA_BUFFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
                     DMA_ENABLE | DMA_READ);
     assert_relevant_interrupts(qts, 0);
 
     qtest_system_reset(qts);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(qts, 0);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==, 0);
     assert_relevant_interrupts(qts, 0);
 
@@ -674,7 +681,7 @@ static void test_reset_cancels_gated_dma_request(void)
     }
 
     assert_guest_memory_filled(qts, NEXT_MEMORY_SENTINEL);
-    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(qts, NEXT_DMA_BUFFER);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
                     DMA_ENABLE | DMA_READ);
     assert_relevant_interrupts(qts, 0);
@@ -881,7 +888,7 @@ static void test_migrate_pending_gated_dma_request(void)
     fdc_send_command(source, read_command, sizeof(read_command));
 
     assert_guest_memory_filled(source, NEXT_MEMORY_SENTINEL);
-    g_assert_cmphex(qtest_readl(source, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(source, NEXT_DMA_BUFFER);
     g_assert_cmphex(qtest_readl(source, NEXT_DMA_CSR) & DMA_STATE_MASK, ==,
                     DMA_ENABLE | DMA_READ);
     assert_relevant_interrupts(source, 0);
@@ -908,7 +915,7 @@ static void test_migrate_pending_gated_dma_request(void)
     wait_migration_complete(destination, "incoming");
 
     assert_guest_memory_filled(destination, NEXT_MEMORY_SENTINEL);
-    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_NEXT), ==, 0);
+    assert_dma_next_read_alias(destination, NEXT_DMA_BUFFER);
     g_assert_cmphex(qtest_readl(destination, NEXT_DMA_CSR) & DMA_STATE_MASK,
                     ==, DMA_ENABLE | DMA_READ);
     assert_relevant_interrupts(destination, 0);
