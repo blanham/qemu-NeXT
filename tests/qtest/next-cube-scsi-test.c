@@ -1234,7 +1234,7 @@ static void test_scsi_cd_read_10_chain(void)
     cleanup_test_media(media);
 }
 
-static void reset_after_cd_inquiry_then_read(QTestState *qts)
+static void reset_after_staged_cd_inquiry_then_read(QTestState *qts)
 {
     enum {
         INQUIRY_LENGTH = 36,
@@ -1284,7 +1284,7 @@ static void reset_after_cd_inquiry_then_read(QTestState *qts)
                   NEXT_CD_SECTOR_SIZE);
 }
 
-static void test_scsi_cd_reset_after_read(void)
+static void test_scsi_cd_reset_after_staged_inquiry(void)
 {
     static const uint8_t test_unit_ready[6] = { 0 };
     uint8_t sector[NEXT_CD_SECTOR_SIZE];
@@ -1296,7 +1296,7 @@ static void test_scsi_cd_reset_after_read(void)
     g_assert_cmphex(submit_nodata_cdb(qts, 3, test_unit_ready), ==, 0x00);
 
     qtest_memset(qts, NEXT_DMA_BUFFER2, 0xcc, sizeof(sector));
-    reset_after_cd_inquiry_then_read(qts);
+    reset_after_staged_cd_inquiry_then_read(qts);
     qtest_memread(qts, NEXT_DMA_BUFFER2, sector, sizeof(sector));
     for (i = 0; i < sizeof(sector); i++) {
         g_assert_cmphex(sector[i], ==,
@@ -1754,8 +1754,8 @@ int main(int argc, char **argv)
                    test_scsi_cd_read_10);
     qtest_add_func("/next-cube/scsi/cd-read-10-chain",
                    test_scsi_cd_read_10_chain);
-    qtest_add_func("/next-cube/scsi/cd-reset-after-read",
-                   test_scsi_cd_reset_after_read);
+    qtest_add_func("/next-cube/scsi/cd-reset-after-staged-inquiry",
+                   test_scsi_cd_reset_after_staged_inquiry);
     qtest_add_func("/next-cube/mmio/dsp-mapping", test_dsp_mmio_mapping);
     qtest_add_func("/next-cube/mmio/printer-mapping",
                    test_printer_mmio_mapping);
