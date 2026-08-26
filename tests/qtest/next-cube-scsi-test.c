@@ -37,6 +37,9 @@
 #define NEXT_DMA_BUFFER2   0x04004000
 #define NEXT_DMA_BUFFER3   0x04006000
 #define NEXT_SECTOR_SIZE   512
+#define NEXT_CD_SECTOR_SIZE 2048
+#define NEXT_CD_SECTORS     4
+#define NEXT_CD_SIZE        (NEXT_CD_SECTOR_SIZE * NEXT_CD_SECTORS)
 
 #define ESP_CMD_RESET      0x02
 #define ESP_CMD_BUSRESET   0x03
@@ -88,6 +91,13 @@ typedef struct TestDisk {
     char *rom_path;
     char *disk_path;
 } TestDisk;
+
+typedef struct TestMedia {
+    int rom_fd;
+    int cd_fd;
+    char *rom_path;
+    char *cd_path;
+} TestMedia;
 
 static TestDisk test_disk = {
     .rom_fd = -1,
@@ -183,6 +193,68 @@ static QTestState *next_cube_scsi_disk_start(TestDisk *disk)
     return qtest_initf("-machine next-cube -bios %s "
                        "-drive file=%s,if=scsi,format=raw",
                        quoted_rom_path, quoted_disk_path);
+}
+
+static void cleanup_test_media(void *opaque)
+{
+    TestMedia *media = opaque;
+
+    qtest_remove_abrt_handler(media);
+    if (media->rom_fd >= 0) {
+        close(media->rom_fd);
+        media->rom_fd = -1;
+    }
+    if (media->cd_fd >= 0) {
+        close(media->cd_fd);
+        media->cd_fd = -1;
+    }
+    if (media->rom_path) {
+        g_unlink(media->rom_path);
+        g_clear_pointer(&media->rom_path, g_free);
+    }
+    if (media->cd_path) {
+        g_unlink(media->cd_path);
+        g_clear_pointer(&media->cd_path, g_free);
+    }
+    g_free(media);
+}
+
+static QTestState *next_cube_scsi_cdrom_start(void)
+{
+    TestMedia *media = g_new0(TestMedia, 1);
+    g_autofree char *quoted_rom_path = NULL;
+    g_autofree char *quoted_cd_path = NULL;
+
+    media->rom_fd = -1;
+    media->cd_fd = -1;
+    qtest_add_abrt_handler(cleanup_test_media, media);
+    g_test_queue_destroy(cleanup_test_media, media);
+
+    media->rom_fd = g_file_open_tmp("next-cube-scsi-rom-XXXXXX",
+                                    &media->rom_path, NULL);
+    g_assert_cmpint(media->rom_fd, >=, 0);
+    g_assert_cmpint(ftruncate(media->rom_fd, NEXT_ROM_SIZE), ==, 0);
+    close(media->rom_fd);
+    media->rom_fd = -1;
+
+    media->cd_fd = g_file_open_tmp("next-cube-scsi-cd-XXXXXX",
+                                   &media->cd_path, NULL);
+    g_assert_cmpint(media->cd_fd, >=, 0);
+    g_assert_cmpint(ftruncate(media->cd_fd, NEXT_CD_SIZE), ==, 0);
+    close(media->cd_fd);
+    media->cd_fd = -1;
+
+    quoted_rom_path = g_shell_quote(media->rom_path);
+    quoted_cd_path = g_shell_quote(media->cd_path);
+    return qtest_initf("-machine next-cube -bios %s -cdrom %s",
+                       quoted_rom_path, quoted_cd_path);
+}
+
+static void test_scsi_cdrom_command_line(void)
+{
+    QTestState *qts = next_cube_scsi_cdrom_start();
+
+    qtest_quit(qts);
 }
 
 static uint8_t submit_nodata_cdb(QTestState *qts, const uint8_t cdb[6])
@@ -1298,6 +1370,8 @@ int main(int argc, char **argv)
                    test_scsi_dma_chain_states);
     qtest_add_func("/next-cube/scsi/write-dma-chain",
                    test_scsi_write_dma_chain);
+    qtest_add_func("/next-cube/scsi/cdrom-command-line",
+                   test_scsi_cdrom_command_line);
     qtest_add_func("/next-cube/mmio/dsp-mapping", test_dsp_mmio_mapping);
     qtest_add_func("/next-cube/mmio/printer-mapping",
                    test_printer_mmio_mapping);
