@@ -691,6 +691,11 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
     NextDMAChannelState *c = &s->channel[channel];
 
     if (value & NEXT_DMA_CMD_RESET) {
+        if (channel == NEXT_DMA_SCC) {
+            qemu_bh_cancel(s->scc_bh);
+            s->scc_running = false;
+            s->scc_reschedule = false;
+        }
         c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE |
                     NEXT_DMA_CSR_COMPLETE | NEXT_DMA_CSR_BUSEXC);
         c->next_initbuf_valid = false;
@@ -1416,6 +1421,18 @@ void next_dma_set_scc_request(NextDMAState *s, unsigned channel, bool level)
     }
 }
 
+void next_dma_scc_post_load(NextDMAState *s)
+{
+    if (!s) {
+        return;
+    }
+
+    qemu_bh_cancel(s->scc_bh);
+    s->scc_running = false;
+    s->scc_reschedule = false;
+    next_dma_scc_schedule_request(s);
+}
+
 typedef struct NextDMAEnetTxRange {
     uint32_t first_start;
     uint32_t first_end;
@@ -1713,6 +1730,7 @@ static int next_dma_post_load(void *opaque, int version_id)
         next_dma_update_irq(s, channel);
     }
     timer_del(&s->video_retrace_timer);
+    next_dma_scc_post_load(s);
 
     /* Host callbacks and their opaque are deliberately not VMState. */
     s->rx_ready = false;

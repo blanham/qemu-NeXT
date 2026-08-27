@@ -185,6 +185,7 @@ static int next_serial_post_load(void *opaque, int version_id)
 
     next_serial_apply_clocks(s);
     next_serial_update_irq(s);
+    next_dma_scc_post_load(s->dma);
     return 0;
 }
 

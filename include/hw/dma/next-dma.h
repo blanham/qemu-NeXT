@@ -97,6 +97,7 @@ void next_dma_set_sound_out_notify(NextDMAState *s,
 void next_dma_set_scc_ops(NextDMAState *s, const NextDMASCCOps *ops,
                           void *opaque);
 void next_dma_set_scc_request(NextDMAState *s, unsigned channel, bool level);
+void next_dma_scc_post_load(NextDMAState *s);
 
 NextDMAResult next_dma_enet_tx_read(NextDMAState *s, uint8_t *frame,
                                     size_t capacity, size_t *length);

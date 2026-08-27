@@ -979,6 +979,8 @@ static int escc_post_load(void *opaque, int version_id)
     escc_dma_tx_watch_cancel(&s->chn[1]);
     escc_update_parameters(&s->chn[0]);
     escc_update_parameters(&s->chn[1]);
+    escc_update_irq(&s->chn[0]);
+    escc_update_irq(&s->chn[1]);
     escc_update_dma_request(&s->chn[0]);
     escc_update_dma_request(&s->chn[1]);
     return 0;

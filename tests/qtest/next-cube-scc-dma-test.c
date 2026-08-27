@@ -23,14 +23,20 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qdict.h"
+#include "qobject/qlist.h"
 
 #define NEXT_DMA_BASE       0x02000000
 #define NEXT_DMA_SCC_CSR    (NEXT_DMA_BASE + 0x00c0)
 #define NEXT_DMA_NEXT       (NEXT_DMA_SCC_CSR + 0x4000)
 #define NEXT_DMA_LIMIT      (NEXT_DMA_SCC_CSR + 0x4004)
+#define NEXT_DMA_START      (NEXT_DMA_SCC_CSR + 0x4008)
+#define NEXT_DMA_STOP       (NEXT_DMA_SCC_CSR + 0x400c)
 #define NEXT_DMA_SETENABLE  0x00010000
+#define NEXT_DMA_SETSUPDATE 0x00020000
 #define NEXT_DMA_READ       0x00040000
 #define NEXT_DMA_CLRCOMPLETE 0x00080000
+#define NEXT_DMA_RESET      0x00100000
 #define NEXT_DMA_ENABLE     0x01000000
 #define NEXT_DMA_SUPDATE    0x02000000
 #define NEXT_DMA_COMPLETE   0x08000000
@@ -47,6 +53,7 @@
 #define NEXT_SCC_DMA_IRQ    (1U << 21)
 #define NEXT_ROM_SIZE       (128 * 1024)
 #define NEXT_SCC_BACKPRESSURE_LENGTH (128 * 1024)
+#define NEXT_MIGRATION_POLL_LIMIT 10000
 
 typedef struct TestROM {
     int fd;
@@ -68,7 +75,8 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_cube_scc_dma_start(int *sock_fd)
+static QTestState *next_cube_scc_dma_start_with_args(const char *extra_args,
+                                                     int *sock_fd)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -85,8 +93,14 @@ static QTestState *next_cube_scc_dma_start(int *sock_fd)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    args = g_strdup_printf("-machine next-cube -bios %s", quoted_rom_path);
+    args = g_strdup_printf("-machine next-cube -bios %s %s",
+                           quoted_rom_path, extra_args ?: "");
     return qtest_init_with_serial(args, sock_fd);
+}
+
+static QTestState *next_cube_scc_dma_start(int *sock_fd)
+{
+    return next_cube_scc_dma_start_with_args(NULL, sock_fd);
 }
 
 static QTestState *next_cube_scc_dma_start_file(const char *path)
@@ -562,6 +576,511 @@ static void test_scc_dma_arbitration(void)
     qtest_quit(qts);
 }
 
+static void test_scc_dma_transmit_chain(void)
+{
+    static const uint8_t message[] = "12345678";
+    uint8_t received[sizeof(message) - 1];
+    GPollFD pollfd = { .events = G_IO_IN };
+    int sock_fd;
+    QTestState *qts = next_cube_scc_dma_start(&sock_fd);
+
+    scc_configure_tx(qts);
+    qtest_memwrite(qts, NEXT_TEST_RAM, message, sizeof(message) - 1);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_TEST_RAM);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_TEST_RAM + 4);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_TEST_RAM + 4);
+    qtest_writel(qts, NEXT_DMA_STOP, NEXT_TEST_RAM + sizeof(message) - 1);
+    qtest_writel(qts, NEXT_DMA_SCC_CSR,
+                 NEXT_DMA_SETENABLE | NEXT_DMA_SETSUPDATE);
+
+    g_assert_true(receive_exact(sock_fd, received, 4));
+    g_assert_cmpmem(received, 4, message, 4);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_TEST_RAM + 4);
+    pollfd.fd = sock_fd;
+    pollfd.revents = 0;
+    g_assert_cmpint(g_poll(&pollfd, 1, 0), ==, 0);
+
+    qtest_writel(qts, NEXT_DMA_SCC_CSR, NEXT_DMA_CLRCOMPLETE);
+    g_assert_true(receive_exact(sock_fd, received + 4, 4));
+    g_assert_cmpmem(received, sizeof(received), message, sizeof(message) - 1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_TEST_RAM + sizeof(message) - 1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCC_DMA_IRQ,
+                    ==, NEXT_SCC_DMA_IRQ);
+
+    close(sock_fd);
+    qtest_quit(qts);
+}
+
+static void test_scc_dma_receive_chain(void)
+{
+    static const uint8_t message[] = "abcdefgh";
+    uint8_t first[4];
+    uint8_t second[4];
+    unsigned int i;
+    int sock_fd;
+    QTestState *qts = next_cube_scc_dma_start(&sock_fd);
+
+    scc_configure_rx(qts, NEXT_SCC_A_CTRL);
+    g_assert_cmpint(send(sock_fd, message, sizeof(message) - 1, 0),
+                    ==, sizeof(message) - 1);
+    wait_for_rx_available(qts, NEXT_SCC_A_CTRL);
+    qtest_memset(qts, NEXT_TEST_RAM, 0xa5, sizeof(message) - 1);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_TEST_RAM);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_TEST_RAM + 4);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_TEST_RAM + 4);
+    qtest_writel(qts, NEXT_DMA_STOP, NEXT_TEST_RAM + sizeof(message) - 1);
+    qtest_writel(qts, NEXT_DMA_SCC_CSR,
+                 NEXT_DMA_SETENABLE | NEXT_DMA_SETSUPDATE | NEXT_DMA_READ);
+
+    for (i = 0; i < 10000; i++) {
+        if (qtest_readl(qts, NEXT_DMA_SCC_CSR) & NEXT_DMA_COMPLETE) {
+            break;
+        }
+    }
+    g_assert_cmpuint(i, <, 10000);
+    qtest_memread(qts, NEXT_TEST_RAM, first, sizeof(first));
+    g_assert_cmpmem(first, sizeof(first), message, sizeof(first));
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_TEST_RAM + 4);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCC_DMA_IRQ,
+                    ==, NEXT_SCC_DMA_IRQ);
+
+    qtest_writel(qts, NEXT_DMA_SCC_CSR,
+                 NEXT_DMA_CLRCOMPLETE | NEXT_DMA_READ);
+    for (i = 0; i < 10000; i++) {
+        if (qtest_readl(qts, NEXT_DMA_SCC_CSR) & NEXT_DMA_COMPLETE) {
+            break;
+        }
+    }
+    g_assert_cmpuint(i, <, 10000);
+    qtest_memread(qts, NEXT_TEST_RAM + 4, second, sizeof(second));
+    g_assert_cmpmem(second, sizeof(second), message + 4, sizeof(second));
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_TEST_RAM + sizeof(message) - 1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_COMPLETE);
+
+    close(sock_fd);
+    qtest_quit(qts);
+}
+
+static void test_scc_dma_range_error(void)
+{
+    const uint8_t value = 'E';
+    int sock_fd;
+    QTestState *qts = next_cube_scc_dma_start(&sock_fd);
+
+    scc_configure_tx(qts);
+    qtest_memwrite(qts, NEXT_TEST_RAM, &value, sizeof(value));
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_TEST_RAM + 1);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_TEST_RAM);
+    qtest_writel(qts, NEXT_DMA_SCC_CSR, NEXT_DMA_SETENABLE);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCC_DMA_IRQ,
+                    ==, NEXT_SCC_DMA_IRQ);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_TEST_RAM + 1);
+
+    close(sock_fd);
+    qtest_quit(qts);
+}
+
+static void test_scc_dma_reset_cancels_pending(void)
+{
+    g_autofree uint8_t *message =
+        g_malloc(NEXT_SCC_BACKPRESSURE_LENGTH);
+    g_autofree uint8_t *received =
+        g_malloc(NEXT_SCC_BACKPRESSURE_LENGTH);
+    const int receive_buffer_size = 1024;
+    const uint32_t limit = NEXT_TEST_RAM + NEXT_SCC_BACKPRESSURE_LENGTH;
+    uint32_t blocked_next = NEXT_TEST_RAM;
+    uint32_t previous = NEXT_TEST_RAM;
+    GPollFD pollfd = { .events = G_IO_IN };
+    int sock_fd;
+    unsigned stable_reads;
+    size_t i;
+    gint64 deadline;
+    QTestState *qts = next_cube_scc_dma_start(&sock_fd);
+
+    pollfd.fd = sock_fd;
+
+    g_assert_cmpint(setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF,
+                               &receive_buffer_size,
+                               sizeof(receive_buffer_size)), ==, 0);
+    for (i = 0; i < NEXT_SCC_BACKPRESSURE_LENGTH; i++) {
+        message[i] = (uint8_t)(i * 53 + 7);
+    }
+
+    scc_configure_tx(qts);
+    qtest_memwrite(qts, NEXT_TEST_RAM, message,
+                   NEXT_SCC_BACKPRESSURE_LENGTH);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_TEST_RAM);
+    qtest_writel(qts, NEXT_DMA_LIMIT, limit);
+    qtest_writel(qts, NEXT_DMA_SCC_CSR, NEXT_DMA_SETENABLE);
+
+    stable_reads = 0;
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline) {
+        blocked_next = qtest_readl(qts, NEXT_DMA_NEXT);
+        if (blocked_next > NEXT_TEST_RAM && blocked_next < limit &&
+            blocked_next == previous) {
+            if (++stable_reads == 4) {
+                break;
+            }
+        } else {
+            stable_reads = 0;
+        }
+        previous = blocked_next;
+    }
+    g_assert_cmpuint(stable_reads, ==, 4);
+    g_assert_cmphex(blocked_next, >, NEXT_TEST_RAM);
+    g_assert_cmphex(blocked_next, <, limit);
+
+    /* The live transfer is stalled on a full backend when RESET arrives. */
+    qtest_writel(qts, NEXT_DMA_SCC_CSR, NEXT_DMA_RESET);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_SCC_CSR), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCC_DMA_IRQ,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, blocked_next);
+
+    /* Release the backend and drain bytes accepted before RESET. */
+    g_assert_true(receive_exact(sock_fd, received,
+                                blocked_next - NEXT_TEST_RAM));
+    g_assert_cmpmem(received, blocked_next - NEXT_TEST_RAM,
+                    message, blocked_next - NEXT_TEST_RAM);
+    pollfd.revents = 0;
+    g_assert_cmpint(g_poll(&pollfd, 1, 100), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, blocked_next);
+
+    close(sock_fd);
+    qtest_quit(qts);
+}
+
+static void wait_scc_migration_complete(QTestState *qts,
+                                         const char *operation)
+{
+    unsigned int i;
+
+    for (i = 0; i < NEXT_MIGRATION_POLL_LIMIT; i++) {
+        QDict *response = qtest_qmp_assert_success_ref(
+            qts, "{ 'execute': 'query-migrate' }");
+        const char *status = qdict_get_str(response, "status");
+
+        if (!strcmp(status, "completed")) {
+            qobject_unref(response);
+            return;
+        }
+        if (!strcmp(status, "failed") || !strcmp(status, "cancelled")) {
+            g_error("%s migration entered terminal state '%s'",
+                    operation, status);
+        }
+        qobject_unref(response);
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for %s migration", operation);
+}
+
+static void wait_scc_destination_running(QTestState *qts,
+                                         const char *operation)
+{
+    unsigned int i;
+
+    for (i = 0; i < NEXT_MIGRATION_POLL_LIMIT; i++) {
+        QDict *response = qtest_qmp_assert_success_ref(
+            qts, "{ 'execute': 'query-status' }");
+
+        if (qdict_get_bool(response, "running")) {
+            qobject_unref(response);
+            return;
+        }
+        qobject_unref(response);
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for %s QEMU to resume", operation);
+}
+
+static void migrate_scc_wait(QTestState *source, QTestState *destination,
+                             const char *uri)
+{
+    qtest_qmp_assert_success(
+        source, "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    wait_scc_migration_complete(source, "outgoing");
+    wait_scc_destination_running(destination, "incoming");
+}
+
+static char *find_next_serial_escc(QTestState *qts)
+{
+    g_autoptr(QDict) response = NULL;
+    g_autofree char *serial_path = NULL;
+    QList *children;
+    QListEntry *entry;
+
+    response = qtest_qmp(
+        qts, "{ 'execute': 'qom-list', "
+        "'arguments': { 'path': '/machine/unattached' } }");
+    g_assert_nonnull(response);
+    children = qdict_get_qlist(response, "return");
+    QLIST_FOREACH_ENTRY(children, entry) {
+        QDict *child = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(child, "type"), "child<next-serial>")) {
+            g_assert_null(serial_path);
+            serial_path = g_strdup_printf("/machine/unattached/%s",
+                                          qdict_get_str(child, "name"));
+        }
+    }
+    g_assert_nonnull(serial_path);
+    qobject_unref(response);
+    response = NULL;
+
+    response = qtest_qmp(
+        qts, "{ 'execute': 'qom-list', 'arguments': { 'path': %s } }",
+        serial_path);
+    g_assert_nonnull(response);
+    children = qdict_get_qlist(response, "return");
+    QLIST_FOREACH_ENTRY(children, entry) {
+        QDict *child = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(child, "type"), "child<escc>")) {
+            return g_strdup_printf("%s/%s", serial_path,
+                                   qdict_get_str(child, "name"));
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void test_scc_dma_migration_active(void)
+{
+    enum {
+        TX_LENGTH = 32768,
+        TX_BUFFER = NEXT_TEST_RAM,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    g_autofree uint8_t *message = g_malloc(TX_LENGTH);
+    g_autofree uint8_t *prefix = NULL;
+    g_autofree uint8_t *suffix = NULL;
+    const int receive_buffer_size = 1024;
+    uint32_t partial_next = TX_BUFFER;
+    uint32_t previous_next;
+    unsigned stable_reads;
+    int source_fd;
+    int destination_fd;
+    QTestState *source;
+    QTestState *destination;
+    gint64 deadline;
+    size_t i;
+
+    for (i = 0; i < TX_LENGTH; i++) {
+        message[i] = (uint8_t)(i * 17 + 3);
+    }
+
+    tmpdir = g_dir_make_tmp("next-scc-dma-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scc_dma_start_with_args(incoming_args,
+                                                     &destination_fd);
+    source = next_cube_scc_dma_start_with_args(NULL, &source_fd);
+    g_assert_cmpint(setsockopt(source_fd, SOL_SOCKET, SO_RCVBUF,
+                               &receive_buffer_size,
+                               sizeof(receive_buffer_size)), ==, 0);
+
+    scc_configure_tx_at(source, NEXT_SCC_A_CTRL, false);
+    qtest_memwrite(source, TX_BUFFER, message, TX_LENGTH);
+    qtest_writel(source, NEXT_DMA_NEXT, TX_BUFFER);
+    qtest_writel(source, NEXT_DMA_LIMIT, TX_BUFFER + TX_LENGTH);
+    qtest_writel(source, NEXT_DMA_SCC_CSR, NEXT_DMA_SETENABLE);
+
+    previous_next = TX_BUFFER;
+    stable_reads = 0;
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline) {
+        partial_next = qtest_readl(source, NEXT_DMA_NEXT);
+        if (partial_next > TX_BUFFER && partial_next < TX_BUFFER + TX_LENGTH &&
+            partial_next == previous_next) {
+            if (++stable_reads == 4) {
+                break;
+            }
+        } else {
+            stable_reads = 0;
+        }
+        previous_next = partial_next;
+    }
+    g_assert_cmpuint(stable_reads, ==, 4);
+    g_assert_cmphex(partial_next, >, TX_BUFFER);
+    g_assert_cmphex(partial_next, <, TX_BUFFER + TX_LENGTH);
+    migrate_scc_wait(source, destination, uri);
+
+    prefix = g_malloc(partial_next - TX_BUFFER);
+    suffix = g_malloc(TX_LENGTH - (partial_next - TX_BUFFER));
+    g_assert_true(receive_exact(source_fd, prefix,
+                                partial_next - TX_BUFFER));
+    g_assert_cmpmem(prefix, partial_next - TX_BUFFER,
+                    message, partial_next - TX_BUFFER);
+    g_assert_true(receive_exact(destination_fd, suffix,
+                                TX_LENGTH - (partial_next - TX_BUFFER)));
+    g_assert_cmpmem(suffix, TX_LENGTH - (partial_next - TX_BUFFER),
+                    message + (partial_next - TX_BUFFER),
+                    TX_LENGTH - (partial_next - TX_BUFFER));
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_NEXT), ==,
+                    TX_BUFFER + TX_LENGTH);
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_COMPLETE);
+
+    close(source_fd);
+    close(destination_fd);
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_scc_dma_migration_held_rx(void)
+{
+    const uint8_t held_rx = 'R';
+    uint8_t selected_register_value;
+    uint8_t received_rx;
+    enum {
+        RX_BUFFER = NEXT_TEST_RAM,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    int source_fd;
+    int destination_fd;
+    QTestState *source;
+    QTestState *destination;
+
+    tmpdir = g_dir_make_tmp("next-scc-dma-rx-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scc_dma_start_with_args(incoming_args,
+                                                     &destination_fd);
+    source = next_cube_scc_dma_start_with_args(NULL, &source_fd);
+
+    scc_configure_rx(source, NEXT_SCC_A_CTRL);
+    g_assert_cmpint(send(source_fd, &held_rx, sizeof(held_rx), 0), ==,
+                    sizeof(held_rx));
+    wait_for_rx_available(source, NEXT_SCC_A_CTRL);
+    g_assert_cmphex(qtest_readb(source, NEXT_SCC_A_CTRL) & 0x01, ==, 0x01);
+    qtest_memset(source, RX_BUFFER, 0xa5, sizeof(received_rx));
+    qtest_writel(source, NEXT_DMA_NEXT, RX_BUFFER);
+    qtest_writel(source, NEXT_DMA_LIMIT, RX_BUFFER + sizeof(received_rx));
+    qtest_writeb(source, NEXT_SCC_A_CTRL, 3);
+    selected_register_value = qtest_readb(source, NEXT_SCC_A_CTRL);
+    qtest_writeb(source, NEXT_SCC_A_CTRL, 3);
+
+    migrate_scc_wait(source, destination, uri);
+    g_assert_cmphex(qtest_readb(destination, NEXT_SCC_A_CTRL), ==,
+                    selected_register_value);
+    g_assert_cmphex(qtest_readb(destination, NEXT_SCC_A_CTRL) & 0x01, ==,
+                    0x01);
+    qtest_writel(destination, NEXT_DMA_SCC_CSR,
+                 NEXT_DMA_SETENABLE | NEXT_DMA_READ);
+    qtest_memread(destination, RX_BUFFER, &received_rx, sizeof(received_rx));
+    g_assert_cmphex(received_rx, ==, held_rx);
+    g_assert_cmphex(qtest_readb(destination, NEXT_SCC_A_CTRL) & 0x01, ==, 0);
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_NEXT), ==,
+                    RX_BUFFER + sizeof(received_rx));
+    g_assert_cmphex(qtest_readl(destination, NEXT_DMA_SCC_CSR) &
+                    (NEXT_DMA_ENABLE | NEXT_DMA_COMPLETE | NEXT_DMA_BUSEXC),
+                    ==, NEXT_DMA_COMPLETE);
+
+    close(source_fd);
+    close(destination_fd);
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_scc_dma_migration_recomputes_channel_irq(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    int source_fd;
+    int destination_fd;
+    QTestState *source;
+    QTestState *destination;
+
+    tmpdir = g_dir_make_tmp("next-scc-dma-irq-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scc_dma_start_with_args(incoming_args,
+                                                     &destination_fd);
+    source = next_cube_scc_dma_start_with_args(NULL, &source_fd);
+
+    g_autofree char *escc_path = find_next_serial_escc(destination);
+
+    qtest_irq_intercept_out_named(destination, escc_path, "sysbus-irq");
+
+    /* Seed stale A and B output lines on the paused destination. */
+    scc_write_reg_at(destination, NEXT_SCC_B_CTRL, 1, 0x02);
+    scc_write_reg_at(destination, NEXT_SCC_B_CTRL, 3, 0x01);
+    scc_write_reg_at(destination, NEXT_SCC_B_CTRL, 5, 0x68);
+    qtest_writeb(destination, NEXT_SCC_B_DATA, 'D');
+    scc_write_reg_at(destination, NEXT_SCC_A_CTRL, 1, 0x02);
+    scc_write_reg_at(destination, NEXT_SCC_A_CTRL, 3, 0x01);
+    scc_write_reg_at(destination, NEXT_SCC_A_CTRL, 5, 0x68);
+    qtest_writeb(destination, NEXT_SCC_A_DATA, 'A');
+    g_assert_true(qtest_get_irq(destination, 0));
+    g_assert_true(qtest_get_irq(destination, 1));
+
+    /* The source has neither channel pending when its state is loaded. */
+    migrate_scc_wait(source, destination, uri);
+
+    g_assert_false(qtest_get_irq(destination, 0));
+    g_assert_false(qtest_get_irq(destination, 1));
+
+    close(source_fd);
+    close(destination_fd);
+    qtest_quit(source);
+    qtest_quit(destination);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -583,5 +1102,18 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/scc-dma/local-loopback-b",
                    test_scc_dma_local_loopback_b);
     qtest_add_func("/next-cube/scc-dma/arbitration", test_scc_dma_arbitration);
+    qtest_add_func("/next-cube/scc-dma/transmit-chain",
+                   test_scc_dma_transmit_chain);
+    qtest_add_func("/next-cube/scc-dma/receive-chain",
+                   test_scc_dma_receive_chain);
+    qtest_add_func("/next-cube/scc-dma/range-error", test_scc_dma_range_error);
+    qtest_add_func("/next-cube/scc-dma/reset-cancels-pending",
+                   test_scc_dma_reset_cancels_pending);
+    qtest_add_func("/next-cube/scc-dma/migration-active",
+                   test_scc_dma_migration_active);
+    qtest_add_func("/next-cube/scc-dma/migration-held-rx",
+                   test_scc_dma_migration_held_rx);
+    qtest_add_func("/next-cube/scc-dma/migration-recomputes-channel-irq",
+                   test_scc_dma_migration_recomputes_channel_irq);
     return g_test_run();
 }
