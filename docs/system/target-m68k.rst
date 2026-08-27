@@ -82,8 +82,43 @@ diagnosis rather than repairing them.
 ROM preference “serial port A is alternate console” is stored in this NVRAM.
 With ``serial0`` attached, save the preference and reset to move the ROM
 console to SCC channel A.  Channel A is ``serial0`` and channel B is
-``serial1``; the current Mach driver uses interrupt-driven PIO rather than SCC
-DMA.
+``serial1``.  Both channels support interrupt-driven PIO and the shared SCC
+DMA engine described below.
+
+SCC serial DMA
+~~~~~~~~~~~~~~
+
+The NeXT serial controller exposes one shared, bidirectional SCC DMA engine at
+CSR ``0x020000c0``.  It can service either SCC port, but cannot transfer both
+ports at once.  When both ports request service simultaneously, channel A has
+priority.  PIO interrupt 17 and DMA interrupt 21 are separate interrupt
+sources.
+
+The ESCC WR1 request gate controls which port may request DMA.  ``REQENABLE``
+(``0x80``) and ``REQFUNC`` (``0x40``) must be set; ``REQRX`` (``0x20``)
+selects receive, while clearing ``REQRX`` selects transmit.  The DMA CSR
+``READ`` direction must match the WR1 direction.  A direction mismatch leaves
+the request pending and does not create a bus exception.
+
+The active segment uses ``NEXT``/``LIMIT`` at ``0x020040c0``/``0x020040c4``.
+With ``SUPDATE`` set, reaching ``LIMIT`` promotes the segment in
+``START``/``STOP`` (``0x020040c8``/``0x020040cc``).  Each segment completion
+sets ``COMPLETE``.  A promoted segment keeps ``ENABLE`` set and waits for the
+guest to clear ``COMPLETE`` before transferring the next segment; the final
+segment clears ``ENABLE`` while leaving ``COMPLETE`` set.  An enabled
+zero-length segment (``NEXT == LIMIT``) completes without a bus error.  If
+``NEXT > LIMIT`` or a guest-memory transaction fails, the engine sets
+``BUSEXC | COMPLETE``, clears the active state, and asserts DMA interrupt 21.
+
+A channel ``RESET`` command cancels pending SCC work and clears
+``ENABLE``, ``SUPDATE``, ``COMPLETE``, ``BUSEXC``, and the pending
+``NEXT_INIT`` latch.  It does not consume a byte already held by the ESCC.
+Machine reset clears the DMA channel state.  Migration saves the
+guest-visible DMA pointers/status and ESCC register/data state; post-load
+reconstructs PIO and DMA interrupt/request levels and resumes an enabled,
+serviceable transfer at the destination.  If a character backend applies
+backpressure, transmit DMA holds ``NEXT`` at the unaccepted byte and retries
+when the backend becomes writable.
 
 The ESP SCSI controller and 82077 floppy controller share the physical SCSI
 DMA channel at ``0x02000010``.  Selection and direction gates ensure that only

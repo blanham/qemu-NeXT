@@ -127,7 +127,7 @@ static const TestChannel channels[] = {
     { "optical",  0x050, 25, 0, false },
     { "snd-in",   0x080, 22, 0, false },
     { "printer",  0x090, 24, 0, false },
-    { "scc",      0x0c0, 21, 0, false },
+    { "scc",      0x0c0, 21, 0, true  },
     { "dsp",      0x0d0, 20, 0, false },
     { "entx",     0x110, 28, 4, true  },
     /* ENRX exposes the complete saved NEXT/LIMIT/START/STOP bank. */

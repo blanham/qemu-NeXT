@@ -1232,6 +1232,7 @@ static void encode_error(Plan9P1Request *request, uint16_t tag,
     Plan9P1Fcall reply = {
         .type = PLAN9P1_RERROR,
         .tag = tag,
+        .first_edition = request->tx.first_edition,
     };
     const char *text = message;
 
@@ -1397,6 +1398,71 @@ out:
     plan9_auth_clear(&authenticator, sizeof(authenticator));
     if (ret) {
         plan9_auth_clear(reply->auth, sizeof(reply->auth));
+    }
+    return ret;
+}
+
+/*
+ * First Edition's built-in boot identity has an all-zero key.  The native
+ * file server permits that identity to attach without a configured auth
+ * service, but mount -a still sends Tauth and insists on a syntactically
+ * valid ticket reply before it continues with the attach.
+ */
+static int server_first_edition_none_auth(Plan9P1Request *request,
+                                          Plan9P1Fcall *reply)
+{
+    static const uint8_t none_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    Plan9P1Server *server = request->server;
+    uint8_t canonical_none[PLAN9P1_NAMELEN] = { 0 };
+    uint8_t challenge[PLAN9P1_1E_AUTHCHALLEN] = { 0 };
+    uint8_t ticket[15] = { 0 };
+    uint8_t response[PLAN9P1_1E_AUTHREPLYLEN] = { 0 };
+    Error *local_err = NULL;
+    int ret = -EACCES;
+
+    fixed_string(canonical_none, "none");
+    if (server->auth_configured ||
+        memcmp(request->tx.uname, canonical_none, sizeof(canonical_none))) {
+        goto out;
+    }
+    memcpy(challenge, request->tx.first_edition_challenge,
+           sizeof(challenge));
+    if (plan9_auth_decrypt(none_key, challenge, sizeof(challenge),
+                           &local_err) ||
+        challenge[0] != 1) { /* FScchal */
+        goto out;
+    }
+
+    response[0] = 4; /* FSctick */
+    memcpy(response + 1, challenge + 1, 7);
+    if (server_auth_random(server, response + 8, 7, &local_err) ||
+        server_auth_random(server, ticket + 1, 7, &local_err)) {
+        goto out;
+    }
+    ticket[0] = 5; /* FSstick */
+    memcpy(ticket + 8, response + 8, 7);
+    if (plan9_auth_encrypt(none_key, ticket, sizeof(ticket), &local_err)) {
+        goto out;
+    }
+    memcpy(response + 15, ticket, sizeof(ticket));
+    if (plan9_auth_encrypt(none_key, response, sizeof(response),
+                           &local_err)) {
+        goto out;
+    }
+    reply->type = PLAN9P1_RAUTH;
+    reply->fid = request->tx.fid;
+    memcpy(reply->first_edition_reply, response, sizeof(response));
+    ret = 0;
+
+out:
+    error_free(local_err);
+    plan9_auth_clear(challenge, sizeof(challenge));
+    plan9_auth_clear(ticket, sizeof(ticket));
+    plan9_auth_clear(response, sizeof(response));
+    plan9_auth_clear(canonical_none, sizeof(canonical_none));
+    if (ret) {
+        plan9_auth_clear(reply->first_edition_reply,
+                         sizeof(reply->first_edition_reply));
     }
     return ret;
 }
@@ -2473,6 +2539,7 @@ static void coroutine_fn handle_request(Plan9P1Request *request)
     Plan9P1Server *server = request->server;
     Plan9P1Fcall reply = {
         .tag = request->tx.tag,
+        .first_edition = request->tx.first_edition,
     };
     int ret = 0;
 
@@ -2488,6 +2555,13 @@ static void coroutine_fn handle_request(Plan9P1Request *request)
     switch (request->tx.type) {
     case PLAN9P1_TNOP:
         reply.type = PLAN9P1_RNOP;
+        break;
+    case PLAN9P1_TAUTH:
+        if (server_first_edition_none_auth(request, &reply) < 0) {
+            encode_error(request, request->tx.tag, EACCES,
+                         "authentication failed");
+            return;
+        }
         break;
     case PLAN9P1_TSESSION:
         cleanup_fids(server);
@@ -2882,6 +2956,7 @@ static bool request_type(uint8_t type)
     case PLAN9P1_TSTAT:
     case PLAN9P1_TWSTAT:
     case PLAN9P1_TCLWALK:
+    case PLAN9P1_TAUTH:
     case PLAN9P1_TSESSION:
     case PLAN9P1_TATTACH:
         return true;

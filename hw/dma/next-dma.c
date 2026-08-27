@@ -73,6 +73,7 @@
 #define NEXT_DMA_SCSI_FLUSH_EDGES 4
 #define NEXT_DMA_SCSI_DMAMODE     0x10
 #define NEXT_DMA_SCSI_DMAREAD     0x08
+#define NEXT_DMA_SCC_BUDGET       4096
 
 #define NEXT_DMA_ENET_ADDR_MASK   0x0fffffff
 #define NEXT_DMA_ENTX_EOP         0x80000000
@@ -90,6 +91,7 @@ typedef enum NextDMASavedCapability {
 typedef enum NextDMATransferPolicy {
     NEXT_DMA_TRANSFER_INERT,
     NEXT_DMA_TRANSFER_SCSI,
+    NEXT_DMA_TRANSFER_SCC,
     NEXT_DMA_TRANSFER_SOUND_OUT,
     NEXT_DMA_TRANSFER_ENTX,
     NEXT_DMA_TRANSFER_ENRX,
@@ -122,7 +124,7 @@ static const NextDMAChannelDesc next_dma_channels[NEXT_DMA_CHANNEL_COUNT] = {
         "printer", 0x090, 24, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
     },
     [NEXT_DMA_SCC] = {
-        "scc", 0x0c0, 21, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
+        "scc", 0x0c0, 21, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_SCC,
     },
     [NEXT_DMA_DSP] = {
         "dsp", 0x0d0, 20, NEXT_DMA_SAVED_NONE, NEXT_DMA_TRANSFER_INERT,
@@ -179,6 +181,12 @@ struct NextDMAState {
     void *optical_opaque;
     const NextDMASoundOutNotify *sound_out_notify;
     void *sound_out_opaque;
+    const NextDMASCCOps *scc_ops;
+    void *scc_opaque;
+    bool scc_request[2];
+    QEMUBH *scc_bh;
+    bool scc_running;
+    bool scc_reschedule;
     bool rx_ready;
     bool rx_keep_enabled;
     QEMUTimer video_retrace_timer;
@@ -199,6 +207,8 @@ struct NextDMAState {
 };
 
 static void next_dma_floppy_schedule_request(NextDMAState *s);
+static void next_dma_scc_schedule_request(NextDMAState *s);
+static const unsigned next_dma_scc_channels[] = { 1, 0 };
 
 static int next_dma_trace_int(size_t value)
 {
@@ -357,6 +367,140 @@ static bool next_dma_advance(NextDMAState *s, NextDMAChannel channel,
         return next_dma_complete_segment(s, channel);
     }
     return true;
+}
+
+static bool next_dma_scc_serviceable(const NextDMAState *s,
+                                     unsigned channel)
+{
+    const NextDMAChannelState *c = &s->channel[NEXT_DMA_SCC];
+    bool dma_read;
+
+    if (channel >= 2 || !s->scc_ops || !s->scc_ops->is_receive ||
+        !s->scc_request[channel] || !(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE)) {
+        return false;
+    }
+
+    dma_read = c->csr & NEXT_DMA_CSR_READ;
+    if (dma_read != s->scc_ops->is_receive(s->scc_opaque, channel)) {
+        return false;
+    }
+    return dma_read ? !!s->scc_ops->read_byte : !!s->scc_ops->write_byte;
+}
+
+static void next_dma_scc_error(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCC];
+
+    c->csr |= NEXT_DMA_CSR_BUSEXC | NEXT_DMA_CSR_COMPLETE;
+    c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE);
+    next_dma_update_irq(s, NEXT_DMA_SCC);
+}
+
+static void next_dma_scc_run(void *opaque)
+{
+    NextDMAState *s = opaque;
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCC];
+    size_t budget = NEXT_DMA_SCC_BUDGET;
+    bool stalled = false;
+    unsigned channel_index;
+
+    if (s->scc_running) {
+        s->scc_reschedule = true;
+        return;
+    }
+    s->scc_running = true;
+    s->scc_reschedule = false;
+
+    /* The SCC gives channel A (index 1) priority over channel B (index 0). */
+    for (channel_index = 0;
+         channel_index < ARRAY_SIZE(next_dma_scc_channels);
+         channel_index++) {
+        unsigned channel = next_dma_scc_channels[channel_index];
+
+        if (!next_dma_scc_serviceable(s, channel)) {
+            continue;
+        }
+        if (c->next > c->limit) {
+            next_dma_scc_error(s);
+            break;
+        }
+        if (c->next == c->limit) {
+            next_dma_complete_segment(s, NEXT_DMA_SCC);
+            break;
+        }
+        while (budget && c->next < c->limit &&
+               next_dma_scc_serviceable(s, channel)) {
+            uint8_t value;
+
+            if (c->csr & NEXT_DMA_CSR_READ) {
+                if (!s->scc_ops->read_byte(s->scc_opaque, channel,
+                                           &value)) {
+                    stalled = true;
+                    break;
+                }
+                if (address_space_write(s->as, c->next,
+                                        MEMTXATTRS_UNSPECIFIED,
+                                        &value, sizeof(value)) != MEMTX_OK) {
+                    next_dma_scc_error(s);
+                    break;
+                }
+            } else {
+                if (address_space_read(s->as, c->next,
+                                       MEMTXATTRS_UNSPECIFIED,
+                                       &value, sizeof(value)) != MEMTX_OK) {
+                    next_dma_scc_error(s);
+                    break;
+                }
+                if (!s->scc_ops->write_byte(s->scc_opaque, channel, value)) {
+                    stalled = true;
+                    break;
+                }
+            }
+            c->next++;
+            budget--;
+            if (c->next == c->limit) {
+                next_dma_complete_segment(s, NEXT_DMA_SCC);
+            }
+        }
+        if (stalled) {
+            break;
+        }
+        if (!budget) {
+            s->scc_reschedule = true;
+            break;
+        }
+    }
+
+    s->scc_running = false;
+    if (s->scc_reschedule) {
+        s->scc_reschedule = false;
+        next_dma_scc_schedule_request(s);
+    }
+}
+
+static void next_dma_scc_schedule_request(NextDMAState *s)
+{
+    unsigned channel_index;
+
+    if (!s->scc_bh) {
+        return;
+    }
+    if (s->scc_running) {
+        s->scc_reschedule = true;
+        return;
+    }
+    /* Keep request arbitration in the same A-before-B order as service. */
+    for (channel_index = 0;
+         channel_index < ARRAY_SIZE(next_dma_scc_channels);
+         channel_index++) {
+        unsigned channel = next_dma_scc_channels[channel_index];
+
+        if (next_dma_scc_serviceable(s, channel)) {
+            qemu_bh_schedule(s->scc_bh);
+            return;
+        }
+    }
 }
 
 typedef enum NextDMARegister {
@@ -545,6 +689,11 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
     NextDMAChannelState *c = &s->channel[channel];
 
     if (value & NEXT_DMA_CMD_RESET) {
+        if (channel == NEXT_DMA_SCC) {
+            qemu_bh_cancel(s->scc_bh);
+            s->scc_running = false;
+            s->scc_reschedule = false;
+        }
         c->csr &= ~(NEXT_DMA_CSR_ENABLE | NEXT_DMA_CSR_SUPDATE |
                     NEXT_DMA_CSR_COMPLETE | NEXT_DMA_CSR_BUSEXC);
         c->next_initbuf_valid = false;
@@ -567,6 +716,9 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_update_irq(s, channel);
+    if (channel == NEXT_DMA_SCC) {
+        next_dma_scc_schedule_request(s);
+    }
     if (channel == NEXT_DMA_ENRX) {
         next_dma_recompute_rx_ready(s);
     }
@@ -1260,6 +1412,37 @@ void next_dma_set_sound_out_notify(NextDMAState *s,
     }
 }
 
+void next_dma_set_scc_ops(NextDMAState *s, const NextDMASCCOps *ops,
+                          void *opaque)
+{
+    s->scc_ops = ops;
+    s->scc_opaque = opaque;
+    next_dma_scc_schedule_request(s);
+}
+
+void next_dma_set_scc_request(NextDMAState *s, unsigned channel, bool level)
+{
+    if (channel >= 2) {
+        return;
+    }
+    s->scc_request[channel] = level;
+    if (level) {
+        next_dma_scc_schedule_request(s);
+    }
+}
+
+void next_dma_scc_post_load(NextDMAState *s)
+{
+    if (!s) {
+        return;
+    }
+
+    qemu_bh_cancel(s->scc_bh);
+    s->scc_running = false;
+    s->scc_reschedule = false;
+    next_dma_scc_schedule_request(s);
+}
+
 typedef struct NextDMAEnetTxRange {
     uint32_t first_start;
     uint32_t first_end;
@@ -1511,6 +1694,7 @@ static void next_dma_reset_hold(Object *obj, ResetType type)
     int channel;
 
     qemu_bh_cancel(s->floppy_bh);
+    qemu_bh_cancel(s->scc_bh);
     memset(s->channel, 0, sizeof(s->channel));
     memset(&s->trace_scsi_dma_read, 0, sizeof(s->trace_scsi_dma_read));
     s->rx_keep_enabled = false;
@@ -1522,6 +1706,9 @@ static void next_dma_reset_hold(Object *obj, ResetType type)
     s->floppy_in_callback = false;
     s->floppy_running = false;
     s->floppy_reschedule = false;
+    /* SCC request levels are external inputs and survive DMA reset. */
+    s->scc_running = false;
+    s->scc_reschedule = false;
     timer_del(&s->video_retrace_timer);
 
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
@@ -1553,6 +1740,7 @@ static int next_dma_post_load(void *opaque, int version_id)
         next_dma_update_irq(s, channel);
     }
     timer_del(&s->video_retrace_timer);
+    next_dma_scc_post_load(s);
 
     /* Host callbacks and their opaque are deliberately not VMState. */
     s->rx_ready = false;
@@ -1629,6 +1817,7 @@ static void next_dma_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), next_dma_video_retrace_in,
                             NEXT_DMA_VIDEO_RETRACE_GPIO, 1);
     s->floppy_bh = qemu_bh_new(next_dma_floppy_run, s);
+    s->scc_bh = qemu_bh_new(next_dma_scc_run, s);
 
     for (i = 0; i < NEXT_DMA_CHANNEL_COUNT; i++) {
         sysbus_init_irq(sbd, &s->irq[i]);
@@ -1640,6 +1829,7 @@ static void next_dma_finalize(Object *obj)
     NextDMAState *s = NEXT_DMA(obj);
 
     qemu_bh_delete(s->floppy_bh);
+    qemu_bh_delete(s->scc_bh);
 }
 
 static void next_dma_class_init(ObjectClass *klass, const void *data)

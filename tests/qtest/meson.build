@@ -177,6 +177,7 @@ qtests_m68k = ['boot-serial-test'] + \
     'next-dma-test',
     'next-kbd-test',
     'next-cube-serial-test',
+    'next-cube-scc-dma-test',
     'next-cube-floppy-test',
     'next-mb8795-test',
     'next-memctl-test',
