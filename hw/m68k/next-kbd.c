@@ -371,6 +371,23 @@ static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
 {
     int keycode;
 
+    if (evt->key.key == KEY_LEFTALT) {
+        if (evt->key.down) {
+            s->shift |= KD_LALT;
+        } else {
+            s->shift &= ~KD_LALT;
+        }
+        return;
+    }
+
+    /* The NeXT right Alt key is the Plan 9 compose key. */
+    if (evt->key.key == KEY_RIGHTALT) {
+        if (evt->key.down) {
+            nextkbd_put_packet(s, 0x10000000 | KD_RALT | s->shift, true);
+        }
+        return;
+    }
+
     if (evt->key.key >= ARRAY_SIZE(linux_to_nextkbd_keycode)) {
         return;
     }

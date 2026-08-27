@@ -53,6 +53,8 @@
 #define NEXT_MON_DTX      0x00004000
 #define NEXT_KBD_VALID    0x00008000
 #define NEXT_KBD_LSHIFT   0x00000200
+#define NEXT_KBD_LALT     0x00002000
+#define NEXT_KBD_RALT     0x00004000
 #define NEXT_KBD_DEVICE_1 0x10000000
 #define NEXT_MOUSE_PACKET         0x11000000
 #define NEXT_MOUSE_RIGHT_RELEASED 0x00000100
@@ -731,6 +733,33 @@ static void test_key_dequeue_modifiers(void)
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
                     NEXT_KEY_UP | NEXT_KEY_A);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_alt_modifiers(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    /* Left Alt is a modifier bit on the following key packet. */
+    send_key(qts, "alt", true);
+    send_key(qts, "a", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_LALT | NEXT_KEY_A);
+    send_key(qts, "a", false);
+    send_key(qts, "alt", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_LALT | NEXT_KEY_UP | NEXT_KEY_A);
+
+    /* NeXT's right Alt is the Plan 9 compose key. */
+    send_key(qts, "alt_r", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_RALT);
+    send_key(qts, "alt_r", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
+                    (NEXT_KBD_INT | NEXT_KBD_DAV), ==, 0);
 
     qtest_quit(qts);
 }
@@ -1427,6 +1456,7 @@ int main(int argc, char **argv)
                    test_barrier_repeat_is_key_down);
     qtest_add_func("/next-cube/kbd/key-dequeue-modifiers",
                    test_key_dequeue_modifiers);
+    qtest_add_func("/next-cube/kbd/alt-modifiers", test_alt_modifiers);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
                    test_idle_csr_ctx_clear);
     qtest_add_func("/next-cube/monitor/sound-handshake-and-overrun",
