@@ -102,6 +102,10 @@ static size_t fixed_length(int64_t type)
     case PLAN9P1_1E_TSESSION:
     case PLAN9P1_1E_RSESSION:
         return 3;
+    case PLAN9P1_1E_TAUTH:
+        return 69;
+    case PLAN9P1_1E_RAUTH:
+        return 35;
     case PLAN9P1_TSESSION:
         return 11;
     case PLAN9P1_RWALK:
@@ -409,6 +413,14 @@ int plan9p1_decode(const uint8_t *buf, size_t len,
         fcall->type = PLAN9P1_RSESSION;
         fcall->first_edition = true;
         break;
+    case PLAN9P1_1E_TAUTH:
+        fcall->type = PLAN9P1_TAUTH;
+        fcall->first_edition = true;
+        break;
+    case PLAN9P1_1E_RAUTH:
+        fcall->type = PLAN9P1_RAUTH;
+        fcall->first_edition = true;
+        break;
     case PLAN9P1_1E_TATTACH:
         fcall->type = PLAN9P1_TATTACH;
         fcall->first_edition = true;
@@ -520,6 +532,17 @@ int plan9p1_decode(const uint8_t *buf, size_t len,
         GET(cursor_get_u16(&cursor, &fcall->fid));
         GET(cursor_get_u16(&cursor, &fcall->newfid));
         GET(cursor_get(&cursor, fcall->name, sizeof(fcall->name)));
+        break;
+    case PLAN9P1_TAUTH:
+        GET(cursor_get_u16(&cursor, &fcall->fid));
+        GET(cursor_get(&cursor, fcall->uname, sizeof(fcall->uname)));
+        GET(cursor_get(&cursor, fcall->first_edition_challenge,
+                       sizeof(fcall->first_edition_challenge)));
+        break;
+    case PLAN9P1_RAUTH:
+        GET(cursor_get_u16(&cursor, &fcall->fid));
+        GET(cursor_get(&cursor, fcall->first_edition_reply,
+                       sizeof(fcall->first_edition_reply)));
         break;
     case PLAN9P1_TSESSION:
         if (!fcall->first_edition) {
@@ -802,6 +825,17 @@ ssize_t plan9p1_encode(uint8_t *buf, size_t capacity,
         cursor_put_u16(&cursor, fcall->fid);
         cursor_put_u16(&cursor, fcall->newfid);
         cursor_put(&cursor, fcall->name, sizeof(fcall->name));
+        break;
+    case PLAN9P1_TAUTH:
+        cursor_put_u16(&cursor, fcall->fid);
+        cursor_put(&cursor, fcall->uname, sizeof(fcall->uname));
+        cursor_put(&cursor, fcall->first_edition_challenge,
+                   sizeof(fcall->first_edition_challenge));
+        break;
+    case PLAN9P1_RAUTH:
+        cursor_put_u16(&cursor, fcall->fid);
+        cursor_put(&cursor, fcall->first_edition_reply,
+                   sizeof(fcall->first_edition_reply));
         break;
     case PLAN9P1_TSESSION:
         if (!fcall->first_edition) {

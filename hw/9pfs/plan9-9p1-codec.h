@@ -46,10 +46,14 @@
 #define PLAN9P1_MAX_FRAME (16 + PLAN9P1_MAX_DATA)
 
 /* The First Edition placed session and attach messages in the initial gap. */
+#define PLAN9P1_1E_TAUTH 82
+#define PLAN9P1_1E_RAUTH 83
 #define PLAN9P1_1E_TSESSION 52
 #define PLAN9P1_1E_RSESSION 53
 #define PLAN9P1_1E_TATTACH 58
 #define PLAN9P1_1E_RATTACH 59
+#define PLAN9P1_1E_AUTHCHALLEN 36
+#define PLAN9P1_1E_AUTHREPLYLEN 30
 
 typedef struct Error Error;
 
@@ -81,6 +85,8 @@ typedef enum Plan9P1Type {
     PLAN9P1_RWSTAT = 79,
     PLAN9P1_TCLWALK = 80,
     PLAN9P1_RCLWALK = 81,
+    PLAN9P1_TAUTH = PLAN9P1_1E_TAUTH,
+    PLAN9P1_RAUTH = PLAN9P1_1E_RAUTH,
     PLAN9P1_TSESSION = 84,
     PLAN9P1_RSESSION = 85,
     PLAN9P1_TATTACH = 86,
@@ -123,6 +129,8 @@ typedef struct Plan9P1Fcall {
     uint8_t aname[PLAN9P1_NAMELEN];
     uint8_t ename[PLAN9P1_ERRLEN];
     uint8_t challenge[PLAN9P1_CHALLEN];
+    uint8_t first_edition_challenge[PLAN9P1_1E_AUTHCHALLEN];
+    uint8_t first_edition_reply[PLAN9P1_1E_AUTHREPLYLEN];
     uint8_t ticket[PLAN9P1_TICKETLEN];
     uint8_t auth[PLAN9P1_AUTHLEN];
     uint8_t first_edition_auth[PLAN9P1_NAMELEN];

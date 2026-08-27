@@ -129,6 +129,30 @@ static const uint8_t wire_rsession[87] = {
     'a', 'u', 't', 'h',
     [39] = 'd', [40] = 'o', [41] = 'm',
 };
+static const uint8_t wire_tauth[69] = {
+    0x52, 0x02, 0x00, 0x0b, 0x00,
+    'n', 'o', 'n', 'e',
+    [33] = 0x10, [34] = 0x11, [35] = 0x12, [36] = 0x13,
+    [37] = 0x14, [38] = 0x15, [39] = 0x16, [40] = 0x17,
+    [41] = 0x18, [42] = 0x19, [43] = 0x1a, [44] = 0x1b,
+    [45] = 0x1c, [46] = 0x1d, [47] = 0x1e, [48] = 0x1f,
+    [49] = 0x20, [50] = 0x21, [51] = 0x22, [52] = 0x23,
+    [53] = 0x24, [54] = 0x25, [55] = 0x26, [56] = 0x27,
+    [57] = 0x28, [58] = 0x29, [59] = 0x2a, [60] = 0x2b,
+    [61] = 0x2c, [62] = 0x2d, [63] = 0x2e, [64] = 0x2f,
+    [65] = 0x30, [66] = 0x31, [67] = 0x32, [68] = 0x33,
+};
+static const uint8_t wire_rauth[35] = {
+    0x53, 0x03, 0x00, 0x0b, 0x00,
+    [5] = 0x40, [6] = 0x41, [7] = 0x42, [8] = 0x43,
+    [9] = 0x44, [10] = 0x45, [11] = 0x46, [12] = 0x47,
+    [13] = 0x48, [14] = 0x49, [15] = 0x4a, [16] = 0x4b,
+    [17] = 0x4c, [18] = 0x4d, [19] = 0x4e, [20] = 0x4f,
+    [21] = 0x50, [22] = 0x51, [23] = 0x52, [24] = 0x53,
+    [25] = 0x54, [26] = 0x55, [27] = 0x56, [28] = 0x57,
+    [29] = 0x58, [30] = 0x59, [31] = 0x5a, [32] = 0x5b,
+    [33] = 0x5c, [34] = 0x5d,
+};
 static const uint8_t wire_tattach[146] = {
     0x56, 0x51, 0x12, 0x2a, 0x00,
     'g', 'l', 'e', 'n', [33] = '/',
@@ -155,6 +179,7 @@ static const WireCase wire_cases[] = {
     WIRE_CASE(twstat), WIRE_CASE(rwstat),
     WIRE_CASE(tclwalk), WIRE_CASE(rclwalk),
     WIRE_CASE(tsession), WIRE_CASE(rsession),
+    WIRE_CASE(tauth), WIRE_CASE(rauth),
     WIRE_CASE(tattach), WIRE_CASE(rattach),
 };
 
@@ -247,6 +272,25 @@ static void test_golden_fields(void)
     g_assert_cmpuint(fcall.ticket[PLAN9P1_TICKETLEN - 1], ==, 0xa2);
     g_assert_cmpuint(fcall.auth[0], ==, 0xb1);
     g_assert_cmpuint(fcall.auth[PLAN9P1_AUTHLEN - 1], ==, 0xb2);
+
+    g_assert_cmpint(plan9p1_decode(wire_tauth, sizeof(wire_tauth),
+                                  &fcall, &err), ==, 0);
+    g_assert_cmpuint(fcall.type, ==, PLAN9P1_TAUTH);
+    g_assert_true(fcall.first_edition);
+    g_assert_cmpuint(fcall.fid, ==, 0x000b);
+    g_assert_cmpmem(fcall.uname, 4, "none", 4);
+    g_assert_cmpuint(fcall.first_edition_challenge[0], ==, 0x10);
+    g_assert_cmpuint(fcall.first_edition_challenge[
+                         PLAN9P1_1E_AUTHCHALLEN - 1], ==, 0x33);
+
+    g_assert_cmpint(plan9p1_decode(wire_rauth, sizeof(wire_rauth),
+                                  &fcall, &err), ==, 0);
+    g_assert_cmpuint(fcall.type, ==, PLAN9P1_RAUTH);
+    g_assert_true(fcall.first_edition);
+    g_assert_cmpuint(fcall.fid, ==, 0x000b);
+    g_assert_cmpuint(fcall.first_edition_reply[0], ==, 0x40);
+    g_assert_cmpuint(fcall.first_edition_reply[
+                         PLAN9P1_1E_AUTHREPLYLEN - 1], ==, 0x5d);
 }
 
 static void test_fragment_splits(void)
@@ -464,6 +508,8 @@ static void test_malformed_frames(void)
     uint8_t encoded[PLAN9P1_MAX_FRAME];
 
     assert_decode_fails(wire_tnop, sizeof(wire_tnop) - 1);
+    assert_decode_fails(wire_tauth, sizeof(wire_tauth) - 1);
+    assert_decode_fails(wire_rauth, sizeof(wire_rauth) - 1);
     memcpy(bad_write, wire_twrite, sizeof(wire_twrite));
     bad_write[sizeof(wire_twrite)] = 0xff;
     assert_decode_fails(bad_write, sizeof(bad_write));

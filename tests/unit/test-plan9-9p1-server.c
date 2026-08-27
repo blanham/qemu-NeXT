@@ -2661,6 +2661,45 @@ static void test_literal_first_edition_boot_wire(ServerFixture *f,
     literal_exchange(f, tattach, sizeof(tattach), rattach, sizeof(rattach));
 }
 
+static void test_first_edition_none_auth(ServerFixture *f,
+                                         gconstpointer opaque)
+{
+    static const uint8_t none_key[PLAN9_AUTH_DES_KEY_LEN] = { 0 };
+    static const uint8_t client_challenge[7] = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    };
+    Plan9P1Fcall call = {
+        .type = PLAN9P1_TAUTH,
+        .first_edition = true,
+        .tag = 2,
+        .fid = 11,
+    };
+    Plan9P1Fcall reply;
+
+    set_name(call.uname, "none");
+    call.first_edition_challenge[0] = 1; /* FScchal */
+    memcpy(call.first_edition_challenge + 1, client_challenge,
+           sizeof(client_challenge));
+    memcpy(call.first_edition_challenge + 8, "boot", 4);
+    g_assert_cmpint(plan9_auth_encrypt(none_key,
+                                       call.first_edition_challenge,
+                                       sizeof(call.first_edition_challenge),
+                                       &error_abort), ==, 0);
+
+    reply = transact(f, &call);
+    g_assert_cmpuint(reply.type, ==, PLAN9P1_RAUTH);
+    g_assert_true(reply.first_edition);
+    g_assert_cmpuint(reply.tag, ==, call.tag);
+    g_assert_cmpuint(reply.fid, ==, call.fid);
+    g_assert_cmpint(plan9_auth_decrypt(none_key,
+                                       reply.first_edition_reply,
+                                       sizeof(reply.first_edition_reply),
+                                       &error_abort), ==, 0);
+    g_assert_cmpuint(reply.first_edition_reply[0], ==, 4); /* FSctick */
+    g_assert_cmpmem(reply.first_edition_reply + 1, sizeof(client_challenge),
+                    client_challenge, sizeof(client_challenge));
+}
+
 static void test_flush_active_and_queued(ServerFixture *f,
                                          gconstpointer opaque)
 {
@@ -4486,6 +4525,9 @@ int main(int argc, char **argv)
                fixture_setup, test_boot_sequence, fixture_teardown);
     g_test_add("/plan9-9p1-server/first-edition-boot-wire", ServerFixture,
                NULL, fixture_setup, test_literal_first_edition_boot_wire,
+               fixture_teardown);
+    g_test_add("/plan9-9p1-server/first-edition-none-auth", ServerFixture,
+               NULL, fixture_setup, test_first_edition_none_auth,
                fixture_teardown);
     g_test_add("/plan9-9p1-server/fid-path-errors", ServerFixture, NULL,
                fixture_setup, test_fid_and_path_errors, fixture_teardown);
