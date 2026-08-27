@@ -371,6 +371,15 @@ static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
 {
     int keycode;
 
+    if (evt->key.key == KEY_LEFTCTRL || evt->key.key == KEY_RIGHTCTRL) {
+        if (evt->key.down) {
+            s->shift |= KD_CNTL;
+        } else {
+            s->shift &= ~KD_CNTL;
+        }
+        return;
+    }
+
     if (evt->key.key == KEY_LEFTALT) {
         if (evt->key.down) {
             s->shift |= KD_LALT;

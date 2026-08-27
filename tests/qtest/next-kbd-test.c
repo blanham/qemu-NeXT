@@ -52,6 +52,7 @@
 #define NEXT_KBD_CTX      0x00001000
 #define NEXT_MON_DTX      0x00004000
 #define NEXT_KBD_VALID    0x00008000
+#define NEXT_KBD_CTRL     0x00000100
 #define NEXT_KBD_LSHIFT   0x00000200
 #define NEXT_KBD_LALT     0x00002000
 #define NEXT_KBD_RALT     0x00004000
@@ -60,6 +61,7 @@
 #define NEXT_MOUSE_RIGHT_RELEASED 0x00000100
 #define NEXT_MOUSE_LEFT_RELEASED  0x00000001
 #define NEXT_KEY_A        0x39
+#define NEXT_KEY_C        0x33
 #define NEXT_KEY_UP       0x80
 #define NEXT_KEY_LEFT_ARROW  0x09
 #define NEXT_KEY_DOWN_ARROW  0x0f
@@ -764,6 +766,24 @@ static void test_alt_modifiers(void)
     qtest_quit(qts);
 }
 
+static void test_control_modifier(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_key(qts, "ctrl", true);
+    send_key(qts, "c", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_CTRL | NEXT_KEY_C);
+    send_key(qts, "c", false);
+    send_key(qts, "ctrl", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_CTRL | NEXT_KEY_UP | NEXT_KEY_C);
+
+    qtest_quit(qts);
+}
+
 static void test_mouse_packet_irq_and_data(void)
 {
     QTestState *qts = next_cube_kbd_start();
@@ -1457,6 +1477,7 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/kbd/key-dequeue-modifiers",
                    test_key_dequeue_modifiers);
     qtest_add_func("/next-cube/kbd/alt-modifiers", test_alt_modifiers);
+    qtest_add_func("/next-cube/kbd/control-modifier", test_control_modifier);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
                    test_idle_csr_ctx_clear);
     qtest_add_func("/next-cube/monitor/sound-handshake-and-overrun",
