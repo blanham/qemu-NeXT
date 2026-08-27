@@ -1418,6 +1418,8 @@ static void next_machine_init(MachineState *machine)
 
     /* Serial ports and clock select */
     serial_dev = qdev_new(TYPE_NEXT_SERIAL);
+    object_property_set_link(OBJECT(serial_dev), "dma", OBJECT(m->dma),
+                             &error_abort);
     qdev_prop_set_chr(serial_dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(serial_dev, "chrB", serial_hd(1));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);

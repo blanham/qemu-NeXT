@@ -31,6 +31,7 @@ typedef struct {
 #define ESCC_SERIAL_REGS 16
 typedef struct ESCCChannelState {
     qemu_irq irq;
+    qemu_irq dma_request;
     uint32_t rxint, txint, rxint_under_svc, txint_under_svc;
     struct ESCCChannelState *otherchn;
     uint32_t reg;
@@ -68,5 +69,8 @@ struct ESCCState {
 void escc_set_clock_inputs(ESCCState *s, uint32_t pclk_hz,
                            uint32_t ch_b_rtxc_hz,
                            uint32_t ch_a_rtxc_hz);
+bool escc_dma_is_receive(ESCCState *s, unsigned channel);
+bool escc_dma_read_byte(ESCCState *s, unsigned channel, uint8_t *value);
+bool escc_dma_write_byte(ESCCState *s, unsigned channel, uint8_t value);
 
 #endif

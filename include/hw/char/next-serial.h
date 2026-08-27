@@ -36,6 +36,7 @@
 #include "qom/object.h"
 
 #define TYPE_NEXT_SERIAL "next-serial"
+#define NEXT_SERIAL_DMA_REQUEST_GPIO "dma-request"
 
 OBJECT_DECLARE_SIMPLE_TYPE(NextSerialState, NEXT_SERIAL)
 

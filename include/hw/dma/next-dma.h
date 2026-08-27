@@ -75,6 +75,12 @@ typedef struct NextDMASoundOutNotify {
     void (*state_changed)(void *opaque);
 } NextDMASoundOutNotify;
 
+typedef struct NextDMASCCOps {
+    bool (*is_receive)(void *opaque, unsigned channel);
+    bool (*read_byte)(void *opaque, unsigned channel, uint8_t *value);
+    bool (*write_byte)(void *opaque, unsigned channel, uint8_t value);
+} NextDMASCCOps;
+
 void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len);
 void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len);
 void next_dma_scsi_fifo_reset(NextDMAState *s);
@@ -88,6 +94,9 @@ bool next_dma_sound_out_complete(NextDMAState *s);
 void next_dma_set_sound_out_notify(NextDMAState *s,
                                    const NextDMASoundOutNotify *notify,
                                    void *opaque);
+void next_dma_set_scc_ops(NextDMAState *s, const NextDMASCCOps *ops,
+                          void *opaque);
+void next_dma_set_scc_request(NextDMAState *s, unsigned channel, bool level);
 
 NextDMAResult next_dma_enet_tx_read(NextDMAState *s, uint8_t *frame,
                                     size_t capacity, size_t *length);
