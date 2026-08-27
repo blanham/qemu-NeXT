@@ -45,6 +45,12 @@
 #define PLAN9P1_MAX_DATA 8192
 #define PLAN9P1_MAX_FRAME (16 + PLAN9P1_MAX_DATA)
 
+/* The First Edition placed session and attach messages in the initial gap. */
+#define PLAN9P1_1E_TSESSION 52
+#define PLAN9P1_1E_RSESSION 53
+#define PLAN9P1_1E_TATTACH 58
+#define PLAN9P1_1E_RATTACH 59
+
 typedef struct Error Error;
 
 typedef enum Plan9P1Type {
@@ -101,6 +107,7 @@ typedef struct Plan9P1Dir {
 
 typedef struct Plan9P1Fcall {
     Plan9P1Type type;
+    bool first_edition;
     uint16_t tag;
     uint16_t fid;
     uint16_t newfid;
@@ -118,6 +125,7 @@ typedef struct Plan9P1Fcall {
     uint8_t challenge[PLAN9P1_CHALLEN];
     uint8_t ticket[PLAN9P1_TICKETLEN];
     uint8_t auth[PLAN9P1_AUTHLEN];
+    uint8_t first_edition_auth[PLAN9P1_NAMELEN];
     uint8_t authid[PLAN9P1_NAMELEN];
     uint8_t authdom[PLAN9P1_DOMLEN];
     Plan9P1Qid qid;

@@ -1232,6 +1232,7 @@ static void encode_error(Plan9P1Request *request, uint16_t tag,
     Plan9P1Fcall reply = {
         .type = PLAN9P1_RERROR,
         .tag = tag,
+        .first_edition = request->tx.first_edition,
     };
     const char *text = message;
 
@@ -2473,6 +2474,7 @@ static void coroutine_fn handle_request(Plan9P1Request *request)
     Plan9P1Server *server = request->server;
     Plan9P1Fcall reply = {
         .tag = request->tx.tag,
+        .first_edition = request->tx.first_edition,
     };
     int ret = 0;
 

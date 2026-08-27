@@ -2637,6 +2637,30 @@ static void test_literal_boot_wire(ServerFixture *f, gconstpointer opaque)
     literal_exchange(f, tflush, sizeof(tflush), rflush, sizeof(rflush));
 }
 
+static void test_literal_first_edition_boot_wire(ServerFixture *f,
+                                                 gconstpointer opaque)
+{
+    static const uint8_t tsession[3] = {
+        [0] = 52, [1] = 0xff, [2] = 0xff,
+    };
+    static const uint8_t rsession[3] = {
+        [0] = 53, [1] = 0xff, [2] = 0xff,
+    };
+    static const uint8_t tattach[89] = {
+        [0] = 58, [1] = 1, [3] = 1,
+    };
+    static const uint8_t rattach[13] = {
+        [0] = 59, [1] = 1, [3] = 1,
+        [5] = 0x00, [6] = 0x01, [7] = 0x00, [8] = 0x81,
+        [9] = 0xd0, [10] = 0x07,
+    };
+
+    f->literal_stats = true;
+    literal_exchange(f, tsession, sizeof(tsession),
+                     rsession, sizeof(rsession));
+    literal_exchange(f, tattach, sizeof(tattach), rattach, sizeof(rattach));
+}
+
 static void test_flush_active_and_queued(ServerFixture *f,
                                          gconstpointer opaque)
 {
@@ -4460,6 +4484,9 @@ int main(int argc, char **argv)
                fixture_setup, test_session_reply, fixture_teardown);
     g_test_add("/plan9-9p1-server/boot-sequence", ServerFixture, NULL,
                fixture_setup, test_boot_sequence, fixture_teardown);
+    g_test_add("/plan9-9p1-server/first-edition-boot-wire", ServerFixture,
+               NULL, fixture_setup, test_literal_first_edition_boot_wire,
+               fixture_teardown);
     g_test_add("/plan9-9p1-server/fid-path-errors", ServerFixture, NULL,
                fixture_setup, test_fid_and_path_errors, fixture_teardown);
     g_test_add("/plan9-9p1-server/clwalk-directory", ServerFixture, NULL,

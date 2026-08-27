@@ -99,6 +99,9 @@ static size_t fixed_length(int64_t type)
     case PLAN9P1_TCLONE:
     case PLAN9P1_RWRITE:
         return 7;
+    case PLAN9P1_1E_TSESSION:
+    case PLAN9P1_1E_RSESSION:
+        return 3;
     case PLAN9P1_TSESSION:
         return 11;
     case PLAN9P1_RWALK:
@@ -110,6 +113,8 @@ static size_t fixed_length(int64_t type)
         return 15;
     case PLAN9P1_RATTACH:
         return 26;
+    case PLAN9P1_1E_RATTACH:
+        return 13;
     case PLAN9P1_TWALK:
         return 33;
     case PLAN9P1_TCLWALK:
@@ -123,6 +128,8 @@ static size_t fixed_length(int64_t type)
         return 121;
     case PLAN9P1_TATTACH:
         return 146;
+    case PLAN9P1_1E_TATTACH:
+        return 89;
     case PLAN9P1_RREAD:
     case PLAN9P1_TWRITE:
         return 0;
@@ -393,7 +400,27 @@ int plan9p1_decode(const uint8_t *buf, size_t len,
         return -1;
     }
 
-    fcall->type = buf[0];
+    switch (buf[0]) {
+    case PLAN9P1_1E_TSESSION:
+        fcall->type = PLAN9P1_TSESSION;
+        fcall->first_edition = true;
+        break;
+    case PLAN9P1_1E_RSESSION:
+        fcall->type = PLAN9P1_RSESSION;
+        fcall->first_edition = true;
+        break;
+    case PLAN9P1_1E_TATTACH:
+        fcall->type = PLAN9P1_TATTACH;
+        fcall->first_edition = true;
+        break;
+    case PLAN9P1_1E_RATTACH:
+        fcall->type = PLAN9P1_RATTACH;
+        fcall->first_edition = true;
+        break;
+    default:
+        fcall->type = buf[0];
+        break;
+    }
     if (len >= 3) {
         fcall->tag = load_u16(buf + 1);
     }
@@ -495,26 +522,37 @@ int plan9p1_decode(const uint8_t *buf, size_t len,
         GET(cursor_get(&cursor, fcall->name, sizeof(fcall->name)));
         break;
     case PLAN9P1_TSESSION:
-        GET(cursor_get(&cursor, fcall->challenge,
-                       sizeof(fcall->challenge)));
+        if (!fcall->first_edition) {
+            GET(cursor_get(&cursor, fcall->challenge,
+                           sizeof(fcall->challenge)));
+        }
         break;
     case PLAN9P1_RSESSION:
-        GET(cursor_get(&cursor, fcall->challenge,
-                       sizeof(fcall->challenge)));
-        GET(cursor_get(&cursor, fcall->authid, sizeof(fcall->authid)));
-        GET(cursor_get(&cursor, fcall->authdom, sizeof(fcall->authdom)));
+        if (!fcall->first_edition) {
+            GET(cursor_get(&cursor, fcall->challenge,
+                           sizeof(fcall->challenge)));
+            GET(cursor_get(&cursor, fcall->authid, sizeof(fcall->authid)));
+            GET(cursor_get(&cursor, fcall->authdom, sizeof(fcall->authdom)));
+        }
         break;
     case PLAN9P1_TATTACH:
         GET(cursor_get_u16(&cursor, &fcall->fid));
         GET(cursor_get(&cursor, fcall->uname, sizeof(fcall->uname)));
         GET(cursor_get(&cursor, fcall->aname, sizeof(fcall->aname)));
-        GET(cursor_get(&cursor, fcall->ticket, sizeof(fcall->ticket)));
-        GET(cursor_get(&cursor, fcall->auth, sizeof(fcall->auth)));
+        if (fcall->first_edition) {
+            GET(cursor_get(&cursor, fcall->first_edition_auth,
+                           sizeof(fcall->first_edition_auth)));
+        } else {
+            GET(cursor_get(&cursor, fcall->ticket, sizeof(fcall->ticket)));
+            GET(cursor_get(&cursor, fcall->auth, sizeof(fcall->auth)));
+        }
         break;
     case PLAN9P1_RATTACH:
         GET(cursor_get_u16(&cursor, &fcall->fid));
         GET(cursor_get_qid(&cursor, &fcall->qid));
-        GET(cursor_get(&cursor, fcall->auth, sizeof(fcall->auth)));
+        if (!fcall->first_edition) {
+            GET(cursor_get(&cursor, fcall->auth, sizeof(fcall->auth)));
+        }
         break;
     default:
         g_assert_not_reached();
@@ -599,6 +637,20 @@ static ssize_t encoded_length(const Plan9P1Fcall *fcall, Error **errp)
     int64_t type = fcall->type;
     size_t length = fixed_length(type);
 
+    if (fcall->first_edition) {
+        switch (fcall->type) {
+        case PLAN9P1_TSESSION:
+        case PLAN9P1_RSESSION:
+            return 3;
+        case PLAN9P1_TATTACH:
+            return 89;
+        case PLAN9P1_RATTACH:
+            return 13;
+        default:
+            break;
+        }
+    }
+
     if (length == SIZE_MAX) {
         error_setg(errp, "unknown 9P1 message type %" PRId64, type);
         return -1;
@@ -626,6 +678,7 @@ ssize_t plan9p1_encode(uint8_t *buf, size_t capacity,
 {
     Plan9P1Cursor cursor;
     ssize_t length;
+    uint8_t type = fcall ? fcall->type : 0;
 
     if (!fcall) {
         error_setg(errp, "9P1 input fcall is NULL");
@@ -653,7 +706,25 @@ ssize_t plan9p1_encode(uint8_t *buf, size_t capacity,
 
     cursor.p = buf;
     cursor.end = buf + length;
-    cursor_put_u8(&cursor, fcall->type);
+    if (fcall->first_edition) {
+        switch (fcall->type) {
+        case PLAN9P1_TSESSION:
+            type = PLAN9P1_1E_TSESSION;
+            break;
+        case PLAN9P1_RSESSION:
+            type = PLAN9P1_1E_RSESSION;
+            break;
+        case PLAN9P1_TATTACH:
+            type = PLAN9P1_1E_TATTACH;
+            break;
+        case PLAN9P1_RATTACH:
+            type = PLAN9P1_1E_RATTACH;
+            break;
+        default:
+            break;
+        }
+    }
+    cursor_put_u8(&cursor, type);
     cursor_put_u16(&cursor, fcall->tag);
     switch (fcall->type) {
     case PLAN9P1_TNOP:
@@ -733,24 +804,35 @@ ssize_t plan9p1_encode(uint8_t *buf, size_t capacity,
         cursor_put(&cursor, fcall->name, sizeof(fcall->name));
         break;
     case PLAN9P1_TSESSION:
-        cursor_put(&cursor, fcall->challenge, sizeof(fcall->challenge));
+        if (!fcall->first_edition) {
+            cursor_put(&cursor, fcall->challenge, sizeof(fcall->challenge));
+        }
         break;
     case PLAN9P1_RSESSION:
-        cursor_put(&cursor, fcall->challenge, sizeof(fcall->challenge));
-        cursor_put(&cursor, fcall->authid, sizeof(fcall->authid));
-        cursor_put(&cursor, fcall->authdom, sizeof(fcall->authdom));
+        if (!fcall->first_edition) {
+            cursor_put(&cursor, fcall->challenge, sizeof(fcall->challenge));
+            cursor_put(&cursor, fcall->authid, sizeof(fcall->authid));
+            cursor_put(&cursor, fcall->authdom, sizeof(fcall->authdom));
+        }
         break;
     case PLAN9P1_TATTACH:
         cursor_put_u16(&cursor, fcall->fid);
         cursor_put(&cursor, fcall->uname, sizeof(fcall->uname));
         cursor_put(&cursor, fcall->aname, sizeof(fcall->aname));
-        cursor_put(&cursor, fcall->ticket, sizeof(fcall->ticket));
-        cursor_put(&cursor, fcall->auth, sizeof(fcall->auth));
+        if (fcall->first_edition) {
+            cursor_put(&cursor, fcall->first_edition_auth,
+                       sizeof(fcall->first_edition_auth));
+        } else {
+            cursor_put(&cursor, fcall->ticket, sizeof(fcall->ticket));
+            cursor_put(&cursor, fcall->auth, sizeof(fcall->auth));
+        }
         break;
     case PLAN9P1_RATTACH:
         cursor_put_u16(&cursor, fcall->fid);
         cursor_put_qid(&cursor, &fcall->qid);
-        cursor_put(&cursor, fcall->auth, sizeof(fcall->auth));
+        if (!fcall->first_edition) {
+            cursor_put(&cursor, fcall->auth, sizeof(fcall->auth));
+        }
         break;
     default:
         g_assert_not_reached();
