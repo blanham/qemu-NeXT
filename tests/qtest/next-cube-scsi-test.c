@@ -47,10 +47,14 @@
 #define ESP_CMD_BUSRESET   0x03
 #define ESP_CMD_SEL        0x41
 #define ESP_CMD_SELATN     0x42
+#define ESP_CMD_NOP_DMA    0x80
 #define ESP_CMD_TI_DMA     0x90
 #define ESP_CMD_ICCS       0x11
 #define ESP_CMD_MSGACC     0x12
 #define ESP_STAT_INT       0x80
+#define ESP_STAT_TC        0x10
+#define ESP_STAT_PHASE     0x07
+#define ESP_STAT_DI        0x01
 #define ESP_INTR_DC        0x20
 #define ESP_INTR_IL        0x40
 #define ESP_CFG1_RESREPT   0x40
@@ -72,6 +76,8 @@
 #define SCSI_CSR_INTMASK    0x20
 #define SCSI_CSR_FIFOFL     0x04
 #define SCSI_CSR_DMADIR     0x08
+#define SCSI_CSR_DATA_OUT   0xf0
+#define SCSI_CSR_DATA_IN    0xf8
 
 #define NEXT_ESP_CLOCK_HZ  20000000
 #define NEXT_ESP_SEL_VALUE 0x99
@@ -114,9 +120,36 @@ static TestMedia test_media = {
     .cd_fd = -1,
 };
 
+static TestMedia test_media_destination = {
+    .rom_fd = -1,
+    .disk_fd = -1,
+    .cd_fd = -1,
+};
+
 static const uint8_t read_capacity_10[10] = { 0x25 };
 static const uint8_t read_10_cd_sector_1[10] = {
     0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0,
+};
+static const uint8_t netbsd_inquiry_32[6] = {
+    0x12, 0, 0, 0, 32, 0,
+};
+static const uint8_t netbsd_disk_inquiry_prefix[32] = {
+    0x00, 0x00, 0x05, 0x12, 0x1f, 0x00, 0x00, 0x10,
+    'Q', 'E', 'M', 'U', ' ', ' ', ' ', ' ',
+    'Q', 'E', 'M', 'U', ' ', 'H', 'A', 'R',
+    'D', 'D', 'I', 'S', 'K', ' ', ' ', ' ',
+};
+static const uint8_t netbsd_cd_inquiry_prefix[32] = {
+    0x05, 0x80, 0x05, 0x12, 0x1f, 0x00, 0x00, 0x10,
+    'Q', 'E', 'M', 'U', ' ', ' ', ' ', ' ',
+    'Q', 'E', 'M', 'U', ' ', 'C', 'D', '-',
+    'R', 'O', 'M', ' ', ' ', ' ', ' ', ' ',
+};
+static const uint8_t netbsd_disk_capacity[8] = {
+    0x00, 0x00, 0x03, 0xff, 0x00, 0x00, 0x02, 0x00,
+};
+static const uint8_t netbsd_cd_capacity[8] = {
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x08, 0x00,
 };
 
 static void issue_inquiry_dma(QTestState *qts, uint8_t target,
@@ -278,7 +311,8 @@ static QTestState *next_cube_scsi_cdrom_start(TestMedia *media)
                        quoted_rom_path, quoted_cd_path);
 }
 
-static QTestState *next_cube_scsi_media_start(TestMedia *media)
+static QTestState *next_cube_scsi_media_start_with_args(TestMedia *media,
+                                                        const char *extra_args)
 {
     uint8_t cd[NEXT_CD_SIZE];
     g_autofree char *quoted_rom_path = NULL;
@@ -325,9 +359,68 @@ static QTestState *next_cube_scsi_media_start(TestMedia *media)
     quoted_cd_path = g_shell_quote(media->cd_path);
     return qtest_initf(
         "-machine next-cube -bios %s "
-        "-drive file=%s,if=scsi,index=0,format=raw "
-        "-drive file=%s,if=scsi,index=3,format=raw,media=cdrom,readonly=on",
-        quoted_rom_path, quoted_disk_path, quoted_cd_path);
+        "-drive file=%s,if=none,id=netbsd-disk,format=raw "
+        "-device scsi-hd,drive=netbsd-disk,channel=0,scsi-id=0,lun=0,"
+        "vendor=QEMU,product='QEMU HARDDISK',ver=2.5+,scsi_version=5,"
+        "logical_block_size=512,physical_block_size=512 "
+        "-drive file=%s,if=none,id=netbsd-cd,format=raw,readonly=on "
+        "-device scsi-cd,drive=netbsd-cd,channel=0,scsi-id=3,lun=0,"
+        "vendor=QEMU,product='QEMU CD-ROM',ver=2.5+,scsi_version=5,"
+        "logical_block_size=2048,physical_block_size=2048 %s",
+        quoted_rom_path, quoted_disk_path, quoted_cd_path, extra_args ?: "");
+}
+
+static QTestState *next_cube_scsi_media_start(TestMedia *media)
+{
+    return next_cube_scsi_media_start_with_args(media, NULL);
+}
+
+static char *find_unattached_device(QTestState *qts, const char *type)
+{
+    g_autoptr(QDict) response = NULL;
+    g_autofree char *child_type = g_strdup_printf("child<%s>", type);
+    g_autofree char *path = NULL;
+    QList *children;
+    QListEntry *entry;
+
+    response = qtest_qmp(
+        qts, "{ 'execute': 'qom-list', "
+        "'arguments': { 'path': '/machine/unattached' } }");
+    g_assert_nonnull(response);
+    g_assert_true(qdict_haskey(response, "return"));
+    children = qdict_get_qlist(response, "return");
+    QLIST_FOREACH_ENTRY(children, entry) {
+        QDict *child = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(child, "type"), child_type)) {
+            g_assert_null(path);
+            path = g_strdup_printf("/machine/unattached/%s",
+                                   qdict_get_str(child, "name"));
+        }
+    }
+    g_assert_nonnull(path);
+
+    return g_steal_pointer(&path);
+}
+
+static void unrealize_next_kbd(QTestState *qts)
+{
+    g_autofree char *path = find_unattached_device(qts, "next-kbd");
+
+    qtest_qmp_assert_success(
+        qts,
+        "{ 'execute': 'qom-set', 'arguments': { "
+        "'path': %s, 'property': 'realized', 'value': false } }", path);
+}
+
+static void migrate_wait(QTestState *source, QTestState *destination,
+                         const char *uri)
+{
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
 }
 
 static void test_scsi_cdrom_command_line(void)
@@ -412,6 +505,7 @@ static QTestState *start_scsi_write_dma(TestDisk *disk,
     qtest_writeb(qts, NEXT_ESP_TCLO, 0);
     qtest_writeb(qts, NEXT_ESP_TCMID, 2);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_OUT);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     return qts;
@@ -471,6 +565,8 @@ static void test_scsi_disabled_dma_does_not_complete(void)
     qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
     qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
     qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + INQUIRY_LENGTH);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CSR), ==, SCSI_CSR_DATA_IN);
 
     issue_inquiry_dma(qts, 0, INQUIRY_LENGTH);
 
@@ -585,6 +681,7 @@ static void test_scsi_dma_tail_four_fifofl_edges(void)
     qtest_writeb(qts, NEXT_ESP_TCLO, INQUIRY_LENGTH);
     qtest_writeb(qts, NEXT_ESP_TCMID, 0);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     /*
@@ -858,6 +955,7 @@ static void test_scsi_read_dma_chain(void)
     qtest_writeb(qts, NEXT_ESP_TCLO, 0);
     qtest_writeb(qts, NEXT_ESP_TCMID, 2);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     wait_for_scsi_command_completion(qts);
@@ -949,6 +1047,7 @@ static void test_scsi_chained_tail_overflow(void)
     qtest_writeb(qts, NEXT_ESP_TCLO, TRANSFER_LENGTH & 0xff);
     qtest_writeb(qts, NEXT_ESP_TCMID, TRANSFER_LENGTH >> 8);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     wait_for_scsi_command_completion(qts);
@@ -1026,6 +1125,7 @@ static void issue_inquiry_dma(QTestState *qts, uint8_t target,
     qtest_writeb(qts, NEXT_ESP_TCLO, length);
     qtest_writeb(qts, NEXT_ESP_TCMID, 0);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 }
 
@@ -1037,6 +1137,332 @@ static void finish_scsi_command(QTestState *qts)
     g_assert_cmphex(qtest_readb(qts, NEXT_ESP_FIFO), ==, 0);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_MSGACC);
     qtest_readb(qts, NEXT_ESP_INTR);
+}
+
+static uint32_t read_esp_transfer_count(QTestState *qts)
+{
+    return qtest_readb(qts, NEXT_ESP_TCLO) |
+           qtest_readb(qts, NEXT_ESP_TCMID) << 8 |
+           qtest_readb(qts, NEXT_ESP_TCHI) << 16;
+}
+
+static void assert_poisoned_scsi_buffer(QTestState *qts, hwaddr guest_buffer,
+                                        size_t length, uint8_t poison)
+{
+    g_autofree uint8_t *received = g_malloc(length);
+    size_t i;
+
+    qtest_memread(qts, guest_buffer, received, length);
+    for (i = 0; i < length; i++) {
+        g_assert_cmphex(received[i], ==, poison);
+    }
+}
+
+static void assert_netbsd_ti_pending(QTestState *qts, size_t transfer_len,
+                                     bool next_dma_enabled)
+{
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT) & ESP_STAT_PHASE,
+                    ==, ESP_STAT_DI);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT) & ESP_STAT_TC, ==, 0);
+    g_assert_cmphex(read_esp_transfer_count(qts), ==, transfer_len);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
+                    ==, next_dma_enabled ? DMA_ENABLE : 0);
+    assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER, transfer_len, 0xa5);
+}
+
+static void consume_power_on_unit_attention(QTestState *qts, uint8_t target)
+{
+    static const uint8_t test_unit_ready[6] = { 0 };
+
+    g_assert_cmphex(submit_nodata_cdb(qts, target, test_unit_ready), ==, 0x02);
+    g_assert_cmphex(submit_nodata_cdb(qts, target, test_unit_ready), ==, 0x00);
+}
+
+static void run_netbsd_data_in(QTestState *qts, uint8_t target,
+                               const uint8_t *cdb, size_t cdb_len,
+                               const uint8_t *expected, size_t transfer_len,
+                               bool enable_next_dma_before_ti)
+{
+    enum {
+        DMA_BEAT_LENGTH = 16,
+        DMA_FIFOFL_EDGES = 4,
+        NETBSD_DCTL_DATA_IN_LOW = 0xe8,
+    };
+    g_autofree uint8_t *received = g_malloc(transfer_len);
+    size_t dma_window_len = QEMU_ALIGN_UP(transfer_len, DMA_BEAT_LENGTH);
+    size_t i;
+
+    g_assert_cmpuint(transfer_len, <=, 0xffffff);
+    consume_power_on_unit_attention(qts, target);
+    qtest_writeb(qts, NEXT_SCSI_CSR, NETBSD_DCTL_DATA_IN_LOW);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CSR), ==,
+                    NETBSD_DCTL_DATA_IN_LOW);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, dma_window_len);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + dma_window_len);
+    if (enable_next_dma_before_ti) {
+        qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    }
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, target);
+    qtest_writeb(qts, NEXT_ESP_FIFO, 0xc0);
+    for (i = 0; i < cdb_len; i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, cdb[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SELATN);
+    qtest_readb(qts, NEXT_ESP_INTR);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT) & ESP_STAT_PHASE,
+                    ==, ESP_STAT_DI);
+
+    qtest_writeb(qts, NEXT_ESP_TCLO, transfer_len & 0xff);
+    qtest_writeb(qts, NEXT_ESP_TCMID, (transfer_len >> 8) & 0xff);
+    qtest_writeb(qts, NEXT_ESP_TCHI, (transfer_len >> 16) & 0xff);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_NOP_DMA);
+    g_assert_cmphex(read_esp_transfer_count(qts), ==, transfer_len);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+
+    assert_netbsd_ti_pending(qts, transfer_len,
+                             enable_next_dma_before_ti);
+    if (!enable_next_dma_before_ti) {
+        qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+        assert_netbsd_ti_pending(qts, transfer_len, true);
+    }
+
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    g_assert_cmphex(read_esp_transfer_count(qts), ==, 0);
+    finish_scsi_command(qts);
+
+    if (transfer_len % DMA_BEAT_LENGTH) {
+        for (i = 0; i < DMA_FIFOFL_EDGES; i++) {
+            qtest_writeb(qts, NEXT_SCSI_CSR,
+                         SCSI_CSR_DATA_IN | SCSI_CSR_FIFOFL);
+            qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+        }
+    }
+
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, transfer_len);
+    g_assert_cmpmem(received, transfer_len, expected, transfer_len);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + dma_window_len);
+}
+
+static void issue_new_netbsd_inquiry_ti(QTestState *qts, uint8_t target)
+{
+    size_t i;
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5,
+                 sizeof(netbsd_disk_inquiry_prefix));
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + sizeof(netbsd_disk_inquiry_prefix));
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, target);
+    qtest_writeb(qts, NEXT_ESP_FIFO, 0xc0);
+    for (i = 0; i < sizeof(netbsd_inquiry_32); i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, netbsd_inquiry_32[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SELATN);
+    qtest_readb(qts, NEXT_ESP_INTR);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT) & ESP_STAT_PHASE,
+                    ==, ESP_STAT_DI);
+
+    qtest_writeb(qts, NEXT_ESP_TCLO,
+                 sizeof(netbsd_disk_inquiry_prefix));
+    qtest_writeb(qts, NEXT_ESP_TCMID, 0);
+    qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_NOP_DMA);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+}
+
+static void assert_new_netbsd_inquiry_complete(QTestState *qts)
+{
+    uint8_t received[sizeof(netbsd_disk_inquiry_prefix)];
+
+    g_assert_cmphex(read_esp_transfer_count(qts), ==, 0);
+    finish_scsi_command(qts);
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, sizeof(received));
+    g_assert_cmpmem(received, sizeof(received), netbsd_disk_inquiry_prefix,
+                    sizeof(netbsd_disk_inquiry_prefix));
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER + sizeof(received));
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
+                    ==, DMA_COMPLETE);
+}
+
+static void test_scsi_netbsd_order_disk_inquiry(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 0, netbsd_inquiry_32,
+                       sizeof(netbsd_inquiry_32),
+                       netbsd_disk_inquiry_prefix,
+                       sizeof(netbsd_disk_inquiry_prefix), false);
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_netbsd_order_cd_inquiry(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 3, netbsd_inquiry_32,
+                       sizeof(netbsd_inquiry_32), netbsd_cd_inquiry_prefix,
+                       sizeof(netbsd_cd_inquiry_prefix), false);
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_netbsd_order_disk_read_capacity(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 0, read_capacity_10, sizeof(read_capacity_10),
+                       netbsd_disk_capacity, sizeof(netbsd_disk_capacity),
+                       false);
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_netbsd_order_cd_read_capacity(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 3, read_capacity_10, sizeof(read_capacity_10),
+                       netbsd_cd_capacity, sizeof(netbsd_cd_capacity), false);
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_netbsd_order_retains_response_until_dctl_cpudma(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 0, netbsd_inquiry_32,
+                       sizeof(netbsd_inquiry_32),
+                       netbsd_disk_inquiry_prefix,
+                       sizeof(netbsd_disk_inquiry_prefix), false);
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_cpudma_low_retains_response(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 0, netbsd_inquiry_32,
+                       sizeof(netbsd_inquiry_32),
+                       netbsd_disk_inquiry_prefix,
+                       sizeof(netbsd_disk_inquiry_prefix), true);
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_reset_forces_cpudma_low_for_new_ti(void)
+{
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    consume_power_on_unit_attention(qts, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CSR), ==, SCSI_CSR_DATA_IN);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CSR), ==, 0);
+    consume_power_on_unit_attention(qts, 0);
+
+    issue_new_netbsd_inquiry_ti(qts, 0);
+    assert_netbsd_ti_pending(qts, sizeof(netbsd_disk_inquiry_prefix), true);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    assert_new_netbsd_inquiry_complete(qts);
+
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void run_scsi_migration_owner_test(bool cpudma_high)
+{
+    enum {
+        NETBSD_DCTL_DATA_IN_LOW = 0xe8,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    TestMedia *source_media = &test_media;
+    TestMedia *destination_media = &test_media_destination;
+    QTestState *source;
+    QTestState *destination;
+
+    tmpdir = g_dir_make_tmp("next-scsi-owner-migration-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scsi_media_start_with_args(destination_media,
+                                                        incoming_args);
+    source = next_cube_scsi_media_start(source_media);
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+
+    consume_power_on_unit_attention(source, 0);
+    qtest_writeb(source, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    g_assert_cmphex(qtest_readb(source, NEXT_SCSI_CSR), ==,
+                    SCSI_CSR_DATA_IN);
+    if (!cpudma_high) {
+        qtest_writeb(source, NEXT_SCSI_CSR, NETBSD_DCTL_DATA_IN_LOW);
+        g_assert_cmphex(qtest_readb(source, NEXT_SCSI_CSR), ==,
+                        NETBSD_DCTL_DATA_IN_LOW);
+    }
+
+    migrate_wait(source, destination, uri);
+    g_assert_cmphex(qtest_readb(destination, NEXT_SCSI_CSR), ==,
+                    cpudma_high ? SCSI_CSR_DATA_IN :
+                                  NETBSD_DCTL_DATA_IN_LOW);
+
+    issue_new_netbsd_inquiry_ti(destination, 0);
+    if (cpudma_high) {
+        assert_new_netbsd_inquiry_complete(destination);
+    } else {
+        assert_netbsd_ti_pending(destination,
+                                 sizeof(netbsd_disk_inquiry_prefix), true);
+        qtest_writeb(destination, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+        assert_new_netbsd_inquiry_complete(destination);
+    }
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    cleanup_test_media(source_media);
+    cleanup_test_media(destination_media);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_scsi_migration_restores_cpudma_low_for_new_ti(void)
+{
+    run_scsi_migration_owner_test(false);
+}
+
+static void test_scsi_migration_restores_cpudma_high_for_new_ti(void)
+{
+    run_scsi_migration_owner_test(true);
 }
 
 static void read_scsi_dma(QTestState *qts, uint8_t target,
@@ -1065,6 +1491,7 @@ static void read_scsi_dma(QTestState *qts, uint8_t target,
     qtest_writeb(qts, NEXT_ESP_TCLO, transfer_len & 0xff);
     qtest_writeb(qts, NEXT_ESP_TCMID, (transfer_len >> 8) & 0xff);
     qtest_writeb(qts, NEXT_ESP_TCHI, (transfer_len >> 16) & 0xff);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
     wait_for_scsi_command_completion(qts);
     finish_scsi_command(qts);
@@ -1217,6 +1644,7 @@ static void read_cd_sector_1_dma_chain(QTestState *qts)
     qtest_writeb(qts, NEXT_ESP_TCLO, NEXT_CD_SECTOR_SIZE & 0xff);
     qtest_writeb(qts, NEXT_ESP_TCMID, NEXT_CD_SECTOR_SIZE >> 8);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     wait_for_scsi_command_completion(qts);
@@ -1526,6 +1954,7 @@ static void test_scsi_write_dma_chain(void)
     qtest_writeb(qts, NEXT_ESP_TCLO, 0);
     qtest_writeb(qts, NEXT_ESP_TCMID, 2);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_OUT);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
@@ -1747,6 +2176,27 @@ int main(int argc, char **argv)
                    test_scsi_dma_control_does_not_raise_interrupt);
     qtest_add_func("/next-cube/scsi/disabled-dma-does-not-complete",
                    test_scsi_disabled_dma_does_not_complete);
+    qtest_add_func("/next-cube/scsi/netbsd-order-disk-inquiry",
+                   test_scsi_netbsd_order_disk_inquiry);
+    qtest_add_func("/next-cube/scsi/netbsd-order-cd-inquiry",
+                   test_scsi_netbsd_order_cd_inquiry);
+    qtest_add_func("/next-cube/scsi/netbsd-order-disk-read-capacity",
+                   test_scsi_netbsd_order_disk_read_capacity);
+    qtest_add_func("/next-cube/scsi/netbsd-order-cd-read-capacity",
+                   test_scsi_netbsd_order_cd_read_capacity);
+    qtest_add_func(
+        "/next-cube/scsi/netbsd-order-retains-response-until-dctl-cpudma",
+        test_scsi_netbsd_order_retains_response_until_dctl_cpudma);
+    qtest_add_func("/next-cube/scsi/cpudma-low-retains-response",
+                   test_scsi_cpudma_low_retains_response);
+    qtest_add_func("/next-cube/scsi/reset-forces-cpudma-low-for-new-ti",
+                   test_scsi_reset_forces_cpudma_low_for_new_ti);
+    qtest_add_func(
+        "/next-cube/scsi/migration-restores-cpudma-low-for-new-ti",
+        test_scsi_migration_restores_cpudma_low_for_new_ti);
+    qtest_add_func(
+        "/next-cube/scsi/migration-restores-cpudma-high-for-new-ti",
+        test_scsi_migration_restores_cpudma_high_for_new_ti);
     qtest_add_func("/next-cube/scsi/write-dma", test_scsi_write_dma);
     qtest_add_func("/next-cube/scsi/dma-irq-level-invariant",
                    test_scsi_dma_irq_level_invariant);

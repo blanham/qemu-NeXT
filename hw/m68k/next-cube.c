@@ -500,6 +500,13 @@ static bool next_trace_read_sample(NeXTTraceReadSampler *sampler,
 
 static void next_irq(void *opaque, int number, int level);
 
+static void next_scsi_update_esp_dma(NeXTSCSI *s)
+{
+    ESPState *esp = &SYSBUS_ESP(&s->sysbus_esp)->esp;
+
+    esp_dma_enable(esp, 0, !!(s->scsi_csr_1 & SCSICSR_CPUDMA));
+}
+
 static void next_irq(void *opaque, int number, int level)
 {
     NeXTPC *s = NEXT_PC(opaque);
@@ -696,6 +703,7 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
             !!(val & SCSICSR_INTMASK));
         s->scsi_csr_1 = val;
         next_dma_set_scsi_control(s->dma, val);
+        next_scsi_update_esp_dma(s);
         break;
 
     case 1:
@@ -785,7 +793,6 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
     esp->dma_memory_write = nextscsi_write;
     esp->dma_opaque = s->dma;
     sysbus_esp->it_shift = 0;
-    esp->dma_enabled = 1;
     clock_set_hz(esp->clock, NEXT_ESP_CLOCK_HZ);
     sbd = SYS_BUS_DEVICE(sysbus_esp);
     if (!sysbus_realize(sbd, errp)) {
@@ -808,6 +815,7 @@ static void next_scsi_reset(DeviceState *dev)
     s->scsi_csr_1 = 0;
     s->scsi_csr_2 = 0;
     next_dma_set_scsi_control(s->dma, 0);
+    next_scsi_update_esp_dma(s);
 }
 
 static int next_scsi_post_load(void *opaque, int version_id)
@@ -815,6 +823,7 @@ static int next_scsi_post_load(void *opaque, int version_id)
     NeXTSCSI *s = opaque;
 
     next_dma_set_scsi_control(s->dma, s->scsi_csr_1);
+    next_scsi_update_esp_dma(s);
     return 0;
 }
 
