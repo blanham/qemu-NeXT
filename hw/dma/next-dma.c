@@ -73,6 +73,7 @@
 #define NEXT_DMA_SCSI_FLUSH_EDGES 4
 #define NEXT_DMA_SCSI_DMAMODE     0x10
 #define NEXT_DMA_SCSI_DMAREAD     0x08
+#define NEXT_DMA_SCC_BUDGET       4096
 
 #define NEXT_DMA_ENET_ADDR_MASK   0x0fffffff
 #define NEXT_DMA_ENTX_EOP         0x80000000
@@ -374,13 +375,19 @@ static bool next_dma_scc_serviceable(const NextDMAState *s,
                                      unsigned channel)
 {
     const NextDMAChannelState *c = &s->channel[NEXT_DMA_SCC];
+    bool dma_read;
 
-    return channel < 2 && s->scc_ops && s->scc_ops->is_receive &&
-           s->scc_ops->write_byte && s->scc_request[channel] &&
-           (c->csr & NEXT_DMA_CSR_ENABLE) &&
-           !(c->csr & NEXT_DMA_CSR_COMPLETE) &&
-           !(c->csr & NEXT_DMA_CSR_READ) &&
-           !s->scc_ops->is_receive(s->scc_opaque, channel);
+    if (channel >= 2 || !s->scc_ops || !s->scc_ops->is_receive ||
+        !s->scc_request[channel] || !(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE)) {
+        return false;
+    }
+
+    dma_read = c->csr & NEXT_DMA_CSR_READ;
+    if (dma_read != s->scc_ops->is_receive(s->scc_opaque, channel)) {
+        return false;
+    }
+    return dma_read ? !!s->scc_ops->read_byte : !!s->scc_ops->write_byte;
 }
 
 static void next_dma_scc_error(NextDMAState *s)
@@ -396,6 +403,8 @@ static void next_dma_scc_run(void *opaque)
 {
     NextDMAState *s = opaque;
     NextDMAChannelState *c = &s->channel[NEXT_DMA_SCC];
+    size_t budget = NEXT_DMA_SCC_BUDGET;
+    bool stalled = false;
     unsigned channel_index;
 
     if (s->scc_running) {
@@ -422,21 +431,46 @@ static void next_dma_scc_run(void *opaque)
             next_dma_complete_segment(s, NEXT_DMA_SCC);
             break;
         }
-        while (c->next < c->limit &&
+        while (budget && c->next < c->limit &&
                next_dma_scc_serviceable(s, channel)) {
             uint8_t value;
 
-            if (address_space_read(s->as, c->next,
-                                   MEMTXATTRS_UNSPECIFIED,
-                                   &value, sizeof(value)) != MEMTX_OK ||
-                !s->scc_ops->write_byte(s->scc_opaque, channel, value)) {
-                next_dma_scc_error(s);
-                break;
+            if (c->csr & NEXT_DMA_CSR_READ) {
+                if (!s->scc_ops->read_byte(s->scc_opaque, channel,
+                                           &value)) {
+                    stalled = true;
+                    break;
+                }
+                if (address_space_write(s->as, c->next,
+                                        MEMTXATTRS_UNSPECIFIED,
+                                        &value, sizeof(value)) != MEMTX_OK) {
+                    next_dma_scc_error(s);
+                    break;
+                }
+            } else {
+                if (address_space_read(s->as, c->next,
+                                       MEMTXATTRS_UNSPECIFIED,
+                                       &value, sizeof(value)) != MEMTX_OK) {
+                    next_dma_scc_error(s);
+                    break;
+                }
+                if (!s->scc_ops->write_byte(s->scc_opaque, channel, value)) {
+                    stalled = true;
+                    break;
+                }
             }
             c->next++;
+            budget--;
             if (c->next == c->limit) {
                 next_dma_complete_segment(s, NEXT_DMA_SCC);
             }
+        }
+        if (stalled) {
+            break;
+        }
+        if (!budget) {
+            s->scc_reschedule = true;
+            break;
         }
     }
 

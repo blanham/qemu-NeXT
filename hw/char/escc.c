@@ -34,6 +34,7 @@
 #include "ui/console.h"
 
 #include "qemu/cutils.h"
+#include "qemu/timer.h"
 #include "trace.h"
 
 /*
@@ -193,6 +194,8 @@
 #define R_MISC1I 14
 #define R_EXTINT 15
 
+#define ESCC_DMA_TX_RETRY_NS (NANOSECONDS_PER_SECOND / 1000)
+
 static uint8_t sunkbd_layout_dip_switch(const char *sunkbd_layout);
 static void handle_kbd_command(ESCCChannelState *s, int val);
 static int serial_can_receive(void *opaque);
@@ -201,6 +204,29 @@ static void escc_update_parameters(ESCCChannelState *s);
 static void escc_update_dma_request(ESCCChannelState *s);
 static bool escc_data_read(ESCCChannelState *s, uint8_t *value);
 static void escc_data_write(ESCCChannelState *s, uint8_t value);
+static void escc_dma_tx_watch_cancel(ESCCChannelState *s);
+
+static void escc_dma_tx_retry_timer(void *opaque)
+{
+    ESCCChannelState *s = opaque;
+
+    if (!s->dma_tx_blocked) {
+        return;
+    }
+    s->dma_tx_blocked = false;
+    escc_update_dma_request(s);
+}
+
+static gboolean escc_dma_tx_watch(void *do_not_use, GIOCondition cond,
+                                  void *opaque)
+{
+    ESCCChannelState *s = opaque;
+
+    s->dma_tx_watch = 0;
+    s->dma_tx_blocked = false;
+    escc_update_dma_request(s);
+    return G_SOURCE_REMOVE;
+}
 
 static void escc_update_clock(ESCCChannelState *s)
 {
@@ -293,6 +319,7 @@ static void escc_update_irq(ESCCChannelState *s)
 
 static void escc_reset_chn(ESCCChannelState *s)
 {
+    escc_dma_tx_watch_cancel(s);
     s->reg = 0;
     s->rx = s->tx = 0;
     s->rxint = s->txint = 0;
@@ -572,7 +599,8 @@ static void escc_update_dma_request(ESCCChannelState *s)
     bool receive = s->wregs[W_INTR] & 0x20;
     bool ready = receive ? (s->rregs[R_STATUS] & STATUS_RXAV) :
                            ((s->wregs[W_TXCTRL2] & TXCTRL2_TXEN) &&
-                            (s->rregs[R_STATUS] & STATUS_TXEMPTY));
+                            (s->rregs[R_STATUS] & STATUS_TXEMPTY) &&
+                            !s->dma_tx_blocked);
 
     qemu_set_irq(s->dma_request, enabled && ready);
 }
@@ -626,6 +654,65 @@ static void escc_data_write(ESCCChannelState *s, uint8_t value)
     escc_update_dma_request(s);
 }
 
+static void escc_dma_tx_watch_cancel(ESCCChannelState *s)
+{
+    g_clear_handle_id(&s->dma_tx_watch, g_source_remove);
+    if (s->dma_tx_retry_timer) {
+        timer_del(s->dma_tx_retry_timer);
+    }
+    s->dma_tx_blocked = false;
+}
+
+static bool escc_dma_data_write(ESCCChannelState *s, uint8_t value)
+{
+    bool loopback = s->wregs[W_MISC2] & MISC2_LCL_LOOP;
+    bool backend = qemu_chr_fe_backend_connected(&s->chr);
+    int ret;
+
+    if (!(s->wregs[W_TXCTRL2] & TXCTRL2_TXEN) ||
+        !(s->rregs[R_STATUS] & STATUS_TXEMPTY)) {
+        return false;
+    }
+    if (!loopback && backend) {
+        ret = qemu_chr_fe_write(&s->chr, &value, 1);
+        if (ret != 1) {
+            bool transient = ret == 0 || (ret < 0 && errno == EAGAIN);
+
+            if (transient && !s->dma_tx_watch && !s->dma_tx_blocked) {
+                s->dma_tx_blocked = true;
+                escc_update_dma_request(s);
+                s->dma_tx_watch = qemu_chr_fe_add_watch(
+                    &s->chr, G_IO_OUT | G_IO_HUP, escc_dma_tx_watch, s);
+                if (!s->dma_tx_watch && s->dma_tx_retry_timer) {
+                    timer_mod_ns(s->dma_tx_retry_timer,
+                                 qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                                 ESCC_DMA_TX_RETRY_NS);
+                }
+            }
+            return false;
+        }
+    }
+    if (!loopback && !backend &&
+        !(s->type == escc_kbd && !s->disabled)) {
+        return false;
+    }
+
+    trace_escc_mem_writeb_data(CHN_C(s), value);
+    s->txint = 0;
+    escc_update_irq(s);
+    s->tx = value;
+    if (loopback) {
+        serial_receive_byte(s, s->tx);
+    } else if (!backend && s->type == escc_kbd && !s->disabled) {
+        handle_kbd_command(s, value);
+    }
+    s->rregs[R_STATUS] |= STATUS_TXEMPTY;
+    s->rregs[R_SPEC] |= SPEC_ALLSENT;
+    set_txint(s);
+    escc_update_dma_request(s);
+    return true;
+}
+
 bool escc_dma_is_receive(ESCCState *s, unsigned channel)
 {
     if (channel >= ARRAY_SIZE(s->chn)) {
@@ -657,12 +744,7 @@ bool escc_dma_write_byte(ESCCState *s, unsigned channel, uint8_t value)
         return false;
     }
     chn = &s->chn[channel];
-    if (!(chn->wregs[W_TXCTRL2] & TXCTRL2_TXEN) ||
-        !(chn->rregs[R_STATUS] & STATUS_TXEMPTY)) {
-        return false;
-    }
-    escc_data_write(chn, value);
-    return true;
+    return escc_dma_data_write(chn, value);
 }
 
 static void escc_mem_write(void *opaque, hwaddr addr,
@@ -893,6 +975,8 @@ static int escc_post_load(void *opaque, int version_id)
 {
     ESCCState *s = opaque;
 
+    escc_dma_tx_watch_cancel(&s->chn[0]);
+    escc_dma_tx_watch_cancel(&s->chn[1]);
     escc_update_parameters(&s->chn[0]);
     escc_update_parameters(&s->chn[1]);
     escc_update_dma_request(&s->chn[0]);
@@ -1186,6 +1270,8 @@ static void escc_realize(DeviceState *dev, Error **errp)
                           ESCC_SIZE << s->it_shift);
 
     for (i = 0; i < 2; i++) {
+        s->chn[i].dma_tx_retry_timer = timer_new_ns(
+            QEMU_CLOCK_REALTIME, escc_dma_tx_retry_timer, &s->chn[i]);
         if (qemu_chr_fe_backend_connected(&s->chn[i].chr)) {
             qemu_chr_fe_set_handlers(&s->chn[i].chr, serial_can_receive,
                                      serial_receive1, serial_event, NULL,
@@ -1201,6 +1287,20 @@ static void escc_realize(DeviceState *dev, Error **errp)
     if (s->chn[1].type == escc_kbd) {
         s->chn[1].hs = qemu_input_handler_register((DeviceState *)(&s->chn[1]),
                                                    &sunkbd_handler);
+    }
+}
+
+static void escc_unrealize(DeviceState *dev)
+{
+    ESCCState *s = ESCC(dev);
+    unsigned int i;
+
+    for (i = 0; i < 2; i++) {
+        escc_dma_tx_watch_cancel(&s->chn[i]);
+        qemu_chr_fe_deinit(&s->chn[i].chr, false);
+        g_clear_pointer(&s->chn[i].hs, qemu_input_handler_unregister);
+        timer_free(s->chn[i].dma_tx_retry_timer);
+        s->chn[i].dma_tx_retry_timer = NULL;
     }
 }
 
@@ -1222,6 +1322,7 @@ static void escc_class_init(ObjectClass *klass, const void *data)
 
     device_class_set_legacy_reset(dc, escc_reset);
     dc->realize = escc_realize;
+    dc->unrealize = escc_unrealize;
     dc->vmsd = &vmstate_escc;
     device_class_set_props(dc, escc_properties);
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);

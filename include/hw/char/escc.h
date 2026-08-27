@@ -38,6 +38,9 @@ typedef struct ESCCChannelState {
     uint8_t wregs[ESCC_SERIAL_REGS], rregs[ESCC_SERIAL_REGS];
     ESCCSERIOQueue queue;
     CharFrontend chr;
+    guint dma_tx_watch;
+    QEMUTimer *dma_tx_retry_timer;
+    bool dma_tx_blocked;
     int e0_mode, led_mode, caps_lock_mode, num_lock_mode;
     int disabled;
     /* Baud-rate generator inputs after the SCC's divide-by-two stage. */
