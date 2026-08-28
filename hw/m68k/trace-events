@@ -6,5 +6,6 @@
 next_scsi_csr_read(uint64_t addr, uint64_t value, uint64_t repeats) "addr=0x%" PRIx64 " value=0x%" PRIx64 " repeats=%" PRIu64
 next_scsi_csr_write(uint64_t addr, uint64_t old, uint64_t value, int enable, int reset, int fifofl, int dmadir, int cpudma, int intmask) "addr=0x%" PRIx64 " old=0x%" PRIx64 " value=0x%" PRIx64 " enable=%d reset=%d fifofl=%d dmadir=%d cpudma=%d intmask=%d"
 next_scsi_irq(const char *source, int level, uint32_t status, uint32_t mask, uint32_t pc) "source=%s level=%d status=0x%x mask=0x%x pc=0x%x"
+next_irq_update(int level, int vector, uint32_t pending, uint32_t status, uint32_t mask) "level=%d vector=%d pending=0x%x status=0x%x mask=0x%x"
 next_timer_irq(int pending, int level, int vector, uint32_t status, uint32_t scr2) "pending=%d level=%d vector=%d status=0x%x scr2=0x%x"
 next_eventc_latch(uint32_t value, int64_t now_ns) "value=0x%05x now=%" PRId64

@@ -92,7 +92,9 @@ The NeXT serial controller exposes one shared, bidirectional SCC DMA engine at
 CSR ``0x020000c0``.  It can service either SCC port, but cannot transfer both
 ports at once.  When both ports request service simultaneously, channel A has
 priority.  PIO interrupt 17 and DMA interrupt 21 are separate interrupt
-sources.
+sources.  PIO interrupt 17 is a polled IPL5 source and is delivered
+independently of the global NeXT interrupt-mask register; DMA interrupt 21
+remains mask-controlled.
 
 The ESCC WR1 request gate controls which port may request DMA.  ``REQENABLE``
 (``0x80``) and ``REQFUNC`` (``0x40``) must be set; ``REQRX`` (``0x20``)

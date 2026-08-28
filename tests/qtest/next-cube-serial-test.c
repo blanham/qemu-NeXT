@@ -34,6 +34,7 @@
 #include "libqtest.h"
 
 #define NEXT_INTR_STATUS 0x02007000
+#define NEXT_INTR_MASK   0x02007800
 #define NEXT_SCC_BASE    0x02118000
 #define NEXT_SCC_CLOCK   (NEXT_SCC_BASE + 4)
 #define NEXT_INTR_SCC    (1U << 17)
@@ -45,6 +46,8 @@
 #define NEXT_SCC_A_DATA  (NEXT_SCC_BASE + 3)
 
 #define SCC_RR0_RXAVAIL  0x01
+#define SCC_RR3_TX_IP_A  0x10
+#define SCC_WR0_RESET_TX_IP 0x28
 
 typedef struct TestROM {
     int fd;
@@ -115,6 +118,12 @@ static void scc_write_reg(QTestState *qts, uint64_t control,
 {
     qtest_writeb(qts, control, reg);
     qtest_writeb(qts, control, value);
+}
+
+static uint8_t scc_read_reg(QTestState *qts, uint64_t control, uint8_t reg)
+{
+    qtest_writeb(qts, control, reg);
+    return qtest_readb(qts, control);
 }
 
 static void scc_configure_rx_tx(QTestState *qts, uint64_t control,
@@ -219,6 +228,109 @@ static void test_channel_a_loopback(void)
     test_local_loopback(NEXT_SCC_A_CTRL, NEXT_SCC_A_DATA);
 }
 
+static void test_tx_interrupt_enabled_after_buffer_empty(void)
+{
+    QTestState *qts = next_cube_serial_start();
+
+    /*
+     * A transmit buffer can become empty while its interrupt is disabled.
+     * Enabling the interrupt later must expose the pending condition in RR3;
+     * otherwise software sees an asserted IRQ with no serviceable source.
+     */
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 5, 0x68);
+    qtest_writeb(qts, NEXT_SCC_A_DATA, 'P');
+    assert_scc_irq(qts, false);
+
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 1, 0x02);
+    g_assert_cmphex(scc_read_reg(qts, NEXT_SCC_A_CTRL, 3) &
+                    SCC_RR3_TX_IP_A, ==, SCC_RR3_TX_IP_A);
+    assert_scc_irq(qts, true);
+
+    qtest_writeb(qts, NEXT_SCC_A_CTRL, SCC_WR0_RESET_TX_IP);
+    g_assert_cmphex(scc_read_reg(qts, NEXT_SCC_A_CTRL, 3) &
+                    SCC_RR3_TX_IP_A, ==, 0);
+    assert_scc_irq(qts, false);
+
+    qtest_quit(qts);
+}
+
+static void test_shared_irq_clears_across_channels(void)
+{
+    QTestState *qts = next_cube_serial_start();
+
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 5, 0x68);
+    qtest_writeb(qts, NEXT_SCC_A_DATA, 'P');
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 1, 0x02);
+    assert_scc_irq(qts, true);
+
+    /* Make channel B observe channel A's shared pending condition. */
+    scc_write_reg(qts, NEXT_SCC_B_CTRL, 1, 0);
+
+    qtest_writeb(qts, NEXT_SCC_A_CTRL, SCC_WR0_RESET_TX_IP);
+    g_assert_cmphex(scc_read_reg(qts, NEXT_SCC_A_CTRL, 3), ==, 0);
+    assert_scc_irq(qts, false);
+
+    qtest_quit(qts);
+}
+
+#ifdef CONFIG_TRACE_LOG
+static void test_scc_irq_bypasses_interrupt_mask(void)
+{
+    g_autofree char *log = NULL;
+    g_autofree char *log_path = NULL;
+    g_autofree char *quoted_log_path = NULL;
+    g_autofree char *trace_args = NULL;
+    gsize log_len;
+    const char *first_tx_irq;
+    const char *tx_irq_clear;
+    const char *second_tx_irq;
+    int log_fd;
+    QTestState *qts;
+
+    log_fd = g_file_open_tmp("next-serial-irq-XXXXXX", &log_path, NULL);
+    g_assert_cmpint(log_fd, >=, 0);
+    close(log_fd);
+    quoted_log_path = g_shell_quote(log_path);
+    trace_args = g_strdup_printf("-trace next_irq_update -D %s",
+                                 quoted_log_path);
+    qts = next_cube_serial_start_with_backend_args(trace_args, &log_fd);
+
+    qtest_writel(qts, NEXT_INTR_MASK, 0);
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 5, 0x68);
+    qtest_writeb(qts, NEXT_SCC_A_DATA, 'P');
+    scc_write_reg(qts, NEXT_SCC_A_CTRL, 1, 0x02);
+    assert_scc_irq(qts, true);
+
+    /* Loading the next byte must clear and then reassert TxIP. */
+    qtest_writeb(qts, NEXT_SCC_A_DATA, 'Q');
+    assert_scc_irq(qts, true);
+
+    qtest_writel(qts, NEXT_INTR_STATUS, 1U << 12);
+    close(log_fd);
+    qtest_quit(qts);
+
+    g_assert_true(g_file_get_contents(log_path, &log, &log_len, NULL));
+    first_tx_irq = g_strstr_len(
+        log, log_len,
+        "next_irq_update level=5 vector=29 pending=0x20000 "
+        "status=0x20000 mask=0x0");
+    g_assert_nonnull(first_tx_irq);
+    tx_irq_clear = strstr(first_tx_irq,
+                          "next_irq_update level=0 vector=0 pending=0x0 "
+                          "status=0x0 mask=0x0");
+    g_assert_nonnull(tx_irq_clear);
+    second_tx_irq = strstr(tx_irq_clear,
+                           "next_irq_update level=5 vector=29 "
+                           "pending=0x20000 status=0x20000 mask=0x0");
+    g_assert_nonnull(second_tx_irq);
+    g_assert_nonnull(g_strstr_len(
+        log, log_len,
+        "next_irq_update level=0 vector=0 pending=0x0 "
+        "status=0x1000 mask=0x0"));
+    g_unlink(log_path);
+}
+#endif
+
 static void wait_for_rx_available(QTestState *qts)
 {
     unsigned int i;
@@ -268,6 +380,14 @@ int main(int argc, char **argv)
                    test_channel_b_loopback);
     qtest_add_func("/next-cube/serial/channel-a-loopback",
                    test_channel_a_loopback);
+    qtest_add_func("/next-cube/serial/tx-interrupt-enable-after-empty",
+                   test_tx_interrupt_enabled_after_buffer_empty);
+    qtest_add_func("/next-cube/serial/shared-irq-clears-across-channels",
+                   test_shared_irq_clears_across_channels);
+#ifdef CONFIG_TRACE_LOG
+    qtest_add_func("/next-cube/serial/scc-irq-bypasses-interrupt-mask",
+                   test_scc_irq_bypasses_interrupt_mask);
+#endif
     qtest_add_func("/next-cube/serial/serial0-backend-round-trip",
                    test_serial0_backend_round_trip);
 

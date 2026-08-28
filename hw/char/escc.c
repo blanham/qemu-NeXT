@@ -292,7 +292,11 @@ static uint32_t get_queue(void *opaque)
 
 static int escc_update_irq_chn(ESCCChannelState *s)
 {
-    if ((((s->wregs[W_INTR] & INTR_TXINT) && (s->txint == 1)) ||
+    uint8_t tx_ip = s->chn == escc_chn_a ? INTR_TXINTA : INTR_TXINTB;
+    uint8_t rr3 = s->chn == escc_chn_a ? s->rregs[R_INTR]
+                                       : s->otherchn->rregs[R_INTR];
+
+    if ((((s->wregs[W_INTR] & INTR_TXINT) && (rr3 & tx_ip)) ||
         /* tx ints enabled, pending */
         ((((s->wregs[W_INTR] & INTR_RXMODEMSK) == INTR_RXINT1ST) ||
         ((s->wregs[W_INTR] & INTR_RXMODEMSK) == INTR_RXINTALL)) &&
@@ -304,6 +308,12 @@ static int escc_update_irq_chn(ESCCChannelState *s)
         return 1;
     }
     return 0;
+}
+
+bool escc_irq_pending(ESCCState *s)
+{
+    return escc_update_irq_chn(&s->chn[0]) ||
+           escc_update_irq_chn(&s->chn[1]);
 }
 
 static void escc_update_irq(ESCCChannelState *s)
@@ -632,8 +642,7 @@ static void escc_data_write(ESCCChannelState *s, uint8_t value)
      * interrupts are currently pending. The irq will be raised again once
      * the Tx buffer becomes empty below.
      */
-    s->txint = 0;
-    escc_update_irq(s);
+    clr_txint(s);
     s->tx = value;
     if (s->wregs[W_TXCTRL2] & TXCTRL2_TXEN) { /* tx enabled */
         if (s->wregs[W_MISC2] & MISC2_LCL_LOOP) {
@@ -698,8 +707,7 @@ static bool escc_dma_data_write(ESCCChannelState *s, uint8_t value)
     }
 
     trace_escc_mem_writeb_data(CHN_C(s), value);
-    s->txint = 0;
-    escc_update_irq(s);
+    clr_txint(s);
     s->tx = value;
     if (loopback) {
         serial_receive_byte(s, s->tx);
@@ -795,7 +803,21 @@ static void escc_mem_write(void *opaque, hwaddr addr,
                 s->rregs[R_STATUS] |= STATUS_SYNC;
             }
             break;
-        case W_INTR ... W_IVEC:
+        case W_INTR:
+            s->wregs[s->reg] = val;
+            /*
+             * TxIP is latched when the transmit buffer becomes empty,
+             * even while transmit interrupts are disabled.  If software
+             * enables them later, make that already-pending condition
+             * visible in RR3 as well as on the IRQ output.
+             */
+            if ((val & INTR_TXINT) && s->txint) {
+                set_txint(s);
+            } else {
+                escc_update_irq(s);
+            }
+            break;
+        case W_IVEC:
         case W_SYNC1 ... W_TXBUF:
         case W_MISC1 ... W_CLOCK:
         case W_EXTINT:
