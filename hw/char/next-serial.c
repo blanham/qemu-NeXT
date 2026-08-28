@@ -66,7 +66,7 @@ struct NextSerialState {
 
 static void next_serial_update_irq(NextSerialState *s)
 {
-    qemu_set_irq(s->irq, s->irq_level[0] || s->irq_level[1]);
+    qemu_set_irq(s->irq, escc_irq_pending(&s->escc));
 }
 
 static void next_serial_set_irq(void *opaque, int n, int level)
@@ -176,7 +176,7 @@ static void next_serial_reset(DeviceState *dev)
     s->irq_level[0] = false;
     s->irq_level[1] = false;
     next_serial_apply_clocks(s);
-    next_serial_update_irq(s);
+    qemu_irq_lower(s->irq);
 }
 
 static int next_serial_post_load(void *opaque, int version_id)

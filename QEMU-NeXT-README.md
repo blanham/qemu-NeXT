@@ -72,13 +72,6 @@ tar -xjf "$ARCHIVE" -C "$ROOT" --strip-components=1 "plan9-$RELEASE"
 tar -xOf "$ARCHIVE" "plan9-$RELEASE/68020/9nextstation" \
   > "$TFTP/68020/9nextstation"
 
-# First Edition probes for an SCC serial mouse before starting the network.
-# QEMU already supplies the native NeXT keyboard/mouse device, so disable only
-# this obsolete probe in the writable staged root.
-if [ "$RELEASE" = 1e ]; then
-  sed -i '/^[[:space:]]*aux\/mouse -dC 1$/s/^/# /' "$ROOT/rc/bin/termrc"
-fi
-
 "$QEMU" -M next-station -m 64M -bios "$ROM" \
   -global next-pc.system-timer-frequency=4456448 \
   -display gtk \
@@ -98,17 +91,19 @@ home=/usr/tor
 . /usr/tor/lib/profile
 ```
 
-Both editions have been exercised through visible 8½ startup. Second Edition
-uses its archived root unchanged. First Edition requires only the staged-root
-serial-mouse-probe workaround shown above; its archive and kernel remain
-unchanged. The 9P1 service is for these historical kernels and is not a
-9P2000 server.
+Both editions have been exercised through visible 8½ startup with their
+archived kernels and roots unchanged. The 9P1 service is for these historical
+kernels and is not a 9P2000 server.
 
 ## SCC serial DMA
 
 The NeXT serial controller has one shared, bidirectional SCC DMA engine at
 CSR `0x020000c0`. The engine can serve either SCC port, but not both at once;
 if both ports request service simultaneously, channel A has priority.
+
+Normal SCC PIO interrupt 17 is a polled IPL5 source on NeXT hardware and is
+delivered independently of the global interrupt-mask register. SCC DMA
+interrupt 21 remains mask-controlled.
 
 The ESCC WR1 request gate selects the operation: `REQENABLE` (`0x80`) and
 `REQFUNC` (`0x40`) must be set, while `REQRX` (`0x20`) selects receive and its

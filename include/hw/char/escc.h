@@ -72,6 +72,7 @@ struct ESCCState {
 void escc_set_clock_inputs(ESCCState *s, uint32_t pclk_hz,
                            uint32_t ch_b_rtxc_hz,
                            uint32_t ch_a_rtxc_hz);
+bool escc_irq_pending(ESCCState *s);
 bool escc_dma_is_receive(ESCCState *s, unsigned channel);
 bool escc_dma_read_byte(ESCCState *s, unsigned channel, uint8_t *value);
 bool escc_dma_write_byte(ESCCState *s, unsigned channel, uint8_t value);

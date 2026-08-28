@@ -84,6 +84,7 @@
 #define NEXT_SCR2_TIMER_IPL7    0x00008000
 #define NEXT_SCR2_SOFTINT_SHIFT 24
 #define NEXT_IRQ_SOFTINT_MASK   0x00000003
+#define NEXT_SCC_IRQ_STATUS     (1U << 17)
 #define NEXT_EVENTC_MASK        0x000fffff
 
 #define NEXT_IRQ_IPL7_MASK      0xc0000000
@@ -336,7 +337,9 @@ static int next_timer_irq_vector(const NeXTPC *s)
 
 static void next_update_irq(NeXTPC *s)
 {
-    uint32_t pending = s->int_status & s->int_mask;
+    /* The SCC is a polled IPL5 source and bypasses the global mask. */
+    uint32_t pending = (s->int_status & s->int_mask) |
+                       (s->int_status & NEXT_SCC_IRQ_STATUS);
     int level = 0;
 
     if ((pending & NEXT_IRQ_IPL7_MASK) ||
@@ -357,6 +360,8 @@ static void next_update_irq(NeXTPC *s)
         level = 1;
     }
 
+    trace_next_irq_update(level, level ? level + 24 : 0, pending,
+                          s->int_status, s->int_mask);
     m68k_set_irq_level(s->cpu, level, level ? level + 24 : 0);
 }
 
