@@ -163,8 +163,8 @@ Authenticated IL boot to the same desktop with `tor` / `password`:
 
 ![Plan 9 Second Edition booting over authenticated IL to 8½](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/plan9-il.gif)
 
-The historical archives are mirrored by the Oregon State University Open
-Source Lab at:
+The historical archives are mirrored by the
+Oregon State University Open Source Lab at:
 
 ```text
 https://ftp.osuosl.org/pub/plan9/history/
