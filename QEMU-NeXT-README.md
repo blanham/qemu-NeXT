@@ -118,9 +118,9 @@ NFS object contract is in `docs/system/devices/nfs-root.rst`.
 
 ## Plan 9
 
-Native Plan 9 Second Edition support now boots the unmodified
-`68020/9nextstation` kernel through the NeXT ROM. QEMU supplies the original
-NeXT BOOTP reply, TFTP for the kernel, and a writable Second Edition 9P1 root
+Native Plan 9 First and Second Edition support now boots each release's
+unmodified `68020/9nextstation` kernel through the NeXT ROM. QEMU supplies the
+original NeXT BOOTP reply, TFTP for the kernel, and a writable 9P1 root
 service. The compatibility profile uses unauthenticated TCP port 564. The
 historic profile uses authenticated IL (IPv4 protocol 40), with the ticket
 service on IL port 566 and the file service on IL port 17008. I verified the
@@ -144,8 +144,15 @@ https://ftp.osuosl.org/pub/plan9/history/
 https://ftp.osuosl.org/pub/plan9/history/sha256sum.txt
 ```
 
-The verified Second Edition tar archive has SHA-256
-`0bb3c1446deb79b179f73886eb2419ecfac9f9964040683e3d5731f074bc2ce6`.
+The verified tar archives have these SHA-256 identities:
+
+| Edition | Archive | SHA-256 |
+|---|---|---|
+| First | `plan9-1e.tar.bz2` | `8718e279aa35b10a9391f330976d31c177bad00de40e7f0f67232ffa54fb7d77` |
+| Second | `plan9-2e.tar.bz2` | `0bb3c1446deb79b179f73886eb2419ecfac9f9964040683e3d5731f074bc2ce6` |
+
+Both editions have been exercised through visible 8½ startup with their
+archived kernels and root trees unchanged.
 
 ### Build
 
@@ -261,12 +268,28 @@ SLiRP network. Do not expose IL/566 or IL/17008 through host forwarding or a
 bridged/TAP network. Active IL connections block live migration and must
 reconnect after guest reset.
 
+## SCC serial DMA
+
+The NeXT serial controller has one shared, bidirectional SCC DMA engine at CSR
+`0x020000c0`. It can serve either SCC port, but not both at once; channel A has
+priority when both request service. Normal SCC PIO interrupt 17 remains
+independent of the mask-controlled SCC DMA interrupt 21.
+
+The ESCC WR1 request gate selects receive or transmit service, and the DMA CSR
+direction must agree with it. Transfers support the NeXT `NEXT`/`LIMIT`
+segment, `START`/`STOP` promotion through `SUPDATE`, completion interrupts,
+zero-length completion, guest-memory bus exceptions, and transmit-backend
+backpressure. Reset cancels pending work, while migration preserves the
+guest-visible pointers, status, and serial state and resumes a serviceable
+transfer at the destination. Detailed register and lifecycle behavior is in
+`docs/system/target-m68k.rst`.
+
 ## Hardware support
 
 | Hardware | Status | Notes |
 |---|---|---|
 | NeXTcube (MC68040, X15) | Working | Monochrome system; boots NeXTSTEP from SCSI disk. |
-| NeXTstation (MC68040, Warp 9) | Working | Monochrome system; boots NeXTSTEP from SCSI and Plan 9 Second Edition by ROM netboot. |
+| NeXTstation (MC68040, Warp 9) | Working | Monochrome system; boots NeXTSTEP from SCSI and Plan 9 First and Second Editions by ROM netboot. |
 | NeXTstation Color (MC68040, Warp 9C) | Working | 1120 x 832 RGB444 display. Bt463 lookup and tag state is retained but does not alter direct-color scanout. |
 | Original NeXT Computer/Cube (MC68030) | Not implemented | Blocked by the missing MC68030 PMMU and its translation registers and table format. The reserved machine name is `next-computer`. |
 | Turbo systems | Not implemented | Turbo machine timing and board variants have not been modeled. |
@@ -278,7 +301,7 @@ reconnect after guest reset.
 | Color video | Working | Direct RGB444 output and independent 68 Hz retrace interrupt. |
 | Keyboard and mouse | Working | Includes keyboard interrupt delivery, repeat suppression, and capture-free absolute host-pointer translation. |
 | Sound output | Working | DMA output is paced on the virtual clock. Sound input is not implemented. |
-| SCC serial ports | Working | Both channels support interrupt-driven PIO. SCC DMA data transfer is not implemented. |
+| SCC serial ports and DMA | Working | Both channels support interrupt-driven PIO and the shared bidirectional SCC DMA engine. |
 | MB8795 Ethernet | Working | DMA transmit and receive, internal loopback, SLiRP networking, and NeXT ROM BOOTP are supported. |
 | RTC, event counter, and NVRAM | Working | Both supported clock chips are modeled; NVRAM can be persisted in a file. |
 | NextBus | Partial | The Cube NBIC and an empty bus are present. No NextBus cards are implemented. |
@@ -289,7 +312,7 @@ reconnect after guest reset.
 Plan 9 support is the original 9P1 protocol only. The netboot profiles use IPv4
 SLiRP and the NeXT BOOTP vendor format; they are not a general Plan 9 network
 configuration. The 68030 PMMU, Turbo board variants, DSP execution,
-sound input, SCC DMA, NextBus cards, magneto-optical media, and printer data
+sound input, NextBus cards, magneto-optical media, and printer data
 path remain future work.
 
 Detailed machine and device notes are in `docs/system/target-m68k.rst`.
