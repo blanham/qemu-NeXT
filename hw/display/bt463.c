@@ -1,0 +1,337 @@
+/* SPDX-License-Identifier: NCSA
+ *
+ * Copyright (c) 2011-2026 Bryce Lanham
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal with the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute,
+ * sublicense, and/or sell copies of the Software, and to permit persons to
+ * whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimers.
+ *
+ * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimers in the
+ * documentation and/or other materials provided with the distribution.
+ *
+ * Neither the names of the University of Illinois/NCSA nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * Software without specific prior written permission.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS WITH THE SOFTWARE.
+ */
+
+#include "qemu/osdep.h"
+#include "hw/display/bt463.h"
+
+enum Bt463GeneralAccess {
+    BT463_GENERAL_INVALID,
+    BT463_GENERAL_BYTE,
+    BT463_GENERAL_CURSOR,
+    BT463_GENERAL_INPUT_SIGNATURE,
+    BT463_GENERAL_OUTPUT_SIGNATURE,
+    BT463_GENERAL_WTT,
+};
+
+static void bt463_advance_address(Bt463State *s)
+{
+    s->address = (s->address + 1) & BT463_ADDRESS_MASK;
+}
+
+static void bt463_advance_component(Bt463State *s, bool triplet)
+{
+    if (!triplet) {
+        s->component = 0;
+        bt463_advance_address(s);
+        return;
+    }
+
+    s->component++;
+    if (s->component == 3) {
+        s->component = 0;
+        bt463_advance_address(s);
+    }
+}
+
+static enum Bt463GeneralAccess bt463_general_access(uint16_t address)
+{
+    if (address == 0x100 || address == 0x101) {
+        return BT463_GENERAL_CURSOR;
+    }
+    if (address == 0x20e) {
+        return BT463_GENERAL_INPUT_SIGNATURE;
+    }
+    if (address == 0x20f) {
+        return BT463_GENERAL_OUTPUT_SIGNATURE;
+    }
+    if (address >= 0x300 && address <= 0x30f) {
+        return BT463_GENERAL_WTT;
+    }
+
+    switch (address) {
+    case 0x200:
+    case 0x201 ... 0x203:
+    case 0x205 ... 0x20d:
+    case 0x220:
+        return BT463_GENERAL_BYTE;
+    default:
+        return BT463_GENERAL_INVALID;
+    }
+}
+
+static uint8_t bt463_command_mask(uint16_t address)
+{
+    switch (address) {
+    case 0x201:
+        /* CR7-CR6 and CR3-CR2 are defined; the remaining bits are reserved. */
+        return 0xcc;
+    case 0x202:
+        /* CR16-CR10 are defined; CR17 is reserved. */
+        return 0x7f;
+    case 0x203:
+        /* CR27-CR26 and CR22-CR20 are defined. */
+        return 0xc7;
+    default:
+        return 0;
+    }
+}
+
+void bt463_init(Bt463State *s)
+{
+    bt463_reset(s);
+}
+
+void bt463_reset(Bt463State *s)
+{
+    memset(s, 0, sizeof(*s));
+}
+
+uint8_t bt463_address_read(const Bt463State *s, bool high)
+{
+    if (high) {
+        return (s->address >> 8) & 0x0f;
+    }
+    return s->address & 0xff;
+}
+
+void bt463_address_write(Bt463State *s, bool high, uint8_t value)
+{
+    if (high) {
+        s->address = (s->address & 0x00ff) | ((value & 0x0f) << 8);
+    } else {
+        s->address = (s->address & 0x0f00) | value;
+    }
+    s->component = 0;
+}
+
+uint8_t bt463_palette_read(Bt463State *s)
+{
+    uint8_t value = 0;
+
+    if (s->address < BT463_PALETTE_ENTRIES) {
+        value = s->palette[s->address][s->component];
+    }
+    bt463_advance_component(s, true);
+
+    return value;
+}
+
+bool bt463_palette_write(Bt463State *s, uint8_t value)
+{
+    const bool valid = s->address < BT463_PALETTE_ENTRIES;
+
+    if (valid) {
+        s->palette[s->address][s->component] = value;
+    }
+    bt463_advance_component(s, true);
+
+    return valid;
+}
+
+uint8_t bt463_general_read(Bt463State *s)
+{
+    const enum Bt463GeneralAccess access = bt463_general_access(s->address);
+    uint8_t value = 0;
+
+    switch (access) {
+    case BT463_GENERAL_CURSOR:
+        value = s->cursor[s->address - 0x100][s->component];
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_INPUT_SIGNATURE:
+        if (s->component == 0) {
+            value = s->input_signature & 0xff;
+        } else if (s->component == 1) {
+            value = s->input_signature >> 8;
+        }
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_OUTPUT_SIGNATURE:
+        value = s->output_signature[s->component];
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_WTT:
+        if (s->component == 0) {
+            s->wtt_read_latch = s->wtt[s->address - 0x300] & 0xffffff;
+        }
+        value = (s->wtt_read_latch >> (s->component * 8)) & 0xff;
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_BYTE:
+        switch (s->address) {
+        case 0x200:
+            value = 0x2a;
+            break;
+        case 0x201 ... 0x203:
+            value = s->command[s->address - 0x201];
+            break;
+        case 0x205 ... 0x208:
+            value = s->read_mask[s->address - 0x205];
+            break;
+        case 0x209 ... 0x20c:
+            value = s->blink_mask[s->address - 0x209];
+            break;
+        case 0x20d:
+            value = s->test_register;
+            break;
+        case 0x220:
+            value = 0xb0;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        bt463_advance_component(s, false);
+        break;
+    case BT463_GENERAL_INVALID:
+        bt463_advance_component(s, false);
+        break;
+    }
+
+    return value;
+}
+
+bool bt463_general_write(Bt463State *s, uint8_t value)
+{
+    const enum Bt463GeneralAccess access = bt463_general_access(s->address);
+    bool changed = false;
+
+    switch (access) {
+    case BT463_GENERAL_CURSOR:
+        s->cursor[s->address - 0x100][s->component] = value;
+        changed = true;
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_INPUT_SIGNATURE:
+        if (s->component == 0) {
+            s->input_signature = (s->input_signature & 0xff00) | value;
+        } else if (s->component == 1) {
+            s->input_signature = (s->input_signature & 0x00ff) |
+                ((uint16_t)value << 8);
+        }
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_OUTPUT_SIGNATURE:
+        s->output_signature[s->component] = value;
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_WTT:
+        if (s->component == 0) {
+            s->wtt_write_latch = s->wtt[s->address - 0x300] & 0xffffff;
+        }
+        s->wtt_write_latch &= ~(0xffU << (s->component * 8));
+        s->wtt_write_latch |= (uint32_t)value << (s->component * 8);
+        if (s->component == 2) {
+            s->wtt[s->address - 0x300] = s->wtt_write_latch & 0xffffff;
+            changed = true;
+        }
+        bt463_advance_component(s, true);
+        break;
+    case BT463_GENERAL_BYTE:
+        switch (s->address) {
+        case 0x201 ... 0x203: {
+            uint8_t *command = &s->command[s->address - 0x201];
+            uint8_t new_value = value & bt463_command_mask(s->address);
+
+            changed = *command != new_value;
+            *command = new_value;
+            break;
+        }
+        case 0x205 ... 0x208:
+            changed = s->read_mask[s->address - 0x205] != value;
+            s->read_mask[s->address - 0x205] = value;
+            break;
+        case 0x209 ... 0x20c:
+            changed = s->blink_mask[s->address - 0x209] != value;
+            s->blink_mask[s->address - 0x209] = value;
+            break;
+        case 0x20d:
+            s->test_register = value;
+            break;
+        case 0x200:
+        case 0x220:
+            /* ID and revision are read-only. */
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        bt463_advance_component(s, false);
+        break;
+    case BT463_GENERAL_INVALID:
+        bt463_advance_component(s, false);
+        break;
+    }
+
+    return changed;
+}
+
+static int bt463_post_load(void *opaque, int version_id)
+{
+    Bt463State *s = opaque;
+
+    s->address &= BT463_ADDRESS_MASK;
+    s->component %= 3;
+    s->wtt_write_latch &= 0xffffff;
+    s->wtt_read_latch &= 0xffffff;
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->command); i++) {
+        s->command[i] &= bt463_command_mask(0x201 + i);
+    }
+    for (unsigned i = 0; i < BT463_WTT_ENTRIES; i++) {
+        s->wtt[i] &= 0xffffff;
+    }
+
+    return 0;
+}
+
+const VMStateDescription vmstate_bt463 = {
+    .name = "bt463",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = bt463_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(address, Bt463State),
+        VMSTATE_UINT8(component, Bt463State),
+        VMSTATE_UINT8_2DARRAY(palette, Bt463State,
+                             BT463_PALETTE_ENTRIES, 3),
+        VMSTATE_UINT8_2DARRAY(cursor, Bt463State,
+                             BT463_CURSOR_COLORS, 3),
+        VMSTATE_UINT8_ARRAY(command, Bt463State, 3),
+        VMSTATE_UINT8_ARRAY(read_mask, Bt463State, 4),
+        VMSTATE_UINT8_ARRAY(blink_mask, Bt463State, 4),
+        VMSTATE_UINT8(test_register, Bt463State),
+        VMSTATE_UINT16(input_signature, Bt463State),
+        VMSTATE_UINT8_ARRAY(output_signature, Bt463State, 3),
+        VMSTATE_UINT32_ARRAY(wtt, Bt463State, BT463_WTT_ENTRIES),
+        VMSTATE_UINT32(wtt_write_latch, Bt463State),
+        VMSTATE_UINT32(wtt_read_latch, Bt463State),
+        VMSTATE_END_OF_LIST()
+    }
+};

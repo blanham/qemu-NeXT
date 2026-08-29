@@ -1,0 +1,78 @@
+/* SPDX-License-Identifier: NCSA
+ *
+ * Copyright (c) 2011-2026 Bryce Lanham
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal with the Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge, publish, distribute,
+ * sublicense, and/or sell copies of the Software, and to permit persons to
+ * whom the Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimers.
+ *
+ * Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimers in the
+ * documentation and/or other materials provided with the distribution.
+ *
+ * Neither the names of the University of Illinois/NCSA nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * Software without specific prior written permission.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS WITH THE SOFTWARE.
+ */
+
+#ifndef HW_DISPLAY_BT463_H
+#define HW_DISPLAY_BT463_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "migration/vmstate.h"
+
+#define BT463_ADDRESS_MASK       0x0fff
+#define BT463_PALETTE_ENTRIES    0x210
+#define BT463_CURSOR_COLORS      2
+#define BT463_WTT_ENTRIES       16
+
+typedef struct Bt463State {
+    uint16_t address;
+    uint8_t component;
+
+    uint8_t palette[BT463_PALETTE_ENTRIES][3];
+    uint8_t cursor[BT463_CURSOR_COLORS][3];
+    uint8_t command[3];
+    uint8_t read_mask[4];
+    uint8_t blink_mask[4];
+    uint8_t test_register;
+    uint16_t input_signature;
+    uint8_t output_signature[3];
+    uint32_t wtt[BT463_WTT_ENTRIES];
+
+    /* The WTT shifts a complete 24-bit word into the table on B16-B23. */
+    uint32_t wtt_write_latch;
+    uint32_t wtt_read_latch;
+} Bt463State;
+
+extern const VMStateDescription vmstate_bt463;
+
+void bt463_init(Bt463State *s);
+void bt463_reset(Bt463State *s);
+
+uint8_t bt463_address_read(const Bt463State *s, bool high);
+void bt463_address_write(Bt463State *s, bool high, uint8_t value);
+
+uint8_t bt463_palette_read(Bt463State *s);
+bool bt463_palette_write(Bt463State *s, uint8_t value);
+uint8_t bt463_general_read(Bt463State *s);
+bool bt463_general_write(Bt463State *s, uint8_t value);
+
+#endif /* HW_DISPLAY_BT463_H */

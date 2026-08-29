@@ -40,6 +40,7 @@
 #include "qemu/timer.h"
 #include "qemu/units.h"
 #include "ui/console.h"
+#include "hw/display/bt463.h"
 #include "hw/display/framebuffer.h"
 #include "ui/pixel_ops.h"
 
@@ -47,7 +48,6 @@
 #define NEXT_C16_WIDTH 1120
 #define NEXT_C16_HEIGHT 832
 #define NEXT_C16_STRIDE (1152 * 2)
-#define NEXT_BT463_ENTRIES 0x400
 #define NEXT_COLOR_RETRACE_NS (NANOSECONDS_PER_SECOND / 68)
 
 #define NEXT_COLOR_COMMAND_CLRINTR 0x01
@@ -66,10 +66,7 @@ struct NextColorVideoState {
     QemuConsole *console;
     qemu_irq irq;
     QEMUTimer retrace_timer;
-    uint16_t dac_address;
-    uint8_t dac_component;
-    uint8_t palette[NEXT_BT463_ENTRIES][3];
-    uint8_t general[NEXT_BT463_ENTRIES][3];
+    Bt463State bt463;
     uint8_t command;
     uint8_t dram_timing;
     uint8_t vram_timing;
@@ -144,45 +141,19 @@ static const GraphicHwOps next_color_video_ops = {
     .gfx_update = next_color_video_update,
 };
 
-static uint8_t next_color_dac_data_read(NextColorVideoState *s,
-                                        uint8_t table[][3])
-{
-    uint8_t value = table[s->dac_address & 0x3ff][s->dac_component];
-
-    s->dac_component++;
-    if (s->dac_component == 3) {
-        s->dac_component = 0;
-        s->dac_address = (s->dac_address + 1) & 0x3ff;
-    }
-
-    return value;
-}
-
-static void next_color_dac_data_write(NextColorVideoState *s,
-                                      uint8_t table[][3], uint8_t value)
-{
-    table[s->dac_address & 0x3ff][s->dac_component] = value;
-
-    s->dac_component++;
-    if (s->dac_component == 3) {
-        s->dac_component = 0;
-        s->dac_address = (s->dac_address + 1) & 0x3ff;
-    }
-}
-
 static uint64_t next_color_dac_read(void *opaque, hwaddr addr, unsigned size)
 {
     NextColorVideoState *s = opaque;
 
     switch (addr) {
     case 0:
-        return s->dac_address & 0xff;
+        return bt463_address_read(&s->bt463, false);
     case 1:
-        return s->dac_address >> 8;
+        return bt463_address_read(&s->bt463, true);
     case 2:
-        return next_color_dac_data_read(s, s->general);
+        return bt463_general_read(&s->bt463);
     case 3:
-        return next_color_dac_data_read(s, s->palette);
+        return bt463_palette_read(&s->bt463);
     default:
         return 0;
     }
@@ -195,19 +166,20 @@ static void next_color_dac_write(void *opaque, hwaddr addr, uint64_t value,
 
     switch (addr) {
     case 0:
-        s->dac_address = (s->dac_address & 0xff00) | (value & 0xff);
-        s->dac_component = 0;
+        bt463_address_write(&s->bt463, false, value);
         break;
     case 1:
-        s->dac_address = (s->dac_address & 0x00ff) |
-            ((value & 0xff) << 8);
-        s->dac_component = 0;
+        bt463_address_write(&s->bt463, true, value);
         break;
     case 2:
-        next_color_dac_data_write(s, s->general, value);
+        if (bt463_general_write(&s->bt463, value)) {
+            s->invalidate = true;
+        }
         break;
     case 3:
-        next_color_dac_data_write(s, s->palette, value);
+        if (bt463_palette_write(&s->bt463, value)) {
+            s->invalidate = true;
+        }
         break;
     }
 }
@@ -354,10 +326,7 @@ static void next_color_video_reset_hold(Object *obj, ResetType type)
 
     timer_del(&s->retrace_timer);
     next_color_set_irq(s, false);
-    s->dac_address = 0;
-    s->dac_component = 0;
-    memset(s->palette, 0, sizeof(s->palette));
-    memset(s->general, 0, sizeof(s->general));
+    bt463_reset(&s->bt463);
     s->command = 0;
     s->dram_timing = 0;
     s->vram_timing = 0;
@@ -368,8 +337,6 @@ static int next_color_video_post_load(void *opaque, int version_id)
 {
     NextColorVideoState *s = opaque;
 
-    s->dac_address &= 0x3ff;
-    s->dac_component %= 3;
     s->command &=
         NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
     qemu_set_irq(s->irq, s->irq_level);
@@ -383,16 +350,13 @@ static int next_color_video_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_next_color_video = {
     .name = TYPE_NEXT_COLOR_VIDEO,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    /* Version 1 serialized the old generic DAC arrays. */
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = next_color_video_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT16(dac_address, NextColorVideoState),
-        VMSTATE_UINT8(dac_component, NextColorVideoState),
-        VMSTATE_UINT8_2DARRAY(palette, NextColorVideoState,
-                             NEXT_BT463_ENTRIES, 3),
-        VMSTATE_UINT8_2DARRAY(general, NextColorVideoState,
-                             NEXT_BT463_ENTRIES, 3),
+        VMSTATE_STRUCT(bt463, NextColorVideoState, 1, vmstate_bt463,
+                       Bt463State),
         VMSTATE_UINT8(command, NextColorVideoState),
         VMSTATE_UINT8(dram_timing, NextColorVideoState),
         VMSTATE_UINT8(vram_timing, NextColorVideoState),
@@ -469,6 +433,7 @@ static void next_color_video_init(Object *obj)
 {
     NextColorVideoState *s = NEXT_COLOR_VIDEO(obj);
 
+    bt463_init(&s->bt463);
     timer_init_ns(&s->retrace_timer, QEMU_CLOCK_VIRTUAL,
                   next_color_retrace, s);
 }

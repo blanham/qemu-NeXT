@@ -285,6 +285,124 @@ static void assert_dac_triplet(QTestState *qts, unsigned port,
     }
 }
 
+static void test_bt463_mpu_registers(void)
+{
+    QTestState *qts = next_color_start();
+    const uint8_t palette[3] = { 0x12, 0x34, 0x56 };
+    const uint8_t cursor[3] = { 0xa1, 0xb2, 0xc3 };
+    const uint8_t palette_next[3] = { 0x45, 0x67, 0x89 };
+    const uint8_t wtt[3] = { 0xde, 0xad, 0xbe };
+    const uint8_t zero[3] = { 0, 0, 0 };
+
+    /* The address register exposes twelve bits and ignores ADDR12-15. */
+    dac_set_address(qts, 0x0abc);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0xbc);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x0a);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 1, 0xff);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0xbc);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x0f);
+
+    /* Palette RAM and general-register/cursor space are independent ports. */
+    dac_set_address(qts, 0x100);
+    dac_write_triplet(qts, 3, palette);
+    dac_set_address(qts, 0x100);
+    dac_write_triplet(qts, 2, cursor);
+    assert_dac_triplet(qts, 3, 0x100, palette);
+    assert_dac_triplet(qts, 2, 0x100, cursor);
+
+    /* A complete RGB triplet advances one entry, not one component. */
+    dac_set_address(qts, 0x010);
+    dac_write_triplet(qts, 3, palette);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x11);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x00);
+    dac_write_triplet(qts, 3, palette_next);
+    assert_dac_triplet(qts, 3, 0x010, palette);
+    assert_dac_triplet(qts, 3, 0x011, palette_next);
+
+    dac_set_address(qts, 0x30f);
+    dac_write_triplet(qts, 2, wtt);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x10);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x03);
+    assert_dac_triplet(qts, 2, 0x30f, wtt);
+
+    /* Eight-bit registers advance after each access. */
+    dac_set_address(qts, 0x201);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x40);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x02);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x02);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x48);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x80);
+    dac_set_address(qts, 0x201);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x40);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x48);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x80);
+
+    dac_set_address(qts, 0x201);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
+    dac_set_address(qts, 0x202);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
+    dac_set_address(qts, 0x203);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
+    dac_set_address(qts, 0x201);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xcc);
+    dac_set_address(qts, 0x202);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x7f);
+    dac_set_address(qts, 0x203);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xc7);
+
+    /* Test and signature locations retain their architected access widths. */
+    dac_set_address(qts, 0x20d);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xa5);
+    dac_set_address(qts, 0x20d);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xa5);
+    dac_set_address(qts, 0x20e);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x34);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x12);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
+    dac_set_address(qts, 0x20e);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x34);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x12);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    dac_set_address(qts, 0x20f);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x11);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x22);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x33);
+    dac_set_address(qts, 0x20f);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x11);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x22);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x33);
+
+    /* ID and revision are read-only constants. */
+    dac_set_address(qts, 0x200);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x2a);
+    dac_set_address(qts, 0x200);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    dac_set_address(qts, 0x200);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x2a);
+    dac_set_address(qts, 0x220);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xb0);
+    dac_set_address(qts, 0x220);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    dac_set_address(qts, 0x220);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xb0);
+
+    /* Invalid addresses read as zero and never alias valid storage. */
+    dac_set_address(qts, 0x204);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x5a);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    dac_set_address(qts, 0x204);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    dac_set_address(qts, 0x400);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x6b);
+    dac_set_address(qts, 0x000);
+    assert_dac_triplet(qts, 2, 0x000, zero);
+    dac_set_address(qts, 0x210);
+    dac_write_triplet(qts, 3, wtt);
+    assert_dac_triplet(qts, 3, 0x210, zero);
+
+    qtest_quit(qts);
+}
+
 static uint32_t video_irq_status(QTestState *qts)
 {
     return qtest_readl(qts, NEXT_INT_STATUS) &
@@ -430,10 +548,10 @@ static void test_bt463_auto_increment_and_phase_reset(void)
     dac_read_triplet(qts, 3, actual);
     g_assert_cmpmem(actual, sizeof(actual), palette1, sizeof(palette1));
 
-    dac_set_address(qts, 0x310);
+    dac_set_address(qts, 0x30e);
     dac_write_triplet(qts, 2, tag0);
     dac_write_triplet(qts, 2, tag1);
-    dac_set_address(qts, 0x310);
+    dac_set_address(qts, 0x30e);
     dac_read_triplet(qts, 2, actual);
     g_assert_cmpmem(actual, sizeof(actual), tag0, sizeof(tag0));
     dac_read_triplet(qts, 2, actual);
@@ -445,15 +563,15 @@ static void test_bt463_auto_increment_and_phase_reset(void)
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x5a);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x02);
     dac_write_triplet(qts, 3, low_reset);
-    assert_dac_triplet(qts, 3, 0x25a, low_reset);
+    assert_dac_triplet(qts, 3, 0x25a, (const uint8_t[3]) { 0, 0, 0 });
 
     dac_set_address(qts, 0x15a);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xee);
     qtest_writeb(qts, NEXT_COLOR_DAC + 1, 0x03);
-    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x5a);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x5b);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x03);
     dac_write_triplet(qts, 2, high_reset);
-    assert_dac_triplet(qts, 2, 0x35a, high_reset);
+    assert_dac_triplet(qts, 2, 0x35b, (const uint8_t[3]) { 0, 0, 0 });
 
     dac_set_address(qts, 0x3ff);
     qtest_writeb(qts, NEXT_COLOR_DAC + 3, wrap[0]);
@@ -464,8 +582,8 @@ static void test_bt463_auto_increment_and_phase_reset(void)
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x03);
     qtest_writeb(qts, NEXT_COLOR_DAC + 3, wrap[2]);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x00);
-    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x00);
-    assert_dac_triplet(qts, 3, 0x3ff, wrap);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x04);
+    assert_dac_triplet(qts, 3, 0x3ff, (const uint8_t[3]) { 0, 0, 0 });
 
     qtest_quit(qts);
 }
@@ -538,14 +656,28 @@ static void test_registers_and_reset(void)
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DRAM_TIMING), ==, 0);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM_TIMING), ==, 0);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM), ==, 0x5a);
+    dac_set_address(qts, 0x200);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x2a);
+    dac_set_address(qts, 0x201);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    for (uint16_t address = 0x205; address <= 0x20c; address++) {
+        dac_set_address(qts, address);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    }
+    dac_set_address(qts, 0x220);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xb0);
     assert_dac_triplet(qts, 3, 0x100, zero);
+    assert_dac_triplet(qts, 2, 0x100, zero);
     assert_dac_triplet(qts, 2, 0x300, zero);
     assert_dac_triplet(qts, 2, 0x222, zero);
     dac_set_address(qts, 0x222);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xee);
     qtest_system_reset(qts);
+    dac_set_address(qts, 0x300);
     dac_write_triplet(qts, 2, reset_phase);
-    assert_dac_triplet(qts, 2, 0x000, reset_phase);
+    assert_dac_triplet(qts, 2, 0x300, reset_phase);
     g_assert_cmphex(video_irq_status(qts), ==, 0);
     qtest_writeb(qts, NEXT_COLOR_COMMAND,
                  NEXT_COLOR_COMMAND_INTRENA |
@@ -758,6 +890,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-color-video/machine-mapping",
                    test_machine_mapping);
     qtest_add_func("/next-color-video/vram-endpoints", test_vram_endpoints);
+    qtest_add_func("/next-color-video/bt463-mpu-registers",
+                   test_bt463_mpu_registers);
     qtest_add_func("/next-color-video/bt463-retained-registers",
                    test_bt463_retained_registers);
     qtest_add_func("/next-color-video/bt463-auto-increment-and-phase-reset",
