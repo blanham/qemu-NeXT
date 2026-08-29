@@ -725,13 +725,20 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
                           uint8_t window_type, Bt463LoadPhase phase)
 {
     const uint8_t window_tag = window_type & 0x0f;
+
+    /* Table 12 replaces WT E/F; do not inspect their WTT storage. */
+    if (window_tag >= 0x0e &&
+        (s->command[1] & 0x1b) == 0x0a) {
+        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
+    }
+
     const uint32_t wtt = s->wtt[window_type & 0x0f] & 0xffffff;
     const unsigned shift = wtt & 0x1f;
     const unsigned planes = (wtt >> 5) & 0x0f;
     const unsigned mode = (wtt >> 9) & 0x07;
     const bool overlay_location = (wtt >> 12) & 1;
     const unsigned overlay_mask = (wtt >> 13) & 0x0f;
-    const unsigned start = ((wtt >> 17) & 0x3f) << 3;
+    const unsigned start = ((wtt >> 17) & 0x3f) << 4;
     const bool bypass = (wtt >> 23) & 1;
     const bool contiguous = s->command[1] & 0x20;
     const bool eight_planes = s->command[1] & 0x10;
@@ -746,12 +753,6 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     /* The physical start row is validated before any special routing. */
     if (start > 0x200 || (eight_planes && start != 0x100)) {
         return 0;
-    }
-
-    /* Table 12 replaces WT E/F, but only after their WTT is validated. */
-    if (window_tag >= 0x0e &&
-        (s->command[1] & 0x1b) == 0x0a) {
-        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
     }
 
     pixel_start = eight_planes ? 0x100 : start;

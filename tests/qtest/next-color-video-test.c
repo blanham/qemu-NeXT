@@ -1459,7 +1459,7 @@ static void test_bt463_wtt_tags(void)
     program_original_warp9c_init(qts);
     /* The second tag selects a color map beginning at the next 16-byte row. */
     dac_set_address(qts, 0x301);
-    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0x00, 0x01, 0x04 });
+    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0x00, 0x01, 0x02 });
     dac_set_address(qts, 0x010);
     dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xa1, 0x00, 0x00 });
     dac_set_address(qts, 0x020);
