@@ -25,3 +25,11 @@ and verify that every local `docs/boot/` target referenced by the README exists.
 Private lab procedures, unpublished infrastructure, temporary plans, and local
 asset paths do not belong in this public repository. Their removal must not be
 used as a reason to rewrite or discard the public-facing project narrative.
+
+## Bt463 licensing policy
+
+`hw/display/bt463.c` and `include/hw/display/bt463.h` intentionally retain
+their inherited NCSA terms and full notice. The repository owner explicitly
+waives stock QEMU checkpatch SPDX allowlist and boilerplate errors for these
+copied/extracted files. Do not relicense or remove that notice without the
+repository owner's explicit approval.
