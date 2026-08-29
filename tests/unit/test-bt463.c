@@ -633,9 +633,10 @@ static void test_bt463_lookup_overlay_and_cursor(void)
 
     /* CR13 plus dual-cursor mode maps WT E/F to direct cursor colors. */
     state.command[1] = 0x0a;
-    state.wtt[0x0e] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+    /* Table 12 replaces E/F; their WTT storage may contain garbage. */
+    state.wtt[0x0e] = test_bt463_wtt(31, 0, BT463_WTT_RESERVED_7,
                                      0, 0, 0, false);
-    state.wtt[0x0f] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+    state.wtt[0x0f] = test_bt463_wtt(31, 0, BT463_WTT_RESERVED_7,
                                      0, 0, 0, false);
     state.cursor[0][0] = 0xc1;
     state.cursor[0][1] = 0xc2;
@@ -649,6 +650,10 @@ static void test_bt463_lookup_overlay_and_cursor(void)
                     ==, 0xd1d2d3);
 
     /* Table 12 does not alias WT E/F without dual cursor and CR13. */
+    state.wtt[0x0e] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                     0, 0, 0, false);
+    state.wtt[0x0f] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                     0, 0, 0, false);
     state.palette[0][0] = 0x11;
     state.palette[0][1] = 0x22;
     state.palette[0][2] = 0x33;

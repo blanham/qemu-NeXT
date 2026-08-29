@@ -724,6 +724,14 @@ Bt463LoadPhase bt463_load_phase_at(const Bt463State *s,
 uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
                           uint8_t window_type, Bt463LoadPhase phase)
 {
+    const uint8_t window_tag = window_type & 0x0f;
+
+    /* Table 12 replaces WT E/F, so their WTT storage is not decoded. */
+    if (window_tag >= 0x0e &&
+        (s->command[1] & 0x1b) == 0x0a) {
+        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
+    }
+
     const uint32_t wtt = s->wtt[window_type & 0x0f] & 0xffffff;
     const unsigned shift = wtt & 0x1f;
     const unsigned planes = (wtt >> 5) & 0x0f;
@@ -734,7 +742,6 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     const bool bypass = (wtt >> 23) & 1;
     const bool contiguous = s->command[1] & 0x20;
     const bool eight_planes = s->command[1] & 0x10;
-    const uint8_t window_tag = window_type & 0x0f;
     const uint32_t masked = bt463_mask_pixel(s, pixel_pins);
     const uint32_t shifted = shift < 28 ? masked >> shift : 0;
     const unsigned pixel_start = eight_planes ? 0x100 : start;
@@ -798,12 +805,6 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         break;
     default:
         return 0;
-    }
-
-    /* Table 12 is valid only outside CR14 and after WTT validation. */
-    if (window_tag >= 0x0e &&
-        (s->command[1] & 0x1b) == 0x0a) {
-        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
     }
 
     if (eight_planes) {
