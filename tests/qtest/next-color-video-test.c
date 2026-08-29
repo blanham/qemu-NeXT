@@ -858,6 +858,50 @@ static void test_bt463_wtt_tags(void)
     qtest_quit(qts);
 }
 
+static void test_bt463_load_interleave_scanout(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *ppm;
+    static const uint8_t pixels[] = {
+        0xff, 0xf0,
+        0xff, 0xf0,
+    };
+    static const uint8_t lower[] = { 0x10, 0x20, 0x30 };
+    static const uint8_t upper[] = { 0xa0, 0xb0, 0xc0 };
+    static const uint8_t mode_shift0[] = {
+        0x80, 0x08, 0x00, /* 12-plane true color, shift 0 */
+    };
+    static const uint8_t mode_shift4[] = {
+        0x84, 0x08, 0x00, /* 12-plane true color, shift 4 */
+    };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+
+    program_original_warp9c_init(qts);
+    dac_set_address(qts, 0x000);
+    dac_write_triplet(qts, 3, lower);
+    dac_set_address(qts, 0x00f);
+    dac_write_triplet(qts, 3, upper);
+    dac_set_address(qts, 0x300);
+    dac_write_triplet(qts, 2, mode_shift0);
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+    assert_screendump_pixel(qts, ppm, 0, lower);
+    assert_screendump_pixel(qts, ppm, 1, upper);
+
+    /* Changing only the WTT shift flips the initial phase; VRAM is reused. */
+    dac_set_address(qts, 0x300);
+    dac_write_triplet(qts, 2, mode_shift4);
+    assert_screendump_pixel(qts, ppm, 0, upper);
+    assert_screendump_pixel(qts, ppm, 1, lower);
+
+    qtest_quit(qts);
+}
+
 static void test_blanking(void)
 {
     QTestState *qts = next_color_start();
@@ -1033,6 +1077,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-color-video/bt463-lut-invalidation",
                    test_bt463_lut_invalidation);
     qtest_add_func("/next-color-video/bt463-wtt-tags", test_bt463_wtt_tags);
+    qtest_add_func("/next-color-video/bt463-load-interleave",
+                   test_bt463_load_interleave_scanout);
     qtest_add_func("/next-color-video/blanking", test_blanking);
 
     return g_test_run();
