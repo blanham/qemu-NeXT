@@ -43,6 +43,25 @@
 #define BT463_CURSOR_COLORS      2
 #define BT463_WTT_ENTRIES       16
 #define BT463_LEGACY_ENTRIES    0x400
+#define BT463_PIXEL_PIN_MASK    0x0fffffffU
+
+/* Window-type display mode encodings (WTT bits B11:B9). */
+typedef enum Bt463DisplayMode {
+    BT463_WTT_TRUE_COLOR = 0,
+    BT463_WTT_PSEUDO_COLOR = 1,
+    BT463_WTT_BANK_SELECT = 2,
+    BT463_WTT_RESERVED_3 = 3,
+    BT463_TRUE_COLOR_LOAD_INTERLEAVE = 4,
+    BT463_PSEUDO_COLOR_LOAD_INTERLEAVE = 5,
+    BT463_WTT_RESERVED_6 = 6,
+    BT463_WTT_RESERVED_7 = 7,
+} Bt463DisplayMode;
+
+/* Nibble selected by a load-interleave input cycle. */
+typedef enum Bt463LoadPhase {
+    BT463_LOAD_LOWER = 0,
+    BT463_LOAD_UPPER = 1,
+} Bt463LoadPhase;
 
 /*
  * State emitted by the NeXT color-video device before the Bt463 model was
@@ -88,5 +107,15 @@ uint8_t bt463_palette_read(Bt463State *s);
 bool bt463_palette_write(Bt463State *s, uint8_t value);
 uint8_t bt463_general_read(Bt463State *s);
 bool bt463_general_write(Bt463State *s, uint8_t value);
+
+/*
+ * Convert one 28-bit Bt463 pixel-port word to 0xRRGGBB.  pixel_pins uses
+ * bit N for physical input pin PN; window_type selects WT0-WT3 and phase is
+ * used by the two load-interleave display modes.  Invalid/reserved WTT
+ * configurations, and palette addresses outside the 528-entry RAM, return
+ * black.
+ */
+uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
+                          uint8_t window_type, Bt463LoadPhase phase);
 
 #endif /* HW_DISPLAY_BT463_H */

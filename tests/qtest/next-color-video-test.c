@@ -708,6 +708,43 @@ static void test_registers_and_reset(void)
     qtest_quit(qts);
 }
 
+/*
+ * The Warp9C's normal setup is the sequence used by vid_C16_init().  Keep
+ * this fixture deliberately small: the palette values are chosen to make the
+ * four-bit scanout assertions independent of the driver's gamma table.
+ */
+static void program_original_warp9c_init(QTestState *qts)
+{
+    static const uint8_t true_color[3] = { 0x00, 0x01, 0x00 };
+
+    dac_set_address(qts, 0x201);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x40);
+    dac_set_address(qts, 0x202);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    dac_set_address(qts, 0x203);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x80);
+
+    for (uint16_t address = 0x205; address <= 0x208; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xf0);
+    }
+    for (uint16_t address = 0x209; address <= 0x20c; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    }
+
+    for (uint16_t address = 0x300; address <= 0x30f; address++) {
+        dac_set_address(qts, address);
+        dac_write_triplet(qts, 2, true_color);
+    }
+
+    /* Entries used by the four-bit high-nibble inputs. */
+    dac_set_address(qts, 0x000);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x00, 0x00, 0x00 });
+    dac_set_address(qts, 0x0f0);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xff, 0xff, 0xff });
+}
+
 static void test_rgb444_scanout(void)
 {
     QTestState *qts = next_color_start();
@@ -735,6 +772,7 @@ static void test_rgb444_scanout(void)
     }
     ppm = create_test_ppm();
 
+    program_original_warp9c_init(qts);
     qtest_bufwrite(qts, NEXT_COLOR_VRAM, row0, sizeof(row0));
     qtest_bufwrite(qts, NEXT_COLOR_VRAM + NEXT_COLOR_STRIDE,
                    white, sizeof(white));
@@ -747,6 +785,75 @@ static void test_rgb444_scanout(void)
                     expected_row0, sizeof(expected_row0));
     g_assert_cmpmem(raster + NEXT_COLOR_WIDTH * 3, sizeof(expected_white),
                     expected_white, sizeof(expected_white));
+
+    qtest_quit(qts);
+}
+
+static void test_bt463_lut_invalidation(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *before;
+    TestPPM *after;
+    static const uint8_t pixel[] = { 0x12, 0x30 };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    before = create_test_ppm();
+    after = create_test_ppm();
+
+    program_original_warp9c_init(qts);
+    dac_set_address(qts, 0x010);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x10, 0x00, 0x00 });
+    dac_set_address(qts, 0x020);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x00, 0x20, 0x00 });
+    dac_set_address(qts, 0x030);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x00, 0x00, 0x30 });
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixel, sizeof(pixel));
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+    assert_screendump_pixel(qts, before, 0,
+                            (const uint8_t[3]) { 0x10, 0x20, 0x30 });
+
+    /* No VRAM write occurs between these two captures. */
+    dac_set_address(qts, 0x010);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x90, 0x00, 0x00 });
+    assert_screendump_pixel(qts, after, 0,
+                            (const uint8_t[3]) { 0x90, 0x20, 0x30 });
+
+    qtest_quit(qts);
+}
+
+static void test_bt463_wtt_tags(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *ppm;
+    static const uint8_t pixels[] = {
+        0x10, 0x00, /* window type 0 */
+        0x10, 0x01, /* window type 1 */
+    };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+
+    program_original_warp9c_init(qts);
+    /* The second tag selects a color map beginning at the next 16-byte row. */
+    dac_set_address(qts, 0x301);
+    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0x00, 0x01, 0x02 });
+    dac_set_address(qts, 0x010);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xa1, 0x00, 0x00 });
+    dac_set_address(qts, 0x020);
+    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xb2, 0x00, 0x00 });
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+
+    assert_screendump_pixel(qts, ppm, 0,
+                            (const uint8_t[3]) { 0xa1, 0x00, 0x00 });
+    assert_screendump_pixel(qts, ppm, 1,
+                            (const uint8_t[3]) { 0xb2, 0x00, 0x00 });
 
     qtest_quit(qts);
 }
@@ -776,6 +883,7 @@ static void test_blanking(void)
     reset_blank = create_test_ppm();
 
     qtest_bufwrite(qts, NEXT_COLOR_VRAM, red444, sizeof(red444));
+    program_original_warp9c_init(qts);
     assert_screendump_pixel(qts, initial_blank, 0, black);
     assert_screendump_pixel(qts, still_blank, 0, black);
 
@@ -922,6 +1030,9 @@ int main(int argc, char **argv)
     qtest_add_func("/next-color-video/migration-active-timer-and-dac-phase",
                    test_migration_active_timer_and_dac_phase);
     qtest_add_func("/next-color-video/rgb444-scanout", test_rgb444_scanout);
+    qtest_add_func("/next-color-video/bt463-lut-invalidation",
+                   test_bt463_lut_invalidation);
+    qtest_add_func("/next-color-video/bt463-wtt-tags", test_bt463_wtt_tags);
     qtest_add_func("/next-color-video/blanking", test_blanking);
 
     return g_test_run();

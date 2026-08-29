@@ -158,6 +158,210 @@ static void test_bt463_legacy_vmstate(void)
     g_assert_cmpuint(destination.general[0x300][2], ==, 0x33);
 }
 
+static uint32_t test_bt463_wtt(unsigned shift, unsigned planes,
+                               unsigned mode, unsigned overlay_location,
+                               unsigned overlay_mask, unsigned start,
+                               bool bypass)
+{
+    return (shift & 0x1f) |
+        ((planes & 0xf) << 5) |
+        ((mode & 0x7) << 9) |
+        ((overlay_location & 1) << 12) |
+        ((overlay_mask & 0xf) << 13) |
+        ((start & 0x3f) << 17) |
+        ((bypass & 1) << 23);
+}
+
+static uint32_t test_bt463_warp9c_pins(uint8_t red, uint8_t green,
+                                       uint8_t blue, uint8_t overlay)
+{
+    return ((uint32_t)(red & 0xf) << 4) |
+        ((uint32_t)(green & 0xf) << 12) |
+        ((uint32_t)(blue & 0xf) << 20) |
+        (overlay & 0xf) << 24;
+}
+
+static void test_bt463_lookup_true_color(void)
+{
+    Bt463State state;
+    uint32_t compact_pixel;
+
+    bt463_init(&state);
+    state.read_mask[0] = 0xf0;
+    state.read_mask[1] = 0xf0;
+    state.read_mask[2] = 0xf0;
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, false);
+    state.palette[0xa0][0] = 0x12;
+    state.palette[0xb0][1] = 0x34;
+    state.palette[0xc0][2] = 0x56;
+
+    /* Read masks select P4-P7, P12-P15 and P20-P23 before WTT decoding. */
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0xa, 0xb, 0xc,
+                                                           0),
+                                    0, BT463_LOAD_LOWER),
+                    ==, 0x123456);
+
+    /*
+     * A shift of four compacts those same physical nibbles into each
+     * channel's least-significant four bits.
+     */
+    state.wtt[0] = test_bt463_wtt(4, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, false);
+    state.palette[0x0a][0] = 0x21;
+    state.palette[0x0b][1] = 0x43;
+    state.palette[0x0c][2] = 0x65;
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0xa, 0xb, 0xc,
+                                                           0),
+                                    0, BT463_LOAD_LOWER),
+                    ==, 0x214365);
+
+    /*
+     * A four-plane true-color entry packs the three channel fields
+     * contiguously after the shift (P0-P3, P4-P7, P8-P11).
+     */
+    state.read_mask[0] = 0xff;
+    state.read_mask[1] = 0xff;
+    state.read_mask[2] = 0xff;
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, false);
+    compact_pixel = 0x00000cba;
+    state.palette[0x0a][0] = 0x31;
+    state.palette[0x0b][1] = 0x42;
+    state.palette[0x0c][2] = 0x53;
+    g_assert_cmphex(bt463_lookup_rgb(&state, compact_pixel, 0,
+                                    BT463_LOAD_LOWER),
+                    ==, 0x314253);
+}
+
+static void test_bt463_lookup_modes(void)
+{
+    Bt463State state;
+    uint32_t pixel;
+
+    bt463_init(&state);
+    state.read_mask[0] = 0xff;
+    state.read_mask[1] = 0xff;
+    state.read_mask[2] = 0xff;
+    state.read_mask[3] = 0x0f;
+    pixel = 0x00000000 | (0x0b << 8) | 0x0a | (0x0c << 16) |
+        (1U << 24);
+
+    /* Pseudo color addresses all three DACs with one compact pixel index. */
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0, 1, false);
+    state.palette[0x1a][0] = 0x11;
+    state.palette[0x1a][1] = 0x22;
+    state.palette[0x1a][2] = 0x33;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x112233);
+
+    /* Bank select prepends the selected overlay planes to pixel data. */
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_BANK_SELECT,
+                                  0, 1, 0, false);
+    state.palette[0x1a][0] = 0x44;
+    state.palette[0x1a][1] = 0x55;
+    state.palette[0x1a][2] = 0x66;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x445566);
+
+    /* Overlay pins remain fixed at P24-P27 when pixel data is shifted. */
+    state.wtt[0] = test_bt463_wtt(4, 4, BT463_WTT_BANK_SELECT,
+                                  0, 1, 0, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0xa, 0, 0, 1),
+                                    0, BT463_LOAD_LOWER),
+                    ==, 0x445566);
+
+    /*
+     * The fixed overlay source is independent of the shifted pixel-plane
+     * budget, so all four planes may begin at P24.
+     */
+    state.wtt[0] = test_bt463_wtt(24, 4, BT463_WTT_BANK_SELECT,
+                                  0, 1, 0, false);
+    state.palette[0x11][0] = 0x47;
+    state.palette[0x11][1] = 0x58;
+    state.palette[0x11][2] = 0x69;
+    g_assert_cmphex(bt463_lookup_rgb(&state, 1U << 24, 0,
+                                    BT463_LOAD_LOWER),
+                    ==, 0x475869);
+
+    /* Lookup bypass in true-color mode drives each channel directly. */
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, true);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x0a0b0c);
+
+    /* Lookup bypass in pseudo-color mode drives one value to all DACs. */
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0, 0, true);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x0a0a0a);
+}
+
+static void test_bt463_lookup_load_interleave(void)
+{
+    Bt463State state;
+    uint32_t pixel = 0x00000000 | (0x2a << 0) | (0x3b << 8) |
+        (0x4c << 16);
+
+    bt463_init(&state);
+    state.read_mask[0] = 0xff;
+    state.read_mask[1] = 0xff;
+    state.read_mask[2] = 0xff;
+
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
+                                  0, 0, 0, false);
+    state.palette[0x0a][0] = 0x10;
+    state.palette[0x0b][1] = 0x20;
+    state.palette[0x0c][2] = 0x30;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x102030);
+
+    state.palette[0x02][0] = 0x40;
+    state.palette[0x03][1] = 0x50;
+    state.palette[0x04][2] = 0x60;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_UPPER),
+                    ==, 0x405060);
+
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_PSEUDO_COLOR_LOAD_INTERLEAVE,
+                                  0, 0, 0, false);
+    state.palette[0xba][0] = 0x71;
+    state.palette[0xba][1] = 0x72;
+    state.palette[0xba][2] = 0x73;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x717273);
+    state.palette[0x32][0] = 0x81;
+    state.palette[0x32][1] = 0x82;
+    state.palette[0x32][2] = 0x83;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_UPPER),
+                    ==, 0x818283);
+}
+
+static void test_bt463_lookup_invalid(void)
+{
+    Bt463State state;
+    uint32_t pixel = test_bt463_warp9c_pins(0xf, 0xf, 0xf, 0xf);
+
+    bt463_init(&state);
+    memset(state.read_mask, 0xff, sizeof(state.read_mask));
+    state.wtt[0] = test_bt463_wtt(0, 8, 3, 0, 0, 0, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0);
+
+    state.wtt[0] = test_bt463_wtt(5, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0);
+
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0, 0x3f, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     module_call_init(MODULE_INIT_QOM);
@@ -166,5 +370,11 @@ int main(int argc, char **argv)
     g_test_add_func("/bt463/import-legacy-wtt-latches",
                     test_bt463_import_legacy_wtt_latches);
     g_test_add_func("/bt463/legacy-vmstate", test_bt463_legacy_vmstate);
+    g_test_add_func("/bt463/lookup-true-color",
+                    test_bt463_lookup_true_color);
+    g_test_add_func("/bt463/lookup-modes", test_bt463_lookup_modes);
+    g_test_add_func("/bt463/lookup-load-interleave",
+                    test_bt463_lookup_load_interleave);
+    g_test_add_func("/bt463/lookup-invalid", test_bt463_lookup_invalid);
     return g_test_run();
 }

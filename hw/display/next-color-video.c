@@ -80,15 +80,25 @@ static void next_color_video_draw_line(void *opaque, uint8_t *dst,
                                        const uint8_t *src, int width,
                                        int pitch)
 {
+    NextColorVideoState *s = opaque;
     uint32_t *out = (uint32_t *)dst;
 
     for (int x = 0; x < width; x++) {
         uint16_t pixel = lduw_be_p(src + x * 2);
-        uint8_t r = ((pixel >> 12) & 0xf) * 0x11;
-        uint8_t g = ((pixel >> 8) & 0xf) * 0x11;
-        uint8_t b = ((pixel >> 4) & 0xf) * 0x11;
+        uint32_t pixel_pins = ((uint32_t)(pixel >> 12) & 0xf) << 4;
+        uint32_t rgb;
 
-        out[x] = rgb_to_pixel32(r, g, b);
+        /*
+         * Warp9C drives only the four high planes of each color octet;
+         * WT0-WT3 carry the low framebuffer nibble.  Overlay pins P24-P27
+         * are inactive for normal framebuffer scanout.
+         */
+        pixel_pins |= ((uint32_t)(pixel >> 8) & 0xf) << 12;
+        pixel_pins |= ((uint32_t)(pixel >> 4) & 0xf) << 20;
+        rgb = bt463_lookup_rgb(&s->bt463, pixel_pins, pixel & 0xf,
+                               BT463_LOAD_LOWER);
+        out[x] = rgb_to_pixel32((rgb >> 16) & 0xff, (rgb >> 8) & 0xff,
+                                rgb & 0xff);
     }
 }
 

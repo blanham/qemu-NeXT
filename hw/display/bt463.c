@@ -336,6 +336,217 @@ bool bt463_general_write(Bt463State *s, uint8_t value)
     return changed;
 }
 
+static uint32_t bt463_mask_pixel(const Bt463State *s, uint32_t pixel)
+{
+    uint32_t masked = 0;
+
+    pixel &= BT463_PIXEL_PIN_MASK;
+    for (unsigned i = 0; i < 4; i++) {
+        uint32_t value = (pixel >> (i * 8)) & 0xff;
+        uint32_t mask = s->read_mask[i];
+
+        if (i == 3) {
+            mask &= 0x0f;
+        }
+        masked |= (value & mask) << (i * 8);
+    }
+
+    return masked;
+}
+
+static uint32_t bt463_extract_bits(uint32_t value, unsigned first,
+                                   unsigned count)
+{
+    if (!count) {
+        return 0;
+    }
+    return (value >> first) & ((1U << count) - 1);
+}
+
+static uint32_t bt463_overlay_input(uint32_t masked, uint32_t shifted,
+                                    unsigned planes, unsigned mode,
+                                    bool overlay_location)
+{
+    if (!overlay_location) {
+        /* P24-P27 are a fixed overlay port and are not shifted. */
+        return (masked >> 24) & 0x0f;
+    }
+
+    if (mode == BT463_WTT_PSEUDO_COLOR) {
+        return (shifted >> planes) & 0x0f;
+    }
+
+    /* True-color and bank-select use P17, P0, P8, P16 as OL3..OL0. */
+    return (((shifted >> 17) & 1) << 3) |
+        (((shifted >> 0) & 1) << 2) |
+        (((shifted >> 8) & 1) << 1) |
+        (((shifted >> 16) & 1) << 0);
+}
+
+static void bt463_compact_overlay(uint32_t input, unsigned mask,
+                                  uint32_t *value)
+{
+    unsigned count = 0;
+    uint32_t compact = 0;
+
+    for (unsigned i = 0; i < 4; i++) {
+        if (mask & (1U << i)) {
+            compact |= ((input >> i) & 1) << count;
+            count++;
+        }
+    }
+    *value = compact;
+}
+
+static bool bt463_palette_component(const Bt463State *s, unsigned address,
+                                    unsigned component, uint8_t *value)
+{
+    if (address >= BT463_PALETTE_ENTRIES || component >= 3) {
+        return false;
+    }
+    *value = s->palette[address][component];
+    return true;
+}
+
+static bool bt463_lookup_palette_rgb(const Bt463State *s, unsigned address,
+                                     uint8_t rgb[3])
+{
+    for (unsigned i = 0; i < 3; i++) {
+        if (!bt463_palette_component(s, address, i, &rgb[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint32_t bt463_pack_rgb(const uint8_t rgb[3])
+{
+    return ((uint32_t)rgb[0] << 16) | ((uint32_t)rgb[1] << 8) | rgb[2];
+}
+
+uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
+                          uint8_t window_type, Bt463LoadPhase phase)
+{
+    const uint32_t wtt = s->wtt[window_type & 0x0f] & 0xffffff;
+    const unsigned shift = wtt & 0x1f;
+    const unsigned planes = (wtt >> 5) & 0x0f;
+    const unsigned mode = (wtt >> 9) & 0x07;
+    const bool overlay_location = (wtt >> 12) & 1;
+    const unsigned overlay_mask = (wtt >> 13) & 0x0f;
+    const unsigned start = ((wtt >> 17) & 0x3f) << 4;
+    const bool bypass = (wtt >> 23) & 1;
+    const uint32_t masked = bt463_mask_pixel(s, pixel_pins);
+    const uint32_t shifted = shift < 28 ? masked >> shift : 0;
+    uint8_t rgb[3];
+
+    if (shift > 27) {
+        return 0;
+    }
+
+    switch (mode) {
+    case BT463_WTT_TRUE_COLOR: {
+        if (planes > 8 || shift + planes * 3 > 28) {
+            return 0;
+        }
+        if (bypass) {
+            if (planes != 8 || shift + 24 > 28) {
+                return 0;
+            }
+            for (unsigned i = 0; i < 3; i++) {
+                rgb[i] = bt463_extract_bits(shifted, i * 8, 8);
+            }
+            return bt463_pack_rgb(rgb);
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            const unsigned value = bt463_extract_bits(shifted, i * planes,
+                                                      planes);
+            if (!bt463_palette_component(s, start + value, i, &rgb[i])) {
+                return 0;
+            }
+        }
+        return bt463_pack_rgb(rgb);
+    }
+
+    case BT463_WTT_PSEUDO_COLOR: {
+        if (planes > 9 || shift + planes > 28) {
+            return 0;
+        }
+        if (bypass) {
+            if (planes != 8 || shift + 8 > 28) {
+                return 0;
+            }
+            const unsigned value = bt463_extract_bits(shifted, 0, 8);
+            rgb[0] = value;
+            rgb[1] = value;
+            rgb[2] = value;
+            return bt463_pack_rgb(rgb);
+        }
+
+        const unsigned value = bt463_extract_bits(shifted, 0, planes);
+        if (!bt463_lookup_palette_rgb(s, start + value, rgb)) {
+            return 0;
+        }
+        return bt463_pack_rgb(rgb);
+    }
+
+    case BT463_WTT_BANK_SELECT: {
+        uint32_t overlay_value;
+        unsigned value;
+
+        if (bypass || planes > 8 || shift + planes > 28) {
+            return 0;
+        }
+        bt463_compact_overlay(
+            bt463_overlay_input(masked, shifted, planes, mode,
+                                overlay_location),
+            overlay_mask, &overlay_value);
+        value = bt463_extract_bits(shifted, 0, planes);
+        value |= overlay_value << planes;
+        if (!bt463_lookup_palette_rgb(s, start + value, rgb)) {
+            return 0;
+        }
+        return bt463_pack_rgb(rgb);
+    }
+
+    case BT463_TRUE_COLOR_LOAD_INTERLEAVE: {
+        if (bypass || planes != 4 || shift + 24 > 28) {
+            return 0;
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            const unsigned value = bt463_extract_bits(
+                shifted, i * 8 + (phase == BT463_LOAD_UPPER ? 4 : 0), 4);
+            if (!bt463_palette_component(s, start + value, i, &rgb[i])) {
+                return 0;
+            }
+        }
+        return bt463_pack_rgb(rgb);
+    }
+
+    case BT463_PSEUDO_COLOR_LOAD_INTERLEAVE: {
+        unsigned red;
+        unsigned green;
+        unsigned value;
+
+        if (bypass || planes != 8 || shift + 16 > 28) {
+            return 0;
+        }
+        red = bt463_extract_bits(shifted,
+                                 phase == BT463_LOAD_UPPER ? 4 : 0, 4);
+        green = bt463_extract_bits(shifted,
+                                   8 + (phase == BT463_LOAD_UPPER ? 4 : 0),
+                                   4);
+        value = (green << 4) | red;
+        if (!bt463_lookup_palette_rgb(s, start + value, rgb)) {
+            return 0;
+        }
+        return bt463_pack_rgb(rgb);
+    }
+
+    default:
+        return 0;
+    }
+}
+
 static int bt463_post_load(void *opaque, int version_id)
 {
     Bt463State *s = opaque;
