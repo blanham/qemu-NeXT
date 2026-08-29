@@ -90,13 +90,21 @@ static TestROM *create_test_rom(void)
     return rom;
 }
 
-static QTestState *next_color_start_with_args(const char *args)
+static QTestState *next_color_start_with_env(const char *binary_env,
+                                             const char *args)
 {
     TestROM *rom = create_test_rom();
     g_autofree char *quoted_rom_path = g_shell_quote(rom->path);
+    g_autofree char *qemu_args = g_strdup_printf(
+        "-machine next-station-color -m 32M -bios %s %s",
+        quoted_rom_path, args ?: "");
 
-    return qtest_initf("-machine next-station-color -m 32M -bios %s %s",
-                       quoted_rom_path, args ?: "");
+    return qtest_init_ext(binary_env, qemu_args, NULL, true);
+}
+
+static QTestState *next_color_start_with_args(const char *args)
+{
+    return next_color_start_with_env(NULL, args);
 }
 
 static QTestState *next_color_start(void)
@@ -1451,7 +1459,7 @@ static void test_bt463_wtt_tags(void)
     program_original_warp9c_init(qts);
     /* The second tag selects a color map beginning at the next 16-byte row. */
     dac_set_address(qts, 0x301);
-    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0x00, 0x01, 0x02 });
+    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0x00, 0x01, 0x04 });
     dac_set_address(qts, 0x010);
     dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xa1, 0x00, 0x00 });
     dac_set_address(qts, 0x020);
@@ -1641,6 +1649,61 @@ static void test_migration(void)
     qtest_clock_step(destination, 1);
     g_assert_cmphex(video_irq_status(destination), ==,
                     NEXT_COLOR_VIDEO_IRQ_STATUS);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+}
+
+static void test_migration_outer_v1_fixture(void)
+{
+    const char *legacy_binary = g_getenv("QTEST_QEMU_BINARY_V1");
+    TestMigration *migration;
+    g_autofree char *uri = NULL;
+    QTestState *destination;
+    QTestState *source;
+    const uint8_t palette[3] = { 0x12, 0x34, 0x56 };
+    const uint8_t wtt[3] = { 0xaa, 0xbb, 0xcc };
+
+    /*
+     * QMP cannot select a historical VMState version.  An executable built
+     * before the Bt463 extraction is therefore supplied out-of-band when an
+     * actual outer-v1 stream is required; the current migration tests cover
+     * the normal v3 stream when that fixture is unavailable.
+     */
+    if (!legacy_binary || !*legacy_binary) {
+        g_test_skip("set QTEST_QEMU_BINARY_V1 to a pre-Bt463-extraction "
+                    "QEMU binary to generate an outer-v1 stream");
+        return;
+    }
+
+    migration = create_test_migration();
+    uri = g_strdup_printf("unix:%s", migration->socket_path);
+    destination = next_color_start_with_args("-incoming defer");
+    source = next_color_start_with_env("QTEST_QEMU_BINARY_V1", NULL);
+
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        uri);
+
+    /* The v1 device stores the generic 0x400-entry DAC arrays directly. */
+    dac_set_address(source, 0x010);
+    dac_write_triplet(source, 3, palette);
+    dac_set_address(source, 0x300);
+    dac_write_triplet(source, 2, wtt);
+    dac_set_address(source, 0x3abc);
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
+
+    /* The imported legacy address is constrained to the 10-bit DAC space. */
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC), ==, 0xbc);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 1), ==, 0x02);
+    assert_dac_triplet(destination, 3, 0x010, palette);
+    assert_dac_triplet(destination, 2, 0x300, wtt);
 
     qtest_quit(source);
     qtest_quit(destination);
@@ -1920,6 +1983,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-color-video/bt463-original-brightness-rewrite",
                    test_bt463_original_brightness_rewrite);
     qtest_add_func("/next-color-video/migration", test_migration);
+    qtest_add_func("/next-color-video/migration-outer-v1-fixture",
+                   test_migration_outer_v1_fixture);
     qtest_add_func("/next-color-video/migration-active-timer-and-dac-phase",
                    test_migration_active_timer_and_dac_phase);
     qtest_add_func("/next-color-video/migration-complete-bt463-state",

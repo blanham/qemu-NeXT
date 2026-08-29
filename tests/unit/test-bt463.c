@@ -47,7 +47,7 @@ static void test_bt463_import_legacy(void)
     bt463_init(&state);
     bt463_import_legacy(&state, &legacy);
 
-    g_assert_cmpuint(state.address, ==, 0x0abc);
+    g_assert_cmpuint(state.address, ==, 0x02bc);
     g_assert_cmpuint(state.component, ==, 2);
     g_assert_cmpuint(state.palette[0x000][0], ==, 0x12);
     g_assert_cmpuint(state.palette[0x20f][2], ==, 0x34);
@@ -472,7 +472,7 @@ static void test_bt463_lookup_modes(void)
 
     /* Pseudo color addresses all three DACs with one compact pixel index. */
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_PSEUDO_COLOR,
-                                  0, 0, 1, false);
+                                  0, 0, 2, false);
     state.palette[0x1a][0] = 0x11;
     state.palette[0x1a][1] = 0x22;
     state.palette[0x1a][2] = 0x33;
@@ -652,7 +652,7 @@ static void test_bt463_lookup_overlay_and_cursor(void)
     bt463_init(&state);
     memset(state.read_mask, 0xff, sizeof(state.read_mask));
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
-                                  0, 1, 2, false);
+                                  0, 1, 4, false);
     pixel = test_bt463_warp9c_pins(1, 2, 3, 1);
     state.palette[0x21][0] = 0x11;
     state.palette[0x22][1] = 0x22;
@@ -667,7 +667,7 @@ static void test_bt463_lookup_overlay_and_cursor(void)
 
     /* The overlay mask compacts OL0 and OL2 into a two-bit value. */
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
-                                  0, 5, 2, false);
+                                  0, 5, 4, false);
     pixel = test_bt463_warp9c_pins(1, 2, 3, 5);
     state.palette[0x13][0] = 0x91;
     state.palette[0x13][1] = 0x92;
@@ -677,7 +677,7 @@ static void test_bt463_lookup_overlay_and_cursor(void)
 
     /* Alternate true-color overlay location uses shifted P16 as OL0. */
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
-                                  1, 1, 2, false);
+                                  1, 1, 4, false);
     pixel = test_bt463_warp9c_pins(1, 2, 3, 0) | (1U << 16);
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
                     ==, 0xa1a2a3);
@@ -745,6 +745,10 @@ static void test_bt463_lookup_overlay_and_cursor(void)
     state.palette[0x0e0][0] = 0x71;
     state.palette[0x0e0][1] = 0x72;
     state.palette[0x0e0][2] = 0x73;
+    state.wtt[0x0e] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                     0, 0, 0x20, false);
+    state.wtt[0x0f] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                     0, 0, 0x20, false);
     state.command[1] = 0x1a; /* CR14 repurposes WT0-WT3. */
     g_assert_cmphex(bt463_lookup_rgb(&state,
                                     test_bt463_warp9c_pins(0, 0, 0, 0),
@@ -772,7 +776,7 @@ static void test_bt463_fill_palette(Bt463State *state)
 static void test_bt463_lookup_standard_overlay_truth_table(void)
 {
     Bt463State state;
-    const unsigned start = 2;
+    const unsigned start = 4;
     const uint32_t pixel_data = test_bt463_warp9c_pins(0, 0, 0, 0);
 
     bt463_init(&state);
@@ -784,7 +788,7 @@ static void test_bt463_lookup_standard_overlay_truth_table(void)
     /* Table 9: OL=0 is pixel data; overlays are start-$10+$OL. */
     for (unsigned overlay = 0; overlay < 16; overlay++) {
         uint32_t pixel = pixel_data | (overlay << 24);
-        unsigned address = overlay ? 0x10 + overlay : start << 4;
+        unsigned address = overlay ? 0x10 + overlay : start << 3;
 
         g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0,
                                          BT463_LOAD_LOWER), ==,
@@ -795,7 +799,7 @@ static void test_bt463_lookup_standard_overlay_truth_table(void)
     state.command[1] = 0x04;
     for (unsigned overlay = 0; overlay < 16; overlay++) {
         uint32_t pixel = pixel_data | (overlay << 24);
-        unsigned address = overlay ? 0x10 + overlay : start << 4;
+        unsigned address = overlay ? 0x10 + overlay : start << 3;
 
         g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0,
                                          BT463_LOAD_LOWER), ==,
@@ -832,7 +836,7 @@ static void test_bt463_lookup_standard_overlay_truth_table(void)
 static void test_bt463_lookup_single_cursor_truth_table(void)
 {
     Bt463State state;
-    const unsigned start = 2;
+    const unsigned start = 4;
 
     bt463_init(&state);
     memset(state.read_mask, 0xff, sizeof(state.read_mask));
@@ -862,7 +866,7 @@ static void test_bt463_lookup_single_cursor_truth_table(void)
                                   0, 0xe, start, false);
     g_assert_cmphex(bt463_lookup_rgb(&state, 1U << 24, 0,
                                      BT463_LOAD_LOWER), ==,
-                    test_bt463_palette_value(start << 4));
+                    test_bt463_palette_value(start << 3));
     g_assert_cmphex(bt463_lookup_rgb(&state, 2U << 24, 0,
                                      BT463_LOAD_LOWER), ==, 0xc1c2c3);
 
@@ -906,7 +910,7 @@ static void test_bt463_lookup_single_cursor_truth_table(void)
 static void test_bt463_lookup_dual_cursor_truth_table(void)
 {
     Bt463State state;
-    const unsigned start = 2;
+    const unsigned start = 4;
     const uint32_t cursor0 = 0xd1d2d3;
     const uint32_t cursor1 = 0xe1e2e3;
 
@@ -973,7 +977,7 @@ static void test_bt463_lookup_eight_overlay_planes(void)
     state.command[1] = 0x50; /* CR16 plus CR14: fixed eight-plane overlay. */
     test_bt463_fill_palette(&state);
     state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
-                                  0, 0xf, 0x10, false);
+                                  0, 0xf, 0x20, false);
     state.wtt[0xa] = state.wtt[0];
     state.palette[0xa5][0] = (overlay_color >> 16) & 0xff;
     state.palette[0xa5][1] = (overlay_color >> 8) & 0xff;
@@ -999,7 +1003,7 @@ static void test_bt463_lookup_eight_overlay_planes(void)
 
     /* Pseudo-color is also valid, while window operations are unavailable. */
     state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_PSEUDO_COLOR,
-                                  0, 0xf, 0x10, false);
+                                  0, 0xf, 0x20, false);
     state.palette[0x1ab][0] = 0x41;
     state.palette[0x1ab][1] = 0x52;
     state.palette[0x1ab][2] = 0x63;
@@ -1008,7 +1012,7 @@ static void test_bt463_lookup_eight_overlay_planes(void)
 
     /* CR12 makes an upper-only CR14 overlay word an underlay candidate. */
     state.wtt[1] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
-                                  0, 0xf, 0x10, false);
+                                  0, 0xf, 0x20, false);
     state.palette[0x010][0] = 0x91;
     state.palette[0x010][1] = 0x92;
     state.palette[0x010][2] = 0x93;
@@ -1083,6 +1087,43 @@ static void test_bt463_lookup_invalid(void)
     g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
                                     BT463_LOAD_LOWER), ==, 0);
     state.command[1] = 0x01;
+    g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
+                                    BT463_LOAD_LOWER), ==, 0);
+}
+
+static void test_bt463_lookup_invalid_start(void)
+{
+    Bt463State state;
+    const uint32_t overlay_pixel = test_bt463_warp9c_pins(0, 0, 0, 1);
+
+    bt463_init(&state);
+    memset(state.read_mask, 0xff, sizeof(state.read_mask));
+    state.palette[0x201][0] = 0xa1;
+    state.palette[0x201][1] = 0xa2;
+    state.palette[0x201][2] = 0xa3;
+    state.cursor[0][0] = 0xb1;
+    state.cursor[0][1] = 0xb2;
+    state.cursor[0][2] = 0xb3;
+
+    /* The largest six-bit start field maps to the legal 0x1f8 row. */
+    state.palette[0x1f8][0] = 0x11;
+    state.palette[0x1f8][1] = 0x22;
+    state.palette[0x1f8][2] = 0x33;
+    state.wtt[0] = test_bt463_wtt(0, 0, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0x3f, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, 0, 0, BT463_LOAD_LOWER), ==,
+                    0x112233);
+
+    /* CR14 accepts only the physical start row at 0x100. */
+    state.command[1] = 0x10;
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0xf, 0x10, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
+                                    BT463_LOAD_LOWER), ==, 0);
+
+    /* Start validation also precedes bypass, even if the pixel is direct. */
+    state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0x10, true);
     g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
                                     BT463_LOAD_LOWER), ==, 0);
 }
@@ -1291,6 +1332,8 @@ int main(int argc, char **argv)
     g_test_add_func("/bt463/lookup-eight-overlay-planes",
                     test_bt463_lookup_eight_overlay_planes);
     g_test_add_func("/bt463/lookup-invalid", test_bt463_lookup_invalid);
+    g_test_add_func("/bt463/lookup-invalid-start",
+                    test_bt463_lookup_invalid_start);
     g_test_add_func("/bt463/blink-step", test_bt463_blink_step);
     g_test_add_func("/bt463/mask-bytes", test_bt463_mask_bytes);
     return g_test_run();

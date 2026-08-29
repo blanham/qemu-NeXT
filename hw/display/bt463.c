@@ -192,7 +192,7 @@ void bt463_reset(Bt463State *s)
 void bt463_import_legacy(Bt463State *s, const Bt463LegacyState *legacy)
 {
     bt463_reset(s);
-    s->address = legacy->dac_address & BT463_ADDRESS_MASK;
+    s->address = legacy->dac_address & (BT463_LEGACY_ENTRIES - 1);
     s->component = legacy->dac_component % 3;
 
     /* The old generic palette was larger than the architected Bt463 RAM. */
@@ -725,30 +725,36 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
                           uint8_t window_type, Bt463LoadPhase phase)
 {
     const uint8_t window_tag = window_type & 0x0f;
-
-    /* Table 12 replaces WT E/F, so their WTT storage is not decoded. */
-    if (window_tag >= 0x0e &&
-        (s->command[1] & 0x1b) == 0x0a) {
-        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
-    }
-
     const uint32_t wtt = s->wtt[window_type & 0x0f] & 0xffffff;
     const unsigned shift = wtt & 0x1f;
     const unsigned planes = (wtt >> 5) & 0x0f;
     const unsigned mode = (wtt >> 9) & 0x07;
     const bool overlay_location = (wtt >> 12) & 1;
     const unsigned overlay_mask = (wtt >> 13) & 0x0f;
-    const unsigned start = ((wtt >> 17) & 0x3f) << 4;
+    const unsigned start = ((wtt >> 17) & 0x3f) << 3;
     const bool bypass = (wtt >> 23) & 1;
     const bool contiguous = s->command[1] & 0x20;
     const bool eight_planes = s->command[1] & 0x10;
     const uint32_t masked = bt463_mask_pixel(s, pixel_pins);
     const uint32_t shifted = shift < 28 ? masked >> shift : 0;
-    const unsigned pixel_start = eight_planes ? 0x100 : start;
+    unsigned pixel_start;
     Bt463OverlayRoute route;
     unsigned overlay_input;
     unsigned overlay_value;
     uint8_t rgb[3];
+
+    /* The physical start row is validated before any special routing. */
+    if (start > 0x200 || (eight_planes && start != 0x100)) {
+        return 0;
+    }
+
+    /* Table 12 replaces WT E/F, but only after their WTT is validated. */
+    if (window_tag >= 0x0e &&
+        (s->command[1] & 0x1b) == 0x0a) {
+        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
+    }
+
+    pixel_start = eight_planes ? 0x100 : start;
 
     if (shift > 27) {
         return 0;
