@@ -43,6 +43,7 @@
 #include "hw/display/bt463.h"
 #include "hw/display/framebuffer.h"
 #include "ui/pixel_ops.h"
+#include "trace.h"
 
 #define NEXT_C16_VRAM_SIZE (2 * MiB)
 #define NEXT_C16_WIDTH 1120
@@ -53,6 +54,9 @@
 #define NEXT_COLOR_COMMAND_CLRINTR 0x01
 #define NEXT_COLOR_COMMAND_INTRENA 0x02
 #define NEXT_COLOR_COMMAND_UNBLANK 0x04
+
+/* Warp9C scanout uses P4-P23; P24-P27 are inactive overlay inputs. */
+#define NEXT_COLOR_BT463_BLINK_BYTES 0x07
 
 struct NextColorVideoState {
     SysBusDevice parent_obj;
@@ -223,8 +227,11 @@ static void next_color_schedule_retrace(NextColorVideoState *s);
 static void next_color_retrace(void *opaque)
 {
     NextColorVideoState *s = opaque;
+    const bool invalidate = bt463_retrace_step_visible(
+        &s->bt463, NEXT_COLOR_BT463_BLINK_BYTES);
 
-    if (bt463_retrace_step(&s->bt463)) {
+    trace_next_color_retrace(invalidate);
+    if (invalidate) {
         s->invalidate = true;
     }
     if (s->command & NEXT_COLOR_COMMAND_INTRENA) {

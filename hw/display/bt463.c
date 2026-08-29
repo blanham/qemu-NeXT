@@ -136,9 +136,12 @@ static void bt463_blink_period(const Bt463State *s, unsigned *on,
     }
 }
 
-static bool bt463_blink_visible(const Bt463State *s)
+static bool bt463_blink_visible(const Bt463State *s, uint8_t relevant_bytes)
 {
     for (unsigned i = 0; i < G_N_ELEMENTS(s->blink_mask); i++) {
+        if (!(relevant_bytes & (1U << i))) {
+            continue;
+        }
         uint8_t mask = s->blink_mask[i] & s->read_mask[i];
 
         if (i == 3) {
@@ -155,7 +158,7 @@ static bool bt463_blink_visible(const Bt463State *s)
  * Revision B notes a physical blink defect; model the documented functional
  * production behavior so guests see deterministic blink cadence.
  */
-bool bt463_retrace_step(Bt463State *s)
+bool bt463_retrace_step_visible(Bt463State *s, uint8_t relevant_bytes)
 {
     unsigned on;
     unsigned off;
@@ -170,7 +173,14 @@ bool bt463_retrace_step(Bt463State *s)
         s->blink_phase = !old_phase;
     }
 
-    return old_phase != s->blink_phase && bt463_blink_visible(s);
+    return old_phase != s->blink_phase &&
+        bt463_blink_visible(s, relevant_bytes);
+}
+
+bool bt463_retrace_step(Bt463State *s)
+{
+    /* The generic helper exposes all four modeled mask bytes. */
+    return bt463_retrace_step_visible(s, 0x0f);
 }
 
 void bt463_init(Bt463State *s)
@@ -438,6 +448,71 @@ static uint32_t bt463_extract_bits(uint32_t value, unsigned first,
         return 0;
     }
     return (value >> first) & ((1U << count) - 1);
+}
+
+/*
+ * CR12's underlay path is conditional on the manipulated pixel value.  The
+ * overlay word alone cannot answer that question: a value with OL3 clear may
+ * still carry nonzero color planes.  Keep this check in the mode-specific
+ * pixel pipeline so the same masked inputs used for the final lookup decide
+ * whether an underlay is visible.
+ */
+static bool bt463_pixel_value_is_zero(uint32_t masked, uint32_t shifted,
+                                      unsigned planes, unsigned mode,
+                                      bool contiguous, bool bypass,
+                                      Bt463LoadPhase phase)
+{
+    switch (mode) {
+    case BT463_WTT_TRUE_COLOR:
+        if (bypass) {
+            for (unsigned i = 0; i < 3; i++) {
+                if (bt463_extract_bits(shifted, i * 8, 8)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (contiguous) {
+            static const unsigned channel_offset[] = { 0, 8, 4 };
+
+            for (unsigned i = 0; i < 3; i++) {
+                if (bt463_extract_bits(masked, channel_offset[i], planes)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        for (unsigned i = 0; i < 3; i++) {
+            if (bt463_extract_bits(shifted, i * 8, planes)) {
+                return false;
+            }
+        }
+        return true;
+
+    case BT463_WTT_PSEUDO_COLOR:
+        return bt463_extract_bits(shifted, 0, bypass ? 8 : planes) == 0;
+
+    case BT463_TRUE_COLOR_LOAD_INTERLEAVE:
+        for (unsigned i = 0; i < 3; i++) {
+            if (bt463_extract_bits(masked,
+                                   i * 8 + (phase == BT463_LOAD_UPPER ? 4 : 0),
+                                   4)) {
+                return false;
+            }
+        }
+        return true;
+
+    case BT463_PSEUDO_COLOR_LOAD_INTERLEAVE:
+        return bt463_extract_bits(masked,
+                                  phase == BT463_LOAD_UPPER ? 4 : 0, 4) == 0 &&
+            bt463_extract_bits(masked,
+                               8 + (phase == BT463_LOAD_UPPER ? 4 : 0), 4) == 0;
+
+    case BT463_WTT_BANK_SELECT:
+    default:
+        /* Bank-select never routes through the underlay path. */
+        return false;
+    }
 }
 
 static uint32_t bt463_overlay_input(const Bt463State *s, uint32_t masked,
@@ -740,6 +815,13 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     case BT463_ROUTE_OVERLAY:
     case BT463_ROUTE_UNDERLAY: {
         bool selected;
+
+        if (route == BT463_ROUTE_UNDERLAY &&
+            !bt463_pixel_value_is_zero(masked, shifted, planes, mode,
+                                       contiguous, bypass, phase)) {
+            /* A nonzero pixel takes priority over the underlay. */
+            break;
+        }
 
         if (bt463_lookup_routed_overlay(s, overlay_value, pixel_start,
                                         eight_planes,

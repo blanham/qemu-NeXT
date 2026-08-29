@@ -16,6 +16,9 @@ g364fb_write(uint64_t addr, uint32_t new) "write addr=0x%"PRIx64": 0x%x"
 # next-fb.c
 nextfb_update(int first, int last, bool invalidate) "first=%d last=%d invalidate=%d"
 
+# next-color-video.c
+next_color_retrace(bool invalidate) "invalidate=%d"
+
 # vmware_vga.c
 vmware_value_read(uint32_t index, uint32_t value) "index %d, value 0x%x"
 vmware_value_write(uint32_t index, uint32_t value) "index %d, value 0x%x"

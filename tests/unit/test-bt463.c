@@ -700,6 +700,14 @@ static void test_bt463_lookup_standard_overlay_truth_table(void)
                         test_bt463_palette_value(address));
     }
 
+    /* Underlay is selected only for a zero manipulated pixel value. */
+    state.palette[0x30][0] = 0x31;
+    state.palette[0x20][1] = 0x22;
+    state.palette[0x20][2] = 0x23;
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(1, 0, 0, 1),
+                                    0, BT463_LOAD_LOWER), ==, 0x312223);
+
     /* CR16 maps every selected overlay to the common 0x201-0x20f palette. */
     state.command[1] = 0x40;
     for (unsigned overlay = 1; overlay < 16; overlay++) {
@@ -771,6 +779,14 @@ static void test_bt463_lookup_single_cursor_truth_table(void)
                         test_bt463_palette_value(0x10 + overlay));
     }
 
+    /* A nonzero pixel still wins over an underlay-selected overlay word. */
+    state.palette[0x30][0] = 0x31;
+    state.palette[0x20][1] = 0x22;
+    state.palette[0x20][2] = 0x23;
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(1, 0, 0, 2),
+                                    0, BT463_LOAD_LOWER), ==, 0x312223);
+
     /* Alternate true-color source and CR15 contiguous source are routed too. */
     state.command[1] = 0x01;
     state.wtt[0] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
@@ -834,6 +850,14 @@ static void test_bt463_lookup_dual_cursor_truth_table(void)
     g_assert_cmphex(bt463_lookup_rgb(&state, 12U << 24, 0,
                                      BT463_LOAD_LOWER), ==,
                     test_bt463_palette_value(0x1c));
+
+    /* Dual-cursor underlay also yields to nonzero pixel data. */
+    state.palette[0x30][0] = 0x31;
+    state.palette[0x20][1] = 0x22;
+    state.palette[0x20][2] = 0x23;
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(1, 0, 0, 4),
+                                    0, BT463_LOAD_LOWER), ==, 0x312223);
 }
 
 static void test_bt463_lookup_eight_overlay_planes(void)
@@ -979,6 +1003,21 @@ static void test_bt463_blink_step(void)
     }
     g_assert_false(bt463_retrace_step(&state));
     g_assert_false(state.blink_phase);
+
+    /* A board may exclude an otherwise modeled mask byte from scanout. */
+    bt463_reset(&state);
+    memset(state.read_mask, 0xff, sizeof(state.read_mask));
+    state.blink_mask[3] = 0xff;
+    state.command[0] = 0x04;
+    for (unsigned retrace = 0; retrace < 15; retrace++) {
+        g_assert_false(bt463_retrace_step_visible(&state, 0x07));
+    }
+    g_assert_false(bt463_retrace_step_visible(&state, 0x07));
+    g_assert_false(state.blink_phase);
+    state.blink_phase = true;
+    state.blink_counter = 15;
+    state.blink_mask[0] = 0xf0;
+    g_assert_true(bt463_retrace_step_visible(&state, 0x07));
 
     /* Read masks independently suppress the same blink byte's visibility. */
     bt463_reset(&state);

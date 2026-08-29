@@ -850,6 +850,71 @@ static void test_bt463_blink_command0_reset(void)
     qtest_quit(qts);
 }
 
+static void test_bt463_board_blink_relevance(void)
+{
+    TestPPM *trace = create_test_ppm();
+    g_autofree char *quoted_trace_path = g_shell_quote(trace->path);
+    g_autofree char *args =
+        g_strdup_printf("-trace enable=next_color_retrace,file=%s",
+                        quoted_trace_path);
+    QTestState *qts = next_color_start_with_args(args);
+    TestPPM *ppm;
+    static const uint8_t red[] = { 0xff, 0x00, 0x00 };
+    static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+    program_blink_fixture(qts, 0x44); /* 16 on, 16 off. */
+
+    /* Make byte 3 visible to the generic helper while its pins stay idle. */
+    dac_set_address(qts, 0x208);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x0f);
+    dac_set_address(qts, 0x209);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    dac_set_address(qts, 0x20c);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
+    assert_screendump_pixel(qts, ppm, 0, red);
+
+    /* Warp9C P24-P27 are inactive: byte-3 blinking cannot redraw scanout. */
+    qtest_clock_step(qts, 16 * NEXT_COLOR_RETRACE_NS);
+    assert_screendump_pixel(qts, ppm, 0, red);
+
+    /* An active color byte still invalidates and changes the visible pixel. */
+    dac_set_address(qts, 0x20c);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    dac_set_address(qts, 0x209);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xf0);
+    dac_set_address(qts, 0x201);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x44); /* Reset phase to on. */
+    assert_screendump_pixel(qts, ppm, 0, red);
+    qtest_clock_step(qts, 16 * NEXT_COLOR_RETRACE_NS);
+    assert_screendump_pixel(qts, ppm, 0, black);
+
+    qtest_quit(qts);
+
+    {
+        g_autofree char *events = NULL;
+        gsize events_length;
+        const char *cursor;
+        unsigned invalidations = 0;
+
+        g_assert_true(g_file_get_contents(trace->path, &events,
+                                          &events_length, NULL));
+        cursor = events;
+        while ((cursor = g_strstr_len(cursor, events_length -
+                                      (cursor - events),
+                                      "invalidate=1"))) {
+            invalidations++;
+            cursor += strlen("invalidate=1");
+        }
+        /* The inactive byte-3 phase is absent; the active byte flips once. */
+        g_assert_cmpuint(invalidations, ==, 1);
+    }
+}
+
 static void test_rgb444_scanout(void)
 {
     QTestState *qts = next_color_start();
@@ -1220,6 +1285,8 @@ int main(int argc, char **argv)
                    test_bt463_blink_rates);
     qtest_add_func("/next-color-video/bt463-blink-command0-reset",
                    test_bt463_blink_command0_reset);
+    qtest_add_func("/next-color-video/bt463-board-blink-relevance",
+                   test_bt463_board_blink_relevance);
     qtest_add_func("/next-color-video/blanking", test_blanking);
 
     return g_test_run();

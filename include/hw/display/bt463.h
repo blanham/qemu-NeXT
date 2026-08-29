@@ -116,8 +116,12 @@ uint8_t bt463_general_read(Bt463State *s);
 bool bt463_general_write(Bt463State *s, uint8_t value);
 
 /*
- * Advance one vertical retrace; return true when a visible blink phase flips.
+ * Advance one vertical retrace; return true when a relevant blink phase flips.
+ * relevant_bytes selects the modeled input bytes (bits 0..3).
  */
+bool bt463_retrace_step_visible(Bt463State *s, uint8_t relevant_bytes);
+
+/* Advance a retrace with all four modeled input bytes visible. */
 bool bt463_retrace_step(Bt463State *s);
 
 /*
