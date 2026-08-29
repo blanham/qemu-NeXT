@@ -734,15 +734,218 @@ static void test_registers_and_reset(void)
     qtest_quit(qts);
 }
 
-/*
- * The Warp9C's normal setup is the sequence used by vid_C16_init().  Keep
- * this fixture deliberately small: the palette values are chosen to make the
- * four-bit scanout assertions independent of the driver's gamma table.
- */
-static void program_original_warp9c_init(QTestState *qts)
+static void test_bt463_complete_reset(void)
 {
-    static const uint8_t true_color[3] = { 0x00, 0x01, 0x00 };
+    QTestState *qts = next_color_start();
+    const uint8_t zero[3] = { 0, 0, 0 };
+    TestPPM *ppm = NULL;
+    static const uint8_t reset_black[] = { 0, 0, 0 };
+    static const uint8_t command_values[] = { 0x44, 0x20, 0xc7 };
 
+    /* Fill every architected DAC array before reset. */
+    for (uint16_t address = 0; address < 0x210; address++) {
+        const uint8_t value[3] = {
+            (uint8_t)(address + 1),
+            (uint8_t)(address >> 1),
+            (uint8_t)(address ^ 0xa5),
+        };
+
+        dac_set_address(qts, address);
+        dac_write_triplet(qts, 3, value);
+    }
+    dac_set_address(qts, 0x100);
+    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0xc1, 0xc2, 0xc3 });
+    dac_set_address(qts, 0x101);
+    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0xd1, 0xd2, 0xd3 });
+
+    for (uint16_t address = 0x201; address <= 0x203; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2,
+                     command_values[address - 0x201]);
+    }
+    for (uint16_t address = 0x205; address <= 0x208; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x10 + address);
+    }
+    for (uint16_t address = 0x209; address <= 0x20c; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x20 + address);
+    }
+    dac_set_address(qts, 0x20d);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xa5);
+    dac_set_address(qts, 0x20e);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x34);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x12);
+    dac_set_address(qts, 0x20f);
+    dac_write_triplet(qts, 2, (const uint8_t[3]) { 0x56, 0x78, 0x9a });
+
+    /* Keep WT0 valid for the pre-reset scanout and vary every other WTT. */
+    for (uint16_t address = 0x300; address <= 0x30f; address++) {
+        const uint8_t value[3] = {
+            address == 0x300 ? 0x00 : (uint8_t)(address - 0x2ff),
+            address == 0x300 ? 0x01 : (uint8_t)(address >> 1),
+            address == 0x300 ? 0x00 : (uint8_t)(address ^ 0x5a),
+        };
+
+        dac_set_address(qts, address);
+        dac_write_triplet(qts, 2, value);
+    }
+
+    /* Leave the DAC in the middle of a palette triplet and advance blink. */
+    dac_set_address(qts, 0x2a0);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0x7f);
+    qtest_writeb(qts, NEXT_COLOR_VRAM, 0xf0);
+    qtest_writeb(qts, NEXT_COLOR_VRAM + 1, 0x00);
+    qtest_writeb(qts, NEXT_COLOR_COMMAND,
+                 NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK);
+    qtest_clock_step(qts, 16 * NEXT_COLOR_RETRACE_NS);
+    g_assert_cmphex(video_irq_status(qts), ==, NEXT_COLOR_VIDEO_IRQ_STATUS);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_COMMAND), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DRAM_TIMING), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM_TIMING), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM), ==, 0xf0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM + 1), ==, 0x00);
+    g_assert_cmphex(video_irq_status(qts), ==, 0);
+
+    /* Reset output is deterministic black while the board VRAM survives. */
+    if (require_screendump(qts)) {
+        ppm = create_test_ppm();
+        assert_screendump_pixel(qts, ppm, 0, reset_black);
+    }
+
+    /* All 528 palette entries and both cursor colors are cleared. */
+    for (uint16_t address = 0; address < 0x210; address++) {
+        assert_dac_triplet(qts, 3, address, zero);
+    }
+    assert_dac_triplet(qts, 2, 0x100, zero);
+    assert_dac_triplet(qts, 2, 0x101, zero);
+
+    for (uint16_t address = 0x201; address <= 0x203; address++) {
+        dac_set_address(qts, address);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    }
+    for (uint16_t address = 0x205; address <= 0x20c; address++) {
+        dac_set_address(qts, address);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    }
+    dac_set_address(qts, 0x20d);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    dac_set_address(qts, 0x20e);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    dac_set_address(qts, 0x20f);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0);
+
+    for (uint16_t address = 0x300; address <= 0x30f; address++) {
+        assert_dac_triplet(qts, 2, address, zero);
+    }
+
+    /* A first palette write starts at component zero after reset. */
+    dac_set_address(qts, 0);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xa5);
+    assert_dac_triplet(qts, 3, 0,
+                       (const uint8_t[3]) { 0xa5, 0x00, 0x00 });
+
+    qtest_quit(qts);
+}
+
+/* Gamma[] and BRIGHT_MAX are copied from vid_C16_init()/SetBrightness(). */
+#define NEXT_COLOR_BRIGHT_MAX 0x3d
+
+static const uint8_t original_warp9c_gamma[256] = {
+    0, 16, 23, 28, 32, 36, 39, 42,
+    45, 48, 50, 53, 55, 58, 60, 62,
+    64, 66, 68, 70, 71, 73, 75, 77,
+    78, 80, 81, 83, 84, 86, 87, 89,
+    90, 92, 93, 94, 96, 97, 98, 100,
+    101, 102, 103, 105, 106, 107, 108, 109,
+    111, 112, 113, 114, 115, 116, 117, 118,
+    119, 121, 122, 123, 124, 125, 126, 127,
+    128, 129, 130, 131, 132, 133, 134, 135,
+    135, 136, 137, 138, 139, 140, 141, 142,
+    143, 144, 145, 145, 146, 147, 148, 149,
+    150, 151, 151, 152, 153, 154, 155, 156,
+    156, 157, 158, 159, 160, 160, 161, 162,
+    163, 164, 164, 165, 166, 167, 167, 168,
+    169, 170, 170, 171, 172, 173, 173, 174,
+    175, 176, 176, 177, 178, 179, 179, 180,
+    181, 181, 182, 183, 183, 184, 185, 186,
+    186, 187, 188, 188, 189, 190, 190, 191,
+    192, 192, 193, 194, 194, 195, 196, 196,
+    197, 198, 198, 199, 199, 200, 201, 201,
+    202, 203, 203, 204, 204, 205, 206, 206,
+    207, 208, 208, 209, 209, 210, 211, 211,
+    212, 212, 213, 214, 214, 215, 215, 216,
+    217, 217, 218, 218, 219, 220, 220, 221,
+    221, 222, 222, 223, 224, 224, 225, 225,
+    226, 226, 227, 228, 228, 229, 229, 230,
+    230, 231, 231, 232, 233, 233, 234, 234,
+    235, 235, 236, 236, 237, 237, 238, 238,
+    239, 240, 240, 241, 241, 242, 242, 243,
+    243, 244, 244, 245, 245, 246, 246, 247,
+    247, 248, 248, 249, 249, 250, 250, 251,
+    251, 252, 252, 253, 253, 254, 254, 255,
+};
+
+static uint8_t original_warp9c_brightness_value(unsigned index,
+                                                unsigned brightness)
+{
+    unsigned scale = (brightness * 64) / NEXT_COLOR_BRIGHT_MAX;
+    unsigned level = ((original_warp9c_gamma[index] * scale) >> 6) + 0x08;
+
+    return MIN(level, 0xff);
+}
+
+static void program_original_warp9c_set_brightness(QTestState *qts,
+                                                    unsigned brightness)
+{
+    unsigned scale = (brightness * 64) / NEXT_COLOR_BRIGHT_MAX;
+
+    /* Keep the DAC write order byte-for-byte with vid_C16_SetBrightness(). */
+    for (uint16_t address = 0; address < 0x100; address++) {
+        unsigned level = ((original_warp9c_gamma[address] * scale) >> 6) +
+            0x08;
+
+        if (level > 0xff) {
+            level = 0xff;
+        }
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, level);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, level);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, level);
+    }
+}
+
+static void original_warp9c_expected_palette(unsigned address,
+                                             unsigned brightness,
+                                             uint8_t value[3])
+{
+    if (address < 0x100) {
+        value[0] = original_warp9c_brightness_value(address, brightness);
+        value[1] = value[0];
+        value[2] = value[0];
+    } else if (address < 0x200) {
+        value[0] = original_warp9c_gamma[address - 0x100];
+        value[1] = value[0];
+        value[2] = value[0];
+    } else if (address < 0x20c) {
+        memset(value, 0, 3);
+    } else {
+        memset(value, 0xff, 3);
+    }
+}
+
+static void program_original_warp9c_init_at_brightness(QTestState *qts,
+                                                        unsigned brightness)
+{
+    unsigned level;
+    /* This is the command/mask/WTT sequence in vid_C16_init(). */
     dac_set_address(qts, 0x201);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x40);
     dac_set_address(qts, 0x202);
@@ -761,14 +964,169 @@ static void program_original_warp9c_init(QTestState *qts)
 
     for (uint16_t address = 0x300; address <= 0x30f; address++) {
         dac_set_address(qts, address);
-        dac_write_triplet(qts, 2, true_color);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x01);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
     }
 
-    /* Entries used by the four-bit high-nibble inputs. */
-    dac_set_address(qts, 0x000);
-    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x00, 0x00, 0x00 });
-    dac_set_address(qts, 0x0f0);
-    dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xff, 0xff, 0xff });
+    for (uint16_t address = 0x100; address < 0x200; address++) {
+        level = original_warp9c_gamma[address - 0x100];
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, level);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, level);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, level);
+    }
+    for (uint16_t address = 0x20c; address < 0x210; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xff);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xff);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xff);
+    }
+
+    /* This is the final vid_C16_SetBrightness() rewrite of entries 0..255. */
+    program_original_warp9c_set_brightness(qts, brightness);
+}
+
+static void program_original_warp9c_init(QTestState *qts)
+{
+    program_original_warp9c_init_at_brightness(qts, NEXT_COLOR_BRIGHT_MAX);
+}
+
+static void test_bt463_original_init_sequence(void)
+{
+    QTestState *qts = next_color_start();
+    static const uint8_t zero[3] = { 0, 0, 0 };
+    static const uint8_t white[3] = { 0xff, 0xff, 0xff };
+    static const uint8_t command[] = { 0x40, 0x00, 0x80 };
+
+    program_original_warp9c_init(qts);
+
+    /* Commands and masks are the individual byte writes from vid_C16_init. */
+    for (uint16_t address = 0x201; address <= 0x203; address++) {
+        dac_set_address(qts, address);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==,
+                        command[address - 0x201]);
+    }
+    for (uint16_t address = 0x205; address <= 0x208; address++) {
+        dac_set_address(qts, address);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0xf0);
+    }
+    for (uint16_t address = 0x209; address <= 0x20c; address++) {
+        dac_set_address(qts, address);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 2), ==, 0x00);
+    }
+    for (uint16_t address = 0x300; address <= 0x30f; address++) {
+        assert_dac_triplet(qts, 2, address,
+                           (const uint8_t[3]) { 0x00, 0x01, 0x00 });
+    }
+
+    /* vid_C16_init first writes the unscaled copy of Gamma to 0x100..1ff. */
+    for (unsigned index = 0; index < 256; index++) {
+        const uint8_t gamma[3] = {
+            original_warp9c_gamma[index],
+            original_warp9c_gamma[index],
+            original_warp9c_gamma[index],
+        };
+
+        assert_dac_triplet(qts, 3, 0x100 + index, gamma);
+    }
+    for (uint16_t address = 0x200; address < 0x20c; address++) {
+        assert_dac_triplet(qts, 3, address, zero);
+    }
+    for (uint16_t address = 0x20c; address < 0x210; address++) {
+        assert_dac_triplet(qts, 3, address, white);
+    }
+
+    /* SetBrightness rewrites all three DAC components of entries 0..255. */
+    for (unsigned index = 0; index < 256; index++) {
+        const uint8_t brightness[3] = {
+            original_warp9c_brightness_value(index, NEXT_COLOR_BRIGHT_MAX),
+            original_warp9c_brightness_value(index, NEXT_COLOR_BRIGHT_MAX),
+            original_warp9c_brightness_value(index, NEXT_COLOR_BRIGHT_MAX),
+        };
+
+        assert_dac_triplet(qts, 3, index, brightness);
+    }
+
+    qtest_quit(qts);
+}
+
+static void test_bt463_original_brightness_rewrite(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *ppm;
+    static const uint8_t pixels[] = {
+        0x00, 0x00, /* index 0 on every channel */
+        0x22, 0x20, /* index 0x20 on every channel */
+        0x88, 0x80, /* index 0x80 on every channel */
+        0xff, 0xf0, /* index 0xff on every channel */
+        0x20, 0x00, /* red only */
+        0x02, 0x00, /* green only */
+        0x00, 0x20, /* blue only */
+    };
+    uint8_t vram_before[sizeof(pixels)];
+    const unsigned brightness_levels[] = {
+        NEXT_COLOR_BRIGHT_MAX, 0x1f, 0,
+    };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+
+    program_original_warp9c_init(qts);
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
+    for (unsigned i = 0; i < sizeof(vram_before); i++) {
+        vram_before[i] = qtest_readb(qts, NEXT_COLOR_VRAM + i);
+    }
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+
+    /* Check the source arithmetic at endpoint and midpoint values. */
+    g_assert_cmpuint(original_warp9c_brightness_value(0,
+                                                     NEXT_COLOR_BRIGHT_MAX),
+                     ==, 0x08);
+    g_assert_cmpuint(original_warp9c_brightness_value(0x20,
+                                                     NEXT_COLOR_BRIGHT_MAX),
+                     ==, 0x62);
+    g_assert_cmpuint(original_warp9c_brightness_value(0x80,
+                                                     NEXT_COLOR_BRIGHT_MAX),
+                     ==, 0xbd);
+    g_assert_cmpuint(original_warp9c_brightness_value(0xff,
+                                                     NEXT_COLOR_BRIGHT_MAX),
+                     ==, 0xff);
+    g_assert_cmpuint(original_warp9c_brightness_value(0x20, 0x1f),
+                     ==, 0x35);
+    g_assert_cmpuint(original_warp9c_brightness_value(0x80, 0x1f),
+                     ==, 0x62);
+    g_assert_cmpuint(original_warp9c_brightness_value(0xff, 0x1f),
+                     ==, 0x87);
+
+    for (unsigned level = 0; level < G_N_ELEMENTS(brightness_levels);
+         level++) {
+        program_original_warp9c_set_brightness(qts, brightness_levels[level]);
+
+        /* No VRAM write occurs as the LUT-only brightness update runs. */
+        for (unsigned i = 0; i < sizeof(vram_before); i++) {
+            g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM + i), ==,
+                            vram_before[i]);
+        }
+        for (unsigned i = 0; i < sizeof(pixels); i += 2) {
+            uint16_t pixel = ((uint16_t)pixels[i] << 8) | pixels[i + 1];
+            uint8_t expected[3] = {
+                original_warp9c_brightness_value(
+                    ((pixel >> 12) & 0xf) << 4, brightness_levels[level]),
+                original_warp9c_brightness_value(
+                    ((pixel >> 8) & 0xf) << 4, brightness_levels[level]),
+                original_warp9c_brightness_value(
+                    ((pixel >> 4) & 0xf) << 4, brightness_levels[level]),
+            };
+
+            assert_screendump_pixel(qts, ppm, i / 2, expected);
+        }
+    }
+
+    qtest_quit(qts);
 }
 
 static void program_blink_fixture(QTestState *qts, uint8_t command0)
@@ -800,8 +1158,8 @@ static void test_bt463_blink_rates(void)
     for (unsigned i = 0; i < G_N_ELEMENTS(rates); i++) {
         QTestState *qts = next_color_start();
         TestPPM *ppm;
-        static const uint8_t red[] = { 0xff, 0x00, 0x00 };
-        static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+        static const uint8_t red[] = { 0xff, 0x08, 0x08 };
+        static const uint8_t black[] = { 0x08, 0x08, 0x08 };
 
         if (!require_screendump(qts)) {
             qtest_quit(qts);
@@ -828,8 +1186,8 @@ static void test_bt463_blink_command0_reset(void)
 {
     QTestState *qts = next_color_start();
     TestPPM *ppm;
-    static const uint8_t red[] = { 0xff, 0x00, 0x00 };
-    static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+    static const uint8_t red[] = { 0xff, 0x08, 0x08 };
+    static const uint8_t black[] = { 0x08, 0x08, 0x08 };
 
     if (!require_screendump(qts)) {
         qtest_quit(qts);
@@ -859,8 +1217,8 @@ static void test_bt463_board_blink_relevance(void)
                         quoted_trace_path);
     QTestState *qts = next_color_start_with_args(args);
     TestPPM *ppm;
-    static const uint8_t red[] = { 0xff, 0x00, 0x00 };
-    static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+    static const uint8_t red[] = { 0xff, 0x08, 0x08 };
+    static const uint8_t black[] = { 0x08, 0x08, 0x08 };
 
     if (!require_screendump(qts)) {
         qtest_quit(qts);
@@ -935,10 +1293,10 @@ static void test_rgb444_scanout(void)
     };
     static const uint8_t white[] = { 0xff, 0xf0 };
     static const uint8_t expected_row0[] = {
-        0xff, 0x00, 0x00,
-        0x00, 0xff, 0x00,
-        0x00, 0x00, 0xff,
-        0x00, 0x00, 0x00,
+        0xff, 0x08, 0x08,
+        0x08, 0xff, 0x08,
+        0x08, 0x08, 0xff,
+        0x08, 0x08, 0x08,
     };
     static const uint8_t expected_white[] = { 0xff, 0xff, 0xff };
     g_autofree char *contents = NULL;
@@ -1002,6 +1360,46 @@ static void test_bt463_lut_invalidation(void)
     qtest_quit(qts);
 }
 
+static void test_bt463_original_gamma_ramp(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *ppm;
+    static const uint8_t pixels[] = {
+        0x00, 0x00, /* Gamma index 0 on every channel. */
+        0x22, 0x20, /* Gamma index 0x20 on every channel. */
+        0x88, 0x80, /* Gamma index 0x80 on every channel. */
+        0xff, 0xf0, /* Gamma index 0xff on every channel. */
+        0x20, 0x00, /* Red only. */
+        0x02, 0x00, /* Green only. */
+        0x00, 0x20, /* Blue only. */
+    };
+    static const uint8_t expected[][3] = {
+        { 0x08, 0x08, 0x08 },
+        { 0x62, 0x62, 0x62 },
+        { 0xbd, 0xbd, 0xbd },
+        { 0xff, 0xff, 0xff },
+        { 0x62, 0x08, 0x08 },
+        { 0x08, 0x62, 0x08 },
+        { 0x08, 0x08, 0x62 },
+    };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+
+    program_original_warp9c_init(qts);
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(expected); i++) {
+        assert_screendump_pixel(qts, ppm, i, expected[i]);
+    }
+
+    qtest_quit(qts);
+}
+
 static void test_bt463_wtt_tags(void)
 {
     QTestState *qts = next_color_start();
@@ -1029,7 +1427,7 @@ static void test_bt463_wtt_tags(void)
     qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
 
     assert_screendump_pixel(qts, ppm, 0,
-                            (const uint8_t[3]) { 0xa1, 0x00, 0x00 });
+                            (const uint8_t[3]) { 0xa1, 0x08, 0x08 });
     assert_screendump_pixel(qts, ppm, 1,
                             (const uint8_t[3]) { 0xb2, 0x00, 0x00 });
 
@@ -1095,7 +1493,7 @@ static void test_blanking(void)
     TestPPM *reset_blank;
     static const uint8_t red444[] = { 0xf0, 0x00 };
     static const uint8_t black[] = { 0x00, 0x00, 0x00 };
-    static const uint8_t red[] = { 0xff, 0x00, 0x00 };
+    static const uint8_t red[] = { 0xff, 0x08, 0x08 };
 
     if (!require_screendump(qts)) {
         qtest_quit(qts);
@@ -1261,6 +1659,175 @@ static void test_migration_active_timer_and_dac_phase(void)
     qtest_quit(destination);
 }
 
+static void test_migration_complete_bt463_state(void)
+{
+    TestMigration *migration = create_test_migration();
+    g_autofree char *uri =
+        g_strdup_printf("unix:%s", migration->socket_path);
+    QTestState *destination =
+        next_color_start_with_args("-incoming defer");
+    QTestState *source = next_color_start();
+    TestPPM *ppm = NULL;
+    const unsigned brightness = 0x1f;
+    const uint8_t enabled =
+        NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
+    static const uint8_t command_values[3] = { 0x44, 0x00, 0x80 };
+    static const uint8_t read_mask_values[4] = { 0xf0, 0xe1, 0xd2, 0xc3 };
+    static const uint8_t blink_mask_values[4] = { 0xf0, 0x0f, 0xaa, 0x55 };
+    const int64_t elapsed = NEXT_COLOR_RETRACE_NS / 2;
+    const int64_t remaining = NEXT_COLOR_RETRACE_NS - elapsed;
+    int64_t source_clock;
+
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        uri);
+
+    /* Start from the exact driver state, then exercise every writable field. */
+    program_original_warp9c_init_at_brightness(source, brightness);
+    for (uint16_t address = 0x300; address <= 0x30f; address++) {
+        const uint32_t value = 0x000100 + address - 0x300;
+        const uint8_t wtt[3] = {
+            value,
+            value >> 8,
+            value >> 16,
+        };
+
+        dac_set_address(source, address);
+        dac_write_triplet(source, 2, wtt);
+    }
+    for (uint16_t address = 0x205; address <= 0x208; address++) {
+        dac_set_address(source, address);
+        qtest_writeb(source, NEXT_COLOR_DAC + 2,
+                     read_mask_values[address - 0x205]);
+    }
+    for (uint16_t address = 0x209; address <= 0x20c; address++) {
+        dac_set_address(source, address);
+        qtest_writeb(source, NEXT_COLOR_DAC + 2,
+                     blink_mask_values[address - 0x209]);
+    }
+    dac_set_address(source, 0x201);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, 0x44);
+    dac_set_address(source, 0x100);
+    dac_write_triplet(source, 2, (const uint8_t[3]) { 0xc1, 0xc2, 0xc3 });
+    dac_set_address(source, 0x101);
+    dac_write_triplet(source, 2, (const uint8_t[3]) { 0xd1, 0xd2, 0xd3 });
+    dac_set_address(source, 0x20d);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, 0xa5);
+    dac_set_address(source, 0x20e);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, 0x34);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, 0x12);
+    dac_set_address(source, 0x20f);
+    dac_write_triplet(source, 2, (const uint8_t[3]) { 0x56, 0x78, 0x9a });
+
+    /* Preserve a real palette component phase across migration. */
+    dac_set_address(source, 0x050);
+    qtest_writeb(source, NEXT_COLOR_DAC + 3, 0x5a);
+
+    qtest_writeb(source, NEXT_COLOR_VRAM, 0xf0);
+    qtest_writeb(source, NEXT_COLOR_VRAM + 1, 0x00);
+    qtest_writeb(source, NEXT_COLOR_COMMAND, enabled);
+    source_clock = qtest_clock_step(source,
+                                    16 * NEXT_COLOR_RETRACE_NS + elapsed);
+    g_assert_cmphex(video_irq_status(source), ==,
+                    NEXT_COLOR_VIDEO_IRQ_STATUS);
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    qtest_qmp_eventwait(source, "STOP");
+    qtest_qmp_eventwait(destination, "RESUME");
+    qtest_clock_set(destination, source_clock);
+
+    /* The destination resumes with the saved address/component phase. */
+    qtest_writeb(destination, NEXT_COLOR_DAC + 3, 0x6b);
+    qtest_writeb(destination, NEXT_COLOR_DAC + 3, 0x7c);
+    assert_dac_triplet(destination, 3, 0x050,
+                       (const uint8_t[3]) { 0x5a, 0x6b, 0x7c });
+
+    /* Every palette entry, including both driver LUT regions, migrated. */
+    for (unsigned address = 0; address < 0x210; address++) {
+        uint8_t expected[3];
+
+        original_warp9c_expected_palette(address, brightness, expected);
+        if (address == 0x050) {
+            expected[0] = 0x5a;
+            expected[1] = 0x6b;
+            expected[2] = 0x7c;
+        }
+        assert_dac_triplet(destination, 3, address, expected);
+    }
+    assert_dac_triplet(destination, 2, 0x100,
+                       (const uint8_t[3]) { 0xc1, 0xc2, 0xc3 });
+    assert_dac_triplet(destination, 2, 0x101,
+                       (const uint8_t[3]) { 0xd1, 0xd2, 0xd3 });
+
+    /* Commands, masks, test/signature bytes, and every WTT entry survive. */
+    for (uint16_t address = 0x201; address <= 0x203; address++) {
+        dac_set_address(destination, address);
+        g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==,
+                        command_values[address - 0x201]);
+    }
+    for (uint16_t address = 0x205; address <= 0x208; address++) {
+        dac_set_address(destination, address);
+        g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==,
+                        read_mask_values[address - 0x205]);
+    }
+    for (uint16_t address = 0x209; address <= 0x20c; address++) {
+        dac_set_address(destination, address);
+        g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==,
+                        blink_mask_values[address - 0x209]);
+    }
+    dac_set_address(destination, 0x20d);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0xa5);
+    dac_set_address(destination, 0x20e);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x34);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x12);
+    dac_set_address(destination, 0x20f);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x56);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x78);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x9a);
+    for (uint16_t address = 0x300; address <= 0x30f; address++) {
+        const uint32_t value = 0x000100 + address - 0x300;
+
+        assert_dac_triplet(destination, 2, address,
+                           (const uint8_t[3]) {
+                               value,
+                               value >> 8,
+                               value >> 16,
+                           });
+    }
+
+    /* IRQ and the half-period timer deadline continue at the destination. */
+    g_assert_cmphex(video_irq_status(destination), ==,
+                    NEXT_COLOR_VIDEO_IRQ_STATUS);
+    qtest_writeb(destination, NEXT_COLOR_COMMAND,
+                 NEXT_COLOR_COMMAND_CLRINTR | NEXT_COLOR_COMMAND_UNBLANK);
+    qtest_writeb(destination, NEXT_COLOR_COMMAND, enabled);
+    qtest_clock_step(destination, remaining - 1);
+    g_assert_cmphex(video_irq_status(destination), ==, 0);
+    qtest_clock_step(destination, 1);
+    g_assert_cmphex(video_irq_status(destination), ==,
+                    NEXT_COLOR_VIDEO_IRQ_STATUS);
+
+    /* The saved blink phase changes the same VRAM pixel at the next retrace. */
+    if (require_screendump(destination)) {
+        ppm = create_test_ppm();
+        assert_screendump_pixel(destination, ppm, 0,
+                                (const uint8_t[3]) { 0x08, 0x08, 0x08 });
+        qtest_writeb(destination, NEXT_COLOR_COMMAND,
+                     NEXT_COLOR_COMMAND_CLRINTR |
+                     NEXT_COLOR_COMMAND_UNBLANK);
+        qtest_writeb(destination, NEXT_COLOR_COMMAND, enabled);
+        qtest_clock_step(destination, 15 * NEXT_COLOR_RETRACE_NS);
+        assert_screendump_pixel(destination, ppm, 0,
+                                (const uint8_t[3]) { 0x83, 0x08, 0x08 });
+    }
+
+    qtest_quit(source);
+    qtest_quit(destination);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1280,12 +1847,22 @@ int main(int argc, char **argv)
                    test_retrace_ack_preserves_phase);
     qtest_add_func("/next-color-video/registers-and-reset",
                    test_registers_and_reset);
+    qtest_add_func("/next-color-video/bt463-complete-reset",
+                   test_bt463_complete_reset);
+    qtest_add_func("/next-color-video/bt463-original-init-sequence",
+                   test_bt463_original_init_sequence);
+    qtest_add_func("/next-color-video/bt463-original-brightness-rewrite",
+                   test_bt463_original_brightness_rewrite);
     qtest_add_func("/next-color-video/migration", test_migration);
     qtest_add_func("/next-color-video/migration-active-timer-and-dac-phase",
                    test_migration_active_timer_and_dac_phase);
+    qtest_add_func("/next-color-video/migration-complete-bt463-state",
+                   test_migration_complete_bt463_state);
     qtest_add_func("/next-color-video/rgb444-scanout", test_rgb444_scanout);
     qtest_add_func("/next-color-video/bt463-lut-invalidation",
                    test_bt463_lut_invalidation);
+    qtest_add_func("/next-color-video/bt463-original-gamma-ramp",
+                   test_bt463_original_gamma_ramp);
     qtest_add_func("/next-color-video/bt463-wtt-tags", test_bt463_wtt_tags);
     qtest_add_func("/next-color-video/bt463-load-interleave",
                    test_bt463_load_interleave_scanout);

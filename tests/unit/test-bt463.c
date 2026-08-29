@@ -243,6 +243,78 @@ static void test_bt463_vmstate(void)
     g_assert_true(destination.blink_phase);
 }
 
+static void test_bt463_reset_every_state(void)
+{
+    Bt463State state;
+    const uint8_t zero_rgb[3] = { 0, 0, 0 };
+    const uint8_t zero_bytes[4] = { 0, 0, 0, 0 };
+
+    bt463_init(&state);
+    state.address = 0xabc;
+    state.component = 2;
+    for (unsigned address = 0; address < BT463_PALETTE_ENTRIES; address++) {
+        for (unsigned component = 0; component < 3; component++) {
+            state.palette[address][component] =
+                (address + component + 1) & 0xff;
+        }
+    }
+    for (unsigned cursor = 0; cursor < BT463_CURSOR_COLORS; cursor++) {
+        for (unsigned component = 0; component < 3; component++) {
+            state.cursor[cursor][component] =
+                0x10 * (cursor + 1) + component;
+        }
+    }
+    state.command[0] = 0x40;
+    state.command[1] = 0x20;
+    state.command[2] = 0x80;
+    for (unsigned i = 0; i < 4; i++) {
+        state.read_mask[i] = 0x10 + i;
+        state.blink_mask[i] = 0x20 + i;
+    }
+    state.test_register = 0xa5;
+    state.input_signature = 0x1234;
+    state.output_signature[0] = 0x56;
+    state.output_signature[1] = 0x78;
+    state.output_signature[2] = 0x9a;
+    for (unsigned i = 0; i < BT463_WTT_ENTRIES; i++) {
+        state.wtt[i] = 0x10000 + i;
+    }
+    state.wtt_write_latch = 0xabcdef;
+    state.wtt_read_latch = 0x123456;
+    state.blink_counter = 31;
+    state.blink_phase = false;
+
+    bt463_reset(&state);
+
+    g_assert_cmpuint(state.address, ==, 0);
+    g_assert_cmpuint(state.component, ==, 0);
+    for (unsigned address = 0; address < BT463_PALETTE_ENTRIES; address++) {
+        g_assert_cmpmem(state.palette[address], sizeof(zero_rgb),
+                        zero_rgb, sizeof(zero_rgb));
+    }
+    for (unsigned cursor = 0; cursor < BT463_CURSOR_COLORS; cursor++) {
+        g_assert_cmpmem(state.cursor[cursor], sizeof(zero_rgb),
+                        zero_rgb, sizeof(zero_rgb));
+    }
+    g_assert_cmpmem(state.command, sizeof(state.command), zero_rgb,
+                    sizeof(zero_rgb));
+    g_assert_cmpmem(state.read_mask, sizeof(state.read_mask), zero_bytes,
+                    sizeof(zero_bytes));
+    g_assert_cmpmem(state.blink_mask, sizeof(state.blink_mask), zero_bytes,
+                    sizeof(zero_bytes));
+    g_assert_cmpuint(state.test_register, ==, 0);
+    g_assert_cmpuint(state.input_signature, ==, 0);
+    g_assert_cmpmem(state.output_signature, sizeof(state.output_signature),
+                    zero_rgb, sizeof(zero_rgb));
+    for (unsigned i = 0; i < BT463_WTT_ENTRIES; i++) {
+        g_assert_cmpuint(state.wtt[i], ==, 0);
+    }
+    g_assert_cmpuint(state.wtt_write_latch, ==, 0);
+    g_assert_cmpuint(state.wtt_read_latch, ==, 0);
+    g_assert_cmpuint(state.blink_counter, ==, 0);
+    g_assert_true(state.blink_phase);
+}
+
 static uint32_t test_bt463_wtt(unsigned shift, unsigned planes,
                                unsigned mode, unsigned overlay_location,
                                unsigned overlay_mask, unsigned start,
@@ -1198,6 +1270,8 @@ int main(int argc, char **argv)
                     test_bt463_import_legacy_wtt_latches);
     g_test_add_func("/bt463/legacy-vmstate", test_bt463_legacy_vmstate);
     g_test_add_func("/bt463/vmstate", test_bt463_vmstate);
+    g_test_add_func("/bt463/reset-every-state",
+                    test_bt463_reset_every_state);
     g_test_add_func("/bt463/lookup-true-color",
                     test_bt463_lookup_true_color);
     g_test_add_func("/bt463/lookup-contiguous-planes",
