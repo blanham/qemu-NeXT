@@ -82,6 +82,13 @@ static void next_color_video_draw_line(void *opaque, uint8_t *dst,
 {
     NextColorVideoState *s = opaque;
     uint32_t *out = (uint32_t *)dst;
+    Bt463LoadPhase seed = BT463_LOAD_LOWER;
+
+    if (width > 0) {
+        const uint16_t first_pixel = lduw_be_p(src);
+
+        seed = bt463_load_phase_seed(&s->bt463, first_pixel & 0xf);
+    }
 
     for (int x = 0; x < width; x++) {
         uint16_t pixel = lduw_be_p(src + x * 2);
@@ -97,7 +104,7 @@ static void next_color_video_draw_line(void *opaque, uint8_t *dst,
         pixel_pins |= ((uint32_t)(pixel >> 4) & 0xf) << 20;
         rgb = bt463_lookup_rgb(
             &s->bt463, pixel_pins, pixel & 0xf,
-            bt463_load_phase(&s->bt463, pixel & 0xf, x));
+            bt463_load_phase_at(seed, x));
         out[x] = rgb_to_pixel32((rgb >> 16) & 0xff, (rgb >> 8) & 0xff,
                                 rgb & 0xff);
     }

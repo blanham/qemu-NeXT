@@ -864,7 +864,7 @@ static void test_bt463_load_interleave_scanout(void)
     TestPPM *ppm;
     static const uint8_t pixels[] = {
         0xff, 0xf0,
-        0xff, 0xf0,
+        0xff, 0xf1,
     };
     static const uint8_t lower[] = { 0x10, 0x20, 0x30 };
     static const uint8_t upper[] = { 0xa0, 0xb0, 0xc0 };
@@ -888,6 +888,8 @@ static void test_bt463_load_interleave_scanout(void)
     dac_write_triplet(qts, 3, upper);
     dac_set_address(qts, 0x300);
     dac_write_triplet(qts, 2, mode_shift0);
+    dac_set_address(qts, 0x301);
+    dac_write_triplet(qts, 2, mode_shift4);
     qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
     qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
     assert_screendump_pixel(qts, ppm, 0, lower);
@@ -896,6 +898,8 @@ static void test_bt463_load_interleave_scanout(void)
     /* Changing only the WTT shift flips the initial phase; VRAM is reused. */
     dac_set_address(qts, 0x300);
     dac_write_triplet(qts, 2, mode_shift4);
+    dac_set_address(qts, 0x301);
+    dac_write_triplet(qts, 2, mode_shift0);
     assert_screendump_pixel(qts, ppm, 0, upper);
     assert_screendump_pixel(qts, ppm, 1, lower);
 

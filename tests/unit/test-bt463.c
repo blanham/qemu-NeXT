@@ -339,8 +339,11 @@ static void test_bt463_lookup_load_interleave(void)
     /* Shift four selects the upper nibble first but leaves octets fixed. */
     state.wtt[0] = test_bt463_wtt(4, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
-    g_assert_cmpuint(bt463_load_phase(&state, 0, 0), ==, BT463_LOAD_UPPER);
-    g_assert_cmpuint(bt463_load_phase(&state, 0, 1), ==, BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_seed(&state, 0), ==, BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_UPPER, 0), ==,
+                     BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_UPPER, 1), ==,
+                     BT463_LOAD_LOWER);
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_UPPER),
                     ==, 0x405060);
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
@@ -348,9 +351,31 @@ static void test_bt463_lookup_load_interleave(void)
 
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
-    g_assert_cmpuint(bt463_load_phase(&state, 0, 0), ==, BT463_LOAD_LOWER);
-    g_assert_cmpuint(bt463_load_phase(&state, 0, 1), ==, BT463_LOAD_UPPER);
-    g_assert_cmpuint(bt463_load_phase(&state, 0, 2), ==, BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_seed(&state, 0), ==, BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_LOWER, 0), ==,
+                     BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_LOWER, 1), ==,
+                     BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_LOWER, 2), ==,
+                     BT463_LOAD_LOWER);
+
+    /* The first tag seeds the line; later tags cannot re-seed its phase. */
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
+                                  0, 0, 0, false);
+    state.wtt[1] = test_bt463_wtt(4, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
+                                  0, 0, 0, false);
+    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 0),
+                     ==, BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 1),
+                     ==, BT463_LOAD_UPPER);
+    state.wtt[0] = test_bt463_wtt(4, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
+                                  0, 0, 0, false);
+    state.wtt[1] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
+                                  0, 0, 0, false);
+    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 0),
+                     ==, BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 1),
+                     ==, BT463_LOAD_LOWER);
 }
 
 static void test_bt463_lookup_overlay_and_cursor(void)

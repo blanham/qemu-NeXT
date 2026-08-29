@@ -464,21 +464,20 @@ static bool bt463_lookup_standard_overlay(const Bt463State *s,
     return bt463_lookup_palette_rgb(s, address, rgb);
 }
 
-Bt463LoadPhase bt463_load_phase(const Bt463State *s, uint8_t window_type,
-                                unsigned pixel_index)
+Bt463LoadPhase bt463_load_phase_seed(const Bt463State *s,
+                                     uint8_t window_type)
 {
     const uint32_t wtt = s->wtt[window_type & 0x0f] & 0xffffff;
     const unsigned shift = wtt & 0x1f;
-    const unsigned mode = (wtt >> 9) & 0x07;
-    bool upper;
 
-    if (mode != BT463_TRUE_COLOR_LOAD_INTERLEAVE &&
-        mode != BT463_PSEUDO_COLOR_LOAD_INTERLEAVE) {
-        return BT463_LOAD_LOWER;
-    }
+    return shift == 4 ? BT463_LOAD_UPPER : BT463_LOAD_LOWER;
+}
 
-    /* Shift 4 starts on the upper nibble; each following pixel toggles it. */
-    upper = shift == 4;
+Bt463LoadPhase bt463_load_phase_at(Bt463LoadPhase seed,
+                                   unsigned pixel_index)
+{
+    bool upper = seed == BT463_LOAD_UPPER;
+
     if (pixel_index & 1) {
         upper = !upper;
     }
