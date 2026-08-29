@@ -1401,6 +1401,7 @@ F: tests/functional/m68k/test_mcf5208evb.py
 NeXT system emulators
 M: Thomas Huth <th.huth+qemu@posteo.eu>
 S: Odd Fixes
+F: QEMU-NeXT-README.md
 F: docs/system/target-m68k.rst
 F: hw/audio/next-sound.c
 F: hw/block/next-floppy.c
@@ -1428,6 +1429,7 @@ F: include/hw/nvram/next-nvram.h
 F: include/hw/rtc/next-rtc.h
 F: tests/functional/m68k/test_nextcube.py
 F: tests/qtest/next-*.c
+F: tests/unit/test-bt463.c
 
 q800
 M: Laurent Vivier <laurent@vivier.eu>

@@ -66,15 +66,42 @@ Pass means the guest reached a usable Workspace Manager desktop after `bsd mach_
 
 Authenticated ROM catalog SHA-256: `fd0a97bab109833dc2e58771c4ea985445514ad2658e9a901746bba2464a24da`.
 
-The table is generated from the verified lab campaign. Firmware and disk images are external inputs; Git contains their identities and reproduction procedure, not their bytes.
+The table is generated from the verification campaign. Firmware and disk images are external inputs; Git contains their identities and reproduction procedure, not their bytes.
 <!-- next-rom-matrix:end -->
 
-The campaign tooling lives in the companion `lab` repository. Place the four files at
-the relative paths recorded by `catalog/next-roms.json`, keep the canonical NeXTSTEP
-disk at `assets/disks/next-old.img`, build a clean registered QEMU worktree through
-`nextcube_lab.baseline_cli build`, and run the `verify` subcommand shown in the lab ROM
-matrix documentation with the same explicit source, build, catalog, and ROM-root inputs. The
-aggregate JSON is authoritative; the table above is generated from it.
+## NeXTSTEP v66 ROM/SCSI boot
+
+The v66 ROM is conventionally named `Rev_2.5_v66.bin` and has SHA-1
+`b3534796abae238a0111299fc406a9349f7fee24`. Firmware and disk images are not
+included; provide them as external inputs with `-bios` and `-drive`.
+
+Clone the public repository and build the m68k system emulator:
+
+```sh
+REF=feature/plan9-1e-9p1
+git clone --branch "$REF" --single-branch https://github.com/blanham/qemu-NeXT.git qemu-NeXT
+cd qemu-NeXT
+mkdir build
+cd build
+../configure --target-list=m68k-softmmu
+./pyvenv/bin/meson setup --reconfigure --force-fallback-for=slirp . ..
+grep -qx '#define CONFIG_SLIRP_PLAN9_BOOTP' config-host.h || {
+  echo "bundled Plan 9-capable slirp was not selected" >&2
+  exit 1
+}
+make -j"$(nproc)" qemu-system-m68k qemu-img
+```
+
+The ROM and a raw NeXT SCSI disk can then be booted with:
+
+```sh
+QEMU="$PWD/qemu-system-m68k"
+ROM=/path/to/Rev_2.5_v66.bin
+DISK=/path/to/next-disk.img
+
+"$QEMU" -M next-cube -m 64M -bios "$ROM" \
+  -drive "if=scsi,format=raw,file=$DISK" -display gtk
+```
 
 ## NetBSD/next68k NFS-root boot
 
@@ -137,7 +164,7 @@ Authenticated IL boot to the same desktop with `tor` / `password`:
 ![Plan 9 Second Edition booting over authenticated IL to 8½](https://raw.githubusercontent.com/blanham/qemu-NeXT/metachicken/docs/boot/plan9-il.gif)
 
 The historical archives are mirrored by the Oregon State University Open
-Source Lab at:
+Source archive at:
 
 ```text
 https://ftp.osuosl.org/pub/plan9/history/
@@ -154,6 +181,49 @@ The verified tar archives have these SHA-256 identities:
 Both editions have been exercised through visible 8½ startup with their
 archived kernels and root trees unchanged.
 
+### Archive verification and staging
+
+Verify an archive before extracting it, stage its matching
+`68020/9nextstation` member below a TFTP directory, and extract the matching
+top-level tree below a writable root directory. Then launch either edition
+with the same user-facing command, changing `RELEASE` and `ROOT`:
+
+```sh
+QEMU=/path/to/qemu-system-m68k
+ROM=/path/to/Rev_2.5_v66.bin
+RELEASE=2e
+ARCHIVE=/path/to/plan9-$RELEASE.tar.bz2
+TFTP=/path/to/tftp
+ROOT=/path/to/plan9-2e-root
+
+case "$RELEASE" in
+  1e) EXPECTED_SHA256=8718e279aa35b10a9391f330976d31c177bad00de40e7f0f67232ffa54fb7d77 ;;
+  2e) EXPECTED_SHA256=0bb3c1446deb79b179f73886eb2419ecfac9f9964040683e3d5731f074bc2ce6 ;;
+  *) echo "unsupported Plan 9 release: $RELEASE" >&2; exit 1 ;;
+esac
+printf '%s  %s\n' "$EXPECTED_SHA256" "$ARCHIVE" | sha256sum -c - || exit 1
+mkdir -p "$TFTP/68020" "$ROOT"
+tar -xjf "$ARCHIVE" -C "$ROOT" --strip-components=1 "plan9-$RELEASE"
+tar -xOf "$ARCHIVE" "plan9-$RELEASE/68020/9nextstation" \
+  > "$TFTP/68020/9nextstation"
+
+# First Edition probes for an SCC serial mouse before starting the network.
+# QEMU already supplies the native NeXT keyboard/mouse device, so disable only
+# this obsolete probe in the writable staged root.
+if [ "$RELEASE" = 1e ]; then
+  sed -i '/^[[:space:]]*aux\/mouse -dC 1$/s/^/# /' "$ROOT/rc/bin/termrc"
+fi
+
+"$QEMU" -M next-station -m 64M -bios "$ROM" \
+  -global next-pc.system-timer-frequency=4456448 \
+  -display gtk \
+  -fsdev "local,id=plan9root,path=$ROOT,security_model=none" \
+  -netdev "user,id=nextnet,ipv6=off,tftp=$TFTP,bootfile=68020/9nextstation" \
+  -object "plan9-9p1-server,id=plan9fs,fsdev=plan9root,netdev=nextnet,guest-address=10.0.2.100,port=564" \
+  -net "nic,model=next-mb8795,netdev=nextnet" \
+  -no-reboot
+```
+
 ### Build
 
 From a clean checkout of the public branch:
@@ -166,7 +236,7 @@ cd build-next
 ../configure --target-list=m68k-softmmu --enable-debug \
   --enable-trace-backends=log
 ./pyvenv/bin/meson setup --reconfigure --force-fallback-for=slirp . ..
-ninja -j"$(nproc)" qemu-system-m68k qemu-img qemu-plan9-keydb
+ninja -j"$(nproc)" qemu-system-m68k qemu-img
 ```
 
 The Plan 9 runs need a staged kernel directory containing
@@ -182,12 +252,10 @@ QEMU="$PWD/qemu-system-m68k"
 ROM=/path/to/Rev_2.5_v66.BIN
 TFTP=/path/to/tftp
 ROOT=/path/to/rootfs
-QMP=/tmp/next-plan9.qmp
 
 "$QEMU" -M next-station \
   -global next-pc.system-timer-frequency=4456448 \
   -bios "$ROM" -m 64M -display gtk \
-  -qmp "unix:$QMP,server=on,wait=off" \
   -fsdev "local,id=plan9root,path=$ROOT,security_model=none" \
   -netdev "user,id=nextnet,ipv6=off,tftp=$TFTP,bootfile=68020/9nextstation" \
   -object "plan9-9p1-server,id=plan9fs,fsdev=plan9root,netdev=nextnet,guest-address=10.0.2.100,port=564" \
@@ -210,63 +278,10 @@ home=/usr/tor
 . /usr/tor/lib/profile
 ```
 
-The companion NeXT lab checkout automates archive verification and staging;
-the direct command above is useful when those paths already exist.
-
-#### Authenticated historical IL launch
-
-Provision the native encrypted key database and its separate QEMU Secret in a
-private directory. The tool requires that directory to be owned by the current
-user with mode 0700; it creates both output files with mode 0600 and refuses to
-overwrite either path.
-
-```sh
-KEYDIR=/path/to/private-plan9-keys
-mkdir -p "$KEYDIR"
-chmod 0700 "$KEYDIR"
-
-./qemu-plan9-keydb create \
-  --keydb "$KEYDIR/keys" \
-  --secret "$KEYDIR/master.b64" \
-  --server-id p9fs
-```
-
-Enter and confirm the password for `tor` at the controlling terminal. Do not
-put the password or the decoded seven-byte master key in argv, environment
-variables, QMP, logs, Git, or capture files.
-
-Launch QEMU with the base64 Secret file and authenticated IL transport:
-
-```sh
-QEMU="$PWD/qemu-system-m68k"
-ROM=/path/to/Rev_2.5_v66.BIN
-TFTP=/path/to/tftp
-ROOT=/path/to/rootfs
-KEYDIR=/path/to/private-plan9-keys
-QMP=/tmp/next-plan9-il.qmp
-
-"$QEMU" -M next-station \
-  -global next-pc.system-timer-frequency=4456448 \
-  -bios "$ROM" -m 64M -display gtk \
-  -qmp "unix:$QMP,server=on,wait=off" \
-  -fsdev "local,id=plan9root,path=$ROOT,security_model=none" \
-  -netdev "user,id=nextnet,ipv6=off,tftp=$TFTP,bootfile=68020/9nextstation" \
-  -object "secret,id=plan9-master-key,format=base64,file=$KEYDIR/master.b64" \
-  -object "plan9-9p1-server,id=plan9fs,fsdev=plan9root,netdev=nextnet,guest-address=10.0.2.100,transport=il,il-port=17008,auth-port=566,auth-id=p9fs,auth-domain=nextlab,keydb=$KEYDIR/keys,key-secret=plan9-master-key" \
-  -net "nic,model=next-mb8795,netdev=nextnet" \
-  -no-reboot
-```
-
-At the ROM prompt enter `ben() 68020/9nextstation`. At the root source prompt
-enter `il`, accept `tor` at `user[tor]:`, and type the provisioned password
-directly in the GTK guest console. The password must not be injected with QMP
-because QMP transcripts record key events.
-
-The DES ticket protocol is obsolete and unauthenticated encryption is not a
-modern security boundary. Use this profile only on QEMU's private user-mode
-SLiRP network. Do not expose IL/566 or IL/17008 through host forwarding or a
-bridged/TAP network. Active IL connections block live migration and must
-reconnect after guest reset.
+The authenticated historical IL profile requires externally provisioned
+credentials and is intentionally not reproduced with key material or
+credential-management commands in this public guide. The TCP profile above
+provides the self-contained Plan 9 netboot path.
 
 ## SCC serial DMA
 
