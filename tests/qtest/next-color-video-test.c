@@ -1245,12 +1245,16 @@ static void test_bt463_blink_command0_reset(void)
 
 static void test_bt463_board_blink_relevance(void)
 {
+#ifdef CONFIG_TRACE_LOG
     TestPPM *trace = create_test_ppm();
     g_autofree char *quoted_trace_path = g_shell_quote(trace->path);
     g_autofree char *args =
-        g_strdup_printf("-trace enable=next_color_retrace,file=%s",
+        g_strdup_printf("-trace enable=next_color_retrace -D %s",
                         quoted_trace_path);
     QTestState *qts = next_color_start_with_args(args);
+#else
+    QTestState *qts = next_color_start();
+#endif
     TestPPM *ppm;
     static const uint8_t red[] = { 0xff, 0x08, 0x08 };
     static const uint8_t black[] = { 0x08, 0x08, 0x08 };
@@ -1296,6 +1300,7 @@ static void test_bt463_board_blink_relevance(void)
 
     qtest_quit(qts);
 
+#ifdef CONFIG_TRACE_LOG
     {
         g_autofree char *events = NULL;
         gsize events_length;
@@ -1314,6 +1319,11 @@ static void test_bt463_board_blink_relevance(void)
         /* The inactive byte-3 phase is absent; the active byte flips once. */
         g_assert_cmpuint(invalidations, ==, 1);
     }
+#else
+    /* The screen assertions above remain backend-independent. */
+    g_test_message("textual trace invalidation oracle skipped: "
+                   "CONFIG_TRACE_LOG is unavailable");
+#endif
 }
 
 static void test_rgb444_scanout(void)
@@ -1678,8 +1688,8 @@ static void test_migration_outer_v1_fixture(void)
 
     migration = create_test_migration();
     uri = g_strdup_printf("unix:%s", migration->socket_path);
-    destination = next_color_start_with_args("-incoming defer");
-    source = next_color_start_with_env("QTEST_QEMU_BINARY_V1", NULL);
+    destination = next_color_start_with_args("-nic none -incoming defer");
+    source = next_color_start_with_env("QTEST_QEMU_BINARY_V1", "-nic none");
 
     qtest_qmp_assert_success(
         destination,
