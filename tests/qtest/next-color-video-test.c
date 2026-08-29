@@ -325,6 +325,14 @@ static void test_bt463_mpu_registers(void)
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x03);
     assert_dac_triplet(qts, 2, 0x30f, wtt);
 
+    /* The twelve-bit address wraps from its final value to zero. */
+    dac_set_address(qts, 0x0fff);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0x11);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0x22);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0x33);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x00);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x00);
+
     /* Eight-bit registers advance after each access. */
     dac_set_address(qts, 0x201);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x40);
