@@ -41,9 +41,9 @@ QEMU provides three 68040 NeXT machine types:
   port, which applies the programmed window-type table, palette RAM, cursor
   colors, overlay/underlay routing, read and blink masks, and blink phase
   before producing RGB scanout.  This includes the full 528-entry palette and
-  the firmware's gamma/brightness LUT updates through the DAC at
-  ``0x02118100``.  The display has an independent 68 Hz retrace interrupt on
-  interrupt-status bit 13.  It has no NextBus.
+  the NeXTSTEP guest display driver updates the gamma and brightness LUTs via
+  the DAC at ``0x02118100``.  The display has an independent 68 Hz retrace
+  interrupt on status bit 13.  It has no NextBus.
 
 The name ``next-computer`` is reserved for the original 68030 NeXT
 Computer/Cube (machine type 0).  It is not available because QEMU does

@@ -290,7 +290,7 @@ transfer at the destination. Detailed register and lifecycle behavior is in
 |---|---|---|
 | NeXTcube (MC68040, X15) | Working | Monochrome system; boots NeXTSTEP from SCSI disk. |
 | NeXTstation (MC68040, Warp 9) | Working | Monochrome system; boots NeXTSTEP from SCSI and Plan 9 First and Second Editions by ROM netboot. |
-| NeXTstation Color (MC68040, Warp 9C) | Working | 1120 x 832 Bt463-mediated RGB444 display. Warp9C VRAM words pass through the Bt463 window-type tables, 528-entry palette, cursor/overlay routing, masks, and blink state; firmware gamma and brightness LUT updates affect scanout. |
+| NeXTstation Color (MC68040, Warp 9C) | Working | 1120 x 832 Bt463-mediated RGB444 display. Warp9C VRAM words pass through the Bt463 window-type tables, 528-entry palette, cursor/overlay routing, masks, and blink state; the NeXTSTEP guest display driver's gamma and brightness LUT updates affect scanout. |
 | Original NeXT Computer/Cube (MC68030) | Not implemented | Blocked by the missing MC68030 PMMU and its translation registers and table format. The reserved machine name is `next-computer`. |
 | Turbo systems | Not implemented | Turbo machine timing and board variants have not been modeled. |
 | MC68040 CPU and FPU | Working | Includes the floating-point state frames and exceptions required by Mach. |

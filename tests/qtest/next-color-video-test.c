@@ -802,6 +802,7 @@ static void test_bt463_complete_reset(void)
     g_assert_cmphex(video_irq_status(qts), ==, NEXT_COLOR_VIDEO_IRQ_STATUS);
 
     qtest_system_reset(qts);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xa5);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_COMMAND), ==, 0);
@@ -811,7 +812,14 @@ static void test_bt463_complete_reset(void)
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_VRAM + 1), ==, 0x00);
     g_assert_cmphex(video_irq_status(qts), ==, 0);
 
+    /* The direct post-reset write must have used address 0, component 0. */
+    assert_dac_triplet(qts, 3, 0,
+                       (const uint8_t[3]) { 0xa5, 0x00, 0x00 });
+    dac_set_address(qts, 0);
+    dac_write_triplet(qts, 3, zero);
+
     /* Reset output is deterministic black while the board VRAM survives. */
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
     if (require_screendump(qts)) {
         ppm = create_test_ppm();
         assert_screendump_pixel(qts, ppm, 0, reset_black);
@@ -855,7 +863,12 @@ static void test_bt463_complete_reset(void)
     qtest_quit(qts);
 }
 
-/* Gamma[] and BRIGHT_MAX are copied from vid_C16_init()/SetBrightness(). */
+/*
+ * Source: /home/blanham/projects/NeXT/references/original-source/NeXTMach/
+ * mk-108.1/nextdev/video.c, Gamma[] initializer used by vid_C16_init() and
+ * vid_C16_SetBrightness() under COLOR_FB.  The digest test below
+ * independently checks this exact copy.
+ */
 #define NEXT_COLOR_BRIGHT_MAX 0x3d
 
 static const uint8_t original_warp9c_gamma[256] = {
@@ -892,6 +905,17 @@ static const uint8_t original_warp9c_gamma[256] = {
     247, 248, 248, 249, 249, 250, 250, 251,
     251, 252, 252, 253, 253, 254, 254, 255,
 };
+
+static void test_bt463_original_gamma_digest(void)
+{
+    g_autofree char *digest = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, original_warp9c_gamma,
+        G_N_ELEMENTS(original_warp9c_gamma));
+
+    g_assert_cmpstr(digest, ==,
+                    "b10c349fd56b298262a26a52ea4c6288"
+                    "10218deb2ff4a6fd82266e3da41322f6");
+}
 
 static uint8_t original_warp9c_brightness_value(unsigned index,
                                                 unsigned brightness)
@@ -1892,6 +1916,8 @@ int main(int argc, char **argv)
                    test_bt463_complete_reset);
     qtest_add_func("/next-color-video/bt463-original-init-sequence",
                    test_bt463_original_init_sequence);
+    qtest_add_func("/next-color-video/bt463-original-gamma-digest",
+                   test_bt463_original_gamma_digest);
     qtest_add_func("/next-color-video/bt463-original-brightness-rewrite",
                    test_bt463_original_brightness_rewrite);
     qtest_add_func("/next-color-video/migration", test_migration);
