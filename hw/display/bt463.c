@@ -146,6 +146,15 @@ void bt463_import_legacy(Bt463State *s, const Bt463LegacyState *legacy)
         s->wtt[i] = entry[0] | ((uint32_t)entry[1] << 8) |
             ((uint32_t)entry[2] << 16);
     }
+
+    /* Resume a partially completed WTT triplet from the imported entry. */
+    if (s->address >= 0x300 &&
+        s->address < 0x300 + BT463_WTT_ENTRIES && s->component != 0) {
+        uint32_t wtt = s->wtt[s->address - 0x300];
+
+        s->wtt_write_latch = wtt;
+        s->wtt_read_latch = wtt;
+    }
 }
 
 uint8_t bt463_address_read(Bt463State *s, bool high)

@@ -68,9 +68,46 @@ static void test_bt463_import_legacy(void)
                     legacy.general[0x20f], 3);
     g_assert_cmphex(state.wtt[0], ==, 0x332211);
     g_assert_cmphex(state.wtt[15], ==, 0xccbbaa);
-    g_assert_cmpuint(state.wtt_write_latch, ==, 0);
-    g_assert_cmpuint(state.wtt_read_latch, ==, 0);
     g_assert_cmpuint(vmstate_bt463_legacy.version_id, ==, 1);
+}
+
+static void test_bt463_import_legacy_wtt_latches(void)
+{
+    Bt463State read_state;
+    Bt463State write_state;
+    Bt463LegacyState read_legacy = { 0 };
+    Bt463LegacyState write_legacy = { 0 };
+
+    read_legacy.dac_address = 0x0301;
+    read_legacy.dac_component = 1;
+    read_legacy.general[0x301][0] = 0xa1;
+    read_legacy.general[0x301][1] = 0xb2;
+    read_legacy.general[0x301][2] = 0xc3;
+    bt463_init(&read_state);
+    bt463_import_legacy(&read_state, &read_legacy);
+
+    /* A partial legacy read resumes from the imported WTT entry. */
+    g_assert_cmphex(bt463_general_read(&read_state), ==, 0xb2);
+    g_assert_cmphex(bt463_general_read(&read_state), ==, 0xc3);
+    g_assert_cmpuint(read_state.address, ==, 0x302);
+    g_assert_cmpuint(read_state.component, ==, 0);
+
+    write_legacy.dac_address = 0x0302;
+    write_legacy.dac_component = 1;
+    write_legacy.general[0x302][0] = 0x11;
+    write_legacy.general[0x302][1] = 0x22;
+    write_legacy.general[0x302][2] = 0x33;
+    bt463_init(&write_state);
+    bt463_import_legacy(&write_state, &write_legacy);
+
+    /* A partial legacy write preserves the untouched red component. */
+    bt463_general_write(&write_state, 0xaa);
+    bt463_general_write(&write_state, 0xbb);
+    bt463_address_write(&write_state, false, 0x02);
+    bt463_address_write(&write_state, true, 0x03);
+    g_assert_cmphex(bt463_general_read(&write_state), ==, 0x11);
+    g_assert_cmphex(bt463_general_read(&write_state), ==, 0xaa);
+    g_assert_cmphex(bt463_general_read(&write_state), ==, 0xbb);
 }
 
 static void test_bt463_legacy_vmstate(void)
@@ -126,6 +163,8 @@ int main(int argc, char **argv)
     module_call_init(MODULE_INIT_QOM);
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/bt463/import-legacy", test_bt463_import_legacy);
+    g_test_add_func("/bt463/import-legacy-wtt-latches",
+                    test_bt463_import_legacy_wtt_latches);
     g_test_add_func("/bt463/legacy-vmstate", test_bt463_legacy_vmstate);
     return g_test_run();
 }
