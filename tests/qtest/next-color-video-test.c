@@ -864,10 +864,9 @@ static void test_bt463_complete_reset(void)
 }
 
 /*
- * Source: /home/blanham/projects/NeXT/references/original-source/NeXTMach/
- * mk-108.1/nextdev/video.c, Gamma[] initializer used by vid_C16_init() and
- * vid_C16_SetBrightness() under COLOR_FB.  The digest test below
- * independently checks this exact copy.
+ * Source: NeXTMach mk-108.1, nextdev/video.c, Gamma[] initializer under
+ * COLOR_FB, used by vid_C16_init() and vid_C16_SetBrightness().  The digest
+ * test below independently checks this exact copy.
  */
 #define NEXT_COLOR_BRIGHT_MAX 0x3d
 
