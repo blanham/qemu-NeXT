@@ -122,7 +122,7 @@ Stage the next68k standalone program as `$TFTP/boot`, and extract a disposable
 NetBSD root tree at `$ROOT` with `netbsd` at its top level. Launch it with:
 
 ```sh
-QEMU=$PWD/build-next/qemu-system-m68k
+QEMU="$PWD/qemu-system-m68k"
 ROM=/path/to/Rev_2.5_v66.BIN
 TFTP=/path/to/tftp
 ROOT=/path/to/netbsd-root
