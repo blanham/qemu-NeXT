@@ -115,8 +115,42 @@ void bt463_reset(Bt463State *s)
     memset(s, 0, sizeof(*s));
 }
 
-uint8_t bt463_address_read(const Bt463State *s, bool high)
+void bt463_import_legacy(Bt463State *s, const Bt463LegacyState *legacy)
 {
+    bt463_reset(s);
+    s->address = legacy->dac_address & BT463_ADDRESS_MASK;
+    s->component = legacy->dac_component % 3;
+
+    /* The old generic palette was larger than the architected Bt463 RAM. */
+    memcpy(s->palette, legacy->palette, sizeof(s->palette));
+    memcpy(s->cursor[0], legacy->general[0x100], sizeof(s->cursor[0]));
+    memcpy(s->cursor[1], legacy->general[0x101], sizeof(s->cursor[1]));
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->command); i++) {
+        s->command[i] = legacy->general[0x201 + i][0] &
+            bt463_command_mask(0x201 + i);
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->read_mask); i++) {
+        s->read_mask[i] = legacy->general[0x205 + i][0];
+        s->blink_mask[i] = legacy->general[0x209 + i][0];
+    }
+    s->test_register = legacy->general[0x20d][0];
+    s->input_signature = legacy->general[0x20e][0] |
+        ((uint16_t)legacy->general[0x20e][1] << 8);
+    memcpy(s->output_signature, legacy->general[0x20f],
+           sizeof(s->output_signature));
+
+    for (unsigned i = 0; i < BT463_WTT_ENTRIES; i++) {
+        const uint8_t *entry = legacy->general[0x300 + i];
+
+        s->wtt[i] = entry[0] | ((uint32_t)entry[1] << 8) |
+            ((uint32_t)entry[2] << 16);
+    }
+}
+
+uint8_t bt463_address_read(Bt463State *s, bool high)
+{
+    s->component = 0;
     if (high) {
         return (s->address >> 8) & 0x0f;
     }
@@ -310,6 +344,21 @@ static int bt463_post_load(void *opaque, int version_id)
 
     return 0;
 }
+
+const VMStateDescription vmstate_bt463_legacy = {
+    .name = "bt463-legacy",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT16(dac_address, Bt463LegacyState),
+        VMSTATE_UINT8(dac_component, Bt463LegacyState),
+        VMSTATE_UINT8_2DARRAY(palette, Bt463LegacyState,
+                             BT463_LEGACY_ENTRIES, 3),
+        VMSTATE_UINT8_2DARRAY(general, Bt463LegacyState,
+                             BT463_LEGACY_ENTRIES, 3),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 const VMStateDescription vmstate_bt463 = {
     .name = "bt463",

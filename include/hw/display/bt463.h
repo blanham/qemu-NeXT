@@ -42,6 +42,18 @@
 #define BT463_PALETTE_ENTRIES    0x210
 #define BT463_CURSOR_COLORS      2
 #define BT463_WTT_ENTRIES       16
+#define BT463_LEGACY_ENTRIES    0x400
+
+/*
+ * State emitted by the NeXT color-video device before the Bt463 model was
+ * extracted.  This remains solely as an incoming migration format.
+ */
+typedef struct Bt463LegacyState {
+    uint16_t dac_address;
+    uint8_t dac_component;
+    uint8_t palette[BT463_LEGACY_ENTRIES][3];
+    uint8_t general[BT463_LEGACY_ENTRIES][3];
+} Bt463LegacyState;
 
 typedef struct Bt463State {
     uint16_t address;
@@ -63,11 +75,13 @@ typedef struct Bt463State {
 } Bt463State;
 
 extern const VMStateDescription vmstate_bt463;
+extern const VMStateDescription vmstate_bt463_legacy;
 
 void bt463_init(Bt463State *s);
 void bt463_reset(Bt463State *s);
+void bt463_import_legacy(Bt463State *s, const Bt463LegacyState *legacy);
 
-uint8_t bt463_address_read(const Bt463State *s, bool high);
+uint8_t bt463_address_read(Bt463State *s, bool high);
 void bt463_address_write(Bt463State *s, bool high, uint8_t value);
 
 uint8_t bt463_palette_read(Bt463State *s);

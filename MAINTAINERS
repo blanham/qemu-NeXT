@@ -1405,6 +1405,7 @@ F: docs/system/target-m68k.rst
 F: hw/audio/next-sound.c
 F: hw/block/next-floppy.c
 F: hw/char/next-serial.c
+F: hw/display/bt463.c
 F: hw/display/next-*.c
 F: hw/dma/next-dma.c
 F: hw/m68k/next-*.c
@@ -1417,6 +1418,7 @@ F: hw/rtc/next-rtc.c
 F: include/hw/audio/next-sound.h
 F: include/hw/block/next-floppy.h
 F: include/hw/char/next-serial.h
+F: include/hw/display/bt463.h
 F: include/hw/display/next-*.h
 F: include/hw/dma/next-dma.h
 F: include/hw/m68k/next-cube.h

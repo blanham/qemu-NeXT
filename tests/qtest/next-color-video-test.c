@@ -333,6 +333,20 @@ static void test_bt463_mpu_registers(void)
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x00);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x00);
 
+    /* Reading either address byte also restarts the component phase. */
+    dac_set_address(qts, 0x012);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xa1);
+    qtest_readb(qts, NEXT_COLOR_DAC);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xb2);
+    assert_dac_triplet(qts, 3, 0x012,
+                       (const uint8_t[3]) { 0xb2, 0x00, 0x00 });
+    dac_set_address(qts, 0x013);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xc3);
+    qtest_readb(qts, NEXT_COLOR_DAC + 1);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 3, 0xd4);
+    assert_dac_triplet(qts, 3, 0x013,
+                       (const uint8_t[3]) { 0xd4, 0x00, 0x00 });
+
     /* Eight-bit registers advance after each access. */
     dac_set_address(qts, 0x201);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x40);
@@ -583,11 +597,7 @@ static void test_bt463_auto_increment_and_phase_reset(void)
 
     dac_set_address(qts, 0x3ff);
     qtest_writeb(qts, NEXT_COLOR_DAC + 3, wrap[0]);
-    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0xff);
-    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x03);
     qtest_writeb(qts, NEXT_COLOR_DAC + 3, wrap[1]);
-    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0xff);
-    g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x03);
     qtest_writeb(qts, NEXT_COLOR_DAC + 3, wrap[2]);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC), ==, 0x00);
     g_assert_cmphex(qtest_readb(qts, NEXT_COLOR_DAC + 1), ==, 0x04);

@@ -67,6 +67,8 @@ struct NextColorVideoState {
     qemu_irq irq;
     QEMUTimer retrace_timer;
     Bt463State bt463;
+    /* Incoming-only storage for the pre-Bt463-model migration format. */
+    Bt463LegacyState bt463_legacy;
     uint8_t command;
     uint8_t dram_timing;
     uint8_t vram_timing;
@@ -333,10 +335,25 @@ static void next_color_video_reset_hold(Object *obj, ResetType type)
     s->invalidate = true;
 }
 
+static bool next_color_video_legacy_state(void *opaque G_GNUC_UNUSED,
+                                          int version_id)
+{
+    return version_id == 1;
+}
+
+static bool next_color_video_bt463_state(void *opaque G_GNUC_UNUSED,
+                                         int version_id)
+{
+    return version_id >= 2;
+}
+
 static int next_color_video_post_load(void *opaque, int version_id)
 {
     NextColorVideoState *s = opaque;
 
+    if (version_id == 1) {
+        bt463_import_legacy(&s->bt463, &s->bt463_legacy);
+    }
     s->command &=
         NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
     qemu_set_irq(s->irq, s->irq_level);
@@ -352,11 +369,15 @@ static const VMStateDescription vmstate_next_color_video = {
     .name = TYPE_NEXT_COLOR_VIDEO,
     /* Version 1 serialized the old generic DAC arrays. */
     .version_id = 2,
-    .minimum_version_id = 2,
+    .minimum_version_id = 1,
     .post_load = next_color_video_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_STRUCT(bt463, NextColorVideoState, 1, vmstate_bt463,
-                       Bt463State),
+        VMSTATE_STRUCT_TEST(bt463_legacy, NextColorVideoState,
+                            next_color_video_legacy_state, 1,
+                            vmstate_bt463_legacy, Bt463LegacyState),
+        VMSTATE_STRUCT_TEST(bt463, NextColorVideoState,
+                            next_color_video_bt463_state, 2, vmstate_bt463,
+                            Bt463State),
         VMSTATE_UINT8(command, NextColorVideoState),
         VMSTATE_UINT8(dram_timing, NextColorVideoState),
         VMSTATE_UINT8(vram_timing, NextColorVideoState),
