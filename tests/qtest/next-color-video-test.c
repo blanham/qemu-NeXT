@@ -643,6 +643,32 @@ static void test_command_and_retrace_irq(void)
     qtest_quit(qts);
 }
 
+static void test_retrace_ack_preserves_phase(void)
+{
+    QTestState *qts = next_color_start();
+    const uint8_t enabled =
+        NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
+
+    /* Two acknowledgements before the deadline must not defer retrace. */
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, enabled);
+    qtest_clock_step(qts, NEXT_COLOR_RETRACE_NS / 2);
+    qtest_writeb(qts, NEXT_COLOR_COMMAND,
+                 NEXT_COLOR_COMMAND_CLRINTR |
+                 NEXT_COLOR_COMMAND_UNBLANK);
+    qtest_clock_step(qts, NEXT_COLOR_RETRACE_NS / 4);
+    qtest_writeb(qts, NEXT_COLOR_COMMAND,
+                 NEXT_COLOR_COMMAND_CLRINTR |
+                 NEXT_COLOR_COMMAND_UNBLANK);
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, enabled);
+    qtest_clock_step(qts, NEXT_COLOR_RETRACE_NS -
+                     NEXT_COLOR_RETRACE_NS / 2 -
+                     NEXT_COLOR_RETRACE_NS / 4);
+    g_assert_cmphex(video_irq_status(qts), ==,
+                    NEXT_COLOR_VIDEO_IRQ_STATUS);
+
+    qtest_quit(qts);
+}
+
 static void test_registers_and_reset(void)
 {
     QTestState *qts = next_color_start();
@@ -743,6 +769,85 @@ static void program_original_warp9c_init(QTestState *qts)
     dac_write_triplet(qts, 3, (const uint8_t[3]) { 0x00, 0x00, 0x00 });
     dac_set_address(qts, 0x0f0);
     dac_write_triplet(qts, 3, (const uint8_t[3]) { 0xff, 0xff, 0xff });
+}
+
+static void program_blink_fixture(QTestState *qts, uint8_t command0)
+{
+    static const uint8_t red444[] = { 0xf0, 0x00 };
+
+    program_original_warp9c_init(qts);
+    dac_set_address(qts, 0x201);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, command0);
+    dac_set_address(qts, 0x209);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xf0);
+    qtest_bufwrite(qts, NEXT_COLOR_VRAM, red444, sizeof(red444));
+    qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
+}
+
+static void test_bt463_blink_rates(void)
+{
+    static const struct {
+        uint8_t rate;
+        unsigned on;
+        unsigned off;
+    } rates[] = {
+        { 0x00, 16, 48 },
+        { 0x04, 16, 16 },
+        { 0x08, 32, 32 },
+        { 0x0c, 64, 64 },
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(rates); i++) {
+        QTestState *qts = next_color_start();
+        TestPPM *ppm;
+        static const uint8_t red[] = { 0xff, 0x00, 0x00 };
+        static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+
+        if (!require_screendump(qts)) {
+            qtest_quit(qts);
+            return;
+        }
+        ppm = create_test_ppm();
+        program_blink_fixture(qts, 0x40 | rates[i].rate);
+
+        assert_screendump_pixel(qts, ppm, 0, red);
+        qtest_clock_step(qts, (rates[i].on - 1) * NEXT_COLOR_RETRACE_NS);
+        assert_screendump_pixel(qts, ppm, 0, red);
+        qtest_clock_step(qts, NEXT_COLOR_RETRACE_NS);
+        assert_screendump_pixel(qts, ppm, 0, black);
+        qtest_clock_step(qts, (rates[i].off - 1) * NEXT_COLOR_RETRACE_NS);
+        assert_screendump_pixel(qts, ppm, 0, black);
+        qtest_clock_step(qts, NEXT_COLOR_RETRACE_NS);
+        assert_screendump_pixel(qts, ppm, 0, red);
+
+        qtest_quit(qts);
+    }
+}
+
+static void test_bt463_blink_command0_reset(void)
+{
+    QTestState *qts = next_color_start();
+    TestPPM *ppm;
+    static const uint8_t red[] = { 0xff, 0x00, 0x00 };
+    static const uint8_t black[] = { 0x00, 0x00, 0x00 };
+
+    if (!require_screendump(qts)) {
+        qtest_quit(qts);
+        return;
+    }
+    ppm = create_test_ppm();
+    program_blink_fixture(qts, 0x44); /* 16 on, 16 off. */
+    qtest_clock_step(qts, 16 * NEXT_COLOR_RETRACE_NS);
+    assert_screendump_pixel(qts, ppm, 0, black);
+
+    /* Rewriting CR0 resets both the counter and the visible phase. */
+    dac_set_address(qts, 0x201);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x44);
+    assert_screendump_pixel(qts, ppm, 0, red);
+    qtest_clock_step(qts, 16 * NEXT_COLOR_RETRACE_NS);
+    assert_screendump_pixel(qts, ppm, 0, black);
+
+    qtest_quit(qts);
 }
 
 static void test_rgb444_scanout(void)
@@ -960,8 +1065,11 @@ static void test_migration(void)
     QTestState *source = next_color_start();
     const uint8_t palette[3] = { 0x12, 0x34, 0x56 };
     const uint8_t tag[3] = { 0xaa, 0xbb, 0xcc };
+    const uint8_t cursor0[3] = { 0xc1, 0xc2, 0xc3 };
+    const uint8_t cursor1[3] = { 0xd1, 0xd2, 0xd3 };
     const uint8_t enabled =
         NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
+    int64_t source_clock;
 
     qtest_qmp_assert_success(
         destination,
@@ -972,10 +1080,22 @@ static void test_migration(void)
     dac_write_triplet(source, 3, palette);
     dac_set_address(source, 0x300);
     dac_write_triplet(source, 2, tag);
+    dac_set_address(source, 0x100);
+    dac_write_triplet(source, 2, cursor0);
+    dac_set_address(source, 0x101);
+    dac_write_triplet(source, 2, cursor1);
+    dac_set_address(source, 0x201);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, 0x44);
+    dac_set_address(source, 0x202);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, 0x02);
+    for (uint16_t address = 0x205; address <= 0x20c; address++) {
+        dac_set_address(source, address);
+        qtest_writeb(source, NEXT_COLOR_DAC + 2, address & 0xff);
+    }
     qtest_writeb(source, NEXT_COLOR_DRAM_TIMING, 0x5a);
     qtest_writeb(source, NEXT_COLOR_VRAM_TIMING, 0xa5);
     qtest_writeb(source, NEXT_COLOR_COMMAND, enabled);
-    qtest_clock_step(source, NEXT_COLOR_RETRACE_NS);
+    source_clock = qtest_clock_step(source, NEXT_COLOR_RETRACE_NS);
     g_assert_cmphex(video_irq_status(source), ==,
                     NEXT_COLOR_VIDEO_IRQ_STATUS);
 
@@ -984,9 +1104,20 @@ static void test_migration(void)
         "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
     qtest_qmp_eventwait(source, "STOP");
     qtest_qmp_eventwait(destination, "RESUME");
+    qtest_clock_set(destination, source_clock);
 
     assert_dac_triplet(destination, 3, 0x100, palette);
     assert_dac_triplet(destination, 2, 0x300, tag);
+    assert_dac_triplet(destination, 2, 0x100, cursor0);
+    assert_dac_triplet(destination, 2, 0x101, cursor1);
+    dac_set_address(destination, 0x201);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x44);
+    g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==, 0x02);
+    for (uint16_t address = 0x205; address <= 0x20c; address++) {
+        dac_set_address(destination, address);
+        g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DAC + 2), ==,
+                        address & 0xff);
+    }
     g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_DRAM_TIMING), ==,
                     0x5a);
     g_assert_cmphex(qtest_readb(destination, NEXT_COLOR_VRAM_TIMING), ==,
@@ -1072,6 +1203,8 @@ int main(int argc, char **argv)
                    test_bt463_auto_increment_and_phase_reset);
     qtest_add_func("/next-color-video/command-and-retrace-irq",
                    test_command_and_retrace_irq);
+    qtest_add_func("/next-color-video/retrace-ack-preserves-phase",
+                   test_retrace_ack_preserves_phase);
     qtest_add_func("/next-color-video/registers-and-reset",
                    test_registers_and_reset);
     qtest_add_func("/next-color-video/migration", test_migration);
@@ -1083,6 +1216,10 @@ int main(int argc, char **argv)
     qtest_add_func("/next-color-video/bt463-wtt-tags", test_bt463_wtt_tags);
     qtest_add_func("/next-color-video/bt463-load-interleave",
                    test_bt463_load_interleave_scanout);
+    qtest_add_func("/next-color-video/bt463-blink-rates",
+                   test_bt463_blink_rates);
+    qtest_add_func("/next-color-video/bt463-blink-command0-reset",
+                   test_bt463_blink_command0_reset);
     qtest_add_func("/next-color-video/blanking", test_blanking);
 
     return g_test_run();

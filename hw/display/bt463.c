@@ -105,6 +105,74 @@ static uint8_t bt463_command_mask(uint16_t address)
     }
 }
 
+static void bt463_reset_blink(Bt463State *s)
+{
+    s->blink_counter = 0;
+    s->blink_phase = true;
+}
+
+static void bt463_blink_period(const Bt463State *s, unsigned *on,
+                               unsigned *off)
+{
+    switch ((s->command[0] >> 2) & 3) {
+    case 0:
+        *on = 16;
+        *off = 48;
+        break;
+    case 1:
+        *on = 16;
+        *off = 16;
+        break;
+    case 2:
+        *on = 32;
+        *off = 32;
+        break;
+    case 3:
+        *on = 64;
+        *off = 64;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static bool bt463_blink_visible(const Bt463State *s)
+{
+    for (unsigned i = 0; i < G_N_ELEMENTS(s->blink_mask); i++) {
+        uint8_t mask = s->blink_mask[i] & s->read_mask[i];
+
+        if (i == 3) {
+            mask &= 0x0f;
+        }
+        if (mask) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Revision B notes a physical blink defect; model the documented functional
+ * production behavior so guests see deterministic blink cadence.
+ */
+bool bt463_retrace_step(Bt463State *s)
+{
+    unsigned on;
+    unsigned off;
+    unsigned duration;
+    bool old_phase;
+
+    bt463_blink_period(s, &on, &off);
+    old_phase = s->blink_phase;
+    duration = old_phase ? on : off;
+    if (++s->blink_counter >= duration) {
+        s->blink_counter = 0;
+        s->blink_phase = !old_phase;
+    }
+
+    return old_phase != s->blink_phase && bt463_blink_visible(s);
+}
+
 void bt463_init(Bt463State *s)
 {
     bt463_reset(s);
@@ -113,6 +181,7 @@ void bt463_init(Bt463State *s)
 void bt463_reset(Bt463State *s)
 {
     memset(s, 0, sizeof(*s));
+    bt463_reset_blink(s);
 }
 
 void bt463_import_legacy(Bt463State *s, const Bt463LegacyState *legacy)
@@ -306,6 +375,11 @@ bool bt463_general_write(Bt463State *s, uint8_t value)
 
             changed = *command != new_value;
             *command = new_value;
+            if (s->address == 0x201) {
+                /* Every CR0 write restarts the documented blink cadence. */
+                changed |= s->blink_counter != 0 || !s->blink_phase;
+                bt463_reset_blink(s);
+            }
             break;
         }
         case 0x205 ... 0x208:
@@ -345,6 +419,9 @@ static uint32_t bt463_mask_pixel(const Bt463State *s, uint32_t pixel)
         uint32_t value = (pixel >> (i * 8)) & 0xff;
         uint32_t mask = s->read_mask[i];
 
+        if (!s->blink_phase) {
+            value &= ~s->blink_mask[i];
+        }
         if (i == 3) {
             mask &= 0x0f;
         }
@@ -396,6 +473,64 @@ static uint32_t bt463_overlay_input(const Bt463State *s, uint32_t masked,
         (((shifted >> 16) & 1) << 0);
 }
 
+typedef enum Bt463OverlayRoute {
+    BT463_ROUTE_PIXEL,
+    BT463_ROUTE_OVERLAY,
+    BT463_ROUTE_UNDERLAY,
+    BT463_ROUTE_CURSOR_0,
+    BT463_ROUTE_CURSOR_1,
+    BT463_ROUTE_INVALID,
+} Bt463OverlayRoute;
+
+static Bt463OverlayRoute bt463_overlay_route(const Bt463State *s,
+                                             unsigned overlay,
+                                             bool eight_planes)
+{
+    const unsigned config = s->command[1] & 3;
+    const unsigned value = overlay & 0x0f;
+
+    switch (config) {
+    case 0: /* Table 9: no cursor. */
+        if (!value) {
+            return eight_planes && (overlay & 0xf0) ? BT463_ROUTE_OVERLAY :
+                BT463_ROUTE_PIXEL;
+        }
+        if ((s->command[1] & 4) && !(value & 8)) {
+            return BT463_ROUTE_UNDERLAY;
+        }
+        return BT463_ROUTE_OVERLAY;
+    case 1: /* Table 10: OL0 is cursor color 0. */
+        if (value & 1) {
+            return BT463_ROUTE_CURSOR_0;
+        }
+        if (!value) {
+            return eight_planes && (overlay & 0xf0) ? BT463_ROUTE_OVERLAY :
+                BT463_ROUTE_PIXEL;
+        }
+        if ((s->command[1] & 4) && !(value & 8)) {
+            return BT463_ROUTE_UNDERLAY;
+        }
+        return BT463_ROUTE_OVERLAY;
+    case 2: /* Table 11: OL1:OL0 select the two cursor colors. */
+        if ((value & 3) == 1) {
+            return BT463_ROUTE_CURSOR_0;
+        }
+        if (value & 2) {
+            return BT463_ROUTE_CURSOR_1;
+        }
+        if (!value) {
+            return eight_planes && (overlay & 0xf0) ? BT463_ROUTE_OVERLAY :
+                BT463_ROUTE_PIXEL;
+        }
+        if ((s->command[1] & 4) && !(value & 8)) {
+            return BT463_ROUTE_UNDERLAY;
+        }
+        return BT463_ROUTE_OVERLAY;
+    default:
+        return BT463_ROUTE_INVALID;
+    }
+}
+
 static void bt463_compact_overlay(uint32_t input, unsigned mask,
                                   uint32_t *value)
 {
@@ -437,36 +572,27 @@ static uint32_t bt463_pack_rgb(const uint8_t rgb[3])
     return ((uint32_t)rgb[0] << 16) | ((uint32_t)rgb[1] << 8) | rgb[2];
 }
 
-static bool bt463_standard_overlay_enabled(const Bt463State *s)
+static bool bt463_lookup_routed_overlay(const Bt463State *s,
+                                        unsigned overlay_value,
+                                        unsigned start, bool eight_planes,
+                                        bool *selected, uint8_t rgb[3])
 {
-    /* CR11:10=00, CR12=0, and CR14=0 select the four-plane overlay path. */
-    return !(s->command[1] & 0x17);
-}
-
-static bool bt463_lookup_standard_overlay(const Bt463State *s,
-                                          uint32_t masked, uint32_t shifted,
-                                          unsigned planes, unsigned mode,
-                                          bool overlay_location,
-                                          unsigned overlay_mask,
-                                          unsigned start, bool *selected,
-                                          uint8_t rgb[3])
-{
-    uint32_t overlay_value;
     unsigned address;
 
     *selected = false;
-    if (!overlay_mask || !bt463_standard_overlay_enabled(s)) {
-        return false;
+
+    if (eight_planes) {
+        if (!overlay_value) {
+            return false;
+        }
+        *selected = true;
+        /* CR14 fixes the overlay map at the first 256 palette entries. */
+        return bt463_lookup_palette_rgb(s, overlay_value, rgb);
     }
 
-    bt463_compact_overlay(
-        bt463_overlay_input(s, masked, shifted, planes, mode,
-                            overlay_location),
-        overlay_mask, &overlay_value);
     if (!overlay_value) {
         return false;
     }
-
     *selected = true;
 
     if ((s->command[1] & 0x40) || start < 0x10) {
@@ -528,9 +654,14 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     const unsigned start = ((wtt >> 17) & 0x3f) << 4;
     const bool bypass = (wtt >> 23) & 1;
     const bool contiguous = s->command[1] & 0x20;
+    const bool eight_planes = s->command[1] & 0x10;
     const uint8_t window_tag = window_type & 0x0f;
     const uint32_t masked = bt463_mask_pixel(s, pixel_pins);
     const uint32_t shifted = shift < 28 ? masked >> shift : 0;
+    const unsigned pixel_start = eight_planes ? 0x100 : start;
+    Bt463OverlayRoute route;
+    unsigned overlay_input;
+    unsigned overlay_value;
     uint8_t rgb[3];
 
     if (window_tag >= 0x0e && (s->command[1] & 0x08)) {
@@ -541,10 +672,13 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         return 0;
     }
 
+    /* Validate the WTT before applying overlay routing. */
+    if (eight_planes && mode != BT463_WTT_TRUE_COLOR &&
+        mode != BT463_WTT_PSEUDO_COLOR) {
+        return 0;
+    }
     switch (mode) {
-    case BT463_WTT_TRUE_COLOR: {
-        bool overlay_selected;
-
+    case BT463_WTT_TRUE_COLOR:
         if (contiguous) {
             if (shift != 0 || planes > 4) {
                 return 0;
@@ -552,14 +686,80 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         } else if (planes > 8 || shift + planes * 3 > 28) {
             return 0;
         }
-        if (bt463_lookup_standard_overlay(s, masked, shifted, planes, mode,
-                                           overlay_location, overlay_mask,
-                                           start, &overlay_selected, rgb)) {
-            return bt463_pack_rgb(rgb);
-        }
-        if (overlay_selected) {
+        break;
+    case BT463_WTT_PSEUDO_COLOR:
+        if (planes > 9 || shift + planes > 28 ||
+            (contiguous && shift > 15)) {
             return 0;
         }
+        break;
+    case BT463_WTT_BANK_SELECT:
+        if (bypass || planes > 8 || shift + planes > 28) {
+            return 0;
+        }
+        break;
+    case BT463_TRUE_COLOR_LOAD_INTERLEAVE:
+        if (phase == BT463_LOAD_INVALID || bypass || planes != 4 ||
+            shift + 24 > 28 || (shift != 0 && shift != 4)) {
+            return 0;
+        }
+        break;
+    case BT463_PSEUDO_COLOR_LOAD_INTERLEAVE:
+        if (phase == BT463_LOAD_INVALID || bypass || planes != 8 ||
+            shift + 16 > 28 || (shift != 0 && shift != 4) ||
+            overlay_location) {
+            return 0;
+        }
+        break;
+    default:
+        return 0;
+    }
+
+    if (eight_planes) {
+        /* CR14 repurposes the WT nibble as the four upper overlay planes. */
+        overlay_input = (window_tag << 4) | ((masked >> 24) & 0x0f);
+    } else {
+        overlay_input = bt463_overlay_input(s, masked, shifted, planes, mode,
+                                            overlay_location);
+    }
+    /* The WTT mask compacts the physical overlay pins before routing. */
+    bt463_compact_overlay(overlay_input & 0x0f, overlay_mask, &overlay_value);
+    if (eight_planes) {
+        /* In CR14, WT0-WT3 are OL4-OL7 and P24-P27 are OL0-OL3. */
+        overlay_value |= overlay_input & 0xf0;
+    }
+    /* Bank-select concatenates overlay bits into pixel data itself. */
+    route = mode == BT463_WTT_BANK_SELECT ? BT463_ROUTE_PIXEL :
+        bt463_overlay_route(s, overlay_value, eight_planes);
+
+    switch (route) {
+    case BT463_ROUTE_CURSOR_0:
+        return bt463_pack_rgb(s->cursor[0]);
+    case BT463_ROUTE_CURSOR_1:
+        return bt463_pack_rgb(s->cursor[1]);
+    case BT463_ROUTE_OVERLAY:
+    case BT463_ROUTE_UNDERLAY: {
+        bool selected;
+
+        if (bt463_lookup_routed_overlay(s, overlay_value, pixel_start,
+                                        eight_planes,
+                                        &selected, rgb)) {
+            return bt463_pack_rgb(rgb);
+        }
+        if (selected) {
+            /* A selected palette address outside RAM is deterministic black. */
+            return 0;
+        }
+        break;
+    }
+    case BT463_ROUTE_INVALID:
+        return 0;
+    case BT463_ROUTE_PIXEL:
+        break;
+    }
+
+    switch (mode) {
+    case BT463_WTT_TRUE_COLOR: {
         if (bypass) {
             if (contiguous || planes != 8 || shift + 24 > 28) {
                 return 0;
@@ -575,7 +775,7 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
             for (unsigned i = 0; i < 3; i++) {
                 const unsigned value = bt463_extract_bits(
                     masked, channel_offset[i], planes);
-                if (!bt463_palette_component(s, start + value, i,
+                if (!bt463_palette_component(s, pixel_start + value, i,
                                              &rgb[i])) {
                     return 0;
                 }
@@ -585,7 +785,8 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         for (unsigned i = 0; i < 3; i++) {
             const unsigned value = bt463_extract_bits(shifted, i * 8,
                                                       planes);
-            if (!bt463_palette_component(s, start + value, i, &rgb[i])) {
+            if (!bt463_palette_component(s, pixel_start + value, i,
+                                         &rgb[i])) {
                 return 0;
             }
         }
@@ -593,23 +794,6 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     }
 
     case BT463_WTT_PSEUDO_COLOR: {
-        bool overlay_selected;
-
-        if (planes > 9 || shift + planes > 28) {
-            return 0;
-        }
-        if (contiguous && shift > 15) {
-            /* CR15 supports either 12- or 16-plane board wiring. */
-            return 0;
-        }
-        if (bt463_lookup_standard_overlay(s, masked, shifted, planes, mode,
-                                           overlay_location, overlay_mask,
-                                           start, &overlay_selected, rgb)) {
-            return bt463_pack_rgb(rgb);
-        }
-        if (overlay_selected) {
-            return 0;
-        }
         if (bypass) {
             if (planes != 8 || shift + 8 > 28) {
                 return 0;
@@ -622,51 +806,32 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         }
 
         const unsigned value = bt463_extract_bits(shifted, 0, planes);
-        if (!bt463_lookup_palette_rgb(s, start + value, rgb)) {
+        if (!bt463_lookup_palette_rgb(s, pixel_start + value, rgb)) {
             return 0;
         }
         return bt463_pack_rgb(rgb);
     }
 
     case BT463_WTT_BANK_SELECT: {
-        uint32_t overlay_value;
+        uint32_t bank_overlay_value;
         unsigned value;
 
-        if (bypass || planes > 8 || shift + planes > 28) {
-            return 0;
-        }
-        bt463_compact_overlay(
-            bt463_overlay_input(s, masked, shifted, planes, mode,
-                                overlay_location),
-            overlay_mask, &overlay_value);
+        bt463_compact_overlay(overlay_input, overlay_mask,
+                              &bank_overlay_value);
         value = bt463_extract_bits(shifted, 0, planes);
-        value |= overlay_value << planes;
-        if (!bt463_lookup_palette_rgb(s, start + value, rgb)) {
+        value |= bank_overlay_value << planes;
+        if (!bt463_lookup_palette_rgb(s, pixel_start + value, rgb)) {
             return 0;
         }
         return bt463_pack_rgb(rgb);
     }
 
     case BT463_TRUE_COLOR_LOAD_INTERLEAVE: {
-        bool overlay_selected;
-
-        if (phase == BT463_LOAD_INVALID || bypass || planes != 4 ||
-            shift + 24 > 28 ||
-            (shift != 0 && shift != 4)) {
-            return 0;
-        }
-        if (bt463_lookup_standard_overlay(s, masked, shifted, planes, mode,
-                                           overlay_location, overlay_mask,
-                                           start, &overlay_selected, rgb)) {
-            return bt463_pack_rgb(rgb);
-        }
-        if (overlay_selected) {
-            return 0;
-        }
         for (unsigned i = 0; i < 3; i++) {
             const unsigned value = bt463_extract_bits(
                 masked, i * 8 + (phase == BT463_LOAD_UPPER ? 4 : 0), 4);
-            if (!bt463_palette_component(s, start + value, i, &rgb[i])) {
+            if (!bt463_palette_component(s, pixel_start + value, i,
+                                         &rgb[i])) {
                 return 0;
             }
         }
@@ -674,34 +839,17 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     }
 
     case BT463_PSEUDO_COLOR_LOAD_INTERLEAVE: {
-        bool overlay_selected;
         unsigned red;
         unsigned green;
         unsigned value;
 
-        if (phase == BT463_LOAD_INVALID || bypass || planes != 8 ||
-            shift + 16 > 28 ||
-            (shift != 0 && shift != 4)) {
-            return 0;
-        }
-        if (overlay_location) {
-            return 0;
-        }
-        if (bt463_lookup_standard_overlay(s, masked, shifted, planes, mode,
-                                           overlay_location, overlay_mask,
-                                           start, &overlay_selected, rgb)) {
-            return bt463_pack_rgb(rgb);
-        }
-        if (overlay_selected) {
-            return 0;
-        }
         red = bt463_extract_bits(masked,
                                  phase == BT463_LOAD_UPPER ? 4 : 0, 4);
         green = bt463_extract_bits(masked,
                                    8 + (phase == BT463_LOAD_UPPER ? 4 : 0),
                                    4);
         value = (green << 4) | red;
-        if (!bt463_lookup_palette_rgb(s, start + value, rgb)) {
+        if (!bt463_lookup_palette_rgb(s, pixel_start + value, rgb)) {
             return 0;
         }
         return bt463_pack_rgb(rgb);
@@ -715,6 +863,13 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
 static int bt463_post_load(void *opaque, int version_id)
 {
     Bt463State *s = opaque;
+    unsigned on;
+    unsigned off;
+
+    if (version_id < 2) {
+        /* Nested v1 state predates the blink cadence fields. */
+        bt463_reset_blink(s);
+    }
 
     s->address &= BT463_ADDRESS_MASK;
     s->component %= 3;
@@ -725,6 +880,10 @@ static int bt463_post_load(void *opaque, int version_id)
     }
     for (unsigned i = 0; i < BT463_WTT_ENTRIES; i++) {
         s->wtt[i] &= 0xffffff;
+    }
+    bt463_blink_period(s, &on, &off);
+    if (s->blink_counter >= (s->blink_phase ? on : off)) {
+        s->blink_counter = 0;
     }
 
     return 0;
@@ -747,7 +906,7 @@ const VMStateDescription vmstate_bt463_legacy = {
 
 const VMStateDescription vmstate_bt463 = {
     .name = "bt463",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = bt463_post_load,
     .fields = (const VMStateField[]) {
@@ -766,6 +925,8 @@ const VMStateDescription vmstate_bt463 = {
         VMSTATE_UINT32_ARRAY(wtt, Bt463State, BT463_WTT_ENTRIES),
         VMSTATE_UINT32(wtt_write_latch, Bt463State),
         VMSTATE_UINT32(wtt_read_latch, Bt463State),
+        VMSTATE_UINT8_V(blink_counter, Bt463State, 2),
+        VMSTATE_BOOL_V(blink_phase, Bt463State, 2),
         VMSTATE_END_OF_LIST()
     }
 };

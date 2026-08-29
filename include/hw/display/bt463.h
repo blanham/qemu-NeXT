@@ -92,6 +92,12 @@ typedef struct Bt463State {
     /* The WTT shifts a complete 24-bit word into the table on B16-B23. */
     uint32_t wtt_write_latch;
     uint32_t wtt_read_latch;
+
+    /*
+     * True while blinking pixels are visible; reset and CR0 writes select it.
+     */
+    uint8_t blink_counter;
+    bool blink_phase;
 } Bt463State;
 
 extern const VMStateDescription vmstate_bt463;
@@ -108,6 +114,11 @@ uint8_t bt463_palette_read(Bt463State *s);
 bool bt463_palette_write(Bt463State *s, uint8_t value);
 uint8_t bt463_general_read(Bt463State *s);
 bool bt463_general_write(Bt463State *s, uint8_t value);
+
+/*
+ * Advance one vertical retrace; return true when a visible blink phase flips.
+ */
+bool bt463_retrace_step(Bt463State *s);
 
 /*
  * Convert one 28-bit Bt463 pixel-port word to 0xRRGGBB.  pixel_pins uses

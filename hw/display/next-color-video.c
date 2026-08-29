@@ -218,13 +218,20 @@ static void next_color_set_irq(NextColorVideoState *s, bool level)
     qemu_set_irq(s->irq, level);
 }
 
+static void next_color_schedule_retrace(NextColorVideoState *s);
+
 static void next_color_retrace(void *opaque)
 {
     NextColorVideoState *s = opaque;
 
+    if (bt463_retrace_step(&s->bt463)) {
+        s->invalidate = true;
+    }
     if (s->command & NEXT_COLOR_COMMAND_INTRENA) {
         next_color_set_irq(s, true);
     }
+    /* Retrace drives blink even when the board interrupt is masked. */
+    next_color_schedule_retrace(s);
 }
 
 static void next_color_schedule_retrace(NextColorVideoState *s)
@@ -245,8 +252,8 @@ static void next_color_command_write(void *opaque, hwaddr addr,
 
     s->command = value &
         (NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK);
-    timer_del(&s->retrace_timer);
-    if (s->command & NEXT_COLOR_COMMAND_INTRENA) {
+    /* CSR acknowledgements must not move the continuous retrace cadence. */
+    if (!timer_pending(&s->retrace_timer)) {
         next_color_schedule_retrace(s);
     }
     s->invalidate = true;
@@ -351,6 +358,7 @@ static void next_color_video_reset_hold(Object *obj, ResetType type)
     s->dram_timing = 0;
     s->vram_timing = 0;
     s->invalidate = true;
+    next_color_schedule_retrace(s);
 }
 
 static bool next_color_video_legacy_state(void *opaque G_GNUC_UNUSED,
@@ -359,10 +367,16 @@ static bool next_color_video_legacy_state(void *opaque G_GNUC_UNUSED,
     return version_id == 1;
 }
 
-static bool next_color_video_bt463_state(void *opaque G_GNUC_UNUSED,
-                                         int version_id)
+static bool next_color_video_bt463_v2_state(void *opaque G_GNUC_UNUSED,
+                                            int version_id)
 {
-    return version_id >= 2;
+    return version_id == 2;
+}
+
+static bool next_color_video_bt463_v3_state(void *opaque G_GNUC_UNUSED,
+                                            int version_id)
+{
+    return version_id >= 3;
 }
 
 static int next_color_video_post_load(void *opaque, int version_id)
@@ -371,12 +385,16 @@ static int next_color_video_post_load(void *opaque, int version_id)
 
     if (version_id == 1) {
         bt463_import_legacy(&s->bt463, &s->bt463_legacy);
+    } else if (version_id == 2) {
+        /* v2 nested Bt463 streams predate the blink fields. */
+        s->bt463.blink_counter = 0;
+        s->bt463.blink_phase = true;
     }
     s->command &=
         NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
     qemu_set_irq(s->irq, s->irq_level);
-    if (!(s->command & NEXT_COLOR_COMMAND_INTRENA)) {
-        timer_del(&s->retrace_timer);
+    if (!timer_pending(&s->retrace_timer)) {
+        next_color_schedule_retrace(s);
     }
     s->invalidate = true;
 
@@ -385,17 +403,20 @@ static int next_color_video_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_next_color_video = {
     .name = TYPE_NEXT_COLOR_VIDEO,
-    /* Version 1 serialized the old generic DAC arrays. */
-    .version_id = 2,
+    /* v1 used generic DAC arrays; v3 adds the Bt463 blink fields. */
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = next_color_video_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_TEST(bt463_legacy, NextColorVideoState,
                             next_color_video_legacy_state, 1,
                             vmstate_bt463_legacy, Bt463LegacyState),
-        VMSTATE_STRUCT_TEST(bt463, NextColorVideoState,
-                            next_color_video_bt463_state, 2, vmstate_bt463,
-                            Bt463State),
+        VMSTATE_VSTRUCT_TEST(bt463, NextColorVideoState,
+                             next_color_video_bt463_v2_state, 2,
+                             vmstate_bt463, Bt463State, 1),
+        VMSTATE_VSTRUCT_TEST(bt463, NextColorVideoState,
+                             next_color_video_bt463_v3_state, 3,
+                             vmstate_bt463, Bt463State, 2),
         VMSTATE_UINT8(command, NextColorVideoState),
         VMSTATE_UINT8(dram_timing, NextColorVideoState),
         VMSTATE_UINT8(vram_timing, NextColorVideoState),
