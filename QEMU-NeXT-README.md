@@ -236,7 +236,7 @@ cd build-next
 ../configure --target-list=m68k-softmmu --enable-debug \
   --enable-trace-backends=log
 ./pyvenv/bin/meson setup --reconfigure --force-fallback-for=slirp . ..
-ninja -j"$(nproc)" qemu-system-m68k qemu-img qemu-plan9-keydb
+ninja -j"$(nproc)" qemu-system-m68k qemu-img tools/qemu-plan9-keydb
 ```
 
 The Plan 9 runs need a staged kernel directory containing
@@ -292,7 +292,7 @@ KEYDIR=/path/to/private-plan9-keys
 mkdir -p "$KEYDIR"
 chmod 0700 "$KEYDIR"
 
-./qemu-plan9-keydb create \
+./tools/qemu-plan9-keydb create \
   --keydb "$KEYDIR/keys" \
   --secret "$KEYDIR/master.b64" \
   --server-id p9fs
