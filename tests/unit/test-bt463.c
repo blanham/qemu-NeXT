@@ -215,6 +215,7 @@ static void test_bt463_vmstate(void)
     g_assert_cmpuint(destination.palette[0x20f][2], ==, 0x5a);
     g_assert_cmpuint(destination.cursor[0][0], ==, 0x11);
     g_assert_cmpuint(destination.cursor[1][2], ==, 0x22);
+    g_assert_cmpuint(destination.command[1], ==, source.command[1]);
     g_assert_cmphex(destination.wtt[0x05], ==, 0x332211);
     g_assert_cmphex(destination.wtt_write_latch, ==, 0x665544);
     g_assert_cmphex(destination.wtt_read_latch, ==, 0x998877);

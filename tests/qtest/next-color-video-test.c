@@ -1047,6 +1047,8 @@ static void test_bt463_original_init_sequence(void)
 
         assert_dac_triplet(qts, 3, index, brightness);
     }
+    /* Index 0xff is verified by DAC readback, not by the RGB444 scanout. */
+    assert_dac_triplet(qts, 3, 0xff, white);
 
     qtest_quit(qts);
 }
@@ -1059,7 +1061,9 @@ static void test_bt463_original_brightness_rewrite(void)
         0x00, 0x00, /* index 0 on every channel */
         0x22, 0x20, /* index 0x20 on every channel */
         0x88, 0x80, /* index 0x80 on every channel */
-        0xff, 0xf0, /* index 0xff on every channel */
+        /* 0xfff0 addresses palette index 0xf0 on each channel. */
+        /* Its low nibble is WT 0xf. */
+        0xff, 0xf0,
         0x20, 0x00, /* red only */
         0x02, 0x00, /* green only */
         0x00, 0x20, /* blue only */
@@ -1368,7 +1372,9 @@ static void test_bt463_original_gamma_ramp(void)
         0x00, 0x00, /* Gamma index 0 on every channel. */
         0x22, 0x20, /* Gamma index 0x20 on every channel. */
         0x88, 0x80, /* Gamma index 0x80 on every channel. */
-        0xff, 0xf0, /* Gamma index 0xff on every channel. */
+        /* 0xfff0 addresses palette index 0xf0 on each channel. */
+        /* Its low nibble is WT 0xf. */
+        0xff, 0xf0,
         0x20, 0x00, /* Red only. */
         0x02, 0x00, /* Green only. */
         0x00, 0x20, /* Blue only. */
@@ -1383,13 +1389,17 @@ static void test_bt463_original_gamma_ramp(void)
         { 0x08, 0x08, 0x62 },
     };
 
+    program_original_warp9c_init(qts);
+    /* The true 0xff endpoint is covered by readback; 0xfff0 scans as 0xf0. */
+    assert_dac_triplet(qts, 3, 0xff,
+                       (const uint8_t[3]) { 0xff, 0xff, 0xff });
+
     if (!require_screendump(qts)) {
         qtest_quit(qts);
         return;
     }
     ppm = create_test_ppm();
 
-    program_original_warp9c_init(qts);
     qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
     qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
 
@@ -1671,9 +1681,11 @@ static void test_migration_complete_bt463_state(void)
     const unsigned brightness = 0x1f;
     const uint8_t enabled =
         NEXT_COLOR_COMMAND_INTRENA | NEXT_COLOR_COMMAND_UNBLANK;
-    static const uint8_t command_values[3] = { 0x44, 0x00, 0x80 };
+    static const uint8_t command_values[3] = { 0x44, 0x01, 0x80 };
     static const uint8_t read_mask_values[4] = { 0xf0, 0xe1, 0xd2, 0xc3 };
     static const uint8_t blink_mask_values[4] = { 0xf0, 0x0f, 0xaa, 0x55 };
+    const unsigned blink_elapsed = 5;
+    const unsigned retraces_to_transition = 15 - blink_elapsed;
     const int64_t elapsed = NEXT_COLOR_RETRACE_NS / 2;
     const int64_t remaining = NEXT_COLOR_RETRACE_NS - elapsed;
     int64_t source_clock;
@@ -1708,6 +1720,9 @@ static void test_migration_complete_bt463_state(void)
     }
     dac_set_address(source, 0x201);
     qtest_writeb(source, NEXT_COLOR_DAC + 2, 0x44);
+    /* CR1=1 is compatible with the fixture: inactive P24-P27 keep OL0 clear. */
+    dac_set_address(source, 0x202);
+    qtest_writeb(source, NEXT_COLOR_DAC + 2, command_values[1]);
     dac_set_address(source, 0x100);
     dac_write_triplet(source, 2, (const uint8_t[3]) { 0xc1, 0xc2, 0xc3 });
     dac_set_address(source, 0x101);
@@ -1728,7 +1743,8 @@ static void test_migration_complete_bt463_state(void)
     qtest_writeb(source, NEXT_COLOR_VRAM + 1, 0x00);
     qtest_writeb(source, NEXT_COLOR_COMMAND, enabled);
     source_clock = qtest_clock_step(source,
-                                    16 * NEXT_COLOR_RETRACE_NS + elapsed);
+                                    (16 + blink_elapsed) *
+                                    NEXT_COLOR_RETRACE_NS + elapsed);
     g_assert_cmphex(video_irq_status(source), ==,
                     NEXT_COLOR_VIDEO_IRQ_STATUS);
 
@@ -1815,11 +1831,36 @@ static void test_migration_complete_bt463_state(void)
         ppm = create_test_ppm();
         assert_screendump_pixel(destination, ppm, 0,
                                 (const uint8_t[3]) { 0x08, 0x08, 0x08 });
-        qtest_writeb(destination, NEXT_COLOR_COMMAND,
-                     NEXT_COLOR_COMMAND_CLRINTR |
-                     NEXT_COLOR_COMMAND_UNBLANK);
-        qtest_writeb(destination, NEXT_COLOR_COMMAND, enabled);
-        qtest_clock_step(destination, 15 * NEXT_COLOR_RETRACE_NS);
+    }
+
+    /*
+     * Five retraces had already elapsed in the off phase at migration.  The
+     * next ten destination retraces must therefore reach the saved phase
+     * transition; a reset/dropped blink counter would need sixteen instead.
+     */
+    qtest_writeb(destination, NEXT_COLOR_COMMAND,
+                 NEXT_COLOR_COMMAND_CLRINTR | NEXT_COLOR_COMMAND_UNBLANK);
+    qtest_writeb(destination, NEXT_COLOR_COMMAND, enabled);
+    for (unsigned retrace = 0; retrace < retraces_to_transition; retrace++) {
+        qtest_clock_step(destination, NEXT_COLOR_RETRACE_NS - 1);
+        g_assert_cmphex(video_irq_status(destination), ==, 0);
+        qtest_clock_step(destination, 1);
+        g_assert_cmphex(video_irq_status(destination), ==,
+                        NEXT_COLOR_VIDEO_IRQ_STATUS);
+        if (retrace + 1 < retraces_to_transition) {
+            if (ppm) {
+                assert_screendump_pixel(destination, ppm, 0,
+                                        (const uint8_t[3]) {
+                                            0x08, 0x08, 0x08,
+                                        });
+            }
+            qtest_writeb(destination, NEXT_COLOR_COMMAND,
+                         NEXT_COLOR_COMMAND_CLRINTR |
+                         NEXT_COLOR_COMMAND_UNBLANK);
+            qtest_writeb(destination, NEXT_COLOR_COMMAND, enabled);
+        }
+    }
+    if (ppm) {
         assert_screendump_pixel(destination, ppm, 0,
                                 (const uint8_t[3]) { 0x83, 0x08, 0x08 });
     }

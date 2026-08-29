@@ -298,7 +298,7 @@ transfer at the destination. Detailed register and lifecycle behavior is in
 | ESP SCSI | Working | Supports disk boot and the NeXT-specific DMA staging behavior. |
 | 82077 floppy | Working | Supports DMA and 720 KiB, 1.44 MiB, and 2.88 MiB raw media. Guest eject does not detach the host backend. |
 | Monochrome video | Working | Includes vertical-retrace interrupts. |
-| Color video | Working | Direct RGB444 output and independent 68 Hz retrace interrupt. |
+| Color video | Working | Bt463-mediated RGB444 output and independent 68 Hz retrace interrupt. |
 | Keyboard and mouse | Working | Includes keyboard interrupt delivery, repeat suppression, and capture-free absolute host-pointer translation. |
 | Sound output | Working | DMA output is paced on the virtual clock. Sound input is not implemented. |
 | SCC serial ports and DMA | Working | Both channels support interrupt-driven PIO and the shared bidirectional SCC DMA engine. |
