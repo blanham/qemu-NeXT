@@ -55,8 +55,8 @@
 #define NEXT_COLOR_COMMAND_INTRENA 0x02
 #define NEXT_COLOR_COMMAND_UNBLANK 0x04
 
-/* Warp9C scanout uses P4-P23; P24-P27 are inactive overlay inputs. */
-#define NEXT_COLOR_BT463_BLINK_BYTES 0x07
+/* Warp9C scanout uses P4-P7, P12-P15, and P20-P23. */
+#define NEXT_COLOR_BT463_BLINK_PINS 0x00f0f0f0U
 
 struct NextColorVideoState {
     SysBusDevice parent_obj;
@@ -228,7 +228,7 @@ static void next_color_retrace(void *opaque)
 {
     NextColorVideoState *s = opaque;
     const bool invalidate = bt463_retrace_step_visible(
-        &s->bt463, NEXT_COLOR_BT463_BLINK_BYTES);
+        &s->bt463, NEXT_COLOR_BT463_BLINK_PINS);
 
     trace_next_color_retrace(invalidate);
     if (invalidate) {

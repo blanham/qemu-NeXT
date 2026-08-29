@@ -631,11 +631,11 @@ static void test_bt463_lookup_overlay_and_cursor(void)
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
                     ==, 0);
 
-    /* CR13 maps WT E/F to the two direct cursor colors. */
-    state.command[1] = 0x08;
-    state.wtt[0x0e] = test_bt463_wtt(31, 0, BT463_WTT_RESERVED_7,
+    /* CR13 plus dual-cursor mode maps WT E/F to direct cursor colors. */
+    state.command[1] = 0x0a;
+    state.wtt[0x0e] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
                                      0, 0, 0, false);
-    state.wtt[0x0f] = test_bt463_wtt(31, 0, BT463_WTT_RESERVED_7,
+    state.wtt[0x0f] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
                                      0, 0, 0, false);
     state.cursor[0][0] = 0xc1;
     state.cursor[0][1] = 0xc2;
@@ -647,6 +647,30 @@ static void test_bt463_lookup_overlay_and_cursor(void)
                     ==, 0xc1c2c3);
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0x0f, BT463_LOAD_LOWER),
                     ==, 0xd1d2d3);
+
+    /* Table 12 does not alias WT E/F without dual cursor and CR13. */
+    state.palette[0][0] = 0x11;
+    state.palette[0][1] = 0x22;
+    state.palette[0][2] = 0x33;
+    state.command[1] = 0x08; /* CR13, no cursor planes. */
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0, 0, 0, 0),
+                                    0x0e, BT463_LOAD_LOWER), ==, 0x112233);
+    state.command[1] = 0x09; /* CR13 plus one cursor plane. */
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0, 0, 0, 0),
+                                    0x0e, BT463_LOAD_LOWER), ==, 0x112233);
+    state.command[1] = 0x02; /* Dual cursor without CR13. */
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0, 0, 0, 0),
+                                    0x0e, BT463_LOAD_LOWER), ==, 0x112233);
+    state.palette[0x0e0][0] = 0x71;
+    state.palette[0x0e0][1] = 0x72;
+    state.palette[0x0e0][2] = 0x73;
+    state.command[1] = 0x1a; /* CR14 repurposes WT0-WT3. */
+    g_assert_cmphex(bt463_lookup_rgb(&state,
+                                    test_bt463_warp9c_pins(0, 0, 0, 0),
+                                    0x0e, BT463_LOAD_LOWER), ==, 0x717273);
 }
 
 static uint32_t test_bt463_palette_value(unsigned address)
@@ -903,12 +927,33 @@ static void test_bt463_lookup_eight_overlay_planes(void)
     state.palette[0x1ab][2] = 0x63;
     g_assert_cmphex(bt463_lookup_rgb(&state, 0x1ab, 0,
                                     BT463_LOAD_LOWER), ==, 0x415263);
+
+    /* CR12 makes an upper-only CR14 overlay word an underlay candidate. */
+    state.wtt[1] = test_bt463_wtt(0, 8, BT463_WTT_TRUE_COLOR,
+                                  0, 0xf, 0x10, false);
+    state.palette[0x010][0] = 0x91;
+    state.palette[0x010][1] = 0x92;
+    state.palette[0x010][2] = 0x93;
+    state.palette[0x100][0] = 0x11;
+    state.palette[0x100][1] = 0x22;
+    state.palette[0x100][2] = 0x33;
+    state.palette[0x110][0] = 0xa1;
+    for (unsigned config = 0; config < 3; config++) {
+        state.command[1] = 0x14 | config; /* CR14 + CR12 + cursor mode. */
+        g_assert_cmphex(bt463_lookup_rgb(&state,
+                                        test_bt463_warp9c_pins(0, 0, 0, 0),
+                                        1, BT463_LOAD_LOWER), ==, 0x919293);
+        g_assert_cmphex(bt463_lookup_rgb(&state,
+                                        test_bt463_warp9c_pins(1, 0, 0, 0),
+                                        1, BT463_LOAD_LOWER), ==, 0xa12233);
+    }
 }
 
 static void test_bt463_lookup_invalid(void)
 {
     Bt463State state;
     uint32_t pixel = test_bt463_warp9c_pins(0xf, 0xf, 0xf, 0xf);
+    const uint32_t overlay_pixel = test_bt463_warp9c_pins(0, 0, 0, 1);
 
     bt463_init(&state);
     memset(state.read_mask, 0xff, sizeof(state.read_mask));
@@ -937,6 +982,31 @@ static void test_bt463_lookup_invalid(void)
                                   1, 0xf, 0, false);
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
                     ==, 0);
+
+    /* Malformed bypass modes cannot be rescued by overlay routing. */
+    state.palette[0x201][0] = 0xa1;
+    state.palette[0x201][1] = 0xa2;
+    state.palette[0x201][2] = 0xa3;
+    state.cursor[0][0] = 0xb1;
+    state.cursor[0][1] = 0xb2;
+    state.cursor[0][2] = 0xb3;
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
+                                  0, 0xf, 0, true);
+    state.command[1] = 0x40; /* Common overlay palette. */
+    g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
+                                    BT463_LOAD_LOWER), ==, 0);
+    state.command[1] = 0x01; /* One cursor plane. */
+    g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
+                                    BT463_LOAD_LOWER), ==, 0);
+
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0xf, 0, true);
+    state.command[1] = 0x40;
+    g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
+                                    BT463_LOAD_LOWER), ==, 0);
+    state.command[1] = 0x01;
+    g_assert_cmphex(bt463_lookup_rgb(&state, overlay_pixel, 0,
+                                    BT463_LOAD_LOWER), ==, 0);
 }
 
 static void test_bt463_blink_step(void)
@@ -1007,17 +1077,20 @@ static void test_bt463_blink_step(void)
     /* A board may exclude an otherwise modeled mask byte from scanout. */
     bt463_reset(&state);
     memset(state.read_mask, 0xff, sizeof(state.read_mask));
+    state.blink_mask[0] = 0x0f;
+    state.blink_mask[1] = 0x0f;
+    state.blink_mask[2] = 0x0f;
     state.blink_mask[3] = 0xff;
     state.command[0] = 0x04;
     for (unsigned retrace = 0; retrace < 15; retrace++) {
-        g_assert_false(bt463_retrace_step_visible(&state, 0x07));
+        g_assert_false(bt463_retrace_step_visible(&state, 0x00f0f0f0U));
     }
-    g_assert_false(bt463_retrace_step_visible(&state, 0x07));
+    g_assert_false(bt463_retrace_step_visible(&state, 0x00f0f0f0U));
     g_assert_false(state.blink_phase);
     state.blink_phase = true;
     state.blink_counter = 15;
     state.blink_mask[0] = 0xf0;
-    g_assert_true(bt463_retrace_step_visible(&state, 0x07));
+    g_assert_true(bt463_retrace_step_visible(&state, 0x00f0f0f0U));
 
     /* Read masks independently suppress the same blink byte's visibility. */
     bt463_reset(&state);

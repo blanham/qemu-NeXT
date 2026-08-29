@@ -136,17 +136,12 @@ static void bt463_blink_period(const Bt463State *s, unsigned *on,
     }
 }
 
-static bool bt463_blink_visible(const Bt463State *s, uint8_t relevant_bytes)
+static bool bt463_blink_visible(const Bt463State *s, uint32_t relevant_pins)
 {
     for (unsigned i = 0; i < G_N_ELEMENTS(s->blink_mask); i++) {
-        if (!(relevant_bytes & (1U << i))) {
-            continue;
-        }
-        uint8_t mask = s->blink_mask[i] & s->read_mask[i];
+        const uint8_t pin_mask = (relevant_pins >> (i * 8)) & 0xff;
+        const uint8_t mask = s->blink_mask[i] & s->read_mask[i] & pin_mask;
 
-        if (i == 3) {
-            mask &= 0x0f;
-        }
         if (mask) {
             return true;
         }
@@ -158,7 +153,7 @@ static bool bt463_blink_visible(const Bt463State *s, uint8_t relevant_bytes)
  * Revision B notes a physical blink defect; model the documented functional
  * production behavior so guests see deterministic blink cadence.
  */
-bool bt463_retrace_step_visible(Bt463State *s, uint8_t relevant_bytes)
+bool bt463_retrace_step_visible(Bt463State *s, uint32_t relevant_pins)
 {
     unsigned on;
     unsigned off;
@@ -174,13 +169,13 @@ bool bt463_retrace_step_visible(Bt463State *s, uint8_t relevant_bytes)
     }
 
     return old_phase != s->blink_phase &&
-        bt463_blink_visible(s, relevant_bytes);
+        bt463_blink_visible(s, relevant_pins & BT463_PIXEL_PIN_MASK);
 }
 
 bool bt463_retrace_step(Bt463State *s)
 {
     /* The generic helper exposes all four modeled mask bytes. */
-    return bt463_retrace_step_visible(s, 0x0f);
+    return bt463_retrace_step_visible(s, BT463_PIXEL_PIN_MASK);
 }
 
 void bt463_init(Bt463State *s)
@@ -567,8 +562,11 @@ static Bt463OverlayRoute bt463_overlay_route(const Bt463State *s,
     switch (config) {
     case 0: /* Table 9: no cursor. */
         if (!value) {
-            return eight_planes && (overlay & 0xf0) ? BT463_ROUTE_OVERLAY :
-                BT463_ROUTE_PIXEL;
+            if (eight_planes && (overlay & 0xf0)) {
+                return (s->command[1] & 4) ? BT463_ROUTE_UNDERLAY :
+                    BT463_ROUTE_OVERLAY;
+            }
+            return BT463_ROUTE_PIXEL;
         }
         if ((s->command[1] & 4) && !(value & 8)) {
             return BT463_ROUTE_UNDERLAY;
@@ -579,8 +577,11 @@ static Bt463OverlayRoute bt463_overlay_route(const Bt463State *s,
             return BT463_ROUTE_CURSOR_0;
         }
         if (!value) {
-            return eight_planes && (overlay & 0xf0) ? BT463_ROUTE_OVERLAY :
-                BT463_ROUTE_PIXEL;
+            if (eight_planes && (overlay & 0xf0)) {
+                return (s->command[1] & 4) ? BT463_ROUTE_UNDERLAY :
+                    BT463_ROUTE_OVERLAY;
+            }
+            return BT463_ROUTE_PIXEL;
         }
         if ((s->command[1] & 4) && !(value & 8)) {
             return BT463_ROUTE_UNDERLAY;
@@ -594,8 +595,11 @@ static Bt463OverlayRoute bt463_overlay_route(const Bt463State *s,
             return BT463_ROUTE_CURSOR_1;
         }
         if (!value) {
-            return eight_planes && (overlay & 0xf0) ? BT463_ROUTE_OVERLAY :
-                BT463_ROUTE_PIXEL;
+            if (eight_planes && (overlay & 0xf0)) {
+                return (s->command[1] & 4) ? BT463_ROUTE_UNDERLAY :
+                    BT463_ROUTE_OVERLAY;
+            }
+            return BT463_ROUTE_PIXEL;
         }
         if ((s->command[1] & 4) && !(value & 8)) {
             return BT463_ROUTE_UNDERLAY;
@@ -739,10 +743,6 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     unsigned overlay_value;
     uint8_t rgb[3];
 
-    if (window_tag >= 0x0e && (s->command[1] & 0x08)) {
-        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
-    }
-
     if (shift > 27) {
         return 0;
     }
@@ -754,7 +754,11 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     }
     switch (mode) {
     case BT463_WTT_TRUE_COLOR:
-        if (contiguous) {
+        if (bypass) {
+            if (contiguous || planes != 8 || shift + 24 > 28) {
+                return 0;
+            }
+        } else if (contiguous) {
             if (shift != 0 || planes > 4) {
                 return 0;
             }
@@ -763,9 +767,15 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         }
         break;
     case BT463_WTT_PSEUDO_COLOR:
-        if (planes > 9 || shift + planes > 28 ||
-            (contiguous && shift > 15)) {
-            return 0;
+        if (bypass) {
+            if (planes != 8 || shift + 8 > 28) {
+                return 0;
+            }
+        } else {
+            if (planes > 9 || shift + planes > 28 ||
+                (contiguous && shift > 15)) {
+                return 0;
+            }
         }
         break;
     case BT463_WTT_BANK_SELECT:
@@ -788,6 +798,12 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         break;
     default:
         return 0;
+    }
+
+    /* Table 12 is valid only outside CR14 and after WTT validation. */
+    if (window_tag >= 0x0e &&
+        (s->command[1] & 0x1b) == 0x0a) {
+        return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
     }
 
     if (eight_planes) {

@@ -117,9 +117,10 @@ bool bt463_general_write(Bt463State *s, uint8_t value);
 
 /*
  * Advance one vertical retrace; return true when a relevant blink phase flips.
- * relevant_bytes selects the modeled input bytes (bits 0..3).
+ * relevant_pins selects the physical input pins that can affect scanout.
+ * Only bits 0..27 are meaningful.
  */
-bool bt463_retrace_step_visible(Bt463State *s, uint8_t relevant_bytes);
+bool bt463_retrace_step_visible(Bt463State *s, uint32_t relevant_pins);
 
 /* Advance a retrace with all four modeled input bytes visible. */
 bool bt463_retrace_step(Bt463State *s);

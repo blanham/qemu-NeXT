@@ -869,11 +869,19 @@ static void test_bt463_board_blink_relevance(void)
     ppm = create_test_ppm();
     program_blink_fixture(qts, 0x44); /* 16 on, 16 off. */
 
-    /* Make byte 3 visible to the generic helper while its pins stay idle. */
+    /* Expose inactive low nibbles and byte 3 to the generic helper. */
+    for (uint16_t address = 0x205; address <= 0x207; address++) {
+        dac_set_address(qts, address);
+        qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
+    }
     dac_set_address(qts, 0x208);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x0f);
     dac_set_address(qts, 0x209);
-    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x00);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x0f);
+    dac_set_address(qts, 0x20a);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x0f);
+    dac_set_address(qts, 0x20b);
+    qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0x0f);
     dac_set_address(qts, 0x20c);
     qtest_writeb(qts, NEXT_COLOR_DAC + 2, 0xff);
     assert_screendump_pixel(qts, ppm, 0, red);
