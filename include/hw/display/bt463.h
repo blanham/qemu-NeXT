@@ -61,6 +61,7 @@ typedef enum Bt463DisplayMode {
 typedef enum Bt463LoadPhase {
     BT463_LOAD_LOWER = 0,
     BT463_LOAD_UPPER = 1,
+    BT463_LOAD_INVALID = 2,
 } Bt463LoadPhase;
 
 /*
@@ -122,8 +123,8 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
 Bt463LoadPhase bt463_load_phase_seed(const Bt463State *s,
                                      uint8_t window_type);
 
-/* Toggle a line seed according to the pixel's position in the scanline. */
-Bt463LoadPhase bt463_load_phase_at(Bt463LoadPhase seed,
+/* Toggle a line seed at each LD* load cycle in a scanline. */
+Bt463LoadPhase bt463_load_phase_at(const Bt463State *s, Bt463LoadPhase seed,
                                    unsigned pixel_index);
 
 #endif /* HW_DISPLAY_BT463_H */

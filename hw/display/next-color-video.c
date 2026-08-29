@@ -104,7 +104,7 @@ static void next_color_video_draw_line(void *opaque, uint8_t *dst,
         pixel_pins |= ((uint32_t)(pixel >> 4) & 0xf) << 20;
         rgb = bt463_lookup_rgb(
             &s->bt463, pixel_pins, pixel & 0xf,
-            bt463_load_phase_at(seed, x));
+            bt463_load_phase_at(&s->bt463, seed, x));
         out[x] = rgb_to_pixel32((rgb >> 16) & 0xff, (rgb >> 8) & 0xff,
                                 rgb & 0xff);
     }

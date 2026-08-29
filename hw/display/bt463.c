@@ -363,17 +363,30 @@ static uint32_t bt463_extract_bits(uint32_t value, unsigned first,
     return (value >> first) & ((1U << count) - 1);
 }
 
-static uint32_t bt463_overlay_input(uint32_t masked, uint32_t shifted,
+static uint32_t bt463_overlay_input(const Bt463State *s, uint32_t masked,
+                                    uint32_t shifted,
                                     unsigned planes, unsigned mode,
                                     bool overlay_location)
 {
     if (!overlay_location) {
-        /* P24-P27 are a fixed overlay port and are not shifted. */
+        /* CR15's 16-plane wiring puts the overlay port at P15-P12. */
+        if (s->command[1] & 0x20) {
+            return (masked >> 12) & 0x0f;
+        }
+        /* Otherwise P24-P27 are a fixed overlay port and are not shifted. */
         return (masked >> 24) & 0x0f;
     }
 
     if (mode == BT463_WTT_PSEUDO_COLOR) {
         return (shifted >> planes) & 0x0f;
+    }
+
+    if (s->command[1] & 0x20) {
+        /* CR15 alternate true-color wiring is P5, P0, P8, P4. */
+        return (((masked >> 5) & 1) << 3) |
+            (((masked >> 0) & 1) << 2) |
+            (((masked >> 8) & 1) << 1) |
+            (((masked >> 4) & 1) << 0);
     }
 
     /* True-color and bank-select use P17, P0, P8, P16 as OL3..OL0. */
@@ -447,7 +460,7 @@ static bool bt463_lookup_standard_overlay(const Bt463State *s,
     }
 
     bt463_compact_overlay(
-        bt463_overlay_input(masked, shifted, planes, mode,
+        bt463_overlay_input(s, masked, shifted, planes, mode,
                             overlay_location),
         overlay_mask, &overlay_value);
     if (!overlay_value) {
@@ -473,12 +486,31 @@ Bt463LoadPhase bt463_load_phase_seed(const Bt463State *s,
     return shift == 4 ? BT463_LOAD_UPPER : BT463_LOAD_LOWER;
 }
 
-Bt463LoadPhase bt463_load_phase_at(Bt463LoadPhase seed,
+static unsigned bt463_pixels_per_load(const Bt463State *s)
+{
+    switch ((s->command[0] >> 6) & 3) {
+    case 1:
+        return 4;
+    case 2:
+        return 1;
+    case 3:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+Bt463LoadPhase bt463_load_phase_at(const Bt463State *s,
+                                   Bt463LoadPhase seed,
                                    unsigned pixel_index)
 {
     bool upper = seed == BT463_LOAD_UPPER;
+    const unsigned pixels_per_load = bt463_pixels_per_load(s);
 
-    if (pixel_index & 1) {
+    if (pixels_per_load == 0 || seed == BT463_LOAD_INVALID) {
+        return BT463_LOAD_INVALID;
+    }
+    if ((pixel_index / pixels_per_load) & 1) {
         upper = !upper;
     }
     return upper ? BT463_LOAD_UPPER : BT463_LOAD_LOWER;
@@ -495,12 +527,13 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     const unsigned overlay_mask = (wtt >> 13) & 0x0f;
     const unsigned start = ((wtt >> 17) & 0x3f) << 4;
     const bool bypass = (wtt >> 23) & 1;
+    const bool contiguous = s->command[1] & 0x20;
     const uint8_t window_tag = window_type & 0x0f;
     const uint32_t masked = bt463_mask_pixel(s, pixel_pins);
     const uint32_t shifted = shift < 28 ? masked >> shift : 0;
     uint8_t rgb[3];
 
-    if (window_tag >= 0x0e && (s->command[1] & 0x0b) == 0x0a) {
+    if (window_tag >= 0x0e && (s->command[1] & 0x08)) {
         return bt463_pack_rgb(s->cursor[window_tag - 0x0e]);
     }
 
@@ -512,7 +545,11 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     case BT463_WTT_TRUE_COLOR: {
         bool overlay_selected;
 
-        if (planes > 8 || shift + planes * 3 > 28) {
+        if (contiguous) {
+            if (shift != 0 || planes > 4) {
+                return 0;
+            }
+        } else if (planes > 8 || shift + planes * 3 > 28) {
             return 0;
         }
         if (bt463_lookup_standard_overlay(s, masked, shifted, planes, mode,
@@ -524,11 +561,24 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
             return 0;
         }
         if (bypass) {
-            if (planes != 8 || shift + 24 > 28) {
+            if (contiguous || planes != 8 || shift + 24 > 28) {
                 return 0;
             }
             for (unsigned i = 0; i < 3; i++) {
                 rgb[i] = bt463_extract_bits(shifted, i * 8, 8);
+            }
+            return bt463_pack_rgb(rgb);
+        }
+        if (contiguous) {
+            static const unsigned channel_offset[] = { 0, 8, 4 };
+
+            for (unsigned i = 0; i < 3; i++) {
+                const unsigned value = bt463_extract_bits(
+                    masked, channel_offset[i], planes);
+                if (!bt463_palette_component(s, start + value, i,
+                                             &rgb[i])) {
+                    return 0;
+                }
             }
             return bt463_pack_rgb(rgb);
         }
@@ -546,6 +596,10 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         bool overlay_selected;
 
         if (planes > 9 || shift + planes > 28) {
+            return 0;
+        }
+        if (contiguous && shift > 15) {
+            /* CR15 supports either 12- or 16-plane board wiring. */
             return 0;
         }
         if (bt463_lookup_standard_overlay(s, masked, shifted, planes, mode,
@@ -582,7 +636,7 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
             return 0;
         }
         bt463_compact_overlay(
-            bt463_overlay_input(masked, shifted, planes, mode,
+            bt463_overlay_input(s, masked, shifted, planes, mode,
                                 overlay_location),
             overlay_mask, &overlay_value);
         value = bt463_extract_bits(shifted, 0, planes);
@@ -596,7 +650,8 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
     case BT463_TRUE_COLOR_LOAD_INTERLEAVE: {
         bool overlay_selected;
 
-        if (bypass || planes != 4 || shift + 24 > 28 ||
+        if (phase == BT463_LOAD_INVALID || bypass || planes != 4 ||
+            shift + 24 > 28 ||
             (shift != 0 && shift != 4)) {
             return 0;
         }
@@ -624,7 +679,8 @@ uint32_t bt463_lookup_rgb(const Bt463State *s, uint32_t pixel_pins,
         unsigned green;
         unsigned value;
 
-        if (bypass || planes != 8 || shift + 16 > 28 ||
+        if (phase == BT463_LOAD_INVALID || bypass || planes != 8 ||
+            shift + 16 > 28 ||
             (shift != 0 && shift != 4)) {
             return 0;
         }

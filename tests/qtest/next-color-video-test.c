@@ -893,7 +893,7 @@ static void test_bt463_load_interleave_scanout(void)
     qtest_bufwrite(qts, NEXT_COLOR_VRAM, pixels, sizeof(pixels));
     qtest_writeb(qts, NEXT_COLOR_COMMAND, NEXT_COLOR_COMMAND_UNBLANK);
     assert_screendump_pixel(qts, ppm, 0, lower);
-    assert_screendump_pixel(qts, ppm, 1, upper);
+    assert_screendump_pixel(qts, ppm, 1, lower);
 
     /* Changing only the WTT shift flips the initial phase; VRAM is reused. */
     dac_set_address(qts, 0x300);
@@ -901,7 +901,7 @@ static void test_bt463_load_interleave_scanout(void)
     dac_set_address(qts, 0x301);
     dac_write_triplet(qts, 2, mode_shift0);
     assert_screendump_pixel(qts, ppm, 0, upper);
-    assert_screendump_pixel(qts, ppm, 1, lower);
+    assert_screendump_pixel(qts, ppm, 1, upper);
 
     qtest_quit(qts);
 }

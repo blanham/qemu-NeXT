@@ -233,6 +233,72 @@ static void test_bt463_lookup_true_color(void)
                     ==, 0x314253);
 }
 
+static void test_bt463_lookup_contiguous_planes(void)
+{
+    Bt463State state;
+    uint32_t pixel;
+
+    bt463_init(&state);
+    memset(state.read_mask, 0xff, sizeof(state.read_mask));
+    state.command[1] = 0x20; /* CR15: 12/16-plane contiguous input. */
+
+    /* CR15 true color is ordered R=P3:0, B=P7:4, G=P11:8. */
+    pixel = (1U << 0) | (2U << 4) | (3U << 8);
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, false);
+    state.palette[1][0] = 0x11;
+    state.palette[2][2] = 0x33;
+    state.palette[3][1] = 0x22;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x112233);
+
+    /* A nonzero shift is not legal for contiguous true color. */
+    state.palette[2][0] = 0x90;
+    state.palette[0][1] = 0x91;
+    state.palette[0][2] = 0x92;
+    state.wtt[0] = test_bt463_wtt(4, 4, BT463_WTT_TRUE_COLOR,
+                                  0, 0, 0, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0);
+
+    /* CR15 leaves pseudo-color contiguous, including its legal high shift. */
+    pixel = 0x1abU << 11;
+    state.wtt[0] = test_bt463_wtt(11, 9, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0, 0, false);
+    state.palette[0x1ab][0] = 0x41;
+    state.palette[0x1ab][1] = 0x52;
+    state.palette[0x1ab][2] = 0x63;
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x415263);
+    pixel = 0x1abU << 15;
+    state.wtt[0] = test_bt463_wtt(15, 9, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0, 0, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0x415263);
+    pixel = 0x1abU << 16;
+    state.wtt[0] = test_bt463_wtt(16, 9, BT463_WTT_PSEUDO_COLOR,
+                                  0, 0, 0, false);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0);
+
+    /* In the 16-plane overlay wiring, normal overlays are P15:P12. */
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
+                                  0, 0xf, 0, false);
+    state.palette[0x20f][0] = 0xa1;
+    state.palette[0x20f][1] = 0xa2;
+    state.palette[0x20f][2] = 0xa3;
+    pixel = (0xfU << 12) | (1U << 24);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0xa1a2a3);
+
+    /* Alternate true-color overlays use P5, P0, P8, P4 as OL3:OL0. */
+    state.wtt[0] = test_bt463_wtt(0, 4, BT463_WTT_TRUE_COLOR,
+                                  1, 0xf, 0, false);
+    pixel = (1U << 0) | (1U << 4) | (1U << 5) | (1U << 8);
+    g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
+                    ==, 0xa1a2a3);
+}
+
 static void test_bt463_lookup_modes(void)
 {
     Bt463State state;
@@ -339,10 +405,11 @@ static void test_bt463_lookup_load_interleave(void)
     /* Shift four selects the upper nibble first but leaves octets fixed. */
     state.wtt[0] = test_bt463_wtt(4, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
+    state.command[0] = 0x80;
     g_assert_cmpuint(bt463_load_phase_seed(&state, 0), ==, BT463_LOAD_UPPER);
-    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_UPPER, 0), ==,
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_UPPER, 0), ==,
                      BT463_LOAD_UPPER);
-    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_UPPER, 1), ==,
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_UPPER, 1), ==,
                      BT463_LOAD_LOWER);
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_UPPER),
                     ==, 0x405060);
@@ -351,31 +418,72 @@ static void test_bt463_lookup_load_interleave(void)
 
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
+    state.command[0] = 0x40;
     g_assert_cmpuint(bt463_load_phase_seed(&state, 0), ==, BT463_LOAD_LOWER);
-    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_LOWER, 0), ==,
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 0), ==,
                      BT463_LOAD_LOWER);
-    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_LOWER, 1), ==,
-                     BT463_LOAD_UPPER);
-    g_assert_cmpuint(bt463_load_phase_at(BT463_LOAD_LOWER, 2), ==,
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 1), ==,
+                     BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 2), ==,
                      BT463_LOAD_LOWER);
 
     /* The first tag seeds the line; later tags cannot re-seed its phase. */
+    state.command[0] = 0x80;
     state.wtt[0] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
     state.wtt[1] = test_bt463_wtt(4, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
-    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 0),
+    g_assert_cmpuint(bt463_load_phase_at(&state,
+                                         bt463_load_phase_seed(&state, 0), 0),
                      ==, BT463_LOAD_LOWER);
-    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 1),
+    g_assert_cmpuint(bt463_load_phase_at(&state,
+                                         bt463_load_phase_seed(&state, 0), 1),
                      ==, BT463_LOAD_UPPER);
     state.wtt[0] = test_bt463_wtt(4, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
     state.wtt[1] = test_bt463_wtt(0, 4, BT463_TRUE_COLOR_LOAD_INTERLEAVE,
                                   0, 0, 0, false);
-    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 0),
+    g_assert_cmpuint(bt463_load_phase_at(&state,
+                                         bt463_load_phase_seed(&state, 0), 0),
                      ==, BT463_LOAD_UPPER);
-    g_assert_cmpuint(bt463_load_phase_at(bt463_load_phase_seed(&state, 0), 1),
+    g_assert_cmpuint(bt463_load_phase_at(&state,
+                                         bt463_load_phase_seed(&state, 0), 1),
                      ==, BT463_LOAD_LOWER);
+
+    /* Multiplexing changes phase only after a complete load cycle. */
+    state.command[0] = 0x40; /* 4:1, four displayed pixels per load. */
+    for (unsigned i = 0; i < 4; i++) {
+        g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, i),
+                         ==, BT463_LOAD_LOWER);
+    }
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 4), ==,
+                     BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 7), ==,
+                     BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 8), ==,
+                     BT463_LOAD_LOWER);
+
+    state.command[0] = 0x80; /* 1:1, one displayed pixel per load. */
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 0), ==,
+                     BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 1), ==,
+                     BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 2), ==,
+                     BT463_LOAD_LOWER);
+
+    state.command[0] = 0xc0; /* 2:1, two displayed pixels per load. */
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 0), ==,
+                     BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 1), ==,
+                     BT463_LOAD_LOWER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 2), ==,
+                     BT463_LOAD_UPPER);
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 3), ==,
+                     BT463_LOAD_UPPER);
+
+    state.command[0] = 0x00; /* Reserved multiplexing selection. */
+    g_assert_cmpuint(bt463_load_phase_at(&state, BT463_LOAD_LOWER, 0), ==,
+                     BT463_LOAD_INVALID);
 }
 
 static void test_bt463_lookup_overlay_and_cursor(void)
@@ -438,8 +546,8 @@ static void test_bt463_lookup_overlay_and_cursor(void)
     g_assert_cmphex(bt463_lookup_rgb(&state, pixel, 0, BT463_LOAD_LOWER),
                     ==, 0);
 
-    /* WT E/F become direct cursor colors in the two-color WTT mode. */
-    state.command[1] = 0x0a;
+    /* CR13 alone maps WT E/F to the two direct cursor colors. */
+    state.command[1] = 0x08;
     state.wtt[0x0e] = test_bt463_wtt(31, 0, BT463_WTT_RESERVED_7,
                                      0, 0, 0, false);
     state.wtt[0x0f] = test_bt463_wtt(31, 0, BT463_WTT_RESERVED_7,
@@ -488,6 +596,8 @@ int main(int argc, char **argv)
     g_test_add_func("/bt463/legacy-vmstate", test_bt463_legacy_vmstate);
     g_test_add_func("/bt463/lookup-true-color",
                     test_bt463_lookup_true_color);
+    g_test_add_func("/bt463/lookup-contiguous-planes",
+                    test_bt463_lookup_contiguous_planes);
     g_test_add_func("/bt463/lookup-modes", test_bt463_lookup_modes);
     g_test_add_func("/bt463/lookup-load-interleave",
                     test_bt463_lookup_load_interleave);
