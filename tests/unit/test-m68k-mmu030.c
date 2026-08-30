@@ -11,8 +11,68 @@
 #include "target/m68k/mmu030.h"
 #include "io/channel-buffer.h"
 #include "migration/qemu-file.h"
+#include "migration/savevm.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
+#include "../qtest/libqtest.h"
+
+#define M68K_MMU030_WIRE_SIZE \
+    (sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t) + \
+     2 * sizeof(uint32_t) + sizeof(uint16_t) + \
+     M68K_MMU030_ATC_ENTRIES * 3 * sizeof(uint32_t) + \
+     sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint32_t) + \
+     sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t))
+
+typedef struct MigrationSubsection {
+    uint8_t *data;
+    size_t size;
+    size_t payload_offset;
+    size_t payload_size;
+} MigrationSubsection;
+
+static void wire_put_u16(uint8_t **cursor, uint16_t value)
+{
+    *(*cursor)++ = value >> 8;
+    *(*cursor)++ = value;
+}
+
+static void wire_put_u32(uint8_t **cursor, uint32_t value)
+{
+    *(*cursor)++ = value >> 24;
+    *(*cursor)++ = value >> 16;
+    *(*cursor)++ = value >> 8;
+    *(*cursor)++ = value;
+}
+
+static void wire_put_u64(uint8_t **cursor, uint64_t value)
+{
+    wire_put_u32(cursor, value >> 32);
+    wire_put_u32(cursor, value);
+}
+
+static void encode_mmu030_wire(uint8_t *wire, const M68KMMU030State *state)
+{
+    uint8_t *cursor = wire;
+
+    wire_put_u64(&cursor, state->crp);
+    wire_put_u64(&cursor, state->srp);
+    wire_put_u32(&cursor, state->tc);
+    wire_put_u32(&cursor, state->tt[0]);
+    wire_put_u32(&cursor, state->tt[1]);
+    wire_put_u16(&cursor, state->mmusr);
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        wire_put_u32(&cursor, state->atc[i].logical);
+        wire_put_u32(&cursor, state->atc[i].physical);
+        wire_put_u32(&cursor, state->atc[i].status);
+    }
+    *cursor++ = state->atc_next;
+    *cursor++ = state->fault_pending;
+    wire_put_u32(&cursor, state->fault_address);
+    wire_put_u32(&cursor, state->fault_pc);
+    wire_put_u16(&cursor, state->fault_ssw);
+    wire_put_u32(&cursor, state->fault_status);
+    g_assert_cmpuint(cursor - wire, ==, M68K_MMU030_WIRE_SIZE);
+}
 
 static void test_mmu030_reset(void)
 {
@@ -116,6 +176,220 @@ static void test_mmu030_vmstate(void)
     object_unref(OBJECT(load_channel));
 }
 
+static size_t migration_find_subsection(const uint8_t *wire, size_t wire_size,
+                                        const char *name,
+                                        size_t *payload_offset)
+{
+    size_t name_size = strlen(name);
+    size_t count = 0;
+
+    g_assert_cmpuint(name_size, <=, UINT8_MAX);
+    for (size_t i = 0; i + 2 + name_size + sizeof(uint32_t) <= wire_size;
+         i++) {
+        if (wire[i] != QEMU_VM_SUBSECTION ||
+            wire[i + 1] != name_size ||
+            memcmp(wire + i + 2, name, name_size) != 0) {
+            continue;
+        }
+        if (count++ == 0) {
+            *payload_offset = i + 2 + name_size + sizeof(uint32_t);
+        }
+    }
+    return count;
+}
+
+static MigrationSubsection migration_read_subsection(const char *path,
+                                                     const char *name)
+{
+    MigrationSubsection subsection = { 0 };
+    g_autoptr(GError) error = NULL;
+    gchar *contents = NULL;
+    gsize contents_size;
+
+    g_assert_true(g_file_get_contents(path, &contents, &contents_size,
+                                      &error));
+    g_assert_no_error(error);
+    subsection.data = (uint8_t *)contents;
+    subsection.size = contents_size;
+    g_assert_cmpuint(migration_find_subsection(subsection.data,
+                                               subsection.size, name,
+                                               &subsection.payload_offset),
+                     ==, 1);
+    subsection.payload_size = M68K_MMU030_WIRE_SIZE;
+    g_assert_cmpuint(subsection.payload_offset + subsection.payload_size,
+                     <=, subsection.size);
+    return subsection;
+}
+
+static char *migration_path_new(char **tmpdir, const char *prefix)
+{
+    g_autoptr(GError) error = NULL;
+    char *path;
+
+    *tmpdir = g_dir_make_tmp(prefix, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(*tmpdir);
+    path = g_build_filename(*tmpdir, "migration.state", NULL);
+    return path;
+}
+
+static void migration_path_cleanup(char *tmpdir, char *path)
+{
+    g_assert_cmpint(g_unlink(path), ==, 0);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static QTestState *m68k_qtest_start(const char *model, const char *extra)
+{
+    return qtest_initf("-machine virt -cpu %s -m 8M -nodefaults %s",
+                       model, extra ?: "");
+}
+
+static void migrate_to_file(QTestState *source, const char *path)
+{
+    g_autofree char *uri = g_strdup_printf("file:%s", path);
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    for (unsigned i = 0; i < 200; i++) {
+        QDict *response = qtest_qmp(source,
+                                    "{ 'execute': 'query-migrate' }");
+        QDict *return_value = qdict_get_qdict(response, "return");
+        const char *status = qdict_get_try_str(return_value, "status");
+        bool done = status && !strcmp(status, "completed");
+        bool failed = status && (!strcmp(status, "failed") ||
+                                 !strcmp(status, "cancelled"));
+
+        qobject_unref(response);
+        g_assert_false(failed);
+        if (done) {
+            return;
+        }
+        g_usleep(10 * 1000);
+    }
+    g_error("timed out waiting for migration to %s", path);
+}
+
+static void migrate_from_file(QTestState *destination, const char *path)
+{
+    g_autofree char *uri = g_strdup_printf("file:%s", path);
+
+    qtest_qmp_assert_success(
+        destination,
+        "{ 'execute': 'migrate-incoming', 'arguments': { 'uri': %s } }",
+        uri);
+    qtest_qmp_eventwait(destination, "RESUME");
+}
+
+static M68KMMU030State migration_pattern(void)
+{
+    M68KMMU030State state = { 0 };
+
+    state.crp = UINT64_C(0x123456789abcdef0);
+    state.srp = UINT64_C(0x0fedcba987654321);
+    state.tc = UINT32_C(0x87654321);
+    state.tt[0] = UINT32_C(0x10203040);
+    state.tt[1] = UINT32_C(0x50607080);
+    state.mmusr = UINT16_C(0xa55a);
+    state.atc_next = 17;
+    state.fault_pending = true;
+    state.fault_address = UINT32_C(0xfeedcafe);
+    state.fault_pc = UINT32_C(0x00123456);
+    state.fault_ssw = UINT16_C(0x5aa5);
+    state.fault_status = UINT32_C(0xdeadbeef);
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        state.atc[i].logical = UINT32_C(0x10000000) + i;
+        state.atc[i].physical = UINT32_C(0x20000000) + i * 0x1000;
+        state.atc[i].status = UINT32_C(0x30000000) + i;
+    }
+    return state;
+}
+
+static void test_cpu_vmstate_gating(void)
+{
+    static const struct {
+        const char *model;
+        unsigned expected_mmu030_subsections;
+        unsigned expected_mmu040_subsections;
+    } cases[] = {
+        { "m68030", 1, 0 },
+        { "m68040", 0, 1 },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+        g_autofree char *tmpdir = NULL;
+        g_autofree char *path = migration_path_new(&tmpdir,
+                                                   "m68k-mmu030-gating-XXXXXX");
+        QTestState *source = m68k_qtest_start(cases[i].model, NULL);
+        g_autofree gchar *wire = NULL;
+        gsize wire_size;
+        size_t payload_offset;
+        size_t subsection_count;
+        size_t mmu040_count;
+
+        migrate_to_file(source, path);
+        g_assert_true(g_file_get_contents(path, &wire, &wire_size, NULL));
+        subsection_count = migration_find_subsection(
+            (const uint8_t *)wire, wire_size, "cpu/68030_mmu",
+            &payload_offset);
+        g_assert_cmpuint(cases[i].expected_mmu030_subsections, ==,
+                         subsection_count);
+        mmu040_count = migration_find_subsection(
+            (const uint8_t *)wire, wire_size, "cpu/68040_mmu",
+            &payload_offset);
+        g_assert_cmpuint(cases[i].expected_mmu040_subsections, ==,
+                         mmu040_count);
+        qtest_quit(source);
+        migration_path_cleanup(g_steal_pointer(&tmpdir),
+                                g_steal_pointer(&path));
+    }
+}
+
+static void test_cpu_migration_stream(void)
+{
+    g_autofree char *source_tmpdir = NULL;
+    g_autofree char *destination_tmpdir = NULL;
+    g_autofree char *source_path = migration_path_new(
+        &source_tmpdir, "m68k-mmu030-source-XXXXXX");
+    g_autofree char *destination_path = migration_path_new(
+        &destination_tmpdir, "m68k-mmu030-destination-XXXXXX");
+    QTestState *source = m68k_qtest_start("m68030", NULL);
+    QTestState *destination = m68k_qtest_start("m68030", "-incoming defer");
+    M68KMMU030State expected = migration_pattern();
+    uint8_t expected_wire[M68K_MMU030_WIRE_SIZE];
+    MigrationSubsection subsection;
+    MigrationSubsection roundtrip;
+
+    encode_mmu030_wire(expected_wire, &expected);
+    migrate_to_file(source, source_path);
+    subsection = migration_read_subsection(source_path, "cpu/68030_mmu");
+    memcpy(subsection.data + subsection.payload_offset, expected_wire,
+           sizeof(expected_wire));
+    g_assert_true(g_file_set_contents(source_path,
+                                      (const gchar *)subsection.data,
+                                      subsection.size, NULL));
+    g_free(subsection.data);
+
+    /* The incoming CPU subsection invokes its post-load TLB flush hook. */
+    migrate_from_file(destination, source_path);
+    /* A successful re-save proves the loaded CPU state remains usable. */
+    migrate_to_file(destination, destination_path);
+    roundtrip = migration_read_subsection(destination_path,
+                                          "cpu/68030_mmu");
+    g_assert_cmpmem(roundtrip.data + roundtrip.payload_offset,
+                    roundtrip.payload_size, expected_wire,
+                    sizeof(expected_wire));
+    g_free(roundtrip.data);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    migration_path_cleanup(g_steal_pointer(&source_tmpdir),
+                            g_steal_pointer(&source_path));
+    migration_path_cleanup(g_steal_pointer(&destination_tmpdir),
+                            g_steal_pointer(&destination_path));
+}
+
 int main(int argc, char **argv)
 {
     module_call_init(MODULE_INIT_QOM);
@@ -123,6 +397,12 @@ int main(int argc, char **argv)
 
     g_test_add_func("/m68k/mmu030/reset", test_mmu030_reset);
     g_test_add_func("/m68k/mmu030/vmstate", test_mmu030_vmstate);
+    if (g_getenv("QTEST_QEMU_BINARY")) {
+        g_test_add_func("/m68k/mmu030/cpu-vmstate-gating",
+                        test_cpu_vmstate_gating);
+        g_test_add_func("/m68k/mmu030/cpu-migration-stream",
+                        test_cpu_migration_stream);
+    }
 
     return g_test_run();
 }

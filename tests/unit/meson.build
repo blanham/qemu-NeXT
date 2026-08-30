@@ -266,6 +266,9 @@ if have_system
     'test-smp-parse': [qom, meson.project_source_root() / 'hw/core/machine-smp.c'],
     'test-vmstate': [migration, io],
     'test-m68k-mmu030': [migration, io,
+                         qom,
+                         meson.project_source_root() / 'tests/qtest/libqmp.c',
+                         meson.project_source_root() / 'tests/qtest/libqtest.c',
                          meson.project_source_root() / 'target/m68k/mmu030.c',
                          meson.project_source_root() / 'target/m68k/mmu030-vmstate.c'],
     'test-bt463': [
@@ -316,6 +319,10 @@ test_env.set('G_TEST_SRCDIR', meson.current_source_dir())
 test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
 if host_os != 'windows'
   test_env.set('QEMU_PLAN9_KEYDB', qemu_plan9_keydb_test.full_path())
+endif
+if emulators.has_key('qemu-system-m68k')
+  test_deps += {'test-m68k-mmu030': emulators['qemu-system-m68k']}
+  test_env.set('QTEST_QEMU_BINARY', emulators['qemu-system-m68k'].full_path())
 endif
 
 slow_tests = {
