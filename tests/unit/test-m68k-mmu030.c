@@ -16,6 +16,18 @@
 #include "qemu/module.h"
 #include "../qtest/libqtest.h"
 
+#define M68K_MMU030_TC_E        (UINT32_C(1) << 31)
+#define M68K_MMU030_TC_PS_SHIFT 20
+#define M68K_MMU030_TC_IS_SHIFT 16
+#define M68K_MMU030_TC_TIA_SHIFT 12
+#define M68K_MMU030_TC_TIB_SHIFT 8
+#define M68K_MMU030_TC_TIC_SHIFT 4
+
+#define M68K_MMU030_TT_E        (UINT32_C(1) << 15)
+#define M68K_MMU030_TT_CI       (UINT32_C(1) << 10)
+#define M68K_MMU030_TT_RW       (UINT32_C(1) << 9)
+#define M68K_MMU030_TT_RWM      (UINT32_C(1) << 8)
+
 #define M68K_MMU030_WIRE_SIZE \
     (sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint32_t) + \
      2 * sizeof(uint32_t) + sizeof(uint16_t) + \
@@ -174,6 +186,108 @@ static void test_mmu030_vmstate(void)
 
     object_unref(OBJECT(save_channel));
     object_unref(OBJECT(load_channel));
+}
+
+static uint32_t mmu030_tc(unsigned ps, unsigned is, unsigned tia,
+                          unsigned tib, unsigned tic, unsigned tid)
+{
+    return M68K_MMU030_TC_E |
+           (ps << M68K_MMU030_TC_PS_SHIFT) |
+           (is << M68K_MMU030_TC_IS_SHIFT) |
+           (tia << M68K_MMU030_TC_TIA_SHIFT) |
+           (tib << M68K_MMU030_TC_TIB_SHIFT) |
+           (tic << M68K_MMU030_TC_TIC_SHIFT) |
+           tid;
+}
+
+static uint32_t mmu030_tt(uint8_t address_base, uint8_t address_mask,
+                          bool cache_inhibit, bool write, bool rw_mask,
+                          uint8_t function_code_base,
+                          uint8_t function_code_mask)
+{
+    return ((uint32_t)address_base << 24) |
+           ((uint32_t)address_mask << 16) |
+           M68K_MMU030_TT_E |
+           (cache_inhibit ? M68K_MMU030_TT_CI : 0) |
+           (write ? 0 : M68K_MMU030_TT_RW) |
+           (rw_mask ? M68K_MMU030_TT_RWM : 0) |
+           ((function_code_base & 7) << 4) |
+           (function_code_mask & 7);
+}
+
+static void test_mmu030_tc_validation(void)
+{
+    g_assert_true(m68k_mmu030_validate_tc(0));
+    g_assert_true(m68k_mmu030_validate_tc(UINT32_C(0x7fffffff)));
+
+    /* 4 KiB pages with two ten-bit table indexes. */
+    g_assert_true(m68k_mmu030_validate_tc(mmu030_tc(12, 0, 10, 10,
+                                                     0, 0)));
+    /* NeXT's 8 KiB layout: 13 + 7 + 7 + 5 = 32. */
+    g_assert_true(m68k_mmu030_validate_tc(mmu030_tc(13, 0, 7, 7, 5,
+                                                     0)));
+    /* A generic 8 KiB layout may use a different table decomposition. */
+    g_assert_true(m68k_mmu030_validate_tc(mmu030_tc(13, 0, 9, 10,
+                                                     0, 0)));
+
+    /* Page size encoding 7 is below the MC68030 minimum of 8. */
+    g_assert_false(m68k_mmu030_validate_tc(mmu030_tc(7, 0, 10, 10,
+                                                      0, 0)));
+    /* The enabled widths must account for all 32 address bits. */
+    g_assert_false(m68k_mmu030_validate_tc(mmu030_tc(12, 0, 10, 9,
+                                                      0, 0)));
+    /* TI fields after the first zero are ignored by the consistency check. */
+    g_assert_true(m68k_mmu030_validate_tc(mmu030_tc(13, 9, 10, 0, 12,
+                                                     0)));
+}
+
+static void test_mmu030_tt_matching(void)
+{
+    M68KMMU030TTResult result;
+    uint32_t tt;
+
+    tt = mmu030_tt(0x12, 0x00, false, false, true, 5, 0);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12abcdef), 5, false);
+    g_assert_true(result.matched);
+    g_assert_false(result.cache_inhibit);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x13abcdef), 5, false);
+    g_assert_false(result.matched);
+
+    tt = mmu030_tt(0x12, 0xff, true, false, true, 5, 7);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12abcdef), 2, false);
+    g_assert_true(result.matched);
+    g_assert_true(result.cache_inhibit);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12abcdef), 7, true);
+    g_assert_true(result.matched);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x13abcdef), 2, false);
+    g_assert_true(result.matched);
+
+    tt = mmu030_tt(0x12, 0x0f, false, false, true, 5, 7);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x1abcdef0), 5, false);
+    g_assert_true(result.matched);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x22abcdef), 5, false);
+    g_assert_false(result.matched);
+
+    tt = mmu030_tt(0x12, 0x00, false, false, false, 5, 0);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12000000), 5, false);
+    g_assert_true(result.matched);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12000000), 5, true);
+    g_assert_false(result.matched);
+
+    tt = mmu030_tt(0x12, 0x00, false, true, false, 5, 0);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12000000), 5, true);
+    g_assert_true(result.matched);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12000000), 5, false);
+    g_assert_false(result.matched);
+
+    tt = mmu030_tt(0x12, 0x00, false, false, true, 5, 0);
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12000000), 4, false);
+    g_assert_false(result.matched);
+
+    tt = mmu030_tt(0x12, 0x00, true, false, true, 5, 0) &
+         ~M68K_MMU030_TT_E;
+    result = m68k_mmu030_tt_match(tt, UINT32_C(0x12000000), 5, false);
+    g_assert_false(result.matched);
 }
 
 static size_t migration_find_subsection(const uint8_t *wire, size_t wire_size,
@@ -397,6 +511,10 @@ int main(int argc, char **argv)
 
     g_test_add_func("/m68k/mmu030/reset", test_mmu030_reset);
     g_test_add_func("/m68k/mmu030/vmstate", test_mmu030_vmstate);
+    g_test_add_func("/m68k/mmu030/tc-validation",
+                    test_mmu030_tc_validation);
+    g_test_add_func("/m68k/mmu030/tt-matching",
+                    test_mmu030_tt_matching);
     if (g_getenv("QTEST_QEMU_BINARY")) {
         g_test_add_func("/m68k/mmu030/cpu-vmstate-gating",
                         test_cpu_vmstate_gating);
