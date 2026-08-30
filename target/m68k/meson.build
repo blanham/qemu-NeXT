@@ -3,6 +3,7 @@ m68k_ss.add(files(
   'cpu.c',
   'fpu_helper.c',
   'helper.c',
+  'mmu030.c',
   'op_helper.c',
   'softfloat.c',
   'translate.c',
@@ -16,7 +17,8 @@ m68k_common_system_ss.add(files('gdbstub.c'))
 
 m68k_system_ss = ss.source_set()
 m68k_system_ss.add(files(
-  'monitor.c'
+  'monitor.c',
+  'mmu030-vmstate.c'
 ))
 m68k_system_ss.add(when: ['CONFIG_SEMIHOSTING'],
   if_true: files('m68k-semi.c'),

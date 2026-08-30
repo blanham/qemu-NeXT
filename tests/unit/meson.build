@@ -265,6 +265,9 @@ if have_system
     'test-bufferiszero': [],
     'test-smp-parse': [qom, meson.project_source_root() / 'hw/core/machine-smp.c'],
     'test-vmstate': [migration, io],
+    'test-m68k-mmu030': [migration, io,
+                         meson.project_source_root() / 'target/m68k/mmu030.c',
+                         meson.project_source_root() / 'target/m68k/mmu030-vmstate.c'],
     'test-bt463': [
       migration,
       io,

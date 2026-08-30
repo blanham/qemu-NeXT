@@ -25,6 +25,7 @@
 #include "exec/cpu-interrupt.h"
 #include "qemu/cpu-float.h"
 #include "cpu-qom.h"
+#include "target/m68k/mmu030.h"
 
 #define OS_BYTE     0
 #define OS_WORD     1
@@ -145,6 +146,7 @@ typedef struct CPUArchState {
         uint32_t ttr[4];
         uint32_t mmusr;
     } mmu;
+    M68KMMU030State mmu030;
 
     /* Control registers.  */
     uint32_t vbr;
