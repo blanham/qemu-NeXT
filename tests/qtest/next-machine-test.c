@@ -19,6 +19,7 @@ typedef struct TestROM {
 
 typedef struct ExpectedSCR1 {
     const char *machine;
+    uint32_t value;
     uint8_t dma_revision;
     uint8_t machine_type;
     uint8_t board_revision;
@@ -85,7 +86,7 @@ static void test_machine_registration(void)
     g_assert_true(qtest_has_machine("next-cube"));
     g_assert_true(qtest_has_machine("next-station"));
     g_assert_true(qtest_has_machine("next-station-color"));
-    g_assert_false(qtest_has_machine("next-computer"));
+    g_assert_true(qtest_has_machine("next-computer"));
 }
 
 static void test_scr1(gconstpointer opaque)
@@ -94,6 +95,7 @@ static void test_scr1(gconstpointer opaque)
     QTestState *qts = next_machine_start(expected->machine, NULL);
     uint32_t scr1 = qtest_readl(qts, NEXT_SCR1);
 
+    g_assert_cmphex(scr1, ==, expected->value);
     g_assert_cmphex(extract32(scr1, 16, 8), ==, expected->dma_revision);
     g_assert_cmphex(extract32(scr1, 12, 4), ==, expected->machine_type);
     g_assert_cmphex(extract32(scr1, 8, 4), ==, expected->board_revision);
@@ -186,6 +188,32 @@ static void test_valid_cpu(void)
     g_test_trap_assert_passed();
 }
 
+static void test_default_cpu(void)
+{
+    QTestState *qts = next_machine_start("next-computer", NULL);
+    g_autofree char *cpus = qtest_hmp(qts, "info cpus");
+
+    g_assert_nonnull(strstr(cpus, "model=m68030"));
+    qtest_quit(qts);
+}
+
+static void test_computer_invalid_cpu(void)
+{
+    TestROM *rom = create_test_rom();
+
+    if (g_test_subprocess()) {
+        QTestState *qts =
+            next_machine_start_with_rom(rom, "next-computer", "-cpu m68040");
+
+        qtest_quit(qts);
+        return;
+    }
+
+    g_test_trap_subprocess(NULL, TEST_TIMEOUT, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr("*Invalid CPU model*");
+}
+
 static void test_missing_firmware(void)
 {
     create_test_rom();
@@ -222,21 +250,31 @@ int main(int argc, char **argv)
     static ExpectedSCR1 scr1_tests[] = {
         {
             .machine = "next-cube",
+            .value = 0x00012002,
             .dma_revision = 1,
             .machine_type = 2,
             .board_revision = 0,
             .cpu_clock = 2,
         }, {
             .machine = "next-station",
+            .value = 0x00011002,
             .dma_revision = 1,
             .machine_type = 1,
             .board_revision = 0,
             .cpu_clock = 2,
         }, {
             .machine = "next-station-color",
+            .value = 0x00013002,
             .dma_revision = 1,
             .machine_type = 3,
             .board_revision = 0,
+            .cpu_clock = 2,
+        }, {
+            .machine = "next-computer",
+            .value = 0x00010102,
+            .dma_revision = 1,
+            .machine_type = 0,
+            .board_revision = 1,
             .cpu_clock = 2,
         },
     };
@@ -256,6 +294,11 @@ int main(int argc, char **argv)
             .product_name = "NeXTstation Color (Warp 9C)",
             .ram_size = 32 * MiB,
             .has_mono_framebuffer = false,
+        }, {
+            .machine = "next-computer",
+            .product_name = "NeXT Computer (68030)",
+            .ram_size = 64 * MiB,
+            .has_mono_framebuffer = true,
         },
     };
     size_t i;
@@ -286,6 +329,10 @@ int main(int argc, char **argv)
     qtest_add_func("/next-machine/next-cube/reject-m68030",
                    test_invalid_cpu);
     qtest_add_func("/next-machine/next-cube/accept-m68040", test_valid_cpu);
+    qtest_add_func("/next-machine/next-computer/default-m68030",
+                   test_default_cpu);
+    qtest_add_func("/next-machine/next-computer/reject-m68040",
+                   test_computer_invalid_cpu);
     qtest_add_func("/next-machine/next-cube/missing-firmware",
                    test_missing_firmware);
 

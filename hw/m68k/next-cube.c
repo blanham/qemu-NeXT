@@ -171,6 +171,7 @@ struct NeXTPC {
 #define TYPE_NEXT_STATION_MACHINE MACHINE_TYPE_NAME("next-station")
 #define TYPE_NEXT_STATION_COLOR_MACHINE \
     MACHINE_TYPE_NAME("next-station-color")
+#define TYPE_NEXT_COMPUTER_MACHINE MACHINE_TYPE_NAME("next-computer")
 
 typedef enum NeXTVideoKind {
     NEXT_VIDEO_MONO,
@@ -185,6 +186,8 @@ typedef enum NeXTDiskMuxKind {
 typedef struct NeXTBoardProfile {
     const char *product_name;
     const char *default_bios;
+    const char *default_cpu_type;
+    const char * const *valid_cpu_types;
     uint8_t slot_id;
     uint8_t dma_revision;
     uint8_t machine_type;
@@ -192,6 +195,7 @@ typedef struct NeXTBoardProfile {
     uint8_t video_memory_speed;
     uint8_t main_memory_speed;
     uint8_t cpu_clock;
+    hwaddr byte_device_offset;
     ram_addr_t default_ram_size;
     ram_addr_t maximum_ram_size;
     NeXTVideoKind video_kind;
@@ -224,13 +228,26 @@ struct NeXTState {
     bool rtc_chip_locked;
 };
 
+static const char * const next_030_cpu_types[] = {
+    M68K_CPU_TYPE_NAME("m68030"),
+    NULL,
+};
+
+static const char * const next_040_cpu_types[] = {
+    M68K_CPU_TYPE_NAME("m68040"),
+    NULL,
+};
+
 static const NeXTBoardProfile next_cube_profile = {
     .product_name = "NeXTcube (68040, X15)",
     .default_bios = "Rev_2.5_v66.bin",
+    .default_cpu_type = M68K_CPU_TYPE_NAME("m68040"),
+    .valid_cpu_types = next_040_cpu_types,
     .dma_revision = 1,
     .machine_type = 2,
     .board_revision = 0,
     .cpu_clock = 2,
+    .byte_device_offset = 0x00100000,
     .default_ram_size = 64 * MiB,
     .maximum_ram_size = 64 * MiB,
     .video_kind = NEXT_VIDEO_MONO,
@@ -242,10 +259,13 @@ static const NeXTBoardProfile next_cube_profile = {
 static const NeXTBoardProfile next_station_profile = {
     .product_name = "NeXTstation (Warp 9)",
     .default_bios = "Rev_2.5_v66.bin",
+    .default_cpu_type = M68K_CPU_TYPE_NAME("m68040"),
+    .valid_cpu_types = next_040_cpu_types,
     .dma_revision = 1,
     .machine_type = 1,
     .board_revision = 0,
     .cpu_clock = 2,
+    .byte_device_offset = 0x00100000,
     .default_ram_size = 64 * MiB,
     .maximum_ram_size = 64 * MiB,
     .video_kind = NEXT_VIDEO_MONO,
@@ -256,15 +276,36 @@ static const NeXTBoardProfile next_station_profile = {
 static const NeXTBoardProfile next_station_color_profile = {
     .product_name = "NeXTstation Color (Warp 9C)",
     .default_bios = "Rev_2.5_v66.bin",
+    .default_cpu_type = M68K_CPU_TYPE_NAME("m68040"),
+    .valid_cpu_types = next_040_cpu_types,
     .dma_revision = 1,
     .machine_type = 3,
     .board_revision = 0,
     .cpu_clock = 2,
+    .byte_device_offset = 0x00100000,
     .default_ram_size = 32 * MiB,
     .maximum_ram_size = 32 * MiB,
     .video_kind = NEXT_VIDEO_COLOR,
     .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
     .has_nextbus = false,
+};
+
+static const NeXTBoardProfile next_computer_profile = {
+    .product_name = "NeXT Computer (68030)",
+    .default_bios = "Rev_1.0_v41.bin",
+    .default_cpu_type = M68K_CPU_TYPE_NAME("m68030"),
+    .valid_cpu_types = next_030_cpu_types,
+    .dma_revision = 1,
+    .machine_type = 0,
+    .board_revision = 1,
+    .cpu_clock = 2,
+    .byte_device_offset = 0,
+    .default_ram_size = 64 * MiB,
+    .maximum_ram_size = 64 * MiB,
+    .video_kind = NEXT_VIDEO_MONO,
+    .disk_mux_kind = NEXT_DISK_MUX_CUBE_OD,
+    .has_nextbus = true,
+    .has_optical_formatter = true,
 };
 
 static uint32_t next_profile_scr1(const NeXTBoardProfile *profile)
@@ -1400,6 +1441,12 @@ static void next_machine_init(MachineState *machine)
         next_machine_create_fdc_and_flpctl(machine, m, pcdev);
         break;
     case NEXT_DISK_MUX_CUBE_OD:
+        /*
+         * The original Cube shares the legacy FDC setup until its
+         * profile-specific disk mux is modeled.
+         */
+        next_machine_create_fdc_and_flpctl(machine, m, pcdev);
+        break;
     default:
         g_assert_not_reached();
     }
@@ -1634,11 +1681,6 @@ static void next_machine_class_init(ObjectClass *oc, const void *data)
         oc, "rtc-chip", "NeXT RTC chip model (mcs1850 or mc68hc68t1)");
 }
 
-static const char * const next_040_cpu_types[] = {
-    M68K_CPU_TYPE_NAME("m68040"),
-    NULL,
-};
-
 static void next_machine_common_class_init(
     ObjectClass *oc, const NeXTBoardProfile *profile, const char *description)
 {
@@ -1651,8 +1693,8 @@ static void next_machine_common_class_init(
     mc->block_default_type = IF_SCSI;
     mc->default_ram_size = profile->default_ram_size;
     mc->default_ram_id = "next.ram";
-    mc->default_cpu_type = M68K_CPU_TYPE_NAME("m68040");
-    mc->valid_cpu_types = next_040_cpu_types;
+    mc->default_cpu_type = profile->default_cpu_type;
+    mc->valid_cpu_types = profile->valid_cpu_types;
     mc->default_nic = TYPE_NEXT_MB8795;
     mc->no_cdrom = true;
     machine_add_audiodev_property(mc);
@@ -1675,6 +1717,13 @@ static void next_station_color_machine_class_init(ObjectClass *oc,
 {
     next_machine_common_class_init(oc, &next_station_color_profile,
                                    "NeXTstation Color (Warp 9C)");
+}
+
+static void next_computer_machine_class_init(ObjectClass *oc,
+                                             const void *data)
+{
+    next_machine_common_class_init(oc, &next_computer_profile,
+                                   "NeXT Computer (68030)");
 }
 
 static const TypeInfo next_machine_typeinfo = {
@@ -1705,12 +1754,19 @@ static const TypeInfo next_station_color_machine_typeinfo = {
     .class_init = next_station_color_machine_class_init,
 };
 
+static const TypeInfo next_computer_machine_typeinfo = {
+    .name = TYPE_NEXT_COMPUTER_MACHINE,
+    .parent = TYPE_NEXT_MACHINE,
+    .class_init = next_computer_machine_class_init,
+};
+
 static void next_register_type(void)
 {
     type_register_static(&next_machine_typeinfo);
     type_register_static(&next_cube_machine_typeinfo);
     type_register_static(&next_station_machine_typeinfo);
     type_register_static(&next_station_color_machine_typeinfo);
+    type_register_static(&next_computer_machine_typeinfo);
     type_register_static(&next_pc_info);
     type_register_static(&next_scsi_info);
 }
