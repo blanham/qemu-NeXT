@@ -197,7 +197,10 @@ static void test_mmu030_vmstate(void)
     for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
         source.atc[i].logical = UINT32_C(0x10000000) + i;
         source.atc[i].physical = UINT32_C(0x20000000) + i * 0x1000;
-        source.atc[i].status = UINT32_C(0x30000000) + i;
+        source.atc[i].status = M68K_MMU030_ATC_VALID |
+                               ((i & 7) << M68K_MMU030_ATC_FC_SHIFT) |
+                               (12 << M68K_MMU030_ATC_PAGE_BITS_SHIFT) |
+                               (i & 0x3f);
     }
 
     file = qemu_file_new_output(QIO_CHANNEL(save_channel));
@@ -386,17 +389,15 @@ static void test_mmu030_descriptor_long_direct_and_early(void)
     g_assert_cmpuint(result.physical, ==, UINT32_C(0x12445678));
     g_assert_cmpuint(memory.read_count, ==, 0);
 
-    /* A direct root checks LIMIT even when FCL selects the root entry. */
+    /* FCL selects the root by function code, so its LIMIT is ignored. */
     state.tc = mmu030_tc(12, 0, 10, 10, 0, 0) |
                M68K_MMU030_TC_FCL;
     state.crp = (UINT64_C(0x00000001) << 32) | UINT32_C(0x00100000);
     g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
-                                     MMU030_TEST_ACCESS_DATA |
-                                     MMU030_TEST_ACCESS_PTEST, 1, true,
-                                     &result), ==, -1);
-    g_assert_true(result.limit_violation);
-    g_assert_cmpuint(result.mmusr, ==,
-                     M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I);
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x12445678));
+    g_assert_false(result.limit_violation);
 
     /* DT=1 in a pointer table maps all remaining index bits contiguously. */
     memset(&memory, 0, sizeof(memory));
@@ -1034,7 +1035,10 @@ static M68KMMU030State migration_pattern(void)
     for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
         state.atc[i].logical = UINT32_C(0x10000000) + i;
         state.atc[i].physical = UINT32_C(0x20000000) + i * 0x1000;
-        state.atc[i].status = UINT32_C(0x30000000) + i;
+        state.atc[i].status = M68K_MMU030_ATC_VALID |
+                              ((i & 7) << M68K_MMU030_ATC_FC_SHIFT) |
+                              (12 << M68K_MMU030_ATC_PAGE_BITS_SHIFT) |
+                              (i & 0x3f);
     }
     return state;
 }
@@ -1123,6 +1127,424 @@ static void test_cpu_migration_stream(void)
                             g_steal_pointer(&destination_path));
 }
 
+static unsigned mmu030_test_atc_valid_count(const M68KMMU030State *state)
+{
+    unsigned count = 0;
+
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        count += (state->atc[i].status & M68K_MMU030_ATC_VALID) != 0;
+    }
+    return count;
+}
+
+static M68KMMU030TranslateResult mmu030_test_atc_result(
+    uint32_t physical, uint32_t page_size, int prot)
+{
+    return (M68KMMU030TranslateResult) {
+        .physical = physical,
+        .page_size = page_size,
+        .prot = prot,
+    };
+}
+
+static void test_mmu030_atc_entries_and_matching(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TranslateResult result;
+    M68KMMU030TranslateResult mapping;
+
+    mapping = mmu030_test_atc_result(UINT32_C(0x80012000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x12345678), 1, &mapping);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    g_assert_cmpuint(state.atc[0].logical, ==, UINT32_C(0x12345000));
+
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x1234567c),
+                                         MMU030_TEST_ACCESS_DATA, 1,
+                                         &result));
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x8001267c));
+    g_assert_cmpuint(result.page_size, ==, 4096);
+    g_assert_cmpint(result.prot, ==, PAGE_READ | PAGE_WRITE);
+
+    /* The three function-code bits are part of the tag, not only FC2. */
+    g_assert_false(m68k_mmu030_atc_lookup(&state, UINT32_C(0x1234567c),
+                                          MMU030_TEST_ACCESS_DATA, 5,
+                                          &result));
+
+    mapping = mmu030_test_atc_result(UINT32_C(0x90012000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x12345678), 5, &mapping);
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x1234567c),
+                                         MMU030_TEST_ACCESS_DATA, 5,
+                                         &result));
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x9001267c));
+
+    /* Page-size bits in the tag determine which low address bits are free. */
+    mapping = mmu030_test_atc_result(UINT32_C(0xa0010000), 8192,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x01012345), 2, &mapping);
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x01013fff),
+                                         MMU030_TEST_ACCESS_DATA, 2,
+                                         &result));
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0xa0011fff));
+    g_assert_false(m68k_mmu030_atc_lookup(&state, UINT32_C(0x01014000),
+                                          MMU030_TEST_ACCESS_DATA, 2,
+                                          &result));
+
+    /* FC2 is also checked independently of the address tag. */
+    g_assert_false(m68k_mmu030_atc_lookup(&state, UINT32_C(0x1234567c),
+                                          MMU030_TEST_ACCESS_DATA, 3,
+                                          &result));
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x1234567c),
+                                         MMU030_TEST_ACCESS_SUPER |
+                                         MMU030_TEST_ACCESS_DATA, 5,
+                                         &result));
+}
+
+static void test_mmu030_atc_permissions_and_replacement(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TranslateResult result;
+    M68KMMU030TranslateResult mapping;
+
+    mapping = mmu030_test_atc_result(UINT32_C(0x10000000), 4096,
+                                     PAGE_READ);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00401234), 1, &mapping);
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x00401238),
+                                         MMU030_TEST_ACCESS_DATA, 1,
+                                         &result));
+    g_assert_false(result.fault);
+    g_assert_cmpint(result.prot, ==, PAGE_READ);
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x00401238),
+                                         MMU030_TEST_ACCESS_DATA |
+                                         MMU030_TEST_ACCESS_STORE, 1,
+                                         &result));
+    g_assert_true(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_WP);
+
+    /* A full ATC uses a deterministic round-robin replacement cursor. */
+    m68k_mmu030_reset(&state);
+    mapping = mmu030_test_atc_result(UINT32_C(0x20000000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        m68k_mmu030_atc_fill(&state, UINT32_C(0x10000000) + i * 0x1000,
+                             1, &mapping);
+    }
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==,
+                     M68K_MMU030_ATC_ENTRIES);
+    g_assert_cmpuint(state.atc_next, ==, 0);
+
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x20000000), 1, &mapping);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==,
+                     M68K_MMU030_ATC_ENTRIES);
+    g_assert_cmpuint(state.atc[0].logical, ==, UINT32_C(0x20000000));
+    g_assert_cmpuint(state.atc_next, ==, 1);
+}
+
+static void test_mmu030_atc_descriptor_attributes_and_errors(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TranslateResult result;
+    M68KMMU030TranslateResult mapping;
+
+    mapping = mmu030_test_atc_result(UINT32_C(0x40000000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    mapping.write_protect = true;
+    mapping.supervisor_only = true;
+    mapping.modified = true;
+    mapping.cache_inhibit = true;
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00604000), 5, &mapping);
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x00604004),
+                                         MMU030_TEST_ACCESS_DATA, 5,
+                                         &result));
+    g_assert_false(result.fault);
+    g_assert_true(result.write_protect);
+    g_assert_true(result.supervisor_only);
+    g_assert_true(result.modified);
+    g_assert_true(result.cache_inhibit);
+    g_assert_cmpint(result.prot, ==, PAGE_READ);
+
+    /* Invalid/limited/bus-error walks leave a B entry for level-zero PTEST. */
+    m68k_mmu030_reset(&state);
+    mapping = mmu030_test_atc_result(0, 4096, PAGE_READ | PAGE_WRITE);
+    mapping.fault = true;
+    mapping.atc_error = true;
+    mapping.mmusr = M68K_MMU030_MMUSR_I;
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00708000), 1, &mapping);
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x00708004),
+                                         MMU030_TEST_ACCESS_DATA, 1,
+                                         &result));
+    g_assert_true(result.fault);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I);
+}
+
+static void test_mmu030_atc_preload_and_level_zero_ptest(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned root_index = (logical >> 22) & 0x3ff;
+    const unsigned page_index = (logical >> 12) & 0x3ff;
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, UINT32_C(0x1000) + root_index * 4,
+                     UINT32_C(0x2002));
+    mmu030_test_putl(&memory, UINT32_C(0x2000) + page_index * 4,
+                     UINT32_C(0x00abc001));
+
+    /* PLOAD must leave the pre-existing MMUSR untouched, even on a probe. */
+    state.mmusr = UINT16_C(0x55aa);
+    g_assert_cmpint(m68k_mmu030_atc_preload(
+                        &state, &ops, logical,
+                        MMU030_TEST_ACCESS_DATA | MMU030_TEST_ACCESS_PTEST, 1,
+                        &result), ==, 0);
+    g_assert_cmpuint(state.mmusr, ==, UINT16_C(0x55aa));
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+
+    memory.read_count = 0;
+    g_assert_true(m68k_mmu030_atc_ptest(&state, logical, false, 1,
+                                       &result));
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
+    g_assert_cmpuint(result.mmusr, ==, 0);
+    g_assert_cmpuint(memory.read_count, ==, 0);
+
+    /* The runtime translation entry point must use the ATC-only PTEST path. */
+    memory.read_count = 0;
+    memory.write_count = 0;
+    g_assert_cmpint(m68k_mmu030_translate_state(
+                        &state, &ops, logical, MMU030_TEST_ACCESS_PTEST, 1,
+                        true, &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
+    g_assert_cmpuint(result.mmusr, ==, 0);
+    g_assert_cmpuint(memory.read_count, ==, 0);
+    g_assert_cmpuint(memory.write_count, ==, 0);
+
+    /* Level zero never falls through to a table walk on an ATC miss. */
+    g_assert_true(m68k_mmu030_atc_ptest(&state, UINT32_C(0x76543210),
+                                       false, 1, &result));
+    g_assert_true(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_I);
+    g_assert_cmpuint(memory.read_count, ==, 0);
+
+    memory.read_count = 0;
+    memory.write_count = 0;
+    g_assert_cmpint(m68k_mmu030_translate_state(
+                        &state, &ops, UINT32_C(0x76543210),
+                        MMU030_TEST_ACCESS_PTEST, 1, true, &result), ==, 0);
+    g_assert_true(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_I);
+    g_assert_cmpuint(memory.read_count, ==, 0);
+    g_assert_cmpuint(memory.write_count, ==, 0);
+
+    state.mmusr = UINT16_C(0xaa55);
+    memory.fail_read = true;
+    g_assert_cmpint(m68k_mmu030_atc_preload(
+                        &state, &ops, logical,
+                        MMU030_TEST_ACCESS_DATA | MMU030_TEST_ACCESS_PTEST, 1,
+                        &result), ==, -1);
+    g_assert_cmpuint(state.mmusr, ==, UINT16_C(0xaa55));
+    memory.fail_read = false;
+
+    /* PLOAD is allowed to populate the ATC while TC.E is clear. */
+    state.tc &= ~M68K_MMU030_TC_ENABLE;
+    m68k_mmu030_atc_flush_all(&state);
+    g_assert_cmpint(m68k_mmu030_atc_preload(
+                        &state, &ops, logical, MMU030_TEST_ACCESS_DATA, 1,
+                        &result), ==, 0);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+}
+
+typedef struct M68KMMU030FlushTrace {
+    unsigned all_count;
+    unsigned range_count;
+    uint32_t range_address;
+    uint32_t range_size;
+    const M68KMMU030State *state;
+    uint32_t observed_tc;
+    uint64_t observed_crp;
+} M68KMMU030FlushTrace;
+
+static void mmu030_test_flush_all(void *opaque)
+{
+    M68KMMU030FlushTrace *trace = opaque;
+
+    trace->all_count++;
+    if (trace->state) {
+        trace->observed_tc = trace->state->tc;
+        trace->observed_crp = trace->state->crp;
+    }
+}
+
+static void mmu030_test_flush_range(void *opaque, uint32_t address,
+                                    uint32_t size)
+{
+    M68KMMU030FlushTrace *trace = opaque;
+
+    trace->range_count++;
+    trace->range_address = address;
+    trace->range_size = size;
+}
+
+static void test_mmu030_atc_coherent_flush_wrappers(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030FlushTrace trace = { 0 };
+    M68KMMU030TranslateResult mapping;
+
+    mapping = mmu030_test_atc_result(UINT32_C(0x30000000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00401000), 1, &mapping);
+    mapping.physical = UINT32_C(0x30002000);
+    mapping.page_size = 8192;
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00402000), 5, &mapping);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 2);
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    m68k_mmu030_atc_flush_page_coherent(
+        &state, UINT32_C(0x00402004), 5, 7, mmu030_test_flush_range, &trace);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    g_assert_cmpuint(trace.range_count, ==, 1);
+    g_assert_cmpuint(trace.range_address, ==, UINT32_C(0x00402000));
+    g_assert_cmpuint(trace.range_size, ==, 8192);
+
+    /* The derived TLB scope is flushed even when the ATC has no tag. */
+    state.tc = mmu030_tc(13, 0, 10, 9, 0, 0);
+    m68k_mmu030_atc_flush_page_coherent(
+        &state, UINT32_C(0x00500004), 5, 7, mmu030_test_flush_range, &trace);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    g_assert_cmpuint(trace.range_count, ==, 2);
+    g_assert_cmpuint(trace.range_address, ==, UINT32_C(0x00500000));
+    g_assert_cmpuint(trace.range_size, ==, 8192);
+
+    m68k_mmu030_atc_flush_fc_coherent(
+        &state, 1, 7, mmu030_test_flush_all, &trace);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 0);
+    g_assert_cmpuint(trace.all_count, ==, 1);
+
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00403000), 1, &mapping);
+    m68k_mmu030_atc_flush_all_coherent(&state, mmu030_test_flush_all,
+                                       &trace);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 0);
+    g_assert_cmpuint(trace.all_count, ==, 2);
+}
+
+static void test_mmu030_control_reconfigure(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030ControlState control;
+    M68KMMU030FlushTrace trace = { .state = &state };
+    M68KMMU030TranslateResult mapping;
+    uint64_t previous_crp;
+    const uint32_t old_tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    const uint32_t new_tc = mmu030_tc(13, 0, 10, 9, 0, 0);
+
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    state.srp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x2000);
+    state.tc = old_tc;
+    state.tt[0] = UINT32_C(0x12348000);
+    state.tt[1] = UINT32_C(0x56788000);
+    mapping = mmu030_test_atc_result(UINT32_C(0x30000000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00401000), 1, &mapping);
+    state.atc_next = 17;
+
+    control = (M68KMMU030ControlState) {
+        .crp = state.crp,
+        .srp = state.srp,
+        .tc = new_tc,
+        .tt = { state.tt[0], state.tt[1] },
+    };
+    g_assert_true(m68k_mmu030_reconfigure(
+        &state, &control, true, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 1);
+    g_assert_cmpuint(trace.observed_tc, ==, old_tc);
+    g_assert_cmpuint(state.tc, ==, new_tc);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 0);
+    g_assert_cmpuint(state.atc_next, ==, 17);
+
+    previous_crp = state.crp;
+    control.crp += UINT64_C(0x1000);
+    control.tt[0] ^= UINT32_C(0x10000);
+    g_assert_true(m68k_mmu030_reconfigure(
+        &state, &control, true, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 2);
+    g_assert_cmpuint(trace.observed_crp, ==, previous_crp);
+    g_assert_cmpuint(state.crp, ==, control.crp);
+    g_assert_cmpuint(state.tt[0], ==, control.tt[0]);
+
+    /* An invalid TC is rejected without flushing or changing controls. */
+    control.tc = mmu030_tc(7, 0, 10, 11, 0, 0);
+    g_assert_false(m68k_mmu030_reconfigure(
+        &state, &control, true, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 2);
+    g_assert_cmpuint(state.tc, ==, new_tc);
+
+    /* PMOVEFD can suppress the flush while still changing the controls. */
+    control.tc = old_tc;
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00402000), 1, &mapping);
+    g_assert_true(m68k_mmu030_reconfigure(
+        &state, &control, false, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 2);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    g_assert_cmpuint(state.tc, ==, old_tc);
+
+    /* FD=0 flushes even when a register write leaves controls unchanged. */
+    state.atc_next = 9;
+    g_assert_true(m68k_mmu030_reconfigure(
+        &state, &control, true, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 3);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 0);
+    g_assert_cmpuint(state.atc_next, ==, 9);
+
+    /* FD=1 leaves an unchanged control image and its ATC untouched. */
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00403000), 1, &mapping);
+    state.atc_next = 11;
+    g_assert_true(m68k_mmu030_reconfigure(
+        &state, &control, false, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 3);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    g_assert_cmpuint(state.atc_next, ==, 11);
+}
+
+static void test_mmu030_atc_flush_scopes(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TranslateResult mapping;
+
+    mapping = mmu030_test_atc_result(UINT32_C(0x30000000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00401000), 1, &mapping);
+    mapping.physical = UINT32_C(0x30001000);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00401000), 5, &mapping);
+    mapping.physical = UINT32_C(0x30002000);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00402000), 1, &mapping);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 3);
+
+    m68k_mmu030_atc_flush_page(&state, UINT32_C(0x00401004), 1, 7);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 2);
+    g_assert_false(m68k_mmu030_atc_lookup(&state, UINT32_C(0x00401004),
+                                          MMU030_TEST_ACCESS_DATA, 1,
+                                          &(M68KMMU030TranslateResult) { 0 }));
+    g_assert_true(m68k_mmu030_atc_lookup(&state, UINT32_C(0x00401004),
+                                         MMU030_TEST_ACCESS_DATA, 5,
+                                         &(M68KMMU030TranslateResult) { 0 }));
+
+    m68k_mmu030_atc_flush_fc(&state, 5, 7);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    m68k_mmu030_atc_flush_fc(&state, 0, 4);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 0);
+
+    /* Flush-all invalidates entries but does not perturb replacement state. */
+    state.atc_next = 19;
+    m68k_mmu030_atc_flush_all(&state);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 0);
+    g_assert_cmpuint(state.atc_next, ==, 19);
+}
+
 int main(int argc, char **argv)
 {
     module_call_init(MODULE_INIT_QOM);
@@ -1148,6 +1570,20 @@ int main(int argc, char **argv)
                     test_mmu030_access_error_frame);
     g_test_add_func("/m68k/mmu030/access-error-rte-roundtrip",
                     test_mmu030_access_error_rte_roundtrip);
+    g_test_add_func("/m68k/mmu030/atc-entries-matching",
+                    test_mmu030_atc_entries_and_matching);
+    g_test_add_func("/m68k/mmu030/atc-permissions-replacement",
+                    test_mmu030_atc_permissions_and_replacement);
+    g_test_add_func("/m68k/mmu030/atc-descriptor-attributes-errors",
+                    test_mmu030_atc_descriptor_attributes_and_errors);
+    g_test_add_func("/m68k/mmu030/atc-preload-ptest",
+                    test_mmu030_atc_preload_and_level_zero_ptest);
+    g_test_add_func("/m68k/mmu030/atc-coherent-flush-wrappers",
+                    test_mmu030_atc_coherent_flush_wrappers);
+    g_test_add_func("/m68k/mmu030/control-reconfigure",
+                    test_mmu030_control_reconfigure);
+    g_test_add_func("/m68k/mmu030/atc-flush-scopes",
+                    test_mmu030_atc_flush_scopes);
     if (g_getenv("QTEST_QEMU_BINARY")) {
         g_test_add_func("/m68k/mmu030/cpu-vmstate-gating",
                         test_cpu_vmstate_gating);

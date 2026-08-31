@@ -61,6 +61,23 @@
 #define M68K_MMU030_DESC_LU         UINT32_C(0x80000000)
 #define M68K_MMU030_DESC_LIMIT_MASK UINT32_C(0x7fff0000)
 
+/*
+ * The architectural ATC is represented as a fully associative array.  The
+ * real part/tag split is kept in the compact status word below so that the
+ * existing migration wire format remains stable while still retaining the
+ * page-size and function-code portions of a tag.
+ */
+#define M68K_MMU030_ATC_VALID           UINT32_C(0x80000000)
+#define M68K_MMU030_ATC_BUS_ERROR       UINT32_C(0x40000000)
+#define M68K_MMU030_ATC_WRITE_PROTECT   UINT32_C(0x20000000)
+#define M68K_MMU030_ATC_SUPERVISOR      UINT32_C(0x10000000)
+#define M68K_MMU030_ATC_MODIFIED        UINT32_C(0x08000000)
+#define M68K_MMU030_ATC_CACHE_INHIBIT   UINT32_C(0x04000000)
+#define M68K_MMU030_ATC_FC_SHIFT        23
+#define M68K_MMU030_ATC_FC_MASK         UINT32_C(0x03800000)
+#define M68K_MMU030_ATC_PAGE_BITS_SHIFT 19
+#define M68K_MMU030_ATC_PAGE_BITS_MASK  UINT32_C(0x00780000)
+
 typedef struct M68KMMU030MemoryOps {
     bool (*readl)(void *opaque, uint32_t address, uint32_t *value);
     bool (*writel)(void *opaque, uint32_t address, uint32_t value);
@@ -76,6 +93,11 @@ typedef struct M68KMMU030TranslateResult {
     bool fault;
     bool bus_error;
     bool limit_violation;
+    /* A failed table search creates a resident ATC entry with B set. */
+    bool atc_error;
+    bool write_protect;
+    bool supervisor_only;
+    bool modified;
 } M68KMMU030TranslateResult;
 
 typedef struct M68KMMU030ATCEntry {
@@ -108,6 +130,13 @@ typedef struct M68KMMU030State {
     uint32_t fault_status;
 } M68KMMU030State;
 
+typedef struct M68KMMU030ControlState {
+    uint64_t crp;
+    uint64_t srp;
+    uint32_t tc;
+    uint32_t tt[2];
+} M68KMMU030ControlState;
+
 void m68k_mmu030_reset(M68KMMU030State *state);
 
 bool m68k_mmu030_validate_tc(uint32_t tc);
@@ -123,9 +152,61 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                      uint8_t function_code, bool probe,
                      M68KMMU030TranslateResult *result);
 
+/* Shared translation path used by the 030 runtime and unit tests. */
+int m68k_mmu030_translate_state(
+    M68KMMU030State *state, const M68KMMU030MemoryOps *ops,
+    uint32_t logical_address, int access_type, uint8_t function_code,
+    bool probe, M68KMMU030TranslateResult *result);
+
 int m68k_mmu030_translate(CPUArchState *env, uint32_t logical_address,
                           int access_type, uint8_t function_code, bool probe,
                           M68KMMU030TranslateResult *result);
+
+/* Architectural address-translation-cache operations. */
+bool m68k_mmu030_atc_lookup(M68KMMU030State *state,
+                            uint32_t logical_address, int access_type,
+                            uint8_t function_code,
+                            M68KMMU030TranslateResult *result);
+void m68k_mmu030_atc_fill(M68KMMU030State *state, uint32_t logical_address,
+                          uint8_t function_code,
+                          const M68KMMU030TranslateResult *result);
+int m68k_mmu030_atc_preload(M68KMMU030State *state,
+                            const M68KMMU030MemoryOps *ops,
+                            uint32_t logical_address, int access_type,
+                            uint8_t function_code,
+                            M68KMMU030TranslateResult *result);
+int m68k_mmu030_atc_ptest(M68KMMU030State *state,
+                          uint32_t logical_address, bool is_write,
+                          uint8_t function_code,
+                          M68KMMU030TranslateResult *result);
+void m68k_mmu030_atc_flush_all(M68KMMU030State *state);
+void m68k_mmu030_atc_flush_fc(M68KMMU030State *state,
+                              uint8_t function_code,
+                              uint8_t function_code_mask);
+void m68k_mmu030_atc_flush_page(M68KMMU030State *state,
+                                uint32_t logical_address,
+                                uint8_t function_code,
+                                uint8_t function_code_mask);
+
+typedef void (*M68KMMU030ATCFlushAllFn)(void *opaque);
+typedef void (*M68KMMU030ATCFlushRangeFn)(void *opaque, uint32_t address,
+                                         uint32_t size);
+
+/* Flush an architectural scope and its derived QEMU TLB through callbacks. */
+void m68k_mmu030_atc_flush_all_coherent(
+    M68KMMU030State *state, M68KMMU030ATCFlushAllFn flush_all,
+    void *opaque);
+void m68k_mmu030_atc_flush_fc_coherent(
+    M68KMMU030State *state, uint8_t function_code,
+    uint8_t function_code_mask, M68KMMU030ATCFlushAllFn flush_all,
+    void *opaque);
+void m68k_mmu030_atc_flush_page_coherent(
+    M68KMMU030State *state, uint32_t logical_address,
+    uint8_t function_code, uint8_t function_code_mask,
+    M68KMMU030ATCFlushRangeFn flush_range, void *opaque);
+bool m68k_mmu030_reconfigure(
+    M68KMMU030State *state, const M68KMMU030ControlState *control,
+    bool flush, M68KMMU030ATCFlushAllFn flush_all, void *opaque);
 
 uint16_t m68k_mmu030_make_ssw(unsigned size, bool is_write, bool is_code,
                               uint8_t function_code);

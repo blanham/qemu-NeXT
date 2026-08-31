@@ -494,8 +494,9 @@ int m68k_mmu030_translate(CPUArchState *env, uint32_t logical_address,
         .opaque = cs->as,
     };
 
-    return m68k_mmu030_walk(&env->mmu030, &ops, logical_address, access_type,
-                            function_code, probe, result);
+    return m68k_mmu030_translate_state(
+        &env->mmu030, &ops, logical_address, access_type, function_code,
+        probe, result);
 }
 
 static void print_address_zone(uint32_t logical, uint32_t physical,

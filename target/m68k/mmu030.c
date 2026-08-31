@@ -27,6 +27,509 @@
 #define M68K_MMU030_TT_RW            (UINT32_C(1) << 9)
 #define M68K_MMU030_TT_RW_MASK       (UINT32_C(1) << 8)
 
+static unsigned m68k_mmu030_atc_page_bits(uint32_t status)
+{
+    unsigned page_bits = (status & M68K_MMU030_ATC_PAGE_BITS_MASK) >>
+                          M68K_MMU030_ATC_PAGE_BITS_SHIFT;
+
+    return page_bits >= 8 && page_bits <= 15 ? page_bits : 0;
+}
+
+static uint32_t m68k_mmu030_atc_page_size(uint32_t status)
+{
+    unsigned page_bits = m68k_mmu030_atc_page_bits(status);
+
+    return page_bits ? UINT32_C(1) << page_bits : 0;
+}
+
+static uint32_t m68k_mmu030_atc_active_page_size(
+    const M68KMMU030State *state)
+{
+    unsigned page_bits = (state->tc >> M68K_MMU030_TC_PS_SHIFT) & 0xf;
+
+    if (page_bits < 8 || page_bits > 15) {
+        page_bits = M68K_MMU030_DEFAULT_PAGE_BITS;
+    }
+    return UINT32_C(1) << page_bits;
+}
+
+static bool m68k_mmu030_atc_entry_valid(const M68KMMU030ATCEntry *entry)
+{
+    return (entry->status & M68K_MMU030_ATC_VALID) != 0 &&
+           m68k_mmu030_atc_page_bits(entry->status) != 0;
+}
+
+static uint8_t m68k_mmu030_atc_entry_fc(const M68KMMU030ATCEntry *entry)
+{
+    return (entry->status & M68K_MMU030_ATC_FC_MASK) >>
+           M68K_MMU030_ATC_FC_SHIFT;
+}
+
+static bool m68k_mmu030_atc_fc_match(const M68KMMU030ATCEntry *entry,
+                                     uint8_t function_code,
+                                     uint8_t function_code_mask)
+{
+    return (((m68k_mmu030_atc_entry_fc(entry) ^ function_code) &
+             function_code_mask & 7) == 0);
+}
+
+static bool m68k_mmu030_atc_address_match(
+    const M68KMMU030ATCEntry *entry, uint32_t logical_address)
+{
+    uint32_t page_size = m68k_mmu030_atc_page_size(entry->status);
+
+    return page_size != 0 &&
+           (entry->logical == (logical_address & ~(page_size - 1)));
+}
+
+static void m68k_mmu030_atc_result_from_entry(
+    const M68KMMU030ATCEntry *entry, uint32_t logical_address,
+    M68KMMU030TranslateResult *result)
+{
+    uint32_t page_size = m68k_mmu030_atc_page_size(entry->status);
+    uint32_t page_mask = ~(page_size - 1);
+
+    memset(result, 0, sizeof(*result));
+    result->physical = (entry->physical & page_mask) +
+                       (logical_address & ~page_mask);
+    result->page_size = page_size;
+    result->prot = PAGE_READ;
+    result->write_protect =
+        (entry->status & M68K_MMU030_ATC_WRITE_PROTECT) != 0;
+    result->supervisor_only =
+        (entry->status & M68K_MMU030_ATC_SUPERVISOR) != 0;
+    result->modified =
+        (entry->status & M68K_MMU030_ATC_MODIFIED) != 0;
+    result->cache_inhibit =
+        (entry->status & M68K_MMU030_ATC_CACHE_INHIBIT) != 0;
+    if (!result->write_protect) {
+        result->prot |= PAGE_WRITE;
+    }
+}
+
+bool m68k_mmu030_atc_lookup(M68KMMU030State *state,
+                            uint32_t logical_address, int access_type,
+                            uint8_t function_code,
+                            M68KMMU030TranslateResult *result)
+{
+    bool is_write = (access_type & M68K_MMU030_ACCESS_STORE) != 0;
+
+    if (!state || !result) {
+        return false;
+    }
+
+    memset(result, 0, sizeof(*result));
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        M68KMMU030ATCEntry *entry = &state->atc[i];
+        uint16_t mmusr = 0;
+
+        if (!m68k_mmu030_atc_entry_valid(entry) ||
+            m68k_mmu030_atc_entry_fc(entry) != (function_code & 7) ||
+            !m68k_mmu030_atc_address_match(entry, logical_address)) {
+            continue;
+        }
+
+        m68k_mmu030_atc_result_from_entry(entry, logical_address, result);
+        if (access_type & M68K_MMU030_ACCESS_CODE) {
+            result->prot |= PAGE_EXEC;
+        }
+        if (entry->status & M68K_MMU030_ATC_BUS_ERROR) {
+            result->bus_error = true;
+            mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I;
+        } else if (result->supervisor_only && !(function_code & 4)) {
+            mmusr = M68K_MMU030_MMUSR_S;
+        } else if (is_write && result->write_protect) {
+            mmusr = M68K_MMU030_MMUSR_WP;
+        }
+        if (mmusr) {
+            result->mmusr = mmusr;
+            result->fault = true;
+        }
+        return true;
+    }
+    return false;
+}
+
+void m68k_mmu030_atc_fill(M68KMMU030State *state, uint32_t logical_address,
+                          uint8_t function_code,
+                          const M68KMMU030TranslateResult *result)
+{
+    uint32_t page_size;
+    uint32_t page_mask;
+    unsigned page_bits;
+    unsigned slot = M68K_MMU030_ATC_ENTRIES;
+    bool replace = true;
+
+    if (!state || !result ||
+        (result->fault && !result->atc_error && !result->write_protect) ||
+        (result->mmusr & M68K_MMU030_MMUSR_T)) {
+        return;
+    }
+
+    page_size = result->page_size;
+    if (page_size < 256 || page_size > 32768 ||
+        (page_size & (page_size - 1)) != 0) {
+        return;
+    }
+    page_bits = 0;
+    while ((UINT32_C(1) << page_bits) < page_size) {
+        page_bits++;
+    }
+    if (page_bits < 8 || page_bits > 15) {
+        return;
+    }
+    page_mask = ~(page_size - 1);
+
+    /* A fill for an existing tag overwrites that tag in place. */
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        M68KMMU030ATCEntry *entry = &state->atc[i];
+
+        if (m68k_mmu030_atc_entry_valid(entry) &&
+            m68k_mmu030_atc_entry_fc(entry) == (function_code & 7) &&
+            m68k_mmu030_atc_address_match(entry, logical_address)) {
+            /* PLOAD/refill replaces a tag despite an older page size. */
+            if (slot == M68K_MMU030_ATC_ENTRIES) {
+                slot = i;
+            } else {
+                entry->status &= ~M68K_MMU030_ATC_VALID;
+            }
+            replace = false;
+        }
+    }
+
+    if (replace) {
+        /* Prefer an invalid entry, scanning from the deterministic cursor. */
+        for (unsigned offset = 0; offset < M68K_MMU030_ATC_ENTRIES;
+             offset++) {
+            unsigned candidate = (state->atc_next + offset) %
+                                  M68K_MMU030_ATC_ENTRIES;
+
+            if (!m68k_mmu030_atc_entry_valid(&state->atc[candidate])) {
+                slot = candidate;
+                break;
+            }
+        }
+        if (slot == M68K_MMU030_ATC_ENTRIES) {
+            slot = state->atc_next % M68K_MMU030_ATC_ENTRIES;
+        }
+    }
+
+    uint32_t status = M68K_MMU030_ATC_VALID |
+                      ((uint32_t)(function_code & 7) <<
+                       M68K_MMU030_ATC_FC_SHIFT) |
+                      ((uint32_t)page_bits << M68K_MMU030_ATC_PAGE_BITS_SHIFT);
+
+    if (result->atc_error) {
+        status |= M68K_MMU030_ATC_BUS_ERROR;
+    }
+    if (result->write_protect || !(result->prot & PAGE_WRITE)) {
+        status |= M68K_MMU030_ATC_WRITE_PROTECT;
+    }
+    if (result->supervisor_only) {
+        status |= M68K_MMU030_ATC_SUPERVISOR;
+    }
+    if (result->modified) {
+        status |= M68K_MMU030_ATC_MODIFIED;
+    }
+    if (result->cache_inhibit) {
+        status |= M68K_MMU030_ATC_CACHE_INHIBIT;
+    }
+
+    state->atc[slot].logical = logical_address & page_mask;
+    state->atc[slot].physical = result->physical & page_mask;
+    state->atc[slot].status = status;
+    if (replace) {
+        state->atc_next = (slot + 1) % M68K_MMU030_ATC_ENTRIES;
+    }
+}
+
+int m68k_mmu030_atc_preload(M68KMMU030State *state,
+                            const M68KMMU030MemoryOps *ops,
+                            uint32_t logical_address, int access_type,
+                            uint8_t function_code,
+                            M68KMMU030TranslateResult *result)
+{
+    uint32_t tc;
+    uint16_t mmusr;
+    int ret;
+
+    if (!state || !result) {
+        return -1;
+    }
+
+    /* PLOAD performs a table search even when ordinary translation is off. */
+    tc = state->tc;
+    mmusr = state->mmusr;
+    state->tc |= M68K_MMU030_TC_ENABLE;
+    ret = m68k_mmu030_walk(state, ops, logical_address, access_type,
+                           function_code, false, result);
+    state->tc = tc;
+    state->mmusr = mmusr;
+    if (ret == 0 || result->atc_error || result->write_protect) {
+        m68k_mmu030_atc_fill(state, logical_address, function_code, result);
+    }
+    return ret;
+}
+
+int m68k_mmu030_atc_ptest(M68KMMU030State *state,
+                          uint32_t logical_address, bool is_write,
+                          uint8_t function_code,
+                          M68KMMU030TranslateResult *result)
+{
+    bool matched = false;
+
+    if (!state || !result) {
+        return -1;
+    }
+
+    memset(result, 0, sizeof(*result));
+    for (unsigned i = 0; i < ARRAY_SIZE(state->tt); i++) {
+        M68KMMU030TTResult tt = m68k_mmu030_tt_match(
+            state->tt[i], logical_address, function_code, is_write);
+
+        if (tt.matched) {
+            result->physical = logical_address;
+            result->page_size = UINT32_C(1) << M68K_MMU030_DEFAULT_PAGE_BITS;
+            result->prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+            result->cache_inhibit = tt.cache_inhibit;
+            result->mmusr = M68K_MMU030_MMUSR_T;
+            state->mmusr = result->mmusr;
+            return 1;
+        }
+    }
+
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        M68KMMU030ATCEntry *entry = &state->atc[i];
+
+        if (!m68k_mmu030_atc_entry_valid(entry) ||
+            m68k_mmu030_atc_entry_fc(entry) != (function_code & 7) ||
+            !m68k_mmu030_atc_address_match(entry, logical_address)) {
+            continue;
+        }
+
+        m68k_mmu030_atc_result_from_entry(entry, logical_address, result);
+        if (entry->status & M68K_MMU030_ATC_BUS_ERROR) {
+            result->bus_error = true;
+            result->mmusr |= M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I;
+        } else {
+            if (entry->status & M68K_MMU030_ATC_WRITE_PROTECT) {
+                result->mmusr |= M68K_MMU030_MMUSR_WP;
+            }
+            if (entry->status & M68K_MMU030_ATC_MODIFIED) {
+                result->mmusr |= M68K_MMU030_MMUSR_M;
+            }
+        }
+        state->mmusr = result->mmusr;
+        matched = true;
+        break;
+    }
+
+    if (!matched) {
+        result->page_size = UINT32_C(1) << M68K_MMU030_DEFAULT_PAGE_BITS;
+        result->mmusr = M68K_MMU030_MMUSR_I;
+        result->fault = true;
+        state->mmusr = result->mmusr;
+    }
+    return 1;
+}
+
+void m68k_mmu030_atc_flush_all(M68KMMU030State *state)
+{
+    if (!state) {
+        return;
+    }
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        state->atc[i].status &= ~M68K_MMU030_ATC_VALID;
+    }
+}
+
+void m68k_mmu030_atc_flush_fc(M68KMMU030State *state,
+                              uint8_t function_code,
+                              uint8_t function_code_mask)
+{
+    if (!state) {
+        return;
+    }
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        M68KMMU030ATCEntry *entry = &state->atc[i];
+
+        if (m68k_mmu030_atc_entry_valid(entry) &&
+            m68k_mmu030_atc_fc_match(entry, function_code,
+                                     function_code_mask)) {
+            entry->status &= ~M68K_MMU030_ATC_VALID;
+        }
+    }
+}
+
+void m68k_mmu030_atc_flush_page(M68KMMU030State *state,
+                                uint32_t logical_address,
+                                uint8_t function_code,
+                                uint8_t function_code_mask)
+{
+    if (!state) {
+        return;
+    }
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        M68KMMU030ATCEntry *entry = &state->atc[i];
+
+        if (m68k_mmu030_atc_entry_valid(entry) &&
+            m68k_mmu030_atc_fc_match(entry, function_code,
+                                     function_code_mask) &&
+            m68k_mmu030_atc_address_match(entry, logical_address)) {
+            entry->status &= ~M68K_MMU030_ATC_VALID;
+        }
+    }
+}
+
+void m68k_mmu030_atc_flush_all_coherent(
+    M68KMMU030State *state, M68KMMU030ATCFlushAllFn flush_all, void *opaque)
+{
+    m68k_mmu030_atc_flush_all(state);
+    if (flush_all) {
+        flush_all(opaque);
+    }
+}
+
+void m68k_mmu030_atc_flush_fc_coherent(
+    M68KMMU030State *state, uint8_t function_code,
+    uint8_t function_code_mask, M68KMMU030ATCFlushAllFn flush_all,
+    void *opaque)
+{
+    m68k_mmu030_atc_flush_fc(state, function_code, function_code_mask);
+    /* QEMU's TLB has no FC tag, so an FC scope requires a full flush. */
+    if (flush_all) {
+        flush_all(opaque);
+    }
+}
+
+void m68k_mmu030_atc_flush_page_coherent(
+    M68KMMU030State *state, uint32_t logical_address,
+    uint8_t function_code, uint8_t function_code_mask,
+    M68KMMU030ATCFlushRangeFn flush_range, void *opaque)
+{
+    bool matched = false;
+
+    if (!state) {
+        return;
+    }
+
+    for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
+        M68KMMU030ATCEntry *entry = &state->atc[i];
+        uint32_t page_size;
+        uint32_t page_address;
+
+        if (!m68k_mmu030_atc_entry_valid(entry) ||
+            !m68k_mmu030_atc_fc_match(entry, function_code,
+                                      function_code_mask) ||
+            !m68k_mmu030_atc_address_match(entry, logical_address)) {
+            continue;
+        }
+
+        matched = true;
+        /* A matching entry retains its effective early-termination size. */
+        page_size = m68k_mmu030_atc_page_size(entry->status);
+        page_address = entry->logical & ~(page_size - 1);
+        entry->status &= ~M68K_MMU030_ATC_VALID;
+        if (flush_range) {
+            flush_range(opaque, page_address, page_size);
+        }
+    }
+
+    if (!matched && flush_range) {
+        uint32_t page_size = m68k_mmu030_atc_active_page_size(state);
+        uint32_t page_address = logical_address & ~(page_size - 1);
+
+        flush_range(opaque, page_address, page_size);
+    }
+}
+
+bool m68k_mmu030_reconfigure(
+    M68KMMU030State *state, const M68KMMU030ControlState *control,
+    bool flush, M68KMMU030ATCFlushAllFn flush_all, void *opaque)
+{
+    bool changed;
+
+    if (!state || !control || !m68k_mmu030_validate_tc(control->tc)) {
+        return false;
+    }
+
+    changed = state->crp != control->crp || state->srp != control->srp ||
+              state->tc != control->tc || state->tt[0] != control->tt[0] ||
+              state->tt[1] != control->tt[1];
+    if (!changed && !flush) {
+        return true;
+    }
+
+    /* Publish new translation controls only after invalidating old entries. */
+    if (flush) {
+        m68k_mmu030_atc_flush_all_coherent(state, flush_all, opaque);
+    }
+    if (!changed) {
+        return true;
+    }
+    state->crp = control->crp;
+    state->srp = control->srp;
+    state->tc = control->tc;
+    state->tt[0] = control->tt[0];
+    state->tt[1] = control->tt[1];
+    return true;
+}
+
+int m68k_mmu030_translate_state(
+    M68KMMU030State *state, const M68KMMU030MemoryOps *ops,
+    uint32_t logical_address, int access_type, uint8_t function_code,
+    bool probe, M68KMMU030TranslateResult *result)
+{
+    int ret;
+
+    if (!state || !result) {
+        return -1;
+    }
+
+    /* The existing 030 helper path is the level-zero PTEST operation. */
+    if (access_type & M68K_MMU030_ACCESS_PTEST) {
+        ret = m68k_mmu030_atc_ptest(
+            state, logical_address,
+            (access_type & M68K_MMU030_ACCESS_STORE) != 0,
+            function_code, result);
+        return ret < 0 ? ret : 0;
+    }
+
+    /* Transparent translation has priority over an architectural ATC hit. */
+    if (state->tc & M68K_MMU030_TC_ENABLE) {
+        bool transparent = false;
+
+        for (unsigned i = 0; i < ARRAY_SIZE(state->tt); i++) {
+            if (m68k_mmu030_tt_match(state->tt[i], logical_address,
+                                     function_code,
+                                     access_type & M68K_MMU030_ACCESS_STORE).
+                    matched) {
+                transparent = true;
+                break;
+            }
+        }
+
+        if (!transparent &&
+            m68k_mmu030_atc_lookup(state, logical_address, access_type,
+                                   function_code, result)) {
+            /* A clear M bit requires a table search before the first write. */
+            if ((access_type & M68K_MMU030_ACCESS_STORE) && !result->fault &&
+                !result->write_protect && !result->modified) {
+                goto table_walk;
+            }
+            return result->fault ? -1 : 0;
+        }
+    }
+
+table_walk:
+    ret = m68k_mmu030_walk(state, ops, logical_address, access_type,
+                           function_code, probe, result);
+    if (!probe && (state->tc & M68K_MMU030_TC_ENABLE)) {
+        m68k_mmu030_atc_fill(state, logical_address, function_code, result);
+    }
+    return ret;
+}
+
 bool m68k_mmu030_validate_tc(uint32_t tc)
 {
     unsigned page_size;
@@ -199,6 +702,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
     uint32_t table_address;
     uint32_t logical_shift;
     bool wp_seen = false;
+    bool supervisor_seen = false;
     bool cache_inhibit = false;
 
     memset(result, 0, sizeof(*result));
@@ -285,7 +789,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
         return -1;
     }
 
-    /* A root page descriptor is direct mapping, but still checks its limit. */
+    /* A root page maps directly; its limit applies only when FCL is clear. */
     logical_shift = 32 - initial_shift;
     unsigned first_index = 0;
     if (ti_count) {
@@ -296,13 +800,17 @@ int m68k_mmu030_walk(M68KMMU030State *state,
     if (root_dt == M68K_MMU030_DESC_PAGE) {
         uint32_t limit = (root_high & M68K_MMU030_DESC_LIMIT_MASK) >> 16;
         bool lower = (root_high & M68K_MMU030_DESC_LU) != 0;
+        bool root_wp = (root_high & M68K_MMU030_DESC_WP) != 0;
+        bool root_supervisor = (root_high & M68K_MMU030_DESC_S) != 0;
+        bool root_modified = (root_high & M68K_MMU030_DESC_M) != 0;
         bool limit_bad = (lower && limit != 0 && first_index < limit) ||
                          (!lower && limit != UINT32_C(0x7fff) &&
                           first_index > limit);
 
-        if (limit_bad) {
+        if ((state->tc & M68K_MMU030_TC_FCL) == 0 && limit_bad) {
             result->fault = true;
             result->limit_violation = true;
+            result->atc_error = true;
             mmusr = M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I;
             result->mmusr = mmusr;
             if (ptest) {
@@ -313,7 +821,30 @@ int m68k_mmu030_walk(M68KMMU030State *state,
 
         result->physical = root_address + logical_address;
         result->cache_inhibit = false;
-        result->mmusr = 0;
+        result->write_protect = root_wp;
+        result->supervisor_only = root_supervisor;
+        result->modified = root_modified;
+        if (root_supervisor && !is_super) {
+            result->mmusr = M68K_MMU030_MMUSR_S;
+            result->atc_error = true;
+            if (ptest) {
+                state->mmusr = result->mmusr;
+                return 0;
+            }
+            result->fault = true;
+            return -1;
+        }
+        result->mmusr = ptest ?
+            ((root_modified ? M68K_MMU030_MMUSR_M : 0) |
+             (root_wp ? M68K_MMU030_MMUSR_WP : 0)) : 0;
+        if (root_wp) {
+            result->prot &= ~PAGE_WRITE;
+        }
+        if (is_write && root_wp && !ptest) {
+            result->fault = true;
+            result->mmusr = M68K_MMU030_MMUSR_WP;
+            return -1;
+        }
         if (ptest) {
             state->mmusr = result->mmusr;
         }
@@ -330,6 +861,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
         if (limit_bad) {
             result->fault = true;
             result->limit_violation = true;
+            result->atc_error = true;
             mmusr = M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I;
             result->mmusr = mmusr;
             if (ptest) {
@@ -364,6 +896,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
         if (!have_index) {
             if (ti_index >= ti_count) {
                 result->fault = true;
+                result->atc_error = true;
                 result->mmusr = M68K_MMU030_MMUSR_I | table_count;
                 if (ptest) {
                     state->mmusr = result->mmusr;
@@ -385,6 +918,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             !ops->readl(ops->opaque, descriptor_address, &first)) {
             result->fault = true;
             result->bus_error = true;
+            result->atc_error = true;
             mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                     (table_count & M68K_MMU030_MMUSR_N_MASK);
             result->mmusr = mmusr;
@@ -398,6 +932,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                                         &second))) {
             result->fault = true;
             result->bus_error = true;
+            result->atc_error = true;
             mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                     (table_count & M68K_MMU030_MMUSR_N_MASK);
             result->mmusr = mmusr;
@@ -413,6 +948,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
         /* DT=0 is invalid; no other descriptor fields are interpreted. */
         if (dt == 0) {
             result->fault = true;
+            result->atc_error = true;
             mmusr = M68K_MMU030_MMUSR_I |
                     (table_count & M68K_MMU030_MMUSR_N_MASK);
             result->mmusr = mmusr;
@@ -436,6 +972,9 @@ int m68k_mmu030_walk(M68KMMU030State *state,
         if (descriptor_wp) {
             wp_seen = true;
         }
+        if (descriptor_s) {
+            supervisor_seen = true;
+        }
 
         /* Supervisor violations stop the search before the offending U bit. */
         if (descriptor_s && !is_super) {
@@ -445,6 +984,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                     (wp_seen ? M68K_MMU030_MMUSR_WP : 0) |
                     (table_count & M68K_MMU030_MMUSR_N_MASK);
             result->mmusr = mmusr;
+            result->atc_error = true;
             if (ptest) {
                 state->mmusr = mmusr;
                 return 0;
@@ -461,6 +1001,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                              first | M68K_MMU030_DESC_U)) {
                 result->fault = true;
                 result->bus_error = true;
+                result->atc_error = true;
                 mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                         (table_count & M68K_MMU030_MMUSR_N_MASK);
                 result->mmusr = mmusr;
@@ -487,6 +1028,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             if (limit_bad) {
                 result->fault = true;
                 result->limit_violation = true;
+                result->atc_error = true;
                 mmusr = M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I |
                         (table_count & M68K_MMU030_MMUSR_N_MASK);
                 result->mmusr = mmusr;
@@ -511,6 +1053,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                     !ops->writel(ops->opaque, descriptor_address, first)) {
                     result->fault = true;
                     result->bus_error = true;
+                    result->atc_error = true;
                     mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                             (table_count & M68K_MMU030_MMUSR_N_MASK);
                     result->mmusr = mmusr;
@@ -526,6 +1069,10 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                                 ((UINT32_C(1) <<
                                   (32 - initial_shift - logical_bits)) - 1));
             result->cache_inhibit = cache_inhibit;
+            result->write_protect = wp_seen;
+            result->supervisor_only = supervisor_seen;
+            result->modified =
+                (first & M68K_MMU030_DESC_M) != 0;
             result->mmusr = ptest ?
                  ((first & M68K_MMU030_DESC_M ?
                   M68K_MMU030_MMUSR_M : 0) |
@@ -562,6 +1109,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                               &indirect_second)))) {
                 result->fault = true;
                 result->bus_error = true;
+                result->atc_error = true;
                 mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                         (table_count & M68K_MMU030_MMUSR_N_MASK);
                 result->mmusr = mmusr;
@@ -573,6 +1121,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             if ((indirect_first & M68K_MMU030_DESC_DT_MASK) !=
                 M68K_MMU030_DESC_PAGE) {
                 result->fault = true;
+                result->atc_error = true;
                 mmusr = M68K_MMU030_MMUSR_I |
                         (table_count & M68K_MMU030_MMUSR_N_MASK);
                 result->mmusr = mmusr;
@@ -589,12 +1138,14 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             bool indirect_m =
                 (indirect_first & M68K_MMU030_DESC_M) != 0;
             wp_seen |= indirect_wp;
+            supervisor_seen |= indirect_s;
             if (indirect_s && !is_super) {
                 mmusr = M68K_MMU030_MMUSR_S |
                         (indirect_m ? M68K_MMU030_MMUSR_M : 0) |
                         (wp_seen ? M68K_MMU030_MMUSR_WP : 0) |
                         (table_count & M68K_MMU030_MMUSR_N_MASK);
                 result->mmusr = mmusr;
+                result->atc_error = true;
                 if (ptest) {
                     state->mmusr = mmusr;
                     return 0;
@@ -609,6 +1160,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                     !ops->writel(ops->opaque, indirect_address, updated)) {
                     result->fault = true;
                     result->bus_error = true;
+                    result->atc_error = true;
                     mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                             (table_count & M68K_MMU030_MMUSR_N_MASK);
                     result->mmusr = mmusr;
@@ -627,6 +1179,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                                  indirect_first)) {
                     result->fault = true;
                     result->bus_error = true;
+                    result->atc_error = true;
                     mmusr = M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I |
                             (table_count & M68K_MMU030_MMUSR_N_MASK);
                     result->mmusr = mmusr;
@@ -645,6 +1198,10 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                                 ((UINT32_C(1) <<
                                   (32 - initial_shift - logical_bits)) - 1));
             result->cache_inhibit = cache_inhibit;
+            result->write_protect = wp_seen;
+            result->supervisor_only = supervisor_seen;
+            result->modified =
+                (indirect_first & M68K_MMU030_DESC_M) != 0;
             result->mmusr = ptest ?
                 ((indirect_m ? M68K_MMU030_MMUSR_M : 0) |
                  (wp_seen ? M68K_MMU030_MMUSR_WP : 0) |
