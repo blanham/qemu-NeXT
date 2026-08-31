@@ -101,6 +101,90 @@ bool m68k_mmu030_pmove_decode(uint16_t extension, unsigned *reg,
     return true;
 }
 
+bool m68k_mmu030_control_decode(uint16_t extension,
+                                M68KMMU030ControlDecode *decode)
+{
+    unsigned format = (extension >> 13) & 7;
+    unsigned mode = (extension >> 10) & 7;
+    unsigned fc_field = extension & 0x1f;
+
+    if (!decode) {
+        return false;
+    }
+    memset(decode, 0, sizeof(*decode));
+    decode->mode = mode;
+
+    /* The function-code field is shared by all three operations. */
+    switch (fc_field & 0x18) {
+    case 0x10:
+        decode->function_code_source = M68K_MMU030_FC_IMMEDIATE;
+        decode->function_code_value = fc_field & 7;
+        break;
+    case 0x08:
+        decode->function_code_source = M68K_MMU030_FC_DREG;
+        decode->function_code_value = fc_field & 7;
+        break;
+    case 0:
+        if (fc_field == 0) {
+            decode->function_code_source = M68K_MMU030_FC_SFC;
+        } else if (fc_field == 1) {
+            decode->function_code_source = M68K_MMU030_FC_DFC;
+        } else {
+            return false;
+        }
+        break;
+    default:
+        return false;
+    }
+
+    switch (format) {
+    case 1: /* PLOAD and PFLUSH share the 030 PMMU format. */
+        if (mode == 0) {
+            /* PLOAD: bit 8 and bits 7:5 are reserved. */
+            if (extension & UINT16_C(0x01e0)) {
+                return false;
+            }
+            decode->operation = M68K_MMU030_CONTROL_PLOAD;
+            decode->is_write = (extension & UINT16_C(0x0200)) == 0;
+            return true;
+        }
+        if (mode != 1 && mode != 4 && mode != 6) {
+            return false;
+        }
+        /* PFLUSH has no R/W or A field. */
+        if (extension & UINT16_C(0x0300)) {
+            return false;
+        }
+        decode->operation = M68K_MMU030_CONTROL_PFLUSH;
+        decode->mask = (extension >> 5) & 7;
+        if (mode == 1 && (decode->mask != 0 || fc_field != 0)) {
+            return false;
+        }
+        return true;
+
+    case 4: /* PTEST. */
+        decode->operation = M68K_MMU030_CONTROL_PTEST;
+        decode->level = mode;
+        decode->is_write = (extension & UINT16_C(0x0200)) == 0;
+        decode->has_address_register = (extension & UINT16_C(0x0100)) != 0;
+        decode->address_register = (extension >> 5) & 7;
+        /*
+         * The register field is reserved when the A bit is clear.  Level
+         * zero additionally forbids the optional descriptor-address result.
+         */
+        if (!decode->has_address_register && decode->address_register != 0) {
+            return false;
+        }
+        if (decode->level == 0 && decode->has_address_register) {
+            return false;
+        }
+        return true;
+
+    default:
+        return false;
+    }
+}
+
 static unsigned m68k_mmu030_atc_page_bits(uint32_t status)
 {
     unsigned page_bits = (status & M68K_MMU030_ATC_PAGE_BITS_MASK) >>
@@ -773,13 +857,15 @@ bool m68k_mmu030_build_short_access_frame(
     return true;
 }
 
-int m68k_mmu030_walk(M68KMMU030State *state,
-                     const M68KMMU030MemoryOps *ops,
-                     uint32_t logical_address, int access_type,
-                     uint8_t function_code, bool probe,
-                     M68KMMU030TranslateResult *result)
+static int m68k_mmu030_walk_level(M68KMMU030State *state,
+                                  const M68KMMU030MemoryOps *ops,
+                                  uint32_t logical_address, int access_type,
+                                  uint8_t function_code, bool probe,
+                                  unsigned ptest_level,
+                                  M68KMMU030TranslateResult *result)
 {
     bool ptest = (access_type & M68K_MMU030_ACCESS_PTEST) != 0;
+    bool bounded_ptest = ptest && ptest_level != 0;
     bool no_history = probe || ptest;
     bool is_write = (access_type & M68K_MMU030_ACCESS_STORE) != 0;
     bool is_super = (function_code & 4) != 0;
@@ -809,28 +895,36 @@ int m68k_mmu030_walk(M68KMMU030State *state,
     }
     result->prot = prot;
 
-    /* Transparent translation is independent of TC.E. */
-    for (unsigned i = 0; i < ARRAY_SIZE(state->tt); i++) {
-        M68KMMU030TTResult tt = m68k_mmu030_tt_match(
-            state->tt[i], logical_address, function_code, is_write);
+    /*
+     * Transparent translation applies to level zero only.  A table PTEST
+     * explicitly bypasses both the TTs and the ATC.
+     */
+    if (!bounded_ptest) {
+        for (unsigned i = 0; i < ARRAY_SIZE(state->tt); i++) {
+            M68KMMU030TTResult tt = m68k_mmu030_tt_match(
+                state->tt[i], logical_address, function_code, is_write);
 
-        if (tt.matched) {
-            mmusr = M68K_MMU030_MMUSR_T;
-            result->physical = logical_address;
-            result->cache_inhibit = tt.cache_inhibit;
-            result->mmusr = mmusr;
-            if (ptest) {
-                state->mmusr = mmusr;
+            if (tt.matched) {
+                mmusr = M68K_MMU030_MMUSR_T;
+                result->physical = logical_address;
+                result->cache_inhibit = tt.cache_inhibit;
+                result->mmusr = mmusr;
+                if (ptest) {
+                    state->mmusr = mmusr;
+                }
+                return 0;
             }
-            return 0;
         }
     }
 
-    if ((state->tc & M68K_MMU030_TC_ENABLE) == 0) {
+    if (!bounded_ptest && (state->tc & M68K_MMU030_TC_ENABLE) == 0) {
         result->physical = logical_address;
         result->cache_inhibit = false;
         result->mmusr = 0;
         result->prot = prot;
+        if (ptest) {
+            state->mmusr = result->mmusr;
+        }
         return 0;
     }
 
@@ -854,15 +948,6 @@ int m68k_mmu030_walk(M68KMMU030State *state,
     while (ti_count < ARRAY_SIZE(ti_width) && ti_width[ti_count]) {
         ti_count++;
     }
-    if (ti_count == 0) {
-        result->fault = true;
-        result->mmusr = M68K_MMU030_MMUSR_I;
-        if (ptest) {
-            state->mmusr = result->mmusr;
-        }
-        return -1;
-    }
-
     if ((state->tc & M68K_MMU030_TC_SRE) && (function_code & 4)) {
         root_high = state->srp >> 32;
         root_address = state->srp;
@@ -1036,6 +1121,13 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             return -1;
         }
 
+        /*
+         * A long descriptor is successful only after both words have been
+         * fetched.  Keep the previous address on a partial/bus-faulted
+         * fetch.
+         */
+        result->descriptor_address = descriptor_address;
+
         descriptor = first;
         dt = descriptor & M68K_MMU030_DESC_DT_MASK;
 
@@ -1085,6 +1177,19 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             }
             result->fault = true;
             return -1;
+        }
+
+        /*
+         * A bounded table PTEST stops after the requested descriptor.  A
+         * page descriptor is still processed to report its attributes, while
+         * an indirect descriptor is followed only when the requested level
+         * extends past it.
+         */
+        if (bounded_ptest && table_count >= ptest_level && !source_page) {
+            result->mmusr = (wp_seen ? M68K_MMU030_MMUSR_WP : 0) |
+                            (table_count & M68K_MMU030_MMUSR_N_MASK);
+            state->mmusr = result->mmusr;
+            return 0;
         }
 
         /* U is meaningful in table descriptors and page descriptors. */
@@ -1194,6 +1299,13 @@ int m68k_mmu030_walk(M68KMMU030State *state,
             bool indirect_long = dt == M68K_MMU030_DESC_VALID8;
             uint32_t page_address;
 
+            if (bounded_ptest) {
+                /*
+                 * The indirect page descriptor is an additional table level
+                 * for PTEST's MMUSR.N accounting.
+                 */
+                table_count++;
+            }
             indirect_address &= ~UINT32_C(3);
             if (!ops || !ops->readl ||
                 !ops->readl(ops->opaque, indirect_address,
@@ -1212,6 +1324,7 @@ int m68k_mmu030_walk(M68KMMU030State *state,
                 }
                 return -1;
             }
+            result->descriptor_address = indirect_address;
             if ((indirect_first & M68K_MMU030_DESC_DT_MASK) !=
                 M68K_MMU030_DESC_PAGE) {
                 result->fault = true;
@@ -1320,4 +1433,42 @@ int m68k_mmu030_walk(M68KMMU030State *state,
         table_address = next_table;
         long_format = dt == M68K_MMU030_DESC_VALID8;
     }
+}
+
+int m68k_mmu030_walk(M68KMMU030State *state,
+                     const M68KMMU030MemoryOps *ops,
+                     uint32_t logical_address, int access_type,
+                     uint8_t function_code, bool probe,
+                     M68KMMU030TranslateResult *result)
+{
+    /*
+     * Preserve the historical walker contract: a direct PTEST-marked walk
+     * remains unbounded.  Architectural PTEST levels use the API below.
+     */
+    return m68k_mmu030_walk_level(state, ops, logical_address, access_type,
+                                  function_code, probe, 0, result);
+}
+
+int m68k_mmu030_ptest(M68KMMU030State *state,
+                      const M68KMMU030MemoryOps *ops,
+                      uint32_t logical_address, bool is_write,
+                      uint8_t function_code, unsigned level,
+                      M68KMMU030TranslateResult *result)
+{
+    int access_type = M68K_MMU030_ACCESS_PTEST;
+
+    if (!state || !result || level == 0 || level > 7) {
+        return -1;
+    }
+    if (is_write) {
+        access_type |= M68K_MMU030_ACCESS_STORE;
+    }
+
+    /*
+     * PTEST reports architectural status rather than taking the walk's
+     * translation fault as a helper error.
+     */
+    m68k_mmu030_walk_level(state, ops, logical_address, access_type,
+                           function_code, true, level, result);
+    return 0;
 }

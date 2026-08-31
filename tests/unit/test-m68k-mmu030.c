@@ -168,6 +168,90 @@ static void test_mmu030_pmove_extension_decode(void)
     }
 }
 
+static void test_mmu030_control_extension_decode(void)
+{
+    static const struct {
+        uint16_t extension;
+        M68KMMU030ControlOperation operation;
+        M68KMMU030FunctionCodeSource function_code_source;
+        unsigned function_code_value;
+        bool is_write;
+        unsigned mode;
+        unsigned mask;
+    } valid[] = {
+        { UINT16_C(0x8011), M68K_MMU030_CONTROL_PTEST,
+          M68K_MMU030_FC_IMMEDIATE, 1, true },
+        { UINT16_C(0x8511), M68K_MMU030_CONTROL_PTEST,
+          M68K_MMU030_FC_IMMEDIATE, 1, true },
+        { UINT16_C(0x8211), M68K_MMU030_CONTROL_PTEST,
+          M68K_MMU030_FC_IMMEDIATE, 1, false },
+        { UINT16_C(0x2200), M68K_MMU030_CONTROL_PLOAD,
+          M68K_MMU030_FC_SFC, 0, false },
+        { UINT16_C(0x2001), M68K_MMU030_CONTROL_PLOAD,
+          M68K_MMU030_FC_DFC, 0, true },
+        { UINT16_C(0x220b), M68K_MMU030_CONTROL_PLOAD,
+          M68K_MMU030_FC_DREG, 3, false },
+        { UINT16_C(0x2015), M68K_MMU030_CONTROL_PLOAD,
+          M68K_MMU030_FC_IMMEDIATE, 5, true },
+        { UINT16_C(0x2400), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_SFC, 0, false, 1, 0 }, /* PFLUSHA */
+        { UINT16_C(0x30f1), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_IMMEDIATE, 1, false, 4, 7 },
+        { UINT16_C(0x30e8), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_DREG, 0, false, 4, 7 },
+        { UINT16_C(0x30e0), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_SFC, 0, false, 4, 7 },
+        { UINT16_C(0x30e1), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_DFC, 0, false, 4, 7 },
+        { UINT16_C(0x38f1), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_IMMEDIATE, 1, false, 6, 7 },
+        { UINT16_C(0x3895), M68K_MMU030_CONTROL_PFLUSH,
+          M68K_MMU030_FC_IMMEDIATE, 5, false, 6, 4 },
+    };
+    static const uint16_t invalid[] = {
+        UINT16_C(0x8420), /* PTEST A=0 must encode An=0. */
+        UINT16_C(0x8101), /* Level zero with an address register is illegal. */
+        UINT16_C(0x2300), /* PLOAD bit 8 is reserved. */
+        UINT16_C(0x2220), /* PLOAD bits 7:5 are reserved. */
+        UINT16_C(0x2202), /* FC 00010 is reserved. */
+        UINT16_C(0x2500), /* PFLUSHA has reserved extension bits. */
+        UINT16_C(0x2401), /* PFLUSHA must encode FC=00000. */
+        UINT16_C(0x3002), /* PFLUSH has a reserved function-code source. */
+        UINT16_C(0x3400), /* PFLUSH mode is reserved. */
+        UINT16_C(0x6000), /* PMOVE extension, not a control operation. */
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(valid); i++) {
+        M68KMMU030ControlDecode decode;
+
+        g_assert_true(m68k_mmu030_control_decode(valid[i].extension,
+                                                 &decode));
+        g_assert_cmpint(decode.operation, ==, valid[i].operation);
+        g_assert_cmpint(decode.function_code_source, ==,
+                        valid[i].function_code_source);
+        g_assert_cmpuint(decode.function_code_value, ==,
+                         valid[i].function_code_value);
+        g_assert_cmpint(decode.is_write, ==, valid[i].is_write);
+        if (valid[i].operation == M68K_MMU030_CONTROL_PTEST) {
+            g_assert_cmpuint(decode.level, ==,
+                             (valid[i].extension >> 10) & 7);
+            g_assert_cmpuint(decode.address_register, ==,
+                             (valid[i].extension >> 5) & 7);
+            g_assert_cmpint(decode.has_address_register, ==,
+                            (valid[i].extension & 0x100) != 0);
+        } else {
+            g_assert_cmpuint(decode.mode, ==, valid[i].mode);
+            g_assert_cmpuint(decode.mask, ==, valid[i].mask);
+        }
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++) {
+        M68KMMU030ControlDecode decode;
+
+        g_assert_false(m68k_mmu030_control_decode(invalid[i], &decode));
+    }
+}
+
 typedef struct MigrationSubsection {
     uint8_t *data;
     size_t size;
@@ -1372,20 +1456,51 @@ static void test_mmu030_atc_preload_and_level_zero_ptest(void)
     mmu030_test_putl(&memory, UINT32_C(0x2000) + page_index * 4,
                      UINT32_C(0x00abc001));
 
-    /* PLOAD must leave the pre-existing MMUSR untouched, even on a probe. */
+    /* PLOADR updates U bits, fills the ATC, and preserves MMUSR. */
     state.mmusr = UINT16_C(0x55aa);
     g_assert_cmpint(m68k_mmu030_atc_preload(
                         &state, &ops, logical,
-                        MMU030_TEST_ACCESS_DATA | MMU030_TEST_ACCESS_PTEST, 1,
+                        MMU030_TEST_ACCESS_DATA, 1,
                         &result), ==, 0);
     g_assert_cmpuint(state.mmusr, ==, UINT16_C(0x55aa));
     g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+    g_assert_cmpuint(mmu030_test_getl(&memory, UINT32_C(0x1000) +
+                                      root_index * 4), ==,
+                     UINT32_C(0x200a));
+    g_assert_cmpuint(mmu030_test_getl(&memory, UINT32_C(0x2000) +
+                                      page_index * 4), ==,
+                     UINT32_C(0x00abc009));
+
+    memory.read_count = 0;
+    g_assert_true(m68k_mmu030_atc_ptest(&state, logical, false, 1,
+                                        &result));
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
+    g_assert_cmpuint(result.mmusr, ==, 0);
+    g_assert_cmpuint(memory.read_count, ==, 0);
+
+    /* PLOADW adds M and updates the ATC permissions without operand access. */
+    state.mmusr = UINT16_C(0x55aa);
+    memory.read_count = 0;
+    memory.write_count = 0;
+    g_assert_cmpint(m68k_mmu030_atc_preload(
+                        &state, &ops, logical,
+                        MMU030_TEST_ACCESS_DATA | MMU030_TEST_ACCESS_STORE,
+                        1, &result), ==, 0);
+    g_assert_cmpuint(state.mmusr, ==, UINT16_C(0x55aa));
+    g_assert_cmpuint(memory.read_count, ==, 2);
+    g_assert_cmpuint(memory.write_count, ==, 1);
+    g_assert_cmpuint(mmu030_test_getl(&memory, UINT32_C(0x2000) +
+                                      page_index * 4), ==,
+                     UINT32_C(0x00abc019));
+    g_assert_true(m68k_mmu030_atc_lookup(
+        &state, logical, MMU030_TEST_ACCESS_DATA, 1, &result));
+    g_assert_true(result.modified);
 
     memory.read_count = 0;
     g_assert_true(m68k_mmu030_atc_ptest(&state, logical, false, 1,
                                        &result));
     g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
-    g_assert_cmpuint(result.mmusr, ==, 0);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_M);
     g_assert_cmpuint(memory.read_count, ==, 0);
 
     /* The runtime translation entry point must use the ATC-only PTEST path. */
@@ -1395,7 +1510,7 @@ static void test_mmu030_atc_preload_and_level_zero_ptest(void)
                         &state, &ops, logical, MMU030_TEST_ACCESS_PTEST, 1,
                         true, &result), ==, 0);
     g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
-    g_assert_cmpuint(result.mmusr, ==, 0);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_M);
     g_assert_cmpuint(memory.read_count, ==, 0);
     g_assert_cmpuint(memory.write_count, ==, 0);
 
@@ -1420,7 +1535,7 @@ static void test_mmu030_atc_preload_and_level_zero_ptest(void)
     memory.fail_read = true;
     g_assert_cmpint(m68k_mmu030_atc_preload(
                         &state, &ops, logical,
-                        MMU030_TEST_ACCESS_DATA | MMU030_TEST_ACCESS_PTEST, 1,
+                        MMU030_TEST_ACCESS_DATA, 1,
                         &result), ==, -1);
     g_assert_cmpuint(state.mmusr, ==, UINT16_C(0xaa55));
     memory.fail_read = false;
@@ -1432,6 +1547,156 @@ static void test_mmu030_atc_preload_and_level_zero_ptest(void)
                         &state, &ops, logical, MMU030_TEST_ACCESS_DATA, 1,
                         &result), ==, 0);
     g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+}
+
+static void test_mmu030_ptest_table_levels(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    M68KMMU030TranslateResult mapping;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const uint32_t root_entry = UINT32_C(0x1000) +
+                                ((logical >> 22) & 0x3ff) * 4;
+    const uint32_t page_entry = UINT32_C(0x2000) +
+                                ((logical >> 12) & 0x3ff) * 4;
+    const uint16_t level_one = UINT16_C(1);
+    const uint16_t level_two = UINT16_C(2);
+    unsigned atc_count;
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x2002));
+    mmu030_test_putl(&memory, page_entry,
+                     UINT32_C(0x00abc001) | M68K_MMU030_DESC_M);
+
+    /* A table PTEST ignores a resident ATC entry and does not fill it. */
+    mapping = mmu030_test_atc_result(UINT32_C(0xfeed0000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, logical, 1, &mapping);
+    atc_count = mmu030_test_atc_valid_count(&state);
+    memory.read_count = 0;
+    memory.write_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, false, 1,
+                                      level_one, &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, 1);
+    g_assert_cmpuint(result.descriptor_address, ==, root_entry);
+    g_assert_cmpuint(state.mmusr, ==, 1);
+    g_assert_cmpuint(memory.read_count, ==, 1);
+    g_assert_cmpuint(memory.write_count, ==, 0);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, atc_count);
+    g_assert_cmpuint(mmu030_test_getl(&memory, root_entry), ==,
+                     UINT32_C(0x2002));
+
+    /* A page terminal stops early and reports the page's M bit and N=2. */
+    memory.read_count = 0;
+    memory.write_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, true, 1,
+                                      level_two, &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_M | 2);
+    g_assert_cmpuint(result.descriptor_address, ==, page_entry);
+    g_assert_cmpuint(state.mmusr, ==, M68K_MMU030_MMUSR_M | 2);
+    g_assert_cmpuint(memory.read_count, ==, 2);
+    g_assert_cmpuint(memory.write_count, ==, 0);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, atc_count);
+    g_assert_cmpuint(mmu030_test_getl(&memory, page_entry), ==,
+                     UINT32_C(0x00abc011));
+
+    /* A requested level beyond a terminal does not fetch another table. */
+    memory.read_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, false, 1,
+                                      7, &result), ==, 0);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_M | 2);
+    g_assert_cmpuint(result.descriptor_address, ==, page_entry);
+    g_assert_cmpuint(memory.read_count, ==, 2);
+}
+
+static void test_mmu030_ptest_indirect_level_bounds(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned a_index = (logical >> 28) & 0xf;
+    const unsigned b_index = (logical >> 24) & 0xf;
+    const unsigned c_index = (logical >> 20) & 0xf;
+    const unsigned d_index = (logical >> 12) & 0xff;
+    const uint32_t fc_entry = UINT32_C(0x1000) + 5 * 4;
+    const uint32_t a_entry = UINT32_C(0x2000) + a_index * 4;
+    const uint32_t b_entry = UINT32_C(0x3000) + b_index * 4;
+    const uint32_t c_entry = UINT32_C(0x4000) + c_index * 4;
+    const uint32_t d_entry = UINT32_C(0x5000) + d_index * 4;
+    const uint32_t indirect_page = UINT32_C(0x7000);
+    const uint32_t fc_descriptor = UINT32_C(0x2002);
+    const uint32_t a_descriptor = UINT32_C(0x3002);
+    const uint32_t b_descriptor = UINT32_C(0x4002);
+    const uint32_t c_descriptor = UINT32_C(0x5002);
+    const uint32_t d_descriptor = indirect_page | M68K_MMU030_DESC_VALID4;
+    const uint32_t page_descriptor = UINT32_C(0x00abc000) |
+                                     M68K_MMU030_DESC_PAGE |
+                                     M68K_MMU030_DESC_M;
+
+    /* FC lookup plus A/B/C/D gives the architectural five-level maximum. */
+    state.tc = mmu030_tc(12, 0, 4, 4, 4, 8) | M68K_MMU030_TC_FCL;
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, fc_entry, fc_descriptor);
+    mmu030_test_putl(&memory, a_entry, a_descriptor);
+    mmu030_test_putl(&memory, b_entry, b_descriptor);
+    mmu030_test_putl(&memory, c_entry, c_descriptor);
+    mmu030_test_putl(&memory, d_entry, d_descriptor);
+    mmu030_test_putl(&memory, indirect_page, page_descriptor);
+
+    /* PTEST level 4 stops immediately before the indirect descriptor. */
+    memory.read_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, false, 5, 4,
+                                      &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, 4);
+    g_assert_cmpuint(result.descriptor_address, ==, c_entry);
+    g_assert_cmpuint(memory.read_count, ==, 4);
+
+    /* At level 5, the indirect descriptor itself is the last fetched entry. */
+    memory.read_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, false, 5, 5,
+                                      &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, 5);
+    g_assert_cmpuint(result.descriptor_address, ==, d_entry);
+    g_assert_cmpuint(memory.read_count, ==, 5);
+
+    /* Level 6 follows indirection and counts the fetched page descriptor. */
+    memory.read_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, false, 5, 6,
+                                      &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_M | 6);
+    g_assert_true(result.modified);
+    g_assert_cmpuint(result.descriptor_address, ==, indirect_page);
+    g_assert_cmpuint(memory.read_count, ==, 6);
+
+    /* Level 7 requests the bottom of the same six-level tree. */
+    memory.read_count = 0;
+    g_assert_cmpint(m68k_mmu030_ptest(&state, &ops, logical, false, 5, 7,
+                                      &result), ==, 0);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_M | 6);
+    g_assert_cmpuint(result.descriptor_address, ==, indirect_page);
+    g_assert_cmpuint(memory.read_count, ==, 6);
+
+    /* PTEST is a read-only table probe: U and M remain exactly as fetched. */
+    g_assert_cmpuint(mmu030_test_getl(&memory, fc_entry), ==, fc_descriptor);
+    g_assert_cmpuint(mmu030_test_getl(&memory, a_entry), ==, a_descriptor);
+    g_assert_cmpuint(mmu030_test_getl(&memory, b_entry), ==, b_descriptor);
+    g_assert_cmpuint(mmu030_test_getl(&memory, c_entry), ==, c_descriptor);
+    g_assert_cmpuint(mmu030_test_getl(&memory, d_entry), ==, d_descriptor);
+    g_assert_cmpuint(mmu030_test_getl(&memory, indirect_page), ==,
+                     page_descriptor);
 }
 
 typedef struct M68KMMU030FlushTrace {
@@ -1685,10 +1950,16 @@ int main(int argc, char **argv)
                     test_mmu030_atc_descriptor_attributes_and_errors);
     g_test_add_func("/m68k/mmu030/atc-preload-ptest",
                     test_mmu030_atc_preload_and_level_zero_ptest);
+    g_test_add_func("/m68k/mmu030/ptest-table-levels",
+                    test_mmu030_ptest_table_levels);
+    g_test_add_func("/m68k/mmu030/ptest-indirect-level-bounds",
+                    test_mmu030_ptest_indirect_level_bounds);
     g_test_add_func("/m68k/mmu030/atc-coherent-flush-wrappers",
                     test_mmu030_atc_coherent_flush_wrappers);
     g_test_add_func("/m68k/mmu030/pmove-extension-decode",
                     test_mmu030_pmove_extension_decode);
+    g_test_add_func("/m68k/mmu030/control-extension-decode",
+                    test_mmu030_control_extension_decode);
     g_test_add_func("/m68k/mmu030/control-reconfigure",
                     test_mmu030_control_reconfigure);
     g_test_add_func("/m68k/mmu030/tt-derived-flush",

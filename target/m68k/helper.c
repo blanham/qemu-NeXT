@@ -1733,6 +1733,143 @@ void HELPER(m68k_pmove)(CPUM68KState *env, uint32_t extension,
     }
 }
 
+static bool m68k_mmu030_control_fc(CPUM68KState *env,
+                                   const M68KMMU030ControlDecode *control,
+                                   uint8_t *function_code)
+{
+    unsigned value;
+
+    switch (control->function_code_source) {
+    case M68K_MMU030_FC_SFC:
+        value = env->sfc;
+        break;
+    case M68K_MMU030_FC_DFC:
+        value = env->dfc;
+        break;
+    case M68K_MMU030_FC_DREG:
+        value = env->dregs[control->function_code_value];
+        break;
+    case M68K_MMU030_FC_IMMEDIATE:
+        value = control->function_code_value;
+        break;
+    default:
+        return false;
+    }
+    *function_code = value & 7;
+    return true;
+}
+
+static int m68k_mmu030_control_access(uint8_t function_code, bool is_write)
+{
+    int access_type = ACCESS_DATA;
+
+    if (function_code & 4) {
+        access_type |= ACCESS_SUPER;
+    }
+    if ((function_code & 3) == 2) {
+        access_type |= ACCESS_CODE;
+    }
+    if (is_write) {
+        access_type |= ACCESS_STORE;
+    }
+    return access_type;
+}
+
+void HELPER(m68k_pload030)(CPUM68KState *env, uint32_t address,
+                           uint32_t extension)
+{
+    M68KMMU030ControlDecode control;
+    M68KMMU030TranslateResult result;
+    M68KMMU030MemoryOps ops = {
+        .readl = m68k_mmu030_address_space_readl,
+        .writel = m68k_mmu030_address_space_writel,
+        .opaque = env_cpu(env)->as,
+    };
+    uint8_t function_code;
+
+    if (!m68k_mmu030_control_decode(extension, &control) ||
+        control.operation != M68K_MMU030_CONTROL_PLOAD ||
+        !m68k_mmu030_control_fc(env, &control, &function_code)) {
+        raise_exception_ra(env, EXCP_LINEF, GETPC());
+    }
+
+    /* PLOAD performs its own table search even when TC.E is clear. */
+    m68k_mmu030_atc_preload(&env->mmu030, &ops, address,
+                            m68k_mmu030_control_access(function_code,
+                                                        control.is_write),
+                            function_code, &result);
+    /*
+     * PLOAD replaces this architectural tag; invalidate any stale derived
+     * translation for the logical page without flushing the whole ATC.
+     */
+    tlb_flush_page(env_cpu(env), address);
+}
+
+void HELPER(m68k_ptest030)(CPUM68KState *env, uint32_t address,
+                           uint32_t extension)
+{
+    M68KMMU030ControlDecode control;
+    M68KMMU030TranslateResult result;
+    M68KMMU030MemoryOps ops = {
+        .readl = m68k_mmu030_address_space_readl,
+        .writel = m68k_mmu030_address_space_writel,
+        .opaque = env_cpu(env)->as,
+    };
+    uint8_t function_code;
+
+    if (!m68k_mmu030_control_decode(extension, &control) ||
+        control.operation != M68K_MMU030_CONTROL_PTEST ||
+        !m68k_mmu030_control_fc(env, &control, &function_code)) {
+        raise_exception_ra(env, EXCP_LINEF, GETPC());
+    }
+
+    if (control.level == 0) {
+        m68k_mmu030_atc_ptest(&env->mmu030, address, control.is_write,
+                              function_code, &result);
+    } else {
+        m68k_mmu030_ptest(&env->mmu030, &ops, address, control.is_write,
+                          function_code, control.level, &result);
+        if (control.has_address_register) {
+            env->aregs[control.address_register] = result.descriptor_address;
+        }
+    }
+}
+
+void HELPER(m68k_pflush030)(CPUM68KState *env, uint32_t address,
+                            uint32_t extension)
+{
+    M68KMMU030ControlDecode control;
+    uint8_t function_code;
+    CPUState *cs = env_cpu(env);
+
+    if (!m68k_mmu030_control_decode(extension, &control) ||
+        control.operation != M68K_MMU030_CONTROL_PFLUSH ||
+        !m68k_mmu030_control_fc(env, &control, &function_code)) {
+        raise_exception_ra(env, EXCP_LINEF, GETPC());
+    }
+
+    switch (control.mode) {
+    case 1:
+        m68k_mmu030_atc_flush_all_coherent(&env->mmu030,
+                                           m68k_pmove_flush_all, cs);
+        break;
+    case 4:
+        m68k_mmu030_atc_flush_fc_coherent(&env->mmu030, function_code,
+                                          control.mask,
+                                          m68k_pmove_flush_all, cs);
+        break;
+    case 6:
+        m68k_mmu030_atc_flush_page_coherent(
+            &env->mmu030, address, function_code, control.mask,
+            (M68KMMU030ATCFlushRangeFn)NULL, cs);
+        /* A target TLB has no FC tag; invalidate the matching page scope. */
+        tlb_flush_page(cs, address);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
 void HELPER(ptest)(CPUM68KState *env, uint32_t addr, uint32_t is_read)
 {
     hwaddr physical;

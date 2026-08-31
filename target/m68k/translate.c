@@ -4654,7 +4654,7 @@ DISAS_INSN(ptest)
     gen_helper_ptest(tcg_env, AREG(insn, 0), is_read);
 }
 
-/* MC68030 PMMU instructions accept only control-alterable EAs. */
+/* PMOVE accepts control addressing modes, including PC-relative modes. */
 static bool m68k_pmove_ea_valid(uint16_t insn)
 {
     unsigned mode = extract32(insn, 3, 3);
@@ -4664,9 +4664,29 @@ static bool m68k_pmove_ea_valid(uint16_t insn)
            (mode == 7 && reg < 4);
 }
 
+/*
+ * PLOAD, PTEST, and the address form of PFLUSH accept only control-alterable
+ * modes; unlike PMOVE, PC-relative modes are not permitted.
+ */
+static bool m68k_mmu030_control_ea_valid(uint16_t insn)
+{
+    unsigned mode = extract32(insn, 3, 3);
+    unsigned reg = extract32(insn, 0, 3);
+
+    return mode == 2 || mode == 5 || mode == 6 ||
+           (mode == 7 && reg < 2);
+}
+
+/* PFLUSHA and FC/mask-only PFLUSH encode no EA in the first word. */
+static bool m68k_mmu030_no_ea_valid(uint16_t insn)
+{
+    return (insn & UINT16_C(0x003f)) == 0;
+}
+
 DISAS_INSN(pmove)
 {
     uint16_t extension = read_im16(env, s);
+    M68KMMU030ControlDecode control;
     unsigned reg;
     unsigned size;
     bool direction;
@@ -4678,6 +4698,60 @@ DISAS_INSN(pmove)
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
+
+    if (m68k_mmu030_control_decode(extension, &control)) {
+        address = tcg_constant_i32(0);
+
+        if (control.operation == M68K_MMU030_CONTROL_PLOAD) {
+            if (!m68k_mmu030_control_ea_valid(insn)) {
+                gen_exception(s, s->base.pc_next, EXCP_LINEF);
+                return;
+            }
+            address = gen_lea(env, s, insn, OS_UNSIZED);
+            if (IS_NULL_QREG(address)) {
+                gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
+                return;
+            }
+            gen_helper_m68k_pload030(tcg_env, address,
+                                     tcg_constant_i32(extension));
+            return;
+        }
+
+        if (control.operation == M68K_MMU030_CONTROL_PTEST) {
+            if (!m68k_mmu030_control_ea_valid(insn)) {
+                gen_exception(s, s->base.pc_next, EXCP_LINEF);
+                return;
+            }
+            address = gen_lea(env, s, insn, OS_UNSIZED);
+            if (IS_NULL_QREG(address)) {
+                gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
+                return;
+            }
+            gen_helper_m68k_ptest030(tcg_env, address,
+                                     tcg_constant_i32(extension));
+            return;
+        }
+
+        /* PFLUSHA and FC-only PFLUSH forms have no effective address. */
+        if (control.mode == 6) {
+            if (!m68k_mmu030_control_ea_valid(insn)) {
+                gen_exception(s, s->base.pc_next, EXCP_LINEF);
+                return;
+            }
+            address = gen_lea(env, s, insn, OS_UNSIZED);
+            if (IS_NULL_QREG(address)) {
+                gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
+                return;
+            }
+        } else if (!m68k_mmu030_no_ea_valid(insn)) {
+            gen_exception(s, s->base.pc_next, EXCP_LINEF);
+            return;
+        }
+        gen_helper_m68k_pflush030(tcg_env, address,
+                                  tcg_constant_i32(extension));
+        return;
+    }
+
     /*
      * F000 is the 68030 PMMU/F-line escape.  Reserved PMMU extension
      * encodings remain emulatable through the F-line vector.

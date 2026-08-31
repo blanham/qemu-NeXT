@@ -87,6 +87,8 @@ typedef struct M68KMMU030MemoryOps {
 typedef struct M68KMMU030TranslateResult {
     uint32_t physical;
     uint32_t page_size;
+    /* Physical address of the last descriptor fetched by a table PTEST. */
+    uint32_t descriptor_address;
     int prot;
     uint16_t mmusr;
     bool cache_inhibit;
@@ -147,9 +149,39 @@ typedef enum M68KMMU030PMOVERegister {
     M68K_MMU030_PMOVE_MMUSR,
 } M68KMMU030PMOVERegister;
 
+/* MC68030 PMMU control-instruction extension fields. */
+typedef enum M68KMMU030ControlOperation {
+    M68K_MMU030_CONTROL_PLOAD,
+    M68K_MMU030_CONTROL_PFLUSH,
+    M68K_MMU030_CONTROL_PTEST,
+} M68KMMU030ControlOperation;
+
+typedef enum M68KMMU030FunctionCodeSource {
+    M68K_MMU030_FC_SFC,
+    M68K_MMU030_FC_DFC,
+    M68K_MMU030_FC_DREG,
+    M68K_MMU030_FC_IMMEDIATE,
+} M68KMMU030FunctionCodeSource;
+
+typedef struct M68KMMU030ControlDecode {
+    M68KMMU030ControlOperation operation;
+    M68KMMU030FunctionCodeSource function_code_source;
+    unsigned function_code_value;
+    unsigned mode;
+    unsigned mask;
+    unsigned level;
+    unsigned address_register;
+    bool is_write;
+    bool has_address_register;
+} M68KMMU030ControlDecode;
+
 /* Decode the PMOVE extension word described by MC68030 Section 9.3. */
 bool m68k_mmu030_pmove_decode(uint16_t extension, unsigned *reg,
                               unsigned *size, bool *direction, bool *fd);
+
+/* Decode an MC68030 PLOAD/PFLUSH/PTEST extension word. */
+bool m68k_mmu030_control_decode(uint16_t extension,
+                                M68KMMU030ControlDecode *decode);
 
 void m68k_mmu030_reset(M68KMMU030State *state);
 
@@ -193,6 +225,16 @@ int m68k_mmu030_atc_ptest(M68KMMU030State *state,
                           uint32_t logical_address, bool is_write,
                           uint8_t function_code,
                           M68KMMU030TranslateResult *result);
+
+/*
+ * Search translation tables for PTEST levels 1..7 without ATC/history side
+ * effects.  Architectural status is returned in result and state->mmusr.
+ */
+int m68k_mmu030_ptest(M68KMMU030State *state,
+                      const M68KMMU030MemoryOps *ops,
+                      uint32_t logical_address, bool is_write,
+                      uint8_t function_code, unsigned level,
+                      M68KMMU030TranslateResult *result);
 void m68k_mmu030_atc_flush_all(M68KMMU030State *state);
 void m68k_mmu030_atc_flush_fc(M68KMMU030State *state,
                               uint8_t function_code,
