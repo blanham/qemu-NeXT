@@ -14,6 +14,7 @@
 #define M68K_MMU030_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "qemu/typedefs.h"
@@ -41,12 +42,56 @@
 #define M68K_MMU030_MMUSR_T         UINT16_C(0x0040)
 #define M68K_MMU030_MMUSR_N_MASK    UINT16_C(0x0007)
 
-/* MC68030 short bus-cycle fault frame and SSW fields (Section 8.4). */
-#define M68K_MMU030_ACCESS_FRAME_SIZE UINT32_C(0x20)
-#define M68K_MMU030_SSW_OF           UINT16_C(0x0100)
+/*
+ * MC68030 bus-cycle fault frames and SSW fields (Sections 8.2 and 8.4).
+ *
+ * The short frame is 16 words.  A long frame contains the same first 16
+ * words followed by 30 words of restart state.  Keep the old short-frame
+ * name as an alias: it is part of the small unit-test API introduced with
+ * the initial PMMU implementation.
+ */
+#define M68K_MMU030_ACCESS_FRAME_SIZE_SHORT UINT32_C(0x20)
+#define M68K_MMU030_ACCESS_FRAME_SIZE_LONG  UINT32_C(0x5c)
+#define M68K_MMU030_ACCESS_FRAME_SIZE       M68K_MMU030_ACCESS_FRAME_SIZE_SHORT
+#define M68K_MMU030_COPROCESSOR_FRAME_SIZE  UINT32_C(0x14)
+#define M68K_MMU030_FRAME_VERSION           UINT8_C(1)
+
+/* Format codes stored in the high nibble of the vector-offset word. */
+#define M68K_MMU030_FAULT_FORMAT_9         UINT8_C(0x9)
+#define M68K_MMU030_FAULT_FORMAT_A         UINT8_C(0xa)
+#define M68K_MMU030_FAULT_FORMAT_B         UINT8_C(0xb)
+
+/* MC68030 special status word (Figure 8-9). */
+#define M68K_MMU030_SSW_FC           UINT16_C(0x8000)
+#define M68K_MMU030_SSW_FB           UINT16_C(0x4000)
+#define M68K_MMU030_SSW_RC           UINT16_C(0x2000)
+#define M68K_MMU030_SSW_RB           UINT16_C(0x1000)
+#define M68K_MMU030_SSW_DF           UINT16_C(0x0100)
+#define M68K_MMU030_SSW_RM           UINT16_C(0x0080)
 #define M68K_MMU030_SSW_RW           UINT16_C(0x0040)
 #define M68K_MMU030_SSW_SIZE_SHIFT   4
+#define M68K_MMU030_SSW_SIZE_MASK    UINT16_C(0x0030)
+#define M68K_MMU030_SSW_SIZE_BYTE    UINT16_C(0x0010)
+#define M68K_MMU030_SSW_SIZE_WORD    UINT16_C(0x0020)
+#define M68K_MMU030_SSW_SIZE_LONG    UINT16_C(0x0000)
 #define M68K_MMU030_SSW_FC_MASK      UINT16_C(0x0007)
+
+/* Multi-cycle instructions which do not use the CAS/CAS2 RM protocol still
+ * need a restart latch.  The latch records completed bus cycles and, for
+ * reads, their values so a handler cannot cause an earlier device cycle to
+ * be issued again when RTE retries the instruction. */
+enum {
+    M68K_MMU030_SPECIAL_NONE = 0,
+    M68K_MMU030_SPECIAL_MOVEP,
+    M68K_MMU030_SPECIAL_PMOVE,
+    M68K_MMU030_SPECIAL_FPU,
+    M68K_MMU030_SPECIAL_SPLIT,
+    M68K_MMU030_SPECIAL_FMOVEM,
+};
+#define M68K_MMU030_SPECIAL_MAX_CYCLES 4
+
+/* Compatibility spelling used by the Task3 short-frame API. */
+#define M68K_MMU030_SSW_OF M68K_MMU030_SSW_DF
 
 /* Descriptor fields common to short and long descriptors. */
 #define M68K_MMU030_DESC_DT_MASK    UINT32_C(0x00000003)
@@ -130,6 +175,59 @@ typedef struct M68KMMU030State {
     uint32_t fault_pc;
     uint16_t fault_ssw;
     uint32_t fault_status;
+
+    /*
+     * Restart information for the 68030 bus-error frames.  These values are
+     * deliberately kept as scalar fields instead of a host-layout struct:
+     * the frame is a big-endian architectural object and the fields are also
+     * migrated independently of host alignment and bit-field rules.
+     */
+    uint8_t fault_format;
+    uint8_t fault_size;
+    uint8_t fault_function_code;
+    uint8_t fault_table_level;
+    uint16_t fault_stage_c;
+    uint16_t fault_stage_b;
+    uint32_t fault_stage_b_address;
+    uint32_t fault_data_output;
+    uint32_t fault_data_input;
+    uint32_t fault_data_input_address;
+    uint32_t fault_descriptor_address;
+    uint32_t fault_instruction_address;
+    uint32_t fault_resume_pc;
+    /* An access frame is live while its handler is running. */
+    bool fault_frame_active;
+    /* A cleared DF lets the translated instruction consume the stacked data
+     * buffer without issuing the completed bus cycle again. */
+    bool fault_data_complete;
+    bool fault_data_input_valid;
+    bool fault_data_write;
+    uint8_t fault_frame_version;
+    /* RTE has restored a bus-cycle frame and still owes its rerun cycle. */
+    bool restart_pending;
+    /* A translated CAS/CAS2/TAS has an indivisible read-modify-write cycle.
+     * This marker is consumed by capture_fault and is intentionally live
+     * only during execution of that translated instruction. */
+    bool fault_rmw;
+    /* Translation-time code fetch metadata is live only while decoding. */
+    bool fault_fetch_active;
+    /* The suspended access was an instruction-pipeline fetch. */
+    bool fault_code_fetch;
+    /* RTE accepted handler-supplied C/B words for the next translation. */
+    bool fault_pipe_accept;
+    /* CAS2 may fault between its independent bus cycles.  Retain the
+     * completed phase and comparison values so RTE resumes at the failed
+     * cycle instead of repeating an observable read/write. */
+    uint8_t fault_rmw_phase;
+    uint32_t fault_rmw_data1;
+    uint32_t fault_rmw_data2;
+    bool fault_rmw_data_valid;
+    /* Restart state for MOVEP, PMOVE, and FPU multi-cycle accesses. */
+    uint8_t fault_special_kind;
+    uint8_t fault_special_phase;
+    bool fault_special_valid;
+    uint32_t fault_special_pc;
+    uint32_t fault_special_data[M68K_MMU030_SPECIAL_MAX_CYCLES];
 } M68KMMU030State;
 
 typedef struct M68KMMU030ControlState {
@@ -184,6 +282,35 @@ bool m68k_mmu030_control_decode(uint16_t extension,
                                 M68KMMU030ControlDecode *decode);
 
 void m68k_mmu030_reset(M68KMMU030State *state);
+
+/* Helpers shared by translated and C-helper multi-cycle instructions. */
+bool m68k_mmu030_special_cycle(M68KMMU030State *state, unsigned kind,
+                               unsigned cycle, uint32_t pc,
+                               uint32_t data, bool is_write);
+void m68k_mmu030_special_record(M68KMMU030State *state, unsigned kind,
+                                unsigned cycle, uint32_t pc, uint32_t data,
+                                bool is_load);
+void m68k_mmu030_special_finish(M68KMMU030State *state, unsigned kind,
+                                unsigned cycles, uint32_t pc);
+void m68k_mmu030_special_complete(M68KMMU030State *state, unsigned kind,
+                                  uint32_t pc);
+void m68k_mmu030_special_clear(M68KMMU030State *state);
+
+/* FMOVEM has up to eight operands, each of which is transferred as two or
+ * three longwords.  Reuse the four-word special-data image for the current
+ * operand and keep the completed-operand count in word three; this keeps the
+ * version-6 migration prefix unchanged while retaining every bus phase. */
+bool m68k_mmu030_fmovem_cycle(M68KMMU030State *state, unsigned reg,
+                              unsigned cycle, uint32_t pc, uint32_t data,
+                              bool is_write);
+void m68k_mmu030_fmovem_record(M68KMMU030State *state, unsigned reg,
+                               unsigned cycle, uint32_t pc, uint32_t data,
+                               bool is_load);
+void m68k_mmu030_fmovem_finish_register(M68KMMU030State *state,
+                                        unsigned reg, unsigned cycles,
+                                        uint32_t pc);
+void m68k_mmu030_fmovem_finish(M68KMMU030State *state, unsigned regs,
+                               uint32_t pc);
 
 bool m68k_mmu030_validate_tc(uint32_t tc);
 /* is_write is true for a write access and false for a read access. */
@@ -274,6 +401,50 @@ uint16_t m68k_mmu030_make_ssw(unsigned size, bool is_write, bool is_code,
                               uint8_t function_code);
 
 uint32_t m68k_mmu030_rte_frame_tail_size(uint16_t format);
+
+/*
+ * Track code words fetched by the translator without issuing speculative
+ * reads beyond the instruction currently being decoded.
+ */
+void m68k_mmu030_begin_instruction_fetch(M68KMMU030State *state,
+                                         uint32_t instruction_pc);
+void m68k_mmu030_record_instruction_fetch(M68KMMU030State *state,
+                                          uint32_t instruction_pc,
+                                          uint32_t fetch_address,
+                                          uint16_t word);
+void m68k_mmu030_end_instruction_fetch(M68KMMU030State *state);
+
+/* Latch one failed CPU access for exception entry. */
+void m68k_mmu030_capture_fault(
+    M68KMMU030State *state, uint32_t logical_address, uint32_t fault_pc,
+    unsigned size, bool is_write, bool is_code, uint8_t function_code,
+    const M68KMMU030TranslateResult *result);
+
+/* Return the exact ordinary access-error frame size selected by the latch. */
+uint32_t m68k_mmu030_access_frame_size(const M68KMMU030State *state);
+
+/*
+ * Build an architectural format A or B frame.  The caller supplies storage
+ * for exactly the selected frame size.  Building a frame consumes the
+ * pending fault context, just as exception entry consumes the core's fault
+ * latch on a physical MC68030.
+ */
+bool m68k_mmu030_build_access_frame(
+    M68KMMU030State *state, uint16_t saved_sr, uint16_t vector_offset,
+    uint8_t *frame, size_t frame_size);
+
+/* Restore the internal restart image from a format A/B frame during RTE. */
+bool m68k_mmu030_restore_access_frame(
+    M68KMMU030State *state, const uint8_t *frame, size_t frame_size,
+    uint16_t *saved_sr, uint32_t *resume_pc);
+
+/* Restore the common state from a format-$9 coprocessor frame. */
+bool m68k_mmu030_restore_coprocessor_frame(
+    M68KMMU030State *state, const uint8_t *frame, size_t frame_size,
+    uint16_t *saved_sr, uint32_t *resume_pc);
+
+/* Consume the one rerun decision restored by RTE. */
+bool m68k_mmu030_consume_restart(M68KMMU030State *state);
 
 bool m68k_mmu030_build_short_access_frame(
     M68KMMU030State *state, uint16_t saved_sr, uint16_t vector_offset,

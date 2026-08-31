@@ -203,7 +203,7 @@ static FloatRoundMode packed_rounding_mode(CPUM68KState *env, bool sign)
 }
 
 void HELPER(stp96)(CPUM68KState *env, FPReg *src, uint32_t addr,
-                   uint32_t kfactor)
+                   uint32_t kfactor, uint32_t pc)
 {
     uintptr_t ra = GETPC();
     float_status status = env->fp_status;
@@ -319,9 +319,30 @@ void HELPER(stp96)(CPUM68KState *env, FPReg *src, uint32_t addr,
     word0 |= (exponent % 10) << 16;
 
 store:
-    cpu_stl_be_data_ra(env, addr, word0, ra);
-    cpu_stl_be_data_ra(env, addr + 4, word1, ra);
-    cpu_stl_be_data_ra(env, addr + 8, word2, ra);
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        const uint32_t words[3] = { word0, word1, word2 };
+        M68KMMU030State *state = &env->mmu030;
+
+        for (unsigned cycle = 0; cycle < ARRAY_SIZE(words); cycle++) {
+            uint32_t cycle_address = addr + cycle * 4;
+            bool skip = m68k_mmu030_special_cycle(
+                state, M68K_MMU030_SPECIAL_FPU, cycle, pc, words[cycle],
+                true);
+
+            if (!skip) {
+                cpu_stl_be_data_ra(env, cycle_address, words[cycle], ra);
+                m68k_mmu030_special_record(
+                    state, M68K_MMU030_SPECIAL_FPU, cycle, pc, words[cycle],
+                    false);
+            }
+        }
+        m68k_mmu030_special_finish(state, M68K_MMU030_SPECIAL_FPU,
+                                   ARRAY_SIZE(words), pc);
+    } else {
+        cpu_stl_be_data_ra(env, addr, word0, ra);
+        cpu_stl_be_data_ra(env, addr + 4, word1, ra);
+        cpu_stl_be_data_ra(env, addr + 8, word2, ra);
+    }
 }
 
 float64 HELPER(redf64)(CPUM68KState *env, FPReg *val)
@@ -962,122 +983,217 @@ void HELPER(fconst)(CPUM68KState *env, FPReg *val, uint32_t offset)
 }
 
 typedef int (*float_access)(CPUM68KState *env, uint32_t addr, FPReg *fp,
-                            uintptr_t ra);
+                            uintptr_t ra, uint32_t pc, unsigned reg);
 
 static uint32_t fmovem_predec(CPUM68KState *env, uint32_t addr, uint32_t mask,
-                              float_access access_fn)
+                              float_access access_fn, uint32_t pc)
 {
     uintptr_t ra = GETPC();
+    unsigned reg = 0;
     int i, size;
 
     for (i = 7; i >= 0; i--, mask <<= 1) {
         if (mask & 0x80) {
-            size = access_fn(env, addr, &env->fregs[i], ra);
+            size = access_fn(env, addr, &env->fregs[i], ra, pc, reg++);
             if ((mask & 0xff) != 0x80) {
                 addr -= size;
             }
         }
     }
 
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        m68k_mmu030_fmovem_finish(&env->mmu030, reg, pc);
+    }
+
     return addr;
 }
 
 static uint32_t fmovem_postinc(CPUM68KState *env, uint32_t addr, uint32_t mask,
-                               float_access access_fn)
+                               float_access access_fn, uint32_t pc)
 {
     uintptr_t ra = GETPC();
+    unsigned reg = 0;
     int i, size;
 
     for (i = 0; i < 8; i++, mask <<= 1) {
         if (mask & 0x80) {
-            size = access_fn(env, addr, &env->fregs[i], ra);
+            size = access_fn(env, addr, &env->fregs[i], ra, pc, reg++);
             addr += size;
         }
+    }
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        m68k_mmu030_fmovem_finish(&env->mmu030, reg, pc);
     }
 
     return addr;
 }
 
 static int cpu_ld_floatx80_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
-                              uintptr_t ra)
+                              uintptr_t ra, uint32_t pc, unsigned reg)
 {
-    uint32_t high;
-    uint64_t low;
+    uint32_t words[3];
 
-    high = cpu_ldl_be_data_ra(env, addr, ra);
-    low = cpu_ldq_be_data_ra(env, addr + 4, ra);
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030State *state = &env->mmu030;
 
-    fp->l.upper = high >> 16;
-    fp->l.lower = low;
+        for (unsigned cycle = 0; cycle < ARRAY_SIZE(words); cycle++) {
+            bool skip = m68k_mmu030_fmovem_cycle(
+                state, reg, cycle, pc, 0, false);
+
+            if (skip) {
+                words[cycle] = state->fault_special_data[cycle];
+            } else {
+                words[cycle] = cpu_ldl_be_data_ra(env, addr + cycle * 4,
+                                                  ra);
+                m68k_mmu030_fmovem_record(state, reg, cycle, pc,
+                                          words[cycle], true);
+            }
+        }
+        m68k_mmu030_fmovem_finish_register(state, reg, ARRAY_SIZE(words), pc);
+    } else {
+        uint32_t high;
+        uint64_t low;
+
+        high = cpu_ldl_be_data_ra(env, addr, ra);
+        low = cpu_ldq_be_data_ra(env, addr + 4, ra);
+        words[0] = high;
+        words[1] = low >> 32;
+        words[2] = low;
+    }
+
+    fp->l.upper = words[0] >> 16;
+    fp->l.lower = ((uint64_t)words[1] << 32) | words[2];
 
     return 12;
 }
 
 static int cpu_st_floatx80_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
-                               uintptr_t ra)
+                               uintptr_t ra, uint32_t pc, unsigned reg)
 {
-    cpu_stl_be_data_ra(env, addr, fp->l.upper << 16, ra);
-    cpu_stq_be_data_ra(env, addr + 4, fp->l.lower, ra);
+    uint32_t words[3] = {
+        fp->l.upper << 16,
+        fp->l.lower >> 32,
+        fp->l.lower,
+    };
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030State *state = &env->mmu030;
+
+        for (unsigned cycle = 0; cycle < ARRAY_SIZE(words); cycle++) {
+            bool skip = m68k_mmu030_fmovem_cycle(
+                state, reg, cycle, pc, words[cycle], true);
+
+            if (!skip) {
+                cpu_stl_be_data_ra(env, addr + cycle * 4, words[cycle], ra);
+                m68k_mmu030_fmovem_record(state, reg, cycle, pc,
+                                          words[cycle], false);
+            }
+        }
+        m68k_mmu030_fmovem_finish_register(state, reg, ARRAY_SIZE(words), pc);
+    } else {
+        cpu_stl_be_data_ra(env, addr, words[0], ra);
+        cpu_stq_be_data_ra(env, addr + 4, fp->l.lower, ra);
+    }
 
     return 12;
 }
 
 static int cpu_ld_float64_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
-                             uintptr_t ra)
+                             uintptr_t ra, uint32_t pc, unsigned reg)
 {
+    uint32_t words[2];
     uint64_t val;
 
-    val = cpu_ldq_be_data_ra(env, addr, ra);
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030State *state = &env->mmu030;
+
+        for (unsigned cycle = 0; cycle < ARRAY_SIZE(words); cycle++) {
+            bool skip = m68k_mmu030_fmovem_cycle(
+                state, reg, cycle, pc, 0, false);
+
+            if (skip) {
+                words[cycle] = state->fault_special_data[cycle];
+            } else {
+                words[cycle] = cpu_ldl_be_data_ra(env, addr + cycle * 4,
+                                                  ra);
+                m68k_mmu030_fmovem_record(state, reg, cycle, pc,
+                                          words[cycle], true);
+            }
+        }
+        m68k_mmu030_fmovem_finish_register(state, reg, ARRAY_SIZE(words), pc);
+        val = ((uint64_t)words[0] << 32) | words[1];
+    } else {
+        val = cpu_ldq_be_data_ra(env, addr, ra);
+    }
     fp->d = float64_to_floatx80(*(float64 *)&val, &env->fp_status);
 
     return 8;
 }
 
 static int cpu_st_float64_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
-                             uintptr_t ra)
+                             uintptr_t ra, uint32_t pc, unsigned reg)
 {
     float64 val;
 
     val = floatx80_to_float64(fp->d, &env->fp_status);
-    cpu_stq_be_data_ra(env, addr, *(uint64_t *)&val, ra);
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        uint64_t data = *(uint64_t *)&val;
+        uint32_t words[2] = { data >> 32, data };
+        M68KMMU030State *state = &env->mmu030;
+
+        for (unsigned cycle = 0; cycle < ARRAY_SIZE(words); cycle++) {
+            bool skip = m68k_mmu030_fmovem_cycle(
+                state, reg, cycle, pc, words[cycle], true);
+
+            if (!skip) {
+                cpu_stl_be_data_ra(env, addr + cycle * 4, words[cycle], ra);
+                m68k_mmu030_fmovem_record(state, reg, cycle, pc,
+                                          words[cycle], false);
+            }
+        }
+        m68k_mmu030_fmovem_finish_register(state, reg, ARRAY_SIZE(words), pc);
+    } else {
+        cpu_stq_be_data_ra(env, addr, *(uint64_t *)&val, ra);
+    }
 
     return 8;
 }
 
 uint32_t HELPER(fmovemx_st_predec)(CPUM68KState *env, uint32_t addr,
-                                   uint32_t mask)
+                                   uint32_t mask, uint32_t pc)
 {
-    return fmovem_predec(env, addr, mask, cpu_st_floatx80_ra);
+    return fmovem_predec(env, addr, mask, cpu_st_floatx80_ra, pc);
 }
 
 uint32_t HELPER(fmovemx_st_postinc)(CPUM68KState *env, uint32_t addr,
-                                    uint32_t mask)
+                                    uint32_t mask, uint32_t pc)
 {
-    return fmovem_postinc(env, addr, mask, cpu_st_floatx80_ra);
+    return fmovem_postinc(env, addr, mask, cpu_st_floatx80_ra, pc);
 }
 
 uint32_t HELPER(fmovemx_ld_postinc)(CPUM68KState *env, uint32_t addr,
-                                    uint32_t mask)
+                                    uint32_t mask, uint32_t pc)
 {
-    return fmovem_postinc(env, addr, mask, cpu_ld_floatx80_ra);
+    return fmovem_postinc(env, addr, mask, cpu_ld_floatx80_ra, pc);
 }
 
 uint32_t HELPER(fmovemd_st_predec)(CPUM68KState *env, uint32_t addr,
-                                   uint32_t mask)
+                                   uint32_t mask, uint32_t pc)
 {
-    return fmovem_predec(env, addr, mask, cpu_st_float64_ra);
+    return fmovem_predec(env, addr, mask, cpu_st_float64_ra, pc);
 }
 
 uint32_t HELPER(fmovemd_st_postinc)(CPUM68KState *env, uint32_t addr,
-                                    uint32_t mask)
+                                    uint32_t mask, uint32_t pc)
 {
-    return fmovem_postinc(env, addr, mask, cpu_st_float64_ra);
+    return fmovem_postinc(env, addr, mask, cpu_st_float64_ra, pc);
 }
 
 uint32_t HELPER(fmovemd_ld_postinc)(CPUM68KState *env, uint32_t addr,
-                                    uint32_t mask)
+                                    uint32_t mask, uint32_t pc)
 {
-    return fmovem_postinc(env, addr, mask, cpu_ld_float64_ra);
+    return fmovem_postinc(env, addr, mask, cpu_ld_float64_ra, pc);
 }
 
 static void make_quotient(CPUM68KState *env, int sign, uint32_t quotient)

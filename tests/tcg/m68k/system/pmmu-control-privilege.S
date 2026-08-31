@@ -7,6 +7,7 @@
         .text
         .globl  _start
 _start:
+        movea.l #0x00008000,%sp
         lea     privilege_handler,%a0
         move.l  %a0,0x20           /* privilege-violation vector (8) */
 

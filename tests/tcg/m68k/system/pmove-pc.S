@@ -9,6 +9,7 @@
         .text
         .globl  _start
 _start:
+        movea.l #0x00008000,%sp
         lea     illegal_handler,%a0
         move.l  %a0,0x10           /* illegal-instruction vector */
         lea     linef_handler,%a0

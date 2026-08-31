@@ -25,7 +25,7 @@ static const VMStateDescription vmstate_mmu030_atc_entry = {
 
 const VMStateDescription vmstate_mmu030_state = {
     .name = "cpu/68030_mmu_state",
-    .version_id = 1,
+    .version_id = 6,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(crp, M68KMMU030State),
@@ -43,6 +43,45 @@ const VMStateDescription vmstate_mmu030_state = {
         VMSTATE_UINT32(fault_pc, M68KMMU030State),
         VMSTATE_UINT16(fault_ssw, M68KMMU030State),
         VMSTATE_UINT32(fault_status, M68KMMU030State),
+        /* Access-error restart state was added after the initial PMMU
+         * migration stream.  Keep the old stream loadable and default the
+         * new fields to zero when loading version 1. */
+        VMSTATE_UINT8_V(fault_format, M68KMMU030State, 2),
+        VMSTATE_UINT8_V(fault_size, M68KMMU030State, 2),
+        VMSTATE_UINT8_V(fault_function_code, M68KMMU030State, 2),
+        VMSTATE_UINT8_V(fault_table_level, M68KMMU030State, 2),
+        VMSTATE_UINT16_V(fault_stage_c, M68KMMU030State, 2),
+        VMSTATE_UINT16_V(fault_stage_b, M68KMMU030State, 2),
+        VMSTATE_UINT32_V(fault_stage_b_address, M68KMMU030State, 2),
+        VMSTATE_UINT32_V(fault_data_output, M68KMMU030State, 2),
+        VMSTATE_UINT32_V(fault_data_input, M68KMMU030State, 2),
+        VMSTATE_UINT32_V(fault_descriptor_address, M68KMMU030State, 2),
+        VMSTATE_UINT32_V(fault_instruction_address, M68KMMU030State, 2),
+        VMSTATE_UINT8_V(fault_frame_version, M68KMMU030State, 2),
+        VMSTATE_BOOL_V(restart_pending, M68KMMU030State, 2),
+        /* Keep version-3 state after the complete version-2 prefix so
+         * readers of the earlier stream retain the old field offsets. */
+        VMSTATE_UINT32_V(fault_resume_pc, M68KMMU030State, 3),
+        VMSTATE_BOOL_V(fault_frame_active, M68KMMU030State, 3),
+        VMSTATE_BOOL_V(fault_data_complete, M68KMMU030State, 3),
+        VMSTATE_BOOL_V(fault_data_input_valid, M68KMMU030State, 3),
+        VMSTATE_BOOL_V(fault_data_write, M68KMMU030State, 3),
+        VMSTATE_UINT32_V(fault_data_input_address, M68KMMU030State, 3),
+        VMSTATE_BOOL_V(fault_fetch_active, M68KMMU030State, 4),
+        VMSTATE_BOOL_V(fault_code_fetch, M68KMMU030State, 4),
+        VMSTATE_BOOL_V(fault_pipe_accept, M68KMMU030State, 4),
+        /* CAS2 phase/data state must survive migration while its handler
+         * repairs a mapping between independent bus cycles. */
+        VMSTATE_UINT8_V(fault_rmw_phase, M68KMMU030State, 5),
+        VMSTATE_UINT32_V(fault_rmw_data1, M68KMMU030State, 5),
+        VMSTATE_UINT32_V(fault_rmw_data2, M68KMMU030State, 5),
+        VMSTATE_BOOL_V(fault_rmw_data_valid, M68KMMU030State, 5),
+        VMSTATE_UINT8_V(fault_special_kind, M68KMMU030State, 6),
+        VMSTATE_UINT8_V(fault_special_phase, M68KMMU030State, 6),
+        VMSTATE_BOOL_V(fault_special_valid, M68KMMU030State, 6),
+        VMSTATE_UINT32_V(fault_special_pc, M68KMMU030State, 6),
+        VMSTATE_UINT32_ARRAY_V(fault_special_data, M68KMMU030State,
+                               M68K_MMU030_SPECIAL_MAX_CYCLES, 6),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -7,7 +7,6 @@
  */
 
 #include "qemu/osdep.h"
-
 #include "target/m68k/mmu030.h"
 #include "exec/page-protection.h"
 #include "qemu/bswap.h"
@@ -784,12 +783,270 @@ void m68k_mmu030_reset(M68KMMU030State *state)
     memset(state, 0, sizeof(*state));
 }
 
+static bool m68k_mmu030_special_matches(const M68KMMU030State *state,
+                                        unsigned kind, uint32_t pc)
+{
+    return state && state->fault_special_valid &&
+           state->fault_special_kind == kind && state->fault_special_pc == pc;
+}
+
+void m68k_mmu030_special_clear(M68KMMU030State *state)
+{
+    if (!state) {
+        return;
+    }
+    state->fault_special_kind = M68K_MMU030_SPECIAL_NONE;
+    state->fault_special_phase = 0;
+    state->fault_special_valid = false;
+    state->fault_special_pc = 0;
+    memset(state->fault_special_data, 0, sizeof(state->fault_special_data));
+}
+
+bool m68k_mmu030_special_cycle(M68KMMU030State *state, unsigned kind,
+                               unsigned cycle, uint32_t pc,
+                               uint32_t data, bool is_write)
+{
+    if (!state || cycle >= M68K_MMU030_SPECIAL_MAX_CYCLES ||
+        kind == M68K_MMU030_SPECIAL_NONE) {
+        return false;
+    }
+
+    /* A handler access belongs to the live frame and must never overwrite
+     * the suspended instruction's continuation.  If it faults, the normal
+     * frame-active guard turns that access into a double bus fault. */
+    if (state->fault_frame_active) {
+        return false;
+    }
+
+    if (!m68k_mmu030_special_matches(state, kind, pc)) {
+        m68k_mmu030_special_clear(state);
+        state->fault_special_kind = kind;
+        state->fault_special_pc = pc;
+        state->fault_special_valid = true;
+    }
+
+    if (state->fault_special_phase > cycle) {
+        return true;
+    }
+
+    /* The ordinary access-frame builder consumes these values if this bus
+     * cycle faults.  Keep the output right-justified, as for gen_store(). */
+    state->fault_data_output = is_write ? data : 0;
+    state->fault_data_input_valid = false;
+    return false;
+}
+
+void m68k_mmu030_special_record(M68KMMU030State *state, unsigned kind,
+                                unsigned cycle, uint32_t pc, uint32_t data,
+                                bool is_load)
+{
+    if (!state || state->fault_frame_active ||
+        cycle >= M68K_MMU030_SPECIAL_MAX_CYCLES ||
+        !m68k_mmu030_special_matches(state, kind, pc)) {
+        return;
+    }
+
+    if (is_load) {
+        state->fault_special_data[cycle] = data;
+    }
+    if (state->fault_special_phase <= cycle) {
+        state->fault_special_phase = cycle + 1;
+    }
+}
+
+void m68k_mmu030_special_finish(M68KMMU030State *state, unsigned kind,
+                                unsigned cycles, uint32_t pc)
+{
+    if (m68k_mmu030_special_matches(state, kind, pc) &&
+        state->fault_special_phase >= cycles) {
+        m68k_mmu030_special_clear(state);
+    }
+}
+
+void m68k_mmu030_special_complete(M68KMMU030State *state, unsigned kind,
+                                  uint32_t pc)
+{
+    if (m68k_mmu030_special_matches(state, kind, pc)) {
+        unsigned failed_cycle = state->fault_special_phase;
+
+        /*
+         * For a read cycle, DF-clear means the handler supplied the failed
+         * bus word in DIB.  Install it in the failed fragment/word slot
+         * before advancing past the failed cycle.
+         */
+        if (state->fault_data_input_valid &&
+            failed_cycle < M68K_MMU030_SPECIAL_MAX_CYCLES) {
+            state->fault_special_data[failed_cycle] =
+                state->fault_data_input;
+        }
+        /*
+         * A handler which clears DF has completed the failed cycle in
+         * software.  Leave later cycles pending so the retried instruction
+         * can issue them on the repaired mapping.
+         */
+        if (failed_cycle < M68K_MMU030_SPECIAL_MAX_CYCLES) {
+            state->fault_special_phase = failed_cycle + 1;
+        }
+    }
+}
+
+static bool m68k_mmu030_fmovem_prepare(M68KMMU030State *state,
+                                       uint32_t pc)
+{
+    if (!state || state->fault_frame_active) {
+        return false;
+    }
+
+    if (!m68k_mmu030_special_matches(state, M68K_MMU030_SPECIAL_FMOVEM,
+                                     pc)) {
+        m68k_mmu030_special_clear(state);
+        state->fault_special_kind = M68K_MMU030_SPECIAL_FMOVEM;
+        state->fault_special_pc = pc;
+        state->fault_special_valid = true;
+    }
+    return true;
+}
+
+bool m68k_mmu030_fmovem_cycle(M68KMMU030State *state, unsigned reg,
+                              unsigned cycle, uint32_t pc, uint32_t data,
+                              bool is_write)
+{
+    if (cycle >= 3 || reg >= 8 || !m68k_mmu030_fmovem_prepare(state, pc)) {
+        return false;
+    }
+
+    /* Word three is the number of complete operands.  Older operands have
+     * already committed all of their device cycles and must not be touched
+     * again when the instruction is retried. */
+    if (state->fault_special_data[3] > reg ||
+        (state->fault_special_data[3] == reg &&
+         state->fault_special_phase > cycle)) {
+        return true;
+    }
+
+    state->fault_data_output = is_write ? data : 0;
+    state->fault_data_input_valid = false;
+    return false;
+}
+
+void m68k_mmu030_fmovem_record(M68KMMU030State *state, unsigned reg,
+                               unsigned cycle, uint32_t pc, uint32_t data,
+                               bool is_load)
+{
+    if (cycle >= 3 || reg >= 8 ||
+        !m68k_mmu030_fmovem_prepare(state, pc) ||
+        state->fault_special_data[3] != reg) {
+        return;
+    }
+
+    if (is_load) {
+        state->fault_special_data[cycle] = data;
+    }
+    if (state->fault_special_phase <= cycle) {
+        state->fault_special_phase = cycle + 1;
+    }
+}
+
+void m68k_mmu030_fmovem_finish_register(M68KMMU030State *state,
+                                        unsigned reg, unsigned cycles,
+                                        uint32_t pc)
+{
+    if (reg >= 8 || cycles > 3 ||
+        !m68k_mmu030_special_matches(state, M68K_MMU030_SPECIAL_FMOVEM,
+                                     pc) ||
+        state->fault_special_data[3] != reg ||
+        state->fault_special_phase < cycles) {
+        return;
+    }
+
+    state->fault_special_data[3] = reg + 1;
+    state->fault_special_phase = 0;
+    memset(state->fault_special_data, 0,
+           3 * sizeof(state->fault_special_data[0]));
+}
+
+void m68k_mmu030_fmovem_finish(M68KMMU030State *state, unsigned regs,
+                               uint32_t pc)
+{
+    if (regs <= 8 && m68k_mmu030_special_matches(
+            state, M68K_MMU030_SPECIAL_FMOVEM, pc) &&
+        state->fault_special_data[3] >= regs) {
+        m68k_mmu030_special_clear(state);
+    }
+}
+
+void m68k_mmu030_begin_instruction_fetch(M68KMMU030State *state,
+                                         uint32_t instruction_pc)
+{
+    bool accepted;
+
+    if (!state || state->fault_frame_active) {
+        return;
+    }
+
+    accepted = state->fault_pipe_accept && state->fault_code_fetch &&
+               state->fault_pc == instruction_pc;
+    state->fault_fetch_active = true;
+    state->fault_code_fetch = true;
+    state->fault_instruction_address = instruction_pc;
+    if (!accepted) {
+        state->fault_stage_c = 0;
+        state->fault_stage_b = 0;
+        state->fault_stage_b_address = instruction_pc + 4;
+    } else if (!state->fault_stage_b_address) {
+        state->fault_stage_b_address = instruction_pc + 4;
+    }
+}
+
+void m68k_mmu030_record_instruction_fetch(M68KMMU030State *state,
+                                          uint32_t instruction_pc,
+                                          uint32_t fetch_address,
+                                          uint16_t word)
+{
+    uint32_t offset;
+
+    if (!state || !state->fault_fetch_active ||
+        state->fault_instruction_address != instruction_pc) {
+        return;
+    }
+
+    offset = fetch_address - instruction_pc;
+    if (offset == 2) {
+        state->fault_stage_c = word;
+    } else if (offset == 4) {
+        state->fault_stage_b = word;
+        state->fault_stage_b_address = fetch_address;
+    }
+}
+
+void m68k_mmu030_end_instruction_fetch(M68KMMU030State *state)
+{
+    if (!state) {
+        return;
+    }
+
+    state->fault_fetch_active = false;
+    if (!state->fault_pending && !state->fault_frame_active) {
+        state->fault_instruction_address = 0;
+        state->fault_stage_c = 0;
+        state->fault_stage_b = 0;
+        state->fault_stage_b_address = 0;
+        state->fault_code_fetch = false;
+        state->fault_pipe_accept = false;
+    }
+}
+
 uint16_t m68k_mmu030_make_ssw(unsigned size, bool is_write, bool is_code,
                               uint8_t function_code)
 {
     unsigned size_code;
 
-    /* Instruction faults use the pipe fault/rerun bits, deferred to Task 7. */
+    /*
+     * The generic helper predates the pipeline-aware fault latch and is
+     * retained for callers which only have the access tuple.  Instruction
+     * faults are completed by m68k_mmu030_capture_fault(), which adds the
+     * appropriate FC/FB/RC/RB bits once the pipe stage is known.
+     */
     if (is_code) {
         return 0;
     }
@@ -816,45 +1073,488 @@ uint16_t m68k_mmu030_make_ssw(unsigned size, bool is_write, bool is_code,
         break;
     }
 
-    return M68K_MMU030_SSW_OF |
+    return M68K_MMU030_SSW_DF |
            (is_write ? 0 : M68K_MMU030_SSW_RW) |
            (size_code << M68K_MMU030_SSW_SIZE_SHIFT) |
            (function_code & M68K_MMU030_SSW_FC_MASK);
 }
 
+void m68k_mmu030_capture_fault(
+    M68KMMU030State *state, uint32_t logical_address, uint32_t fault_pc,
+    unsigned size, bool is_write, bool is_code, uint8_t function_code,
+    const M68KMMU030TranslateResult *result)
+{
+    uint32_t offset;
+    uint16_t stage_c;
+    uint16_t stage_b;
+    uint32_t stage_b_address;
+    uint32_t data_output;
+    uint32_t data_input;
+    uint32_t resume_pc;
+    bool data_input_valid;
+    uint32_t data_input_address;
+    bool pipeline_valid;
+    bool rmw;
+
+    /* The first access error owns the CPU until its frame is consumed.  A
+     * fault while constructing, reading, or vectoring that frame is a
+     * double bus fault; never replace the original restart image.  The CPU
+     * fault ingress paths turn this condition into a halted CPU. */
+    if (!state || state->fault_frame_active) {
+        return;
+    }
+
+    state->fault_pending = true;
+    state->fault_address = logical_address;
+    state->fault_pc = fault_pc;
+    state->fault_size = size > UINT8_MAX ? UINT8_MAX : size;
+    state->fault_function_code = function_code & 7;
+    state->fault_table_level = result ?
+                               result->mmusr & M68K_MMU030_MMUSR_N_MASK : 0;
+    state->fault_status = result ? result->mmusr : 0;
+    state->fault_descriptor_address = result ? result->descriptor_address : 0;
+    /* The translator keeps the most recently decoded pipe image in these
+     * fields.  Preserve it in the frame when it belongs to this instruction;
+     * a prefetch fault can arrive before the new instruction emits its image,
+     * in which case stale words from the preceding instruction are invalid. */
+    /*
+     * RMC helpers may fault after TCG has restored the TB boundary rather
+     * than the exact CAS/CAS2 instruction PC.  Their explicit RMW latch
+     * still carries the correct restart boundary and data image.
+     */
+    pipeline_valid = state->fault_instruction_address == fault_pc ||
+                     ((state->fault_rmw || state->fault_special_valid) &&
+                      state->fault_resume_pc != 0);
+    stage_c = pipeline_valid ? state->fault_stage_c : 0;
+    stage_b = pipeline_valid ? state->fault_stage_b : 0;
+    stage_b_address = pipeline_valid ? state->fault_stage_b_address : 0;
+    data_output = state->fault_data_output;
+    data_input = state->fault_data_input;
+    data_input_address = state->fault_data_input_address;
+    rmw = state->fault_rmw;
+    data_input_valid = !is_code && pipeline_valid &&
+                       state->fault_data_input_valid;
+    /* An explicit TAS read is latched before its write cycle.  If that
+     * write faults, expose the completed byte as DIB so a handler which
+     * clears DF can preserve the original condition-code input. */
+    if (!data_input_valid && !is_code && rmw && size == 1 &&
+        state->fault_rmw_data_valid && state->fault_rmw_phase >= 1) {
+        data_input = state->fault_rmw_data1 & UINT32_C(0xff);
+        data_input_address = logical_address;
+        data_input_valid = true;
+    }
+    /* Only data cycles can be completed by accepting the stacked buffers;
+     * instruction-pipe faults always resume through their PC/rerun bits. */
+    resume_pc = !is_code && pipeline_valid ? state->fault_resume_pc : 0;
+    state->fault_stage_c = 0;
+    state->fault_stage_b = 0;
+    state->fault_stage_b_address = stage_b_address ? stage_b_address :
+                                   fault_pc + 4;
+    state->fault_data_output = 0;
+    state->fault_data_input = 0;
+    state->fault_data_input_address = 0;
+    state->fault_data_input_valid = false;
+    state->fault_data_complete = false;
+    state->fault_data_write = is_write;
+    state->fault_rmw = false;
+    state->fault_instruction_address = fault_pc;
+    state->fault_resume_pc = resume_pc;
+    state->fault_frame_active = false;
+    state->fault_fetch_active = false;
+    state->fault_code_fetch = is_code;
+    state->fault_pipe_accept = false;
+    state->fault_frame_version = M68K_MMU030_FRAME_VERSION;
+    state->restart_pending = false;
+
+    state->fault_ssw = m68k_mmu030_make_ssw(
+        size, is_write, is_code, function_code);
+    if (rmw) {
+        state->fault_ssw |= M68K_MMU030_SSW_RM;
+    }
+    if (is_code) {
+        /*
+         * The pipe words are addressed as C=PC+2 and B=PC+4.  A TLB fill
+         * normally reports the first word (C), while an already executing
+         * translation can report the next prefetched word (B).  Keep the
+         * distinction in the SSW so the exception handler can repair only
+         * the invalid stage.
+         */
+        offset = logical_address - fault_pc;
+        if (offset == 4) {
+            state->fault_ssw |= M68K_MMU030_SSW_FB |
+                                M68K_MMU030_SSW_RB;
+            /* Stage B belongs to an instruction already in flight. */
+            state->fault_format = M68K_MMU030_FAULT_FORMAT_B;
+        } else {
+            state->fault_ssw |= M68K_MMU030_SSW_FC |
+                                M68K_MMU030_SSW_RC;
+            /* A stage-C fetch at the boundary is representable in format A. */
+            state->fault_format = M68K_MMU030_FAULT_FORMAT_A;
+        }
+        state->fault_stage_c = stage_c;
+        state->fault_stage_b = stage_b;
+    } else {
+        /* Data faults occur while an instruction is active. */
+        state->fault_format = M68K_MMU030_FAULT_FORMAT_B;
+        state->fault_stage_c = stage_c;
+        state->fault_stage_b = stage_b;
+        if (data_input_valid) {
+            state->fault_data_input = data_input;
+            state->fault_data_input_address = data_input_address;
+            state->fault_data_input_valid = true;
+        }
+        if (is_write) {
+            switch (size) {
+            case 1:
+                data_output &= UINT32_C(0xff);
+                break;
+            case 2:
+                data_output &= UINT32_C(0xffff);
+                break;
+            case 3:
+                data_output &= UINT32_C(0xffffff);
+                break;
+            default:
+                break;
+            }
+            state->fault_data_output = data_output;
+        }
+    }
+}
+
 uint32_t m68k_mmu030_rte_frame_tail_size(uint16_t format)
 {
-    if ((format >> 12) == 0xa) {
+    switch (format >> 12) {
+    case M68K_MMU030_FAULT_FORMAT_9:
+        /* Format 9 is the 10-word coprocessor mid-instruction frame. */
+        return M68K_MMU030_COPROCESSOR_FRAME_SIZE - 8;
+    case M68K_MMU030_FAULT_FORMAT_A:
         /* RTE has already consumed the status, PC, and format words. */
-        return M68K_MMU030_ACCESS_FRAME_SIZE - 8;
+        return M68K_MMU030_ACCESS_FRAME_SIZE_SHORT - 8;
+    case M68K_MMU030_FAULT_FORMAT_B:
+        return M68K_MMU030_ACCESS_FRAME_SIZE_LONG - 8;
+    default:
+        return 0;
     }
-    return 0;
+}
+
+static uint8_t m68k_mmu030_fault_format(const M68KMMU030State *state)
+{
+    uint16_t ssw = state->fault_ssw;
+
+    if (state->fault_format == M68K_MMU030_FAULT_FORMAT_A ||
+        state->fault_format == M68K_MMU030_FAULT_FORMAT_B ||
+        state->fault_format == M68K_MMU030_FAULT_FORMAT_9) {
+        return state->fault_format;
+    }
+
+    /*
+     * A read fault needs the long frame's data input buffer.  Pipeline
+     * faults likewise need the stage-B address and the long restart state.
+     * Writes at an instruction boundary can use the compact format A frame.
+     */
+    if ((ssw & (M68K_MMU030_SSW_FC | M68K_MMU030_SSW_FB |
+                M68K_MMU030_SSW_RC | M68K_MMU030_SSW_RB)) ||
+        ((ssw & (M68K_MMU030_SSW_DF | M68K_MMU030_SSW_RM)) &&
+         (ssw & M68K_MMU030_SSW_RW))) {
+        return M68K_MMU030_FAULT_FORMAT_B;
+    }
+    return M68K_MMU030_FAULT_FORMAT_A;
+}
+
+uint32_t m68k_mmu030_access_frame_size(const M68KMMU030State *state)
+{
+    uint8_t format;
+
+    if (!state) {
+        return 0;
+    }
+    format = m68k_mmu030_fault_format(state);
+    switch (format) {
+    case M68K_MMU030_FAULT_FORMAT_A:
+        return M68K_MMU030_ACCESS_FRAME_SIZE_SHORT;
+    case M68K_MMU030_FAULT_FORMAT_B:
+        return M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
+    default:
+        /* Format 9 is intentionally not built by the ordinary fault path. */
+        return 0;
+    }
+}
+
+bool m68k_mmu030_build_access_frame(
+    M68KMMU030State *state, uint16_t saved_sr, uint16_t vector_offset,
+    uint8_t *frame, size_t frame_size)
+{
+    uint8_t format;
+    uint32_t frame_length;
+    uint16_t version;
+
+    if (!state || !state->fault_pending || state->fault_frame_active ||
+        !frame) {
+        return false;
+    }
+
+    format = m68k_mmu030_fault_format(state);
+    frame_length = m68k_mmu030_access_frame_size(state);
+    if (!frame_length) {
+        return false;
+    }
+    if (frame_size != frame_length) {
+        return false;
+    }
+
+    memset(frame, 0, frame_length);
+    stw_be_p(frame + 0x00, saved_sr);
+    stl_be_p(frame + 0x02, state->fault_pc);
+    stw_be_p(frame + 0x06,
+             ((uint16_t)format << 12) | (vector_offset & 0x0fff));
+    stw_be_p(frame + 0x0a, state->fault_ssw);
+    stw_be_p(frame + 0x0c, state->fault_stage_c);
+    stw_be_p(frame + 0x0e, state->fault_stage_b);
+    stl_be_p(frame + 0x10, state->fault_address);
+    stl_be_p(frame + 0x18, state->fault_data_output);
+    if (format == M68K_MMU030_FAULT_FORMAT_B) {
+        uint32_t stage_b_address = state->fault_stage_b_address;
+
+        if (!stage_b_address &&
+            (state->fault_ssw & M68K_MMU030_SSW_RB)) {
+            stage_b_address = state->fault_pc + 4;
+        }
+        stl_be_p(frame + 0x24, stage_b_address);
+        stl_be_p(frame + 0x2c, state->fault_data_input);
+        version = state->fault_frame_version ?
+                  state->fault_frame_version : M68K_MMU030_FRAME_VERSION;
+        stw_be_p(frame + 0x36, (version & 0xf) << 12);
+    }
+
+    /* The frame has consumed the pending MMU fault context. */
+    state->fault_pending = false;
+    state->fault_format = format;
+    state->fault_frame_active = true;
+    return true;
+}
+
+bool m68k_mmu030_restore_access_frame(
+    M68KMMU030State *state, const uint8_t *frame, size_t frame_size,
+    uint16_t *saved_sr, uint32_t *resume_pc)
+{
+    uint16_t format_word;
+    uint16_t ssw;
+    uint8_t format;
+    uint32_t expected_size;
+    uint32_t restored_pc;
+    bool data_input_valid;
+    uint32_t data_input_address;
+    bool code_fetch;
+    bool special_valid;
+
+    if (!state || !frame || frame_size < M68K_MMU030_ACCESS_FRAME_SIZE_SHORT) {
+        return false;
+    }
+
+    format_word = lduw_be_p(frame + 0x06);
+    format = format_word >> 12;
+    switch (format) {
+    case M68K_MMU030_FAULT_FORMAT_A:
+        expected_size = M68K_MMU030_ACCESS_FRAME_SIZE_SHORT;
+        break;
+    case M68K_MMU030_FAULT_FORMAT_B:
+        expected_size = M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
+        break;
+    default:
+        return false;
+    }
+    if (frame_size != expected_size) {
+        return false;
+    }
+    if (format == M68K_MMU030_FAULT_FORMAT_B &&
+        (lduw_be_p(frame + 0x36) >> 12) != M68K_MMU030_FRAME_VERSION) {
+        return false;
+    }
+
+    ssw = lduw_be_p(frame + 0x0a);
+    if (saved_sr) {
+        *saved_sr = lduw_be_p(frame + 0x00);
+    }
+    if (resume_pc) {
+        *resume_pc = ldl_be_p(frame + 0x02);
+    }
+    restored_pc = ldl_be_p(frame + 0x02);
+
+    /* A completed read may precede a non-RMC write in the same translated
+     * instruction.  Preserve that internal validity bit across RTE; the
+     * architectural SSW RM bit is reserved for indivisible RMC operations
+     * (CAS/CAS2/TAS), not every ordinary read-then-write instruction. */
+    data_input_valid = state->fault_data_input_valid;
+    data_input_address = state->fault_data_input_address;
+    code_fetch = state->fault_code_fetch;
+    /* The special-cycle key is the translated instruction's PC.  QEMU may
+     * restore a faulting helper to the preceding TCG instruction boundary,
+     * so it need not equal the architectural frame PC. */
+    special_valid = state->fault_special_valid;
+
+    state->fault_pending = false;
+    state->fault_format = format;
+    state->fault_pc = restored_pc;
+    state->fault_instruction_address = state->fault_pc;
+    state->fault_ssw = ssw;
+    state->fault_size = 0;
+    switch (ssw & M68K_MMU030_SSW_SIZE_MASK) {
+    case M68K_MMU030_SSW_SIZE_BYTE:
+        state->fault_size = 1;
+        break;
+    case M68K_MMU030_SSW_SIZE_WORD:
+        state->fault_size = 2;
+        break;
+    case M68K_MMU030_SSW_SIZE_LONG:
+        state->fault_size = 4;
+        break;
+    default:
+        state->fault_size = 3;
+        break;
+    }
+    state->fault_function_code = ssw & M68K_MMU030_SSW_FC_MASK;
+    state->fault_stage_c = lduw_be_p(frame + 0x0c);
+    state->fault_stage_b = lduw_be_p(frame + 0x0e);
+    state->fault_address = ldl_be_p(frame + 0x10);
+    state->fault_data_output = ldl_be_p(frame + 0x18);
+    state->fault_descriptor_address = 0;
+    state->fault_table_level = 0;
+    state->fault_data_input = 0;
+    state->fault_data_input_address = 0;
+    state->fault_stage_b_address = 0;
+    state->fault_data_input_valid = false;
+    state->fault_data_complete = false;
+    state->fault_data_write = false;
+    state->fault_frame_version = 0;
+    state->fault_fetch_active = false;
+    state->fault_code_fetch = code_fetch;
+    state->fault_pipe_accept = false;
+    if (format == M68K_MMU030_FAULT_FORMAT_B) {
+        state->fault_stage_b_address = ldl_be_p(frame + 0x24);
+        state->fault_data_input = ldl_be_p(frame + 0x2c);
+        state->fault_frame_version = lduw_be_p(frame + 0x36) >> 12;
+        if (ssw & M68K_MMU030_SSW_RW) {
+            /* A handler which clears DF supplies the read data in DIB. */
+            state->fault_data_input_address = state->fault_address;
+            state->fault_data_input_valid = true;
+        } else if (data_input_valid) {
+            /* Preserve the completed read half of an ordinary translated
+             * read/write instruction. */
+            state->fault_data_input_address = data_input_address;
+            state->fault_data_input_valid = true;
+        }
+    }
+    state->fault_data_write = !(ssw & M68K_MMU030_SSW_RW);
+    state->fault_rmw = !!(ssw & M68K_MMU030_SSW_RM);
+    if (!state->fault_rmw) {
+        state->fault_rmw_phase = 0;
+        state->fault_rmw_data1 = 0;
+        state->fault_rmw_data2 = 0;
+        state->fault_rmw_data_valid = false;
+    }
+    if (!special_valid) {
+        m68k_mmu030_special_clear(state);
+    }
+
+    /* RTE owns the next cycle only when the frame says it is still pending. */
+    state->restart_pending = (ssw & (M68K_MMU030_SSW_DF |
+                                     M68K_MMU030_SSW_RC |
+                                     M68K_MMU030_SSW_RB)) != 0;
+    return true;
+}
+
+bool m68k_mmu030_restore_coprocessor_frame(
+    M68KMMU030State *state, const uint8_t *frame, size_t frame_size,
+    uint16_t *saved_sr, uint32_t *resume_pc)
+{
+    if (!state || !frame || frame_size != M68K_MMU030_COPROCESSOR_FRAME_SIZE ||
+        (lduw_be_p(frame + 0x06) >> 12) != M68K_MMU030_FAULT_FORMAT_9) {
+        return false;
+    }
+
+    if (saved_sr) {
+        *saved_sr = lduw_be_p(frame + 0x00);
+    }
+    if (resume_pc) {
+        *resume_pc = ldl_be_p(frame + 0x02);
+    }
+
+    /* The four internal words are consumed by the coprocessor path.  The
+     * integer PMMU has no corresponding architectural registers, but the
+     * instruction address is part of the common restart image. */
+    state->fault_pending = false;
+    state->fault_format = M68K_MMU030_FAULT_FORMAT_9;
+    state->fault_address = 0;
+    state->fault_ssw = 0;
+    state->fault_status = 0;
+    state->fault_stage_c = 0;
+    state->fault_stage_b = 0;
+    state->fault_stage_b_address = 0;
+    state->fault_data_output = 0;
+    state->fault_data_input = 0;
+    state->fault_data_input_address = 0;
+    state->fault_descriptor_address = 0;
+    state->fault_table_level = 0;
+    state->fault_size = 0;
+    state->fault_function_code = 0;
+    state->fault_frame_version = 0;
+    state->fault_pc = ldl_be_p(frame + 0x02);
+    state->fault_instruction_address = ldl_be_p(frame + 0x08);
+    state->restart_pending = false;
+    state->fault_resume_pc = 0;
+    state->fault_frame_active = false;
+    state->fault_data_complete = false;
+    state->fault_data_input_valid = false;
+    state->fault_data_write = false;
+    state->fault_rmw = false;
+    state->fault_rmw_phase = 0;
+    state->fault_rmw_data1 = 0;
+    state->fault_rmw_data2 = 0;
+    state->fault_rmw_data_valid = false;
+    state->fault_fetch_active = false;
+    state->fault_code_fetch = false;
+    state->fault_pipe_accept = false;
+    return true;
+}
+
+bool m68k_mmu030_consume_restart(M68KMMU030State *state)
+{
+    bool pending;
+
+    if (!state) {
+        return false;
+    }
+    pending = state->restart_pending;
+    state->restart_pending = false;
+    return pending;
 }
 
 bool m68k_mmu030_build_short_access_frame(
     M68KMMU030State *state, uint16_t saved_sr, uint16_t vector_offset,
     uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE])
 {
+    uint8_t format;
+
     if (!state || !state->fault_pending || !frame) {
         return false;
     }
 
-    /*
-     * Section 8.4, format $A: ordinary faults taken at an instruction
-     * boundary use this 16-word frame.  The pipeline and rerun state needed
-     * by long format $B (and format $9 coprocessor frames) is deferred to the
-     * later exception-recovery work; keep those internal words zero here.
-     */
-    memset(frame, 0, M68K_MMU030_ACCESS_FRAME_SIZE);
-    stw_be_p(frame + 0x00, saved_sr);
-    stl_be_p(frame + 0x02, state->fault_pc);
-    stw_be_p(frame + 0x06, UINT16_C(0xa000) | (vector_offset & 0x0fff));
-    stw_be_p(frame + 0x0a, state->fault_ssw);
-    stl_be_p(frame + 0x10, state->fault_address);
-
-    /* The frame has consumed the pending MMU fault context. */
-    state->fault_pending = false;
-    return true;
+    format = state->fault_format;
+    if (format == 0) {
+        state->fault_format = M68K_MMU030_FAULT_FORMAT_A;
+    }
+    if (state->fault_format != M68K_MMU030_FAULT_FORMAT_A) {
+        state->fault_format = format;
+        return false;
+    }
+    bool result = m68k_mmu030_build_access_frame(
+        state, saved_sr, vector_offset, frame,
+        M68K_MMU030_ACCESS_FRAME_SIZE_SHORT);
+    if (!result && format == 0) {
+        state->fault_format = 0;
+    }
+    return result;
 }
 
 static int m68k_mmu030_walk_level(M68KMMU030State *state,
@@ -1093,6 +1793,10 @@ static int m68k_mmu030_walk_level(M68KMMU030State *state,
 
         table_count++;
         descriptor_address = table_address + (index << (source_long ? 3 : 2));
+        /* Preserve the descriptor causing a table-read fault as well as the
+         * descriptor of a successful walk.  This is consumed by the access
+         * error latch when the memory operation below fails. */
+        result->descriptor_address = descriptor_address;
         if (!ops || !ops->readl ||
             !ops->readl(ops->opaque, descriptor_address, &first)) {
             result->fault = true;
@@ -1121,11 +1825,8 @@ static int m68k_mmu030_walk_level(M68KMMU030State *state,
             return -1;
         }
 
-        /*
-         * A long descriptor is successful only after both words have been
-         * fetched.  Keep the previous address on a partial/bus-faulted
-         * fetch.
-         */
+        /* A long descriptor is successful only after both words have been
+         * fetched; descriptor_address remains the base of both words. */
         result->descriptor_address = descriptor_address;
 
         descriptor = first;
@@ -1307,6 +2008,10 @@ static int m68k_mmu030_walk_level(M68KMMU030State *state,
                 table_count++;
             }
             indirect_address &= ~UINT32_C(3);
+            /* An indirect descriptor is a second table access.  Publish its
+             * address before either long/short fetch so a bus error points at
+             * the actual failing table word. */
+            result->descriptor_address = indirect_address;
             if (!ops || !ops->readl ||
                 !ops->readl(ops->opaque, indirect_address,
                             &indirect_first) ||

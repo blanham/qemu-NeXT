@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "cpu.h"
 #include "exec/cputlb.h"
 #include "exec/page-protection.h"
@@ -462,6 +463,17 @@ void m68k_switch_sp(CPUM68KState *env)
 
 #if !defined(CONFIG_USER_ONLY)
 /* MMU: 68030 and 68040 */
+
+/* A second bus fault while the 68030's access frame is live cannot be
+ * represented by another exception frame.  The physical processor halts
+ * with the original frame state intact. */
+static G_NORETURN void m68k_mmu030_double_fault(CPUState *cs)
+{
+    qemu_log_mask(CPU_LOG_INT, "MC68030 double access fault; CPU halted\n");
+    cs->halted = 1;
+    cs->exception_index = EXCP_HLT;
+    cpu_loop_exit(cs);
+}
 
 static bool m68k_mmu030_address_space_readl(void *opaque, uint32_t address,
                                              uint32_t *value)
@@ -1052,15 +1064,26 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             return false;
         }
 
-        /* Capture the faulting instruction, rather than the TB entry PC. */
-        cpu_restore_state(cs, retaddr);
-        env->mmu030.fault_pending = true;
-        env->mmu030.fault_address = address;
-        env->mmu030.fault_pc = env->pc;
-        env->mmu030.fault_ssw = m68k_mmu030_make_ssw(
-            size, qemu_access_type == MMU_DATA_STORE,
-            access_type & ACCESS_CODE, function_code);
-        env->mmu030.fault_status = result.mmusr;
+        if (env->mmu030.fault_frame_active) {
+            m68k_mmu030_double_fault(cs);
+        }
+
+        /*
+         * Runtime TCG accesses carry a host return address from which the
+         * faulting instruction can be restored.  Translator-time code reads
+         * deliberately use retaddr=0; the decoder has already recorded the
+         * instruction PC and successfully fetched C/B words in the PMMU
+         * state, so use that exact PC instead of the stale TB entry.
+         */
+        if (retaddr == 0 && env->mmu030.fault_fetch_active) {
+            env->pc = env->mmu030.fault_instruction_address;
+        } else {
+            cpu_restore_state(cs, retaddr);
+        }
+        m68k_mmu030_capture_fault(
+            &env->mmu030, address, env->pc, size,
+            qemu_access_type == MMU_DATA_STORE,
+            access_type & ACCESS_CODE, function_code, &result);
         cs->exception_index = EXCP_ACCESS;
         cpu_loop_exit(cs);
     }
@@ -1561,44 +1584,61 @@ static void m68k_pmove_flush_all(void *opaque)
 }
 
 static uint64_t m68k_pmove_load(CPUM68KState *env, uint32_t address,
-                                unsigned size, uintptr_t ra)
+                                unsigned size, uintptr_t ra, uint32_t pc)
 {
-    switch (size) {
-    case sizeof(uint16_t):
-        return cpu_lduw_be_mmuidx_ra(env, address, MMU_KERNEL_IDX, ra);
-    case sizeof(uint32_t):
-        return cpu_ldl_be_mmuidx_ra(env, address, MMU_KERNEL_IDX, ra);
-    case sizeof(uint64_t): {
-        uint32_t high = cpu_ldl_be_mmuidx_ra(env, address,
-                                             MMU_KERNEL_IDX, ra);
-        uint32_t low = cpu_ldl_be_mmuidx_ra(env, address + 4,
-                                            MMU_KERNEL_IDX, ra);
-        return ((uint64_t)high << 32) | low;
+    M68KMMU030State *state = &env->mmu030;
+    unsigned cycles = size == sizeof(uint64_t) ? 2 : 1;
+    uint32_t words[2] = { 0, 0 };
+
+    for (unsigned cycle = 0; cycle < cycles; cycle++) {
+        uint32_t cycle_address = address + cycle * sizeof(uint32_t);
+        bool skip = m68k_mmu030_special_cycle(
+            state, M68K_MMU030_SPECIAL_PMOVE, cycle, pc, 0, false);
+
+        if (skip) {
+            words[cycle] = state->fault_special_data[cycle];
+        } else {
+            words[cycle] = cycles == 1 && size == sizeof(uint16_t) ?
+                cpu_lduw_be_mmuidx_ra(env, cycle_address, MMU_KERNEL_IDX, ra) :
+                cpu_ldl_be_mmuidx_ra(env, cycle_address, MMU_KERNEL_IDX, ra);
+            m68k_mmu030_special_record(
+                state, M68K_MMU030_SPECIAL_PMOVE, cycle, pc, words[cycle],
+                true);
+        }
     }
-    default:
-        g_assert_not_reached();
-    }
+
+    m68k_mmu030_special_finish(state, M68K_MMU030_SPECIAL_PMOVE, cycles, pc);
+    return cycles == 2 ? ((uint64_t)words[0] << 32) | words[1] : words[0];
 }
 
 static void m68k_pmove_store(CPUM68KState *env, uint32_t address,
-                             unsigned size, uint64_t value, uintptr_t ra)
+                             unsigned size, uint64_t value, uintptr_t ra,
+                             uint32_t pc)
 {
-    switch (size) {
-    case sizeof(uint16_t):
-        cpu_stw_be_mmuidx_ra(env, address, value, MMU_KERNEL_IDX, ra);
-        break;
-    case sizeof(uint32_t):
-        cpu_stl_be_mmuidx_ra(env, address, value, MMU_KERNEL_IDX, ra);
-        break;
-    case sizeof(uint64_t):
-        cpu_stl_be_mmuidx_ra(env, address, value >> 32,
-                             MMU_KERNEL_IDX, ra);
-        cpu_stl_be_mmuidx_ra(env, address + 4, value,
-                             MMU_KERNEL_IDX, ra);
-        break;
-    default:
-        g_assert_not_reached();
+    M68KMMU030State *state = &env->mmu030;
+    unsigned cycles = size == sizeof(uint64_t) ? 2 : 1;
+
+    for (unsigned cycle = 0; cycle < cycles; cycle++) {
+        uint32_t cycle_address = address + cycle * sizeof(uint32_t);
+        uint32_t word = cycles == 2 ?
+            (cycle ? value : value >> 32) : value;
+        bool skip = m68k_mmu030_special_cycle(
+            state, M68K_MMU030_SPECIAL_PMOVE, cycle, pc, word, true);
+
+        if (!skip) {
+            if (cycles == 1 && size == sizeof(uint16_t)) {
+                cpu_stw_be_mmuidx_ra(env, cycle_address, word,
+                                     MMU_KERNEL_IDX, ra);
+            } else {
+                cpu_stl_be_mmuidx_ra(env, cycle_address, word,
+                                     MMU_KERNEL_IDX, ra);
+            }
+            m68k_mmu030_special_record(
+                state, M68K_MMU030_SPECIAL_PMOVE, cycle, pc, word, false);
+        }
     }
+
+    m68k_mmu030_special_finish(state, M68K_MMU030_SPECIAL_PMOVE, cycles, pc);
 }
 
 static void m68k_pmove_write_control(CPUM68KState *env, unsigned reg,
@@ -1683,7 +1723,8 @@ static void m68k_pmove_write_control(CPUM68KState *env, unsigned reg,
 }
 
 void HELPER(m68k_pmove)(CPUM68KState *env, uint32_t extension,
-                        uint32_t address, uint32_t direction, uint32_t fd)
+                        uint32_t address, uint32_t direction, uint32_t fd,
+                        uint32_t pc)
 {
     unsigned reg;
     unsigned size;
@@ -1725,9 +1766,9 @@ void HELPER(m68k_pmove)(CPUM68KState *env, uint32_t extension,
         default:
             g_assert_not_reached();
         }
-        m68k_pmove_store(env, address, size, value, ra);
+        m68k_pmove_store(env, address, size, value, ra, pc);
     } else {
-        uint64_t value = m68k_pmove_load(env, address, size, ra);
+        uint64_t value = m68k_pmove_load(env, address, size, ra, pc);
 
         m68k_pmove_write_control(env, reg, value, fd, ra);
     }

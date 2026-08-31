@@ -7,6 +7,7 @@
         .text
         .globl  _start
 _start:
+        movea.l #0x00008000,%sp
         lea     config_handler,%a0
         move.l  %a0,0xe0           /* MMU configuration vector (56) */
         lea     bad_tc,%a0

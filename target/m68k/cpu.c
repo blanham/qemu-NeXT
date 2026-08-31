@@ -624,15 +624,64 @@ static int cpu_68030_mmu_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool cpu_68030_mmu_v1_field(void *opaque, int version_id)
+{
+    return version_id == 1;
+}
+
+static bool cpu_68030_mmu_v2_field(void *opaque, int version_id)
+{
+    return version_id == 2;
+}
+
+static bool cpu_68030_mmu_v3_field(void *opaque, int version_id)
+{
+    return version_id == 3;
+}
+
+static bool cpu_68030_mmu_v4_field(void *opaque, int version_id)
+{
+    return version_id == 4;
+}
+
+static bool cpu_68030_mmu_v5_field(void *opaque, int version_id)
+{
+    return version_id == 5;
+}
+
+static bool cpu_68030_mmu_v6_field(void *opaque, int version_id)
+{
+    return version_id >= 6;
+}
+
 const VMStateDescription vmstate_68030_mmu = {
     .name = "cpu/68030_mmu",
-    .version_id = 1,
+    .version_id = 6,
     .minimum_version_id = 1,
     .needed = cpu_68030_mmu_needed,
     .post_load = cpu_68030_mmu_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_STRUCT(env.mmu030, M68kCPU, 0,
-                       vmstate_mmu030_state, M68KMMU030State),
+        /* VMSTATE_STRUCT always passes the current child version.  Keep
+         * every explicit version so old CPU subsections do not consume
+         * appended restart state. */
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v1_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 1),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v2_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 2),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v3_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 3),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v4_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 4),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v5_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 5),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v6_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 6),
         VMSTATE_END_OF_LIST()
     }
 };

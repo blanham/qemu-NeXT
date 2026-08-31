@@ -10,6 +10,7 @@
         .text
         .globl  _start
 _start:
+        movea.l #0x00008000,%sp
         /* Any unexpected exception spins so the runner reports a failure. */
         lea     fault_handler,%a0
         move.l  %a0,0x08           /* bus error */

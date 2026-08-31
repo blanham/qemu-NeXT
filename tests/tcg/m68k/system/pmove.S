@@ -9,6 +9,8 @@
         .text
         .globl  _start
 _start:
+        /* Exception entry now builds the real 68030 frame. */
+        movea.l #0x00008000,%sp
         /* Undefined PMMU encodings are dispatched through the F-line
          * emulator vector; an illegal-instruction vector would fail this
          * check. */

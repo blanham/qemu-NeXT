@@ -110,6 +110,10 @@ typedef struct DisasContext {
     int writeback_mask;
     TCGv writeback[8];
     bool ss_active;
+    uint16_t pipe_stage_c;
+    uint16_t pipe_stage_b;
+    target_ulong pipe_stage_b_address;
+    unsigned pipe_words;
 } DisasContext;
 
 static TCGv get_areg(DisasContext *s, unsigned regno)
@@ -285,6 +289,276 @@ static inline void gen_addr_fault(DisasContext *s)
     gen_exception(s, s->base.pc_next, EXCP_ADDRESS);
 }
 
+/* Latch the pipe image immediately before a translated memory cycle.  The
+ * decoder has consumed all extension words by this point, so C and B are the
+ * words at P+2 and P+4 where P is the saved instruction PC.  A live access
+ * frame belongs to the exception handler; its memory references must not
+ * overwrite the suspended instruction's restart metadata. */
+static inline void gen_mmu030_fault_latch(DisasContext *s, TCGv data_output)
+{
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv active = tcg_temp_new_i32();
+        TCGv complete = tcg_temp_new_i32();
+        TCGLabel *done = gen_new_label();
+
+        tcg_gen_ld8u_i32(active, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_frame_active));
+        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
+        tcg_gen_ld8u_i32(complete, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_complete));
+        tcg_gen_brcondi_i32(TCG_COND_NE, complete, 0, done);
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_code_fetch));
+        tcg_gen_st16_i32(tcg_constant_i32(s->pipe_stage_c), tcg_env,
+                         offsetof(CPUM68KState, mmu030.fault_stage_c));
+        tcg_gen_st16_i32(tcg_constant_i32(s->pipe_stage_b), tcg_env,
+                         offsetof(CPUM68KState, mmu030.fault_stage_b));
+        tcg_gen_st_i32(tcg_constant_i32(s->pipe_stage_b_address), tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_stage_b_address));
+        tcg_gen_st_i32(tcg_constant_i32(s->base.pc_next), tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_instruction_address));
+        tcg_gen_st_i32(tcg_constant_i32(s->pc), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_resume_pc));
+        if (data_output) {
+            tcg_gen_st_i32(data_output, tcg_env,
+                           offsetof(CPUM68KState,
+                                    mmu030.fault_data_output));
+        }
+        gen_set_label(done);
+    }
+}
+
+/* RMC instructions (CAS/CAS2/TAS) perform one indivisible read-modify-write
+ * bus cycle.  Keep that fact in the live fault latch so a permission or
+ * physical-bus error carries SSW.RM and RTE reruns the operation exactly
+ * once.  The marker is cleared by fault_finish after a successful cycle. */
+static inline void gen_mmu030_fault_latch_rmw(DisasContext *s,
+                                               TCGv data_output)
+{
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv active = tcg_temp_new_i32();
+        TCGv complete = tcg_temp_new_i32();
+        TCGLabel *done = gen_new_label();
+
+        gen_mmu030_fault_latch(s, data_output);
+        tcg_gen_ld8u_i32(active, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_frame_active));
+        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
+        tcg_gen_ld8u_i32(complete, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_complete));
+        tcg_gen_brcondi_i32(TCG_COND_NE, complete, 0, done);
+        tcg_gen_st8_i32(tcg_constant_i32(1), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_rmw));
+        gen_set_label(done);
+    }
+}
+
+/* Record a successful read only after qemu_ld has completed.  If that read
+ * is followed by a failed write, the value is the MC68030 DIB and lets RTE
+ * replay the instruction's arithmetic without issuing the read cycle again. */
+static inline void gen_mmu030_fault_record_input(DisasContext *s, TCGv value,
+                                                 TCGv address, int opsize)
+{
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv active = tcg_temp_new_i32();
+        TCGv complete = tcg_temp_new_i32();
+        TCGv input = tcg_temp_new_i32();
+        TCGLabel *done = gen_new_label();
+
+        tcg_gen_ld8u_i32(active, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_frame_active));
+        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
+        tcg_gen_ld8u_i32(complete, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_complete));
+        tcg_gen_brcondi_i32(TCG_COND_NE, complete, 0, done);
+        switch (opsize) {
+        case OS_BYTE:
+            tcg_gen_andi_i32(input, value, 0xff);
+            break;
+        case OS_WORD:
+            tcg_gen_andi_i32(input, value, 0xffff);
+            break;
+        case OS_LONG:
+            tcg_gen_mov_i32(input, value);
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        tcg_gen_st_i32(input, tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_data_input));
+        tcg_gen_st_i32(address, tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_data_input_address));
+        tcg_gen_st8_i32(tcg_constant_i32(1), tcg_env,
+                        offsetof(CPUM68KState,
+                                 mmu030.fault_data_input_valid));
+        gen_set_label(done);
+    }
+}
+
+/* Clear per-instruction bus data only after all of its translated memory
+ * cycles have completed.  A fault exits before this code, leaving the data
+ * available to m68k_mmu030_capture_fault(). */
+static inline void gen_mmu030_fault_finish(DisasContext *s)
+{
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv active = tcg_temp_new_i32();
+        TCGv complete = tcg_temp_new_i32();
+        TCGv rmw = tcg_temp_new_i32();
+        TCGv rmw_valid = tcg_temp_new_i32();
+        TCGv resume = tcg_temp_new_i32();
+        TCGv special_valid = tcg_temp_new_i32();
+        TCGLabel *done = gen_new_label();
+        TCGLabel *check_cycle = gen_new_label();
+        TCGLabel *keep_cycle = gen_new_label();
+        TCGLabel *keep_rmw = gen_new_label();
+
+        tcg_gen_ld8u_i32(active, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_frame_active));
+        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
+        /*
+         * A DF-cleared RM frame is restored before the translator re-enters
+         * the TB that contains the faulting CAS2.  That TB may contain setup
+         * instructions before the CAS2 itself; retain the DIB/comparison
+         * phase until the translated RMC helper reaches its saved end PC.
+         */
+        tcg_gen_ld8u_i32(complete, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_complete));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, complete, 0, check_cycle);
+        tcg_gen_ld8u_i32(rmw, tcg_env,
+                         offsetof(CPUM68KState, mmu030.fault_rmw));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, rmw, 0, check_cycle);
+        tcg_gen_ld_i32(resume, tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_resume_pc));
+        tcg_gen_brcondi_i32(TCG_COND_NE, resume, s->pc, keep_rmw);
+        gen_set_label(check_cycle);
+        /* A CAS2 may have completed its first read/write before a later
+         * bus cycle faulted.  Handler instructions execute before RTE and
+         * must not erase that restart phase.  The CAS2 helper clears the
+         * latch itself once all phases complete. */
+        tcg_gen_ld8u_i32(rmw_valid, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_rmw_data_valid));
+        tcg_gen_brcondi_i32(TCG_COND_NE, rmw_valid, 0, keep_cycle);
+        tcg_gen_ld8u_i32(special_valid, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_special_valid));
+        tcg_gen_brcondi_i32(TCG_COND_NE, special_valid, 0, keep_cycle);
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_data_input));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_data_input_address));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_data_output));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState,
+                                 mmu030.fault_data_input_valid));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_data_write));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState,
+                                 mmu030.fault_data_complete));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_rmw));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_rmw_phase));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_rmw_data1));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_rmw_data2));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState,
+                                 mmu030.fault_rmw_data_valid));
+        tcg_gen_br(done);
+        gen_set_label(keep_rmw);
+        tcg_gen_br(done);
+        gen_set_label(keep_cycle);
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_code_fetch));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_resume_pc));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_instruction_address));
+        gen_set_label(done);
+    }
+}
+
+/* Generate one independently restartable FPU bus cycle.  The 68030 FPU
+ * presents double, extended, and packed operands as a sequence of long-word
+ * transfers; a fault in a later transfer must not issue the earlier device
+ * reads/writes a second time after RTE. */
+static void gen_mmu030_special_load(DisasContext *s, TCGv dst, TCGv addr,
+                                    int index, unsigned cycle, MemOp op)
+{
+    TCGv skip;
+    TCGLabel *access = gen_new_label();
+    TCGLabel *done = gen_new_label();
+
+    g_assert(cycle < M68K_MMU030_SPECIAL_MAX_CYCLES);
+    skip = tcg_temp_new_i32();
+    gen_helper_m68k_mmu030_special_cycle(
+        skip, tcg_env, tcg_constant_i32(M68K_MMU030_SPECIAL_FPU),
+        tcg_constant_i32(cycle), tcg_constant_i32(s->base.pc_next),
+        tcg_constant_i32(0), tcg_constant_i32(0));
+    tcg_gen_brcondi_i32(TCG_COND_EQ, skip, 0, access);
+    tcg_gen_ld_i32(dst, tcg_env,
+                   offsetof(CPUM68KState,
+                            mmu030.fault_special_data[cycle]));
+    tcg_gen_br(done);
+    gen_set_label(access);
+    tcg_gen_qemu_ld_tl(dst, addr, index, op);
+    gen_helper_m68k_mmu030_special_record(
+        tcg_env, tcg_constant_i32(M68K_MMU030_SPECIAL_FPU),
+        tcg_constant_i32(cycle), tcg_constant_i32(s->base.pc_next), dst,
+        tcg_constant_i32(1));
+    gen_set_label(done);
+}
+
+static void gen_mmu030_special_store(DisasContext *s, TCGv addr, TCGv value,
+                                     int index, unsigned cycle, MemOp op)
+{
+    TCGv skip;
+    TCGLabel *access = gen_new_label();
+    TCGLabel *done = gen_new_label();
+
+    g_assert(cycle < M68K_MMU030_SPECIAL_MAX_CYCLES);
+    skip = tcg_temp_new_i32();
+    gen_helper_m68k_mmu030_special_cycle(
+        skip, tcg_env, tcg_constant_i32(M68K_MMU030_SPECIAL_FPU),
+        tcg_constant_i32(cycle), tcg_constant_i32(s->base.pc_next), value,
+        tcg_constant_i32(1));
+    tcg_gen_brcondi_i32(TCG_COND_EQ, skip, 0, access);
+    tcg_gen_br(done);
+    gen_set_label(access);
+    tcg_gen_qemu_st_tl(value, addr, index, op);
+    gen_helper_m68k_mmu030_special_record(
+        tcg_env, tcg_constant_i32(M68K_MMU030_SPECIAL_FPU),
+        tcg_constant_i32(cycle), tcg_constant_i32(s->base.pc_next), value,
+        tcg_constant_i32(0));
+    gen_set_label(done);
+}
+
+static void gen_mmu030_special_finish_fpu(DisasContext *s, unsigned cycles)
+{
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        gen_helper_m68k_mmu030_special_finish(
+            tcg_env, tcg_constant_i32(M68K_MMU030_SPECIAL_FPU),
+            tcg_constant_i32(cycles), tcg_constant_i32(s->base.pc_next));
+    }
+}
+
 /*
  * Generate a load from the specified address.  Narrow values are
  *  sign extended to full register width.
@@ -293,16 +567,105 @@ static inline TCGv gen_load(DisasContext *s, int opsize, TCGv addr,
                             int sign, int index)
 {
     TCGv tmp = tcg_temp_new_i32();
+    TCGLabel *load = NULL;
+    TCGLabel *buffer = NULL;
+    TCGLabel *done = NULL;
 
+    gen_mmu030_fault_latch(s, NULL);
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv complete = tcg_temp_new_i32();
+        TCGv valid = tcg_temp_new_i32();
+        TCGv input_address = tcg_temp_new_i32();
+        TCGv special_valid = tcg_temp_new_i32();
+
+        load = gen_new_label();
+        buffer = gen_new_label();
+        done = gen_new_label();
+        tcg_gen_ld8u_i32(complete, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_complete));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, complete, 0, load);
+        tcg_gen_ld8u_i32(valid, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_input_valid));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, valid, 0, load);
+        tcg_gen_ld8u_i32(special_valid, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_special_valid));
+        tcg_gen_brcondi_i32(TCG_COND_NE, special_valid, 0, load);
+        tcg_gen_ld_i32(input_address, tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_data_input_address));
+        tcg_gen_brcond_i32(TCG_COND_NE, addr, input_address, load);
+        tcg_gen_br(buffer);
+    }
+    if (load) {
+        gen_set_label(load);
+    }
     switch (opsize) {
     case OS_BYTE:
-    case OS_WORD:
-    case OS_LONG:
         tcg_gen_qemu_ld_tl(tmp, addr, index,
                            opsize | (sign ? MO_SIGN : 0) | MO_TE);
         break;
+    case OS_WORD:
+    case OS_LONG:
+        if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+            gen_helper_m68k_mmu030_split_load(
+                tmp, tcg_env, addr,
+                tcg_constant_i32(opsize == OS_WORD ? 2 : 4),
+                tcg_constant_i32(index), tcg_constant_i32(s->base.pc_next));
+            if (sign) {
+                if (opsize == OS_WORD) {
+                    tcg_gen_ext16s_i32(tmp, tmp);
+                }
+            }
+        } else {
+            tcg_gen_qemu_ld_tl(tmp, addr, index,
+                               opsize | (sign ? MO_SIGN : 0) | MO_TE);
+        }
+        break;
     default:
         g_assert_not_reached();
+    }
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        gen_mmu030_fault_record_input(s, tmp, addr, opsize);
+        tcg_gen_br(done);
+        gen_set_label(buffer);
+        tcg_gen_ld_i32(tmp, tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_data_input));
+        if (sign) {
+            switch (opsize) {
+            case OS_BYTE:
+                tcg_gen_ext8s_i32(tmp, tmp);
+                break;
+            case OS_WORD:
+                tcg_gen_ext16s_i32(tmp, tmp);
+                break;
+            default:
+                break;
+            }
+        }
+        {
+            TCGv write = tcg_temp_new_i32();
+            TCGLabel *keep = gen_new_label();
+
+            tcg_gen_ld8u_i32(write, tcg_env,
+                             offsetof(CPUM68KState, mmu030.fault_data_write));
+            tcg_gen_brcondi_i32(TCG_COND_NE, write, 0, keep);
+            tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                            offsetof(CPUM68KState,
+                                     mmu030.fault_data_complete));
+            tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                            offsetof(CPUM68KState,
+                                     mmu030.fault_data_input_valid));
+            tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                           offsetof(CPUM68KState,
+                                    mmu030.fault_data_input_address));
+            tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                           offsetof(CPUM68KState, mmu030.fault_resume_pc));
+            gen_set_label(keep);
+        }
+        gen_set_label(done);
     }
     return tmp;
 }
@@ -311,14 +674,73 @@ static inline TCGv gen_load(DisasContext *s, int opsize, TCGv addr,
 static inline void gen_store(DisasContext *s, int opsize, TCGv addr, TCGv val,
                              int index)
 {
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        /* Keep the right-justified value available if this bus cycle faults.
+         * Address-register writeback remains delayed until after qemu_st, so
+         * retrying the instruction through RTE is transparent. */
+        gen_mmu030_fault_latch(s, val);
+    }
+    TCGLabel *store = NULL;
+    TCGLabel *done = NULL;
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv complete = tcg_temp_new_i32();
+        TCGv write = tcg_temp_new_i32();
+        TCGv fault_address = tcg_temp_new_i32();
+        TCGv special_valid = tcg_temp_new_i32();
+
+        store = gen_new_label();
+        done = gen_new_label();
+        tcg_gen_ld8u_i32(complete, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_data_complete));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, complete, 0, store);
+        tcg_gen_ld8u_i32(write, tcg_env,
+                         offsetof(CPUM68KState, mmu030.fault_data_write));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, write, 0, store);
+        tcg_gen_ld8u_i32(special_valid, tcg_env,
+                         offsetof(CPUM68KState,
+                                  mmu030.fault_special_valid));
+        tcg_gen_brcondi_i32(TCG_COND_NE, special_valid, 0, store);
+        tcg_gen_ld_i32(fault_address, tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_address));
+        tcg_gen_brcond_i32(TCG_COND_NE, addr, fault_address, store);
+        /* The write completed in the handler (DF was cleared). */
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_data_complete));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState,
+                                 mmu030.fault_data_input_valid));
+        tcg_gen_st8_i32(tcg_constant_i32(0), tcg_env,
+                        offsetof(CPUM68KState, mmu030.fault_data_write));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState,
+                                mmu030.fault_data_input_address));
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu030.fault_resume_pc));
+        tcg_gen_br(done);
+        gen_set_label(store);
+    }
     switch (opsize) {
     case OS_BYTE:
+        tcg_gen_qemu_st_tl(val, addr, index, opsize | MO_TE);
+        break;
     case OS_WORD:
     case OS_LONG:
-        tcg_gen_qemu_st_tl(val, addr, index, opsize | MO_TE);
+        if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+            gen_helper_m68k_mmu030_split_store(
+                tcg_env, addr, val,
+                tcg_constant_i32(opsize == OS_WORD ? 2 : 4),
+                tcg_constant_i32(index), tcg_constant_i32(s->base.pc_next));
+        } else {
+            tcg_gen_qemu_st_tl(val, addr, index, opsize | MO_TE);
+        }
         break;
     default:
         g_assert_not_reached();
+    }
+    if (done) {
+        tcg_gen_br(done);
+        gen_set_label(done);
     }
 }
 
@@ -346,9 +768,46 @@ static TCGv gen_ldst(DisasContext *s, int opsize, TCGv addr, TCGv val,
 /* Read a 16-bit immediate constant */
 static inline uint16_t read_im16(CPUM68KState *env, DisasContext *s)
 {
+    target_ulong im_pc = s->pc;
     uint16_t im;
-    im = translator_lduw_end(env, &s->base, s->pc, MO_BE);
+    bool accepted = false;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030) &&
+        env->mmu030.fault_pipe_accept && env->mmu030.fault_code_fetch &&
+        env->mmu030.fault_pc == s->base.pc_next) {
+        /*
+         * RTE accepted the handler's C/B image.  Consume it at the
+         * corresponding extension-word address; the operation word itself
+         * is still fetched from the repaired code page.
+         */
+        if (s->pipe_words == 1) {
+            im = env->mmu030.fault_stage_c;
+            accepted = true;
+        } else if (s->pipe_words == 2) {
+            im = env->mmu030.fault_stage_b;
+            accepted = true;
+        }
+    }
+    if (!accepted) {
+        im = translator_lduw_end(env, &s->base, s->pc, MO_BE);
+    }
     s->pc += 2;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        m68k_mmu030_record_instruction_fetch(&env->mmu030,
+                                             s->base.pc_next, im_pc, im);
+        /* The operation word is in the execution stage while the next two
+         * words occupy C and B.  Keep their architectural addresses: for a
+         * saved PC of P, C is P+2 and B is P+4. */
+        if (s->pipe_words == 1) {
+            s->pipe_stage_c = im;
+        } else if (s->pipe_words == 2) {
+            s->pipe_stage_b = im;
+            s->pipe_stage_b_address = im_pc;
+        }
+        s->pipe_words++;
+    }
+
     return im;
 }
 
@@ -927,22 +1386,49 @@ static void gen_load_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
 {
     TCGv tmp;
     TCGv_i64 t64;
+    bool mmu030 = m68k_feature(s->env, M68K_FEATURE_M68030);
 
     t64 = tcg_temp_new_i64();
     tmp = tcg_temp_new();
+    if (mmu030) {
+        gen_mmu030_fault_latch(s, NULL);
+    }
     switch (opsize) {
     case OS_BYTE:
     case OS_WORD:
     case OS_LONG:
-        tcg_gen_qemu_ld_tl(tmp, addr, index, opsize | MO_SIGN | MO_TE);
+        if (mmu030) {
+            gen_mmu030_special_load(s, tmp, addr, index, 0,
+                                    opsize | MO_SIGN | MO_TE);
+        } else {
+            tcg_gen_qemu_ld_tl(tmp, addr, index, opsize | MO_SIGN | MO_TE);
+        }
         gen_helper_exts32(tcg_env, fp, tmp);
+        gen_mmu030_special_finish_fpu(s, 1);
         break;
     case OS_SINGLE:
-        tcg_gen_qemu_ld_tl(tmp, addr, index, MO_TEUL);
+        if (mmu030) {
+            gen_mmu030_special_load(s, tmp, addr, index, 0, MO_TEUL);
+        } else {
+            tcg_gen_qemu_ld_tl(tmp, addr, index, MO_TEUL);
+        }
         gen_helper_extf32(tcg_env, fp, tmp);
+        gen_mmu030_special_finish_fpu(s, 1);
         break;
     case OS_DOUBLE:
-        tcg_gen_qemu_ld_i64(t64, addr, index, MO_TEUQ);
+        if (mmu030) {
+            TCGv high = tcg_temp_new_i32();
+            TCGv low = tcg_temp_new_i32();
+            TCGv next = tcg_temp_new_i32();
+
+            gen_mmu030_special_load(s, high, addr, index, 0, MO_TEUL);
+            tcg_gen_addi_i32(next, addr, 4);
+            gen_mmu030_special_load(s, low, next, index, 1, MO_TEUL);
+            tcg_gen_concat_i32_i64(t64, low, high);
+            gen_mmu030_special_finish_fpu(s, 2);
+        } else {
+            tcg_gen_qemu_ld_i64(t64, addr, index, MO_TEUQ);
+        }
         gen_helper_extf64(tcg_env, fp, t64);
         break;
     case OS_EXTENDED:
@@ -950,12 +1436,33 @@ static void gen_load_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
             gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
             break;
         }
-        tcg_gen_qemu_ld_i32(tmp, addr, index, MO_TEUL);
-        tcg_gen_shri_i32(tmp, tmp, 16);
-        tcg_gen_st16_i32(tmp, fp, offsetof(FPReg, l.upper));
-        tcg_gen_addi_i32(tmp, addr, 4);
-        tcg_gen_qemu_ld_i64(t64, tmp, index, MO_TEUQ);
-        tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
+        if (mmu030) {
+            TCGv high = tcg_temp_new_i32();
+            TCGv low = tcg_temp_new_i32();
+            TCGv next = tcg_temp_new_i32();
+
+            gen_mmu030_special_load(s, tmp, addr, index, 0, MO_TEUL);
+            tcg_gen_addi_i32(next, addr, 4);
+            gen_mmu030_special_load(s, high, next, index, 1, MO_TEUL);
+            tcg_gen_addi_i32(next, addr, 8);
+            gen_mmu030_special_load(s, low, next, index, 2, MO_TEUL);
+            tcg_gen_shri_i32(tmp, tmp, 16);
+            tcg_gen_st16_i32(tmp, fp, offsetof(FPReg, l.upper));
+            tcg_gen_concat_i32_i64(t64, low, high);
+            gen_mmu030_special_finish_fpu(s, 3);
+        } else {
+            tcg_gen_qemu_ld_i32(tmp, addr, index, MO_TEUL);
+            tcg_gen_shri_i32(tmp, tmp, 16);
+            tcg_gen_st16_i32(tmp, fp, offsetof(FPReg, l.upper));
+            tcg_gen_addi_i32(tmp, addr, 4);
+            tcg_gen_qemu_ld_i64(t64, tmp, index, MO_TEUQ);
+            tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
+        }
+        if (mmu030) {
+            /* The lower longword pair is committed above; do not overwrite
+             * the FP register with the temporary address. */
+            tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
+        }
         break;
     case OS_PACKED:
         if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
@@ -963,11 +1470,22 @@ static void gen_load_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
             TCGv word1 = tcg_temp_new();
             TCGv word2 = tcg_temp_new();
 
-            tcg_gen_qemu_ld_i32(word0, addr, index, MO_TEUL);
-            tcg_gen_addi_i32(tmp, addr, 4);
-            tcg_gen_qemu_ld_i32(word1, tmp, index, MO_TEUL);
-            tcg_gen_addi_i32(tmp, addr, 8);
-            tcg_gen_qemu_ld_i32(word2, tmp, index, MO_TEUL);
+            if (mmu030) {
+                TCGv next = tcg_temp_new_i32();
+
+                gen_mmu030_special_load(s, word0, addr, index, 0, MO_TEUL);
+                tcg_gen_addi_i32(next, addr, 4);
+                gen_mmu030_special_load(s, word1, next, index, 1, MO_TEUL);
+                tcg_gen_addi_i32(next, addr, 8);
+                gen_mmu030_special_load(s, word2, next, index, 2, MO_TEUL);
+                gen_mmu030_special_finish_fpu(s, 3);
+            } else {
+                tcg_gen_qemu_ld_i32(word0, addr, index, MO_TEUL);
+                tcg_gen_addi_i32(tmp, addr, 4);
+                tcg_gen_qemu_ld_i32(word1, tmp, index, MO_TEUL);
+                tcg_gen_addi_i32(tmp, addr, 8);
+                tcg_gen_qemu_ld_i32(word2, tmp, index, MO_TEUL);
+            }
             gen_helper_extp96(tcg_env, fp, word0, word1, word2);
         } else {
             gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
@@ -983,23 +1501,50 @@ static void gen_store_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
 {
     TCGv tmp;
     TCGv_i64 t64;
+    bool mmu030 = m68k_feature(s->env, M68K_FEATURE_M68030);
 
     t64 = tcg_temp_new_i64();
     tmp = tcg_temp_new();
+    if (mmu030) {
+        gen_mmu030_fault_latch(s, NULL);
+    }
     switch (opsize) {
     case OS_BYTE:
     case OS_WORD:
     case OS_LONG:
         gen_helper_reds32(tmp, tcg_env, fp);
-        tcg_gen_qemu_st_tl(tmp, addr, index, opsize | MO_TE);
+        if (mmu030) {
+            gen_mmu030_special_store(s, addr, tmp, index, 0,
+                                     opsize | MO_TE);
+        } else {
+            tcg_gen_qemu_st_tl(tmp, addr, index, opsize | MO_TE);
+        }
+        gen_mmu030_special_finish_fpu(s, 1);
         break;
     case OS_SINGLE:
         gen_helper_redf32(tmp, tcg_env, fp);
-        tcg_gen_qemu_st_tl(tmp, addr, index, MO_TEUL);
+        if (mmu030) {
+            gen_mmu030_special_store(s, addr, tmp, index, 0, MO_TEUL);
+        } else {
+            tcg_gen_qemu_st_tl(tmp, addr, index, MO_TEUL);
+        }
+        gen_mmu030_special_finish_fpu(s, 1);
         break;
     case OS_DOUBLE:
         gen_helper_redf64(t64, tcg_env, fp);
-        tcg_gen_qemu_st_i64(t64, addr, index, MO_TEUQ);
+        if (mmu030) {
+            TCGv high = tcg_temp_new_i32();
+            TCGv low = tcg_temp_new_i32();
+            TCGv next = tcg_temp_new_i32();
+
+            tcg_gen_extr_i64_i32(low, high, t64);
+            gen_mmu030_special_store(s, addr, high, index, 0, MO_TEUL);
+            tcg_gen_addi_i32(next, addr, 4);
+            gen_mmu030_special_store(s, next, low, index, 1, MO_TEUL);
+            gen_mmu030_special_finish_fpu(s, 2);
+        } else {
+            tcg_gen_qemu_st_i64(t64, addr, index, MO_TEUQ);
+        }
         break;
     case OS_EXTENDED:
         if (m68k_feature(s->env, M68K_FEATURE_CF_FPU)) {
@@ -1008,14 +1553,29 @@ static void gen_store_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
         }
         tcg_gen_ld16u_i32(tmp, fp, offsetof(FPReg, l.upper));
         tcg_gen_shli_i32(tmp, tmp, 16);
-        tcg_gen_qemu_st_i32(tmp, addr, index, MO_TEUL);
-        tcg_gen_addi_i32(tmp, addr, 4);
         tcg_gen_ld_i64(t64, fp, offsetof(FPReg, l.lower));
-        tcg_gen_qemu_st_i64(t64, tmp, index, MO_TEUQ);
+        if (mmu030) {
+            TCGv high = tcg_temp_new_i32();
+            TCGv low = tcg_temp_new_i32();
+            TCGv next = tcg_temp_new_i32();
+
+            gen_mmu030_special_store(s, addr, tmp, index, 0, MO_TEUL);
+            tcg_gen_extr_i64_i32(low, high, t64);
+            tcg_gen_addi_i32(next, addr, 4);
+            gen_mmu030_special_store(s, next, high, index, 1, MO_TEUL);
+            tcg_gen_addi_i32(next, addr, 8);
+            gen_mmu030_special_store(s, next, low, index, 2, MO_TEUL);
+            gen_mmu030_special_finish_fpu(s, 3);
+        } else {
+            tcg_gen_qemu_st_i32(tmp, addr, index, MO_TEUL);
+            tcg_gen_addi_i32(tmp, addr, 4);
+            tcg_gen_qemu_st_i64(t64, tmp, index, MO_TEUQ);
+        }
         break;
     case OS_PACKED:
         if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
-            gen_helper_stp96(tcg_env, fp, addr, kfactor);
+            gen_helper_stp96(tcg_env, fp, addr, kfactor,
+                             tcg_constant_i32(s->base.pc_next));
         } else {
             gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
         }
@@ -2063,6 +2623,23 @@ DISAS_INSN(movep)
         i = 2;
     }
 
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        TCGv result = tcg_temp_new();
+
+        /* MOVEP is four (or two) separate byte bus cycles.  The helper keeps
+         * completed cycles in the MC68030 restart latch, so a fault on a
+         * later byte does not replay an earlier device access after RTE. */
+        gen_mmu030_fault_latch(s, NULL);
+        gen_helper_m68k_movep(
+            result, tcg_env, abuf, reg,
+            tcg_constant_i32(!(insn & 0x80)), tcg_constant_i32(i),
+            tcg_constant_i32(s->base.pc_next));
+        if (!(insn & 0x80)) {
+            tcg_gen_mov_i32(reg, result);
+        }
+        return;
+    }
+
     if (insn & 0x80) {
         for ( ; i > 0 ; i--) {
             tcg_gen_shri_i32(dbuf, reg, (i - 1) * 8);
@@ -2357,8 +2934,16 @@ DISAS_INSN(cas)
      */
 
     load = tcg_temp_new();
-    tcg_gen_atomic_cmpxchg_i32(load, addr, cmp, DREG(ext, 6),
-                               IS_USER(s), opc);
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        gen_mmu030_fault_latch_rmw(s, DREG(ext, 6));
+        gen_helper_m68k_mmu030_cas(
+            load, tcg_env, addr, cmp, DREG(ext, 6),
+            tcg_constant_i32(opsize_bytes(opsize)),
+            tcg_constant_i32(IS_USER(s) ? MMU_USER_IDX : MMU_KERNEL_IDX));
+    } else {
+        tcg_gen_atomic_cmpxchg_i32(load, addr, cmp, DREG(ext, 6),
+                                   IS_USER(s), opc);
+    }
     /* update flags before setting cmp to load */
     gen_update_cc_cmp(s, load, cmp, opsize);
     gen_partset_reg(opsize, DREG(ext, 0), load);
@@ -2408,6 +2993,7 @@ DISAS_INSN(cas2w)
      *     Dc2 = (R2)
      */
 
+    gen_mmu030_fault_latch_rmw(s, NULL);
     if (tb_cflags(s->base.tb) & CF_PARALLEL) {
         gen_helper_exit_atomic(tcg_env);
     } else {
@@ -2458,6 +3044,7 @@ DISAS_INSN(cas2l)
      *     Dc2 = (R2)
      */
 
+    gen_mmu030_fault_latch_rmw(s, NULL);
     regs = tcg_constant_i32(REG(ext2, 6) |
                             (REG(ext1, 6) << 3) |
                             (REG(ext2, 0) << 6) |
@@ -2731,8 +3318,16 @@ DISAS_INSN(tas)
             return;
         }
         src1 = tcg_temp_new();
-        tcg_gen_atomic_fetch_or_tl(src1, addr, tcg_constant_tl(0x80),
-                                   IS_USER(s), MO_SB);
+        if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+            gen_mmu030_fault_latch_rmw(s, tcg_constant_i32(0x80));
+            gen_helper_m68k_mmu030_tas(
+                src1, tcg_env, addr,
+                tcg_constant_i32(IS_USER(s) ? MMU_USER_IDX : MMU_KERNEL_IDX),
+                tcg_constant_i32(s->base.pc_next));
+        } else {
+            tcg_gen_atomic_fetch_or_tl(src1, addr, tcg_constant_tl(0x80),
+                                       IS_USER(s), MO_SB);
+        }
         gen_logic_cc(s, src1, OS_BYTE);
 
         switch (mode) {
@@ -4783,8 +5378,10 @@ DISAS_INSN(pmove)
         return;
     }
 
+    gen_mmu030_fault_latch(s, NULL);
     gen_helper_m68k_pmove(tcg_env, tcg_constant_i32(extension), address,
-                          tcg_constant_i32(direction), tcg_constant_i32(fd));
+                          tcg_constant_i32(direction), tcg_constant_i32(fd),
+                          tcg_constant_i32(s->base.pc_next));
 }
 #endif
 
@@ -4893,23 +5490,33 @@ static void gen_store_fcr(DisasContext *s, TCGv val, int reg)
     }
 }
 
-static void gen_qemu_store_fcr(DisasContext *s, TCGv addr, int reg)
+static void gen_qemu_store_fcr(DisasContext *s, TCGv addr, int reg,
+                               unsigned cycle)
 {
     int index = IS_USER(s);
     TCGv tmp;
 
     tmp = tcg_temp_new();
     gen_load_fcr(s, tmp, reg);
-    tcg_gen_qemu_st_tl(tmp, addr, index, MO_TEUL);
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        gen_mmu030_special_store(s, addr, tmp, index, cycle, MO_TEUL);
+    } else {
+        tcg_gen_qemu_st_tl(tmp, addr, index, MO_TEUL);
+    }
 }
 
-static void gen_qemu_load_fcr(DisasContext *s, TCGv addr, int reg)
+static void gen_qemu_load_fcr(DisasContext *s, TCGv addr, int reg,
+                              unsigned cycle)
 {
     int index = IS_USER(s);
     TCGv tmp;
 
     tmp = tcg_temp_new();
-    tcg_gen_qemu_ld_tl(tmp, addr, index, MO_TEUL);
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        gen_mmu030_special_load(s, tmp, addr, index, cycle, MO_TEUL);
+    } else {
+        tcg_gen_qemu_ld_tl(tmp, addr, index, MO_TEUL);
+    }
     gen_store_fcr(s, tmp, reg);
 }
 
@@ -4921,6 +5528,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
     int is_write = (ext >> 13) & 1;
     int mode = extract32(insn, 3, 3);
     int i;
+    unsigned cycle = 0;
     TCGv addr, tmp;
 
     switch (mode) {
@@ -4973,6 +5581,10 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
     }
     gen_helper_fpu_null_to_idle(tcg_env);
 
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        gen_mmu030_fault_latch(s, NULL);
+    }
+
     addr = tcg_temp_new();
     tcg_gen_mov_i32(addr, tmp);
 
@@ -4988,7 +5600,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
     if (is_write && mode == 4) {
         for (i = 2; i >= 0; i--, mask >>= 1) {
             if (mask & 1) {
-                gen_qemu_store_fcr(s, addr, 1 << i);
+                gen_qemu_store_fcr(s, addr, 1 << i, cycle++);
                 if (mask != 1) {
                     tcg_gen_subi_i32(addr, addr, opsize_bytes(OS_LONG));
                 }
@@ -4999,9 +5611,9 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
         for (i = 0; i < 3; i++, mask >>= 1) {
             if (mask & 1) {
                 if (is_write) {
-                    gen_qemu_store_fcr(s, addr, 1 << i);
+                    gen_qemu_store_fcr(s, addr, 1 << i, cycle++);
                 } else {
-                    gen_qemu_load_fcr(s, addr, 1 << i);
+                    gen_qemu_load_fcr(s, addr, 1 << i, cycle++);
                 }
                 if (mask != 1 || mode == 3) {
                     tcg_gen_addi_i32(addr, addr, opsize_bytes(OS_LONG));
@@ -5012,6 +5624,7 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
             tcg_gen_mov_i32(AREG(insn, 0), addr);
         }
     }
+    gen_mmu030_special_finish_fpu(s, cycle);
 }
 
 static void gen_op_fmovem(CPUM68KState *env, DisasContext *s,
@@ -5033,6 +5646,14 @@ static void gen_op_fmovem(CPUM68KState *env, DisasContext *s,
         gen_addr_fault(s);
         return;
     }
+    if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
+        /*
+         * FMOVEM helpers issue several independent bus cycles.  Establish
+         * the ordinary restart PC before the first helper cycle so a
+         * DF-cleared frame can hand control back to the saved instruction.
+         */
+        gen_mmu030_fault_latch(s, NULL);
+    }
     gen_helper_fpu_null_to_idle(tcg_env);
 
     tmp = tcg_temp_new();
@@ -5050,23 +5671,29 @@ static void gen_op_fmovem(CPUM68KState *env, DisasContext *s,
          * only available to store register to memory
          */
         if (opsize == OS_EXTENDED) {
-            gen_helper_fmovemx_st_predec(tmp, tcg_env, addr, tmp);
+            gen_helper_fmovemx_st_predec(tmp, tcg_env, addr, tmp,
+                                         tcg_constant_i32(s->base.pc_next));
         } else {
-            gen_helper_fmovemd_st_predec(tmp, tcg_env, addr, tmp);
+            gen_helper_fmovemd_st_predec(tmp, tcg_env, addr, tmp,
+                                         tcg_constant_i32(s->base.pc_next));
         }
     } else {
         /* postincrement addressing mode */
         if (opsize == OS_EXTENDED) {
             if (is_load) {
-                gen_helper_fmovemx_ld_postinc(tmp, tcg_env, addr, tmp);
+                gen_helper_fmovemx_ld_postinc(tmp, tcg_env, addr, tmp,
+                                              tcg_constant_i32(s->base.pc_next));
             } else {
-                gen_helper_fmovemx_st_postinc(tmp, tcg_env, addr, tmp);
+                gen_helper_fmovemx_st_postinc(tmp, tcg_env, addr, tmp,
+                                              tcg_constant_i32(s->base.pc_next));
             }
         } else {
             if (is_load) {
-                gen_helper_fmovemd_ld_postinc(tmp, tcg_env, addr, tmp);
+                gen_helper_fmovemd_ld_postinc(tmp, tcg_env, addr, tmp,
+                                              tcg_constant_i32(s->base.pc_next));
             } else {
-                gen_helper_fmovemd_st_postinc(tmp, tcg_env, addr, tmp);
+                gen_helper_fmovemd_st_postinc(tmp, tcg_env, addr, tmp,
+                                              tcg_constant_i32(s->base.pc_next));
             }
         }
     }
@@ -6248,10 +6875,28 @@ static void m68k_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     CPUM68KState *env = cpu_env(cpu);
+    uint32_t insn_pc = dc->base.pc_next;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        dc->pipe_stage_c = 0;
+        dc->pipe_stage_b = 0;
+        dc->pipe_stage_b_address = insn_pc + 4;
+        dc->pipe_words = 0;
+        m68k_mmu030_begin_instruction_fetch(&env->mmu030, insn_pc);
+    }
+
     uint16_t insn = read_im16(env, dc);
 
     opcode_table[insn](env, dc, insn);
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        /*
+         * A translator fetch fault exits before this point, leaving the
+         * direct pipeline snapshot for m68k_cpu_tlb_fill().
+         */
+        m68k_mmu030_end_instruction_fetch(&env->mmu030);
+    }
     do_writebacks(dc);
+    gen_mmu030_fault_finish(dc);
 
     dc->pc_prev = dc->base.pc_next;
     dc->base.pc_next = dc->pc;

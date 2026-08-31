@@ -20,6 +20,8 @@
 #include "qemu/log.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
+#include "exec/cputlb.h"
+#include "exec/target_page.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "qemu/bswap.h"
@@ -27,6 +29,133 @@
 #include "qemu/plugin.h"
 
 #if !defined(CONFIG_USER_ONLY)
+
+static G_NORETURN void raise_exception_ra(CPUM68KState *env, int tt,
+                                           uintptr_t raddr);
+
+/* A second bus fault while the 68030's access frame is live cannot be
+ * represented by another exception frame.  The physical processor halts
+ * with the original frame state intact. */
+static G_NORETURN void m68k_mmu030_double_fault(CPUState *cs)
+{
+    qemu_log_mask(CPU_LOG_INT, "MC68030 double access fault; CPU halted\n");
+    cs->halted = 1;
+    cs->exception_index = EXCP_HLT;
+    cpu_loop_exit(cs);
+}
+
+static void m68k_mmu030_consume_data_input(M68KMMU030State *state)
+{
+    state->fault_data_input = 0;
+    state->fault_data_input_address = 0;
+    state->fault_data_input_valid = false;
+    state->fault_data_complete = false;
+}
+
+static G_NORETURN void m68k_rte_format_error(CPUM68KState *env,
+                                             uint32_t rte_pc)
+{
+    /* The attempted frame must remain on the stack for the format handler. */
+    env->pc = rte_pc;
+    raise_exception_ra(env, EXCP_FORMAT, 0);
+}
+
+static void m68k_rte_complete_access(CPUM68KState *env,
+                                     uint32_t fault_pc,
+                                     uint32_t resume_pc,
+                                     uint32_t restored_pc)
+{
+    uint16_t ssw = env->mmu030.fault_ssw;
+    bool rerun;
+    bool special_valid = env->mmu030.fault_special_valid;
+    uint32_t special_pc = env->mmu030.fault_special_pc;
+
+    /* A set DF/RC/RB bit transfers ownership of the next bus cycle to RTE.
+     * Consume that decision here: an already repaired frame must not leave a
+     * stale restart request for a later exception. */
+    rerun = m68k_mmu030_consume_restart(&env->mmu030);
+    if (rerun) {
+        tlb_flush_page(env_cpu(env), env->mmu030.fault_address);
+        env->mmu030.fault_data_complete = false;
+        env->mmu030.fault_data_input_valid = false;
+        env->mmu030.fault_data_write = false;
+        env->mmu030.fault_rmw = false;
+        /* RM cycles may have completed earlier CAS2 phases.  Preserve their
+         * phase/data latch across RTE so the retry starts at the failed bus
+         * cycle rather than repeating reads or the first write. */
+        if (!(ssw & M68K_MMU030_SSW_RM) &&
+            !env->mmu030.fault_special_valid) {
+            env->mmu030.fault_rmw_phase = 0;
+            env->mmu030.fault_rmw_data1 = 0;
+            env->mmu030.fault_rmw_data2 = 0;
+            env->mmu030.fault_rmw_data_valid = false;
+        }
+        env->mmu030.fault_data_input_address = 0;
+        env->mmu030.fault_resume_pc = 0;
+        env->mmu030.fault_pipe_accept = false;
+    } else if (env->mmu030.fault_code_fetch &&
+               restored_pc == fault_pc &&
+               !(ssw & (M68K_MMU030_SSW_RC | M68K_MMU030_SSW_RB))) {
+        /*
+         * RC/RB cleared means the handler accepted the saved instruction
+         * pipeline.  Keep the edited C/B words for the translator's next
+         * decode; re-fetching them from memory would discard the frame's
+         * repaired image.
+         */
+        env->mmu030.fault_pipe_accept = true;
+        env->mmu030.fault_data_complete = false;
+        env->mmu030.fault_data_input_valid = false;
+        env->mmu030.fault_data_write = false;
+        env->mmu030.fault_rmw = false;
+        env->mmu030.fault_rmw_phase = 0;
+        env->mmu030.fault_rmw_data1 = 0;
+        env->mmu030.fault_rmw_data2 = 0;
+        env->mmu030.fault_rmw_data_valid = false;
+        m68k_mmu030_special_clear(&env->mmu030);
+        env->mmu030.fault_data_input_address = 0;
+        env->mmu030.fault_resume_pc = 0;
+    } else if (resume_pc && restored_pc == fault_pc &&
+               !(ssw & (M68K_MMU030_SSW_DF |
+                        M68K_MMU030_SSW_RC |
+                        M68K_MMU030_SSW_RB))) {
+        /* DF was cleared by the handler.  Re-enter the faulting instruction
+         * at its saved PC, but let its translated load consume DIB and its
+         * store consume DOB without repeating an already completed bus
+         * cycle.  This preserves the instruction's arithmetic and flags. */
+        env->mmu030.fault_data_complete = true;
+        env->mmu030.fault_data_write = !(ssw & M68K_MMU030_SSW_RW);
+        if (special_valid &&
+            (env->mmu030.fault_special_kind == M68K_MMU030_SPECIAL_SPLIT ||
+             env->mmu030.fault_special_kind == M68K_MMU030_SPECIAL_FMOVEM)) {
+            /*
+             * The special-cycle helper owns individual fragments.  Mark the
+             * failed fragment consumed so a DF-cleared frame cannot replay a
+             * committed prefix when the original EA is retried.
+             */
+            m68k_mmu030_special_complete(
+                &env->mmu030, env->mmu030.fault_special_kind, special_pc);
+        } else {
+            m68k_mmu030_special_clear(&env->mmu030);
+        }
+    } else {
+        /* QEMU does not retain the MC68030's B/C prefetch registers.  When
+         * RC/RB are cleared, restore_access_frame has consumed the handler's
+         * stack images and the next TB lookup re-fetches from env->pc; this
+         * is the equivalent accepted-pipeline state for the translator. */
+        env->mmu030.fault_data_complete = false;
+        env->mmu030.fault_data_input_valid = false;
+        env->mmu030.fault_data_write = false;
+        env->mmu030.fault_rmw = false;
+        env->mmu030.fault_rmw_phase = 0;
+        env->mmu030.fault_rmw_data1 = 0;
+        env->mmu030.fault_rmw_data2 = 0;
+        env->mmu030.fault_rmw_data_valid = false;
+        m68k_mmu030_special_clear(&env->mmu030);
+        env->mmu030.fault_data_input_address = 0;
+        env->mmu030.fault_resume_pc = 0;
+    }
+    env->mmu030.fault_frame_active = false;
+}
 
 static void cf_rte(CPUM68KState *env)
 {
@@ -45,11 +174,15 @@ static void cf_rte(CPUM68KState *env)
 static void m68k_rte(CPUM68KState *env)
 {
     uint32_t sp;
+    uint32_t frame_start;
+    uint32_t rte_pc;
     uint16_t fmt;
     uint16_t sr;
 
     sp = env->aregs[7];
+    rte_pc = env->pc;
 throwaway:
+    frame_start = sp;
     sr = cpu_lduw_be_mmuidx_ra(env, sp, MMU_KERNEL_IDX, 0);
     sp += 2;
     env->pc = cpu_ldl_be_mmuidx_ra(env, sp, MMU_KERNEL_IDX, 0);
@@ -77,7 +210,83 @@ throwaway:
             break;
         case 0xa:
             if (m68k_feature(env, M68K_FEATURE_M68030)) {
-                sp += m68k_mmu030_rte_frame_tail_size(fmt);
+                uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
+                uint32_t frame_size =
+                    M68K_MMU030_ACCESS_FRAME_SIZE_SHORT;
+                uint16_t restored_sr;
+                uint32_t restored_pc;
+                uint32_t fault_pc = env->mmu030.fault_pc;
+                uint32_t resume_pc = env->mmu030.fault_resume_pc;
+
+                for (uint32_t offset = 0; offset < frame_size; offset += 2) {
+                    stw_be_p(frame + offset,
+                             cpu_lduw_be_mmuidx_ra(env, frame_start + offset,
+                                                   MMU_KERNEL_IDX, 0));
+                }
+                if (!m68k_mmu030_restore_access_frame(
+                        &env->mmu030, frame, frame_size,
+                        &restored_sr, &restored_pc)) {
+                    m68k_rte_format_error(env, rte_pc);
+                }
+                sr = restored_sr;
+                env->pc = restored_pc;
+                m68k_rte_complete_access(env, fault_pc, resume_pc,
+                                         restored_pc);
+                sp = frame_start + frame_size;
+            }
+            break;
+        case 0xb:
+            if (m68k_feature(env, M68K_FEATURE_M68030)) {
+                uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
+                uint32_t frame_size =
+                    M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
+                uint16_t restored_sr;
+                uint32_t restored_pc;
+                uint32_t fault_pc = env->mmu030.fault_pc;
+                uint32_t resume_pc = env->mmu030.fault_resume_pc;
+
+                for (uint32_t offset = 0; offset < frame_size; offset += 2) {
+                    stw_be_p(frame + offset,
+                             cpu_lduw_be_mmuidx_ra(env, frame_start + offset,
+                                                   MMU_KERNEL_IDX, 0));
+                }
+                if (!m68k_mmu030_restore_access_frame(
+                        &env->mmu030, frame, frame_size,
+                        &restored_sr, &restored_pc)) {
+                    m68k_rte_format_error(env, rte_pc);
+                }
+                sr = restored_sr;
+                env->pc = restored_pc;
+                m68k_rte_complete_access(env, fault_pc, resume_pc,
+                                         restored_pc);
+                sp = frame_start + frame_size;
+            }
+            break;
+        case 9:
+            if (m68k_feature(env, M68K_FEATURE_M68030)) {
+                uint8_t frame[M68K_MMU030_COPROCESSOR_FRAME_SIZE];
+                uint32_t frame_size = M68K_MMU030_COPROCESSOR_FRAME_SIZE;
+                uint16_t restored_sr;
+                uint32_t restored_pc;
+
+                for (uint32_t offset = 0; offset < frame_size; offset += 2) {
+                    stw_be_p(frame + offset,
+                             cpu_lduw_be_mmuidx_ra(env, frame_start + offset,
+                                                   MMU_KERNEL_IDX, 0));
+                }
+                if (!m68k_mmu030_restore_coprocessor_frame(
+                        &env->mmu030, frame, frame_size,
+                        &restored_sr, &restored_pc)) {
+                    m68k_rte_format_error(env, rte_pc);
+                }
+                sr = restored_sr;
+                env->pc = restored_pc;
+                sp = frame_start + frame_size;
+            }
+            break;
+        default:
+            if (m68k_feature(env, M68K_FEATURE_M68030)) {
+                m68k_rte_format_error(env, rte_pc);
             }
             break;
         }
@@ -302,46 +511,36 @@ static void m68k_mmu030_access_error_frame(CPUM68KState *env, uint32_t *sp,
                                            uint16_t saved_sr,
                                            uint32_t vector)
 {
-    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE];
+    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
+    uint32_t frame_size;
+
+    if (env->mmu030.fault_frame_active) {
+        m68k_mmu030_double_fault(env_cpu(env));
+    }
 
     /*
-     * Task 3 handles the ordinary instruction-boundary format-$A frame.
-     * Format-$B pipeline/rerun recovery and format-$9 coprocessor frames are
-     * intentionally deferred to Task 7; they must not use the 68040 frame.
+     * The 68030 has two ordinary bus-cycle fault frames.  The latched fault
+     * selects format A at an instruction boundary and format B while an
+     * instruction/data cycle is in progress; the frame builder also handles
+     * legacy callers which only populated the Task 3 fields.
      */
-    if (!m68k_mmu030_build_short_access_frame(&env->mmu030, saved_sr,
-                                              vector, frame)) {
+    frame_size = m68k_mmu030_access_frame_size(&env->mmu030);
+    if (!frame_size) {
+        cpu_abort(env_cpu(env),
+                  "unsupported MC68030 access fault frame format %u\n",
+                  env->mmu030.fault_format);
+    }
+    if (!m68k_mmu030_build_access_frame(&env->mmu030, saved_sr, vector,
+                                        frame, frame_size)) {
         cpu_abort(env_cpu(env),
                   "MC68030 access fault without pending MMU context\n");
     }
 
-    *sp -= M68K_MMU030_ACCESS_FRAME_SIZE;
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x00, lduw_be_p(frame + 0x00),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stl_be_mmuidx_ra(env, *sp + 0x02, ldl_be_p(frame + 0x02),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x06, lduw_be_p(frame + 0x06),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x08, lduw_be_p(frame + 0x08),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x0a, lduw_be_p(frame + 0x0a),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x0c, lduw_be_p(frame + 0x0c),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x0e, lduw_be_p(frame + 0x0e),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stl_be_mmuidx_ra(env, *sp + 0x10, ldl_be_p(frame + 0x10),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x14, lduw_be_p(frame + 0x14),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x16, lduw_be_p(frame + 0x16),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stl_be_mmuidx_ra(env, *sp + 0x18, ldl_be_p(frame + 0x18),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x1c, lduw_be_p(frame + 0x1c),
-                         MMU_KERNEL_IDX, 0);
-    cpu_stw_be_mmuidx_ra(env, *sp + 0x1e, lduw_be_p(frame + 0x1e),
-                         MMU_KERNEL_IDX, 0);
+    *sp -= frame_size;
+    for (uint32_t offset = 0; offset < frame_size; offset += 2) {
+        cpu_stw_be_mmuidx_ra(env, *sp + offset, lduw_be_p(frame + offset),
+                             MMU_KERNEL_IDX, 0);
+    }
 }
 
 static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
@@ -525,6 +724,11 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
 {
     CPUM68KState *env = cpu_env(cs);
 
+    if (m68k_feature(env, M68K_FEATURE_M68030) &&
+        env->mmu030.fault_frame_active) {
+        m68k_mmu030_double_fault(cs);
+    }
+
     cpu_restore_state(cs, retaddr);
 
     if (m68k_feature(env, M68K_FEATURE_M68040)) {
@@ -572,6 +776,31 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
         cs->exception_index = EXCP_ACCESS;
         cpu_loop_exit(cs);
     }
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030TranslateResult result = {
+            .fault = true,
+            .bus_error = true,
+        };
+        bool is_code = access_type == MMU_INST_FETCH;
+        bool is_write = access_type == MMU_DATA_STORE;
+        uint8_t function_code = (mmu_idx != MMU_USER_IDX ? 4 : 0) |
+                                (is_code ? 2 : 1);
+
+        /*
+         * A transaction failure after a successful MMU translation is the
+         * physical data/instruction bus cycle itself.  Table-walk failures
+         * are reported by m68k_mmu030_translate() with their descriptor
+         * address and never reach this callback (the walker uses direct
+         * AddressSpace accesses), so do not manufacture MMUSR table bits
+         * here.
+         */
+        m68k_mmu030_capture_fault(
+            &env->mmu030, addr, env->pc, size, is_write, is_code,
+            function_code, &result);
+        cs->exception_index = EXCP_ACCESS;
+        cpu_loop_exit(cs);
+    }
 }
 
 bool m68k_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
@@ -607,6 +836,363 @@ raise_exception_ra(CPUM68KState *env, int tt, uintptr_t raddr)
 G_NORETURN static void raise_exception(CPUM68KState *env, int tt)
 {
     raise_exception_ra(env, tt, 0);
+}
+
+uint32_t HELPER(m68k_mmu030_special_cycle)(CPUM68KState *env,
+                                           uint32_t kind, uint32_t cycle,
+                                           uint32_t pc, uint32_t data,
+                                           uint32_t is_write)
+{
+    return m68k_mmu030_special_cycle(&env->mmu030, kind, cycle, pc, data,
+                                     is_write != 0);
+}
+
+void HELPER(m68k_mmu030_special_record)(CPUM68KState *env, uint32_t kind,
+                                        uint32_t cycle, uint32_t pc,
+                                        uint32_t data, uint32_t is_load)
+{
+    m68k_mmu030_special_record(&env->mmu030, kind, cycle, pc, data,
+                               is_load != 0);
+}
+
+void HELPER(m68k_mmu030_special_finish)(CPUM68KState *env, uint32_t kind,
+                                        uint32_t cycles, uint32_t pc)
+{
+    m68k_mmu030_special_finish(&env->mmu030, kind, cycles, pc);
+}
+
+static unsigned m68k_mmu030_split_chunk(uint32_t address, unsigned remaining)
+{
+    unsigned page_remaining = TARGET_PAGE_SIZE -
+                               (address & (TARGET_PAGE_SIZE - 1));
+
+    /* A crossing word/long is decomposed into the largest aligned pieces
+     * which remain in the current page.  The byte fallback is required for
+     * an odd address and preserves the big-endian byte lane order. */
+    remaining = MIN(remaining, page_remaining);
+    if (remaining >= 2 && !(address & 1)) {
+        return 2;
+    }
+    return 1;
+}
+
+uint32_t HELPER(m68k_mmu030_split_load)(CPUM68KState *env,
+                                        uint32_t address, uint32_t bytes,
+                                        uint32_t mmu_idx, uint32_t pc)
+{
+    M68KMMU030State *state = &env->mmu030;
+    uintptr_t ra = GETPC();
+    uint32_t value = 0;
+
+    g_assert(bytes == 2 || bytes == 4);
+    if (((address ^ (address + bytes - 1)) & TARGET_PAGE_MASK) == 0) {
+        return bytes == 2 ? cpu_lduw_be_mmuidx_ra(env, address, mmu_idx, ra) :
+                            cpu_ldl_be_mmuidx_ra(env, address, mmu_idx, ra);
+    }
+
+    unsigned offset = 0;
+    unsigned cycle = 0;
+    while (offset < bytes) {
+        uint32_t cycle_address = address + offset;
+        unsigned chunk = m68k_mmu030_split_chunk(cycle_address,
+                                                 bytes - offset);
+        uint32_t piece;
+        bool skip = m68k_mmu030_special_cycle(
+            state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc, 0, false);
+
+        if (skip) {
+            piece = state->fault_special_data[cycle];
+        } else if (chunk == 2) {
+            piece = cpu_lduw_be_mmuidx_ra(env, cycle_address, mmu_idx, ra);
+            m68k_mmu030_special_record(
+                state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc, piece, true);
+        } else {
+            piece = cpu_ldub_mmuidx_ra(env, cycle_address, mmu_idx, ra);
+            m68k_mmu030_special_record(
+                state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc, piece, true);
+        }
+
+        value = (value << (chunk * 8)) | piece;
+        offset += chunk;
+        cycle++;
+    }
+    m68k_mmu030_special_finish(state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc);
+    return value;
+}
+
+void HELPER(m68k_mmu030_split_store)(CPUM68KState *env, uint32_t address,
+                                     uint32_t value, uint32_t bytes,
+                                     uint32_t mmu_idx, uint32_t pc)
+{
+    M68KMMU030State *state = &env->mmu030;
+    uintptr_t ra = GETPC();
+
+    g_assert(bytes == 2 || bytes == 4);
+    if (((address ^ (address + bytes - 1)) & TARGET_PAGE_MASK) == 0) {
+        if (bytes == 2) {
+            cpu_stw_be_mmuidx_ra(env, address, value, mmu_idx, ra);
+        } else {
+            cpu_stl_be_mmuidx_ra(env, address, value, mmu_idx, ra);
+        }
+        return;
+    }
+
+    unsigned offset = 0;
+    unsigned cycle = 0;
+    while (offset < bytes) {
+        uint32_t cycle_address = address + offset;
+        unsigned chunk = m68k_mmu030_split_chunk(cycle_address,
+                                                 bytes - offset);
+        unsigned shift = (bytes - offset - chunk) * 8;
+        uint32_t piece = (value >> shift) &
+                         (chunk == 2 ? UINT32_C(0xffff) : UINT32_C(0xff));
+        bool skip = m68k_mmu030_special_cycle(
+            state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc, piece, true);
+
+        if (!skip) {
+            if (chunk == 2) {
+                cpu_stw_be_mmuidx_ra(env, cycle_address, piece, mmu_idx, ra);
+            } else {
+                cpu_stb_mmuidx_ra(env, cycle_address, piece, mmu_idx, ra);
+            }
+            m68k_mmu030_special_record(
+                state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc, piece, false);
+        }
+
+        offset += chunk;
+        cycle++;
+    }
+    m68k_mmu030_special_finish(state, M68K_MMU030_SPECIAL_SPLIT, cycle, pc);
+}
+
+/* TAS is one indivisible 030 read-modify-write protocol, but unlike CAS its
+ * result is the value returned by the read.  Keep the read value and cycle
+ * phase explicitly so a fault on the write can resume without repeating an
+ * observable device read, and so a DF-cleared frame can complete in software
+ * while preserving TAS's condition-code input. */
+uint32_t HELPER(m68k_mmu030_tas)(CPUM68KState *env, uint32_t address,
+                                 uint32_t mmu_idx, uint32_t pc)
+{
+    M68KMMU030State *state = &env->mmu030;
+    uintptr_t ra = GETPC();
+    uint32_t old;
+    bool completed = state->fault_data_complete && state->fault_rmw &&
+                     state->fault_address == address;
+    bool write_completed = completed && state->fault_data_write;
+
+    /* The live fault state is unique to the current translated instruction;
+     * retain the PC in the helper ABI alongside the other restart helpers. */
+    (void)pc;
+
+    if (completed) {
+        /* DIB supplied by a handler takes precedence over the saved read. */
+        if (state->fault_data_input_valid &&
+            state->fault_data_input_address == address) {
+            old = state->fault_data_input & 0xff;
+        } else {
+            old = state->fault_rmw_data1 & 0xff;
+        }
+        if (!write_completed) {
+            /*
+             * A DF-cleared RM|RW frame supplies only the completed read.
+             * Consume DIB, then perform TAS's write half without rereading.
+             */
+            m68k_mmu030_consume_data_input(state);
+            state->fault_data_write = false;
+            state->fault_data_output = UINT32_C(0x80);
+            cpu_stb_mmuidx_ra(env, address, UINT32_C(0x80), mmu_idx, ra);
+        }
+    } else {
+        if (!state->fault_rmw_data_valid) {
+            state->fault_rmw_phase = 0;
+        }
+        if (state->fault_rmw_phase < 1) {
+            old = cpu_ldub_mmuidx_ra(env, address, mmu_idx, ra);
+            state->fault_rmw_data1 = old;
+            state->fault_rmw_data_valid = true;
+            state->fault_rmw_phase = 1;
+        } else {
+            old = state->fault_rmw_data1;
+        }
+        if (state->fault_rmw_phase < 2) {
+            state->fault_data_output = UINT32_C(0x80);
+            cpu_stb_mmuidx_ra(env, address, UINT32_C(0x80), mmu_idx, ra);
+            state->fault_rmw_phase = 2;
+        }
+    }
+
+    state->fault_data_complete = false;
+    state->fault_data_input = 0;
+    state->fault_data_input_valid = false;
+    state->fault_data_write = false;
+    state->fault_rmw = false;
+    state->fault_rmw_phase = 0;
+    state->fault_rmw_data1 = 0;
+    state->fault_rmw_data2 = 0;
+    state->fault_rmw_data_valid = false;
+    return old;
+}
+
+/*
+ * CAS is a single 030 read-modify-write protocol.  Keep the successful read
+ * in the RMW latch while the write is attempted, and consume a handler's DIB
+ * when RTE returns with RM|RW and DF clear.
+ */
+uint32_t HELPER(m68k_mmu030_cas)(CPUM68KState *env, uint32_t address,
+                                 uint32_t compare, uint32_t update,
+                                 uint32_t bytes, uint32_t mmu_idx)
+{
+    M68KMMU030State *state = &env->mmu030;
+    uintptr_t ra = GETPC();
+    uint32_t mask;
+    uint32_t old;
+    bool completed = state->fault_data_complete && state->fault_rmw &&
+                     state->fault_address == address;
+    bool write_completed = completed && state->fault_data_write;
+
+    switch (bytes) {
+    case 1:
+        mask = 0xff;
+        break;
+    case 2:
+        mask = 0xffff;
+        break;
+    case 4:
+        mask = UINT32_MAX;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    compare &= mask;
+    update &= mask;
+
+    if (completed) {
+        if (state->fault_data_input_valid &&
+            state->fault_data_input_address == address) {
+            old = state->fault_data_input & mask;
+        } else {
+            old = state->fault_rmw_data1 & mask;
+        }
+        if (!write_completed && old == compare) {
+            /*
+             * The read is represented by DIB; only the conditional write
+             * remains to be issued on the repaired mapping.
+             */
+            m68k_mmu030_consume_data_input(state);
+            state->fault_data_write = false;
+            state->fault_data_output = update;
+            switch (bytes) {
+            case 1:
+                cpu_stb_mmuidx_ra(env, address, update, mmu_idx, ra);
+                break;
+            case 2:
+                cpu_stw_be_mmuidx_ra(env, address, update, mmu_idx, ra);
+                break;
+            case 4:
+                cpu_stl_be_mmuidx_ra(env, address, update, mmu_idx, ra);
+                break;
+            }
+        }
+    } else {
+        if (!state->fault_rmw_data_valid) {
+            state->fault_rmw_phase = 0;
+        }
+        if (state->fault_rmw_phase < 1) {
+            switch (bytes) {
+            case 1:
+                old = cpu_ldub_mmuidx_ra(env, address, mmu_idx, ra);
+                break;
+            case 2:
+                old = cpu_lduw_be_mmuidx_ra(env, address, mmu_idx, ra);
+                break;
+            case 4:
+                old = cpu_ldl_be_mmuidx_ra(env, address, mmu_idx, ra);
+                break;
+            default:
+                g_assert_not_reached();
+            }
+            state->fault_rmw_data1 = old & mask;
+            state->fault_rmw_data_valid = true;
+            state->fault_rmw_phase = 1;
+        } else {
+            old = state->fault_rmw_data1 & mask;
+        }
+        if (old == compare && state->fault_rmw_phase < 2) {
+            state->fault_data_output = update;
+            switch (bytes) {
+            case 1:
+                cpu_stb_mmuidx_ra(env, address, update, mmu_idx, ra);
+                break;
+            case 2:
+                cpu_stw_be_mmuidx_ra(env, address, update, mmu_idx, ra);
+                break;
+            case 4:
+                cpu_stl_be_mmuidx_ra(env, address, update, mmu_idx, ra);
+                break;
+            default:
+                g_assert_not_reached();
+            }
+            state->fault_rmw_phase = 2;
+        }
+    }
+
+    state->fault_data_complete = false;
+    state->fault_data_input = 0;
+    state->fault_data_input_valid = false;
+    state->fault_data_write = false;
+    state->fault_data_input_address = 0;
+    state->fault_rmw = false;
+    state->fault_rmw_phase = 0;
+    state->fault_rmw_data1 = 0;
+    state->fault_rmw_data2 = 0;
+    state->fault_rmw_data_valid = false;
+    return old;
+}
+
+uint32_t HELPER(m68k_movep)(CPUM68KState *env, uint32_t address,
+                            uint32_t data, uint32_t is_load,
+                            uint32_t bytes, uint32_t pc)
+{
+    M68KMMU030State *state = &env->mmu030;
+    uintptr_t ra = GETPC();
+    uint32_t result = data;
+    bool mmu030 = m68k_feature(env, M68K_FEATURE_M68030);
+
+    for (unsigned cycle = 0; cycle < bytes; cycle++) {
+        uint32_t cycle_address = address + cycle * 2;
+        uint32_t value;
+        bool skip = mmu030 && m68k_mmu030_special_cycle(
+            state, M68K_MMU030_SPECIAL_MOVEP, cycle, pc,
+            (data >> ((bytes - cycle - 1) * 8)) & 0xff,
+            !is_load);
+
+        if (skip) {
+            value = state->fault_special_data[cycle] & 0xff;
+        } else if (is_load) {
+            value = cpu_ldub_data_ra(env, cycle_address, ra);
+            if (mmu030) {
+                m68k_mmu030_special_record(
+                    state, M68K_MMU030_SPECIAL_MOVEP, cycle, pc, value, true);
+            }
+        } else {
+            value = (data >> ((bytes - cycle - 1) * 8)) & 0xff;
+            cpu_stb_data_ra(env, cycle_address, value, ra);
+            if (mmu030) {
+                m68k_mmu030_special_record(
+                    state, M68K_MMU030_SPECIAL_MOVEP, cycle, pc, value, false);
+            }
+        }
+
+        if (is_load) {
+            unsigned shift = (bytes - cycle - 1) * 8;
+            result = deposit32(result, shift, 8, value);
+        }
+    }
+    if (mmu030) {
+        m68k_mmu030_special_finish(state, M68K_MMU030_SPECIAL_MOVEP,
+                                   bytes, pc);
+    }
+    return result;
 }
 
 void HELPER(raise_exception)(CPUM68KState *env, uint32_t tt)
@@ -831,6 +1417,7 @@ void HELPER(divsll)(CPUM68KState *env, int numr, int regr,
 /* We're executing in a serial context -- no need to be atomic.  */
 void HELPER(cas2w)(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2)
 {
+    M68KMMU030State *state = &env->mmu030;
     uint32_t Dc1 = extract32(regs, 9, 3);
     uint32_t Dc2 = extract32(regs, 6, 3);
     uint32_t Du1 = extract32(regs, 3, 3);
@@ -841,12 +1428,71 @@ void HELPER(cas2w)(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2)
     int16_t u2 = env->dregs[Du2];
     int16_t l1, l2;
     uintptr_t ra = GETPC();
-
-    l1 = cpu_lduw_be_data_ra(env, a1, ra);
-    l2 = cpu_lduw_be_data_ra(env, a2, ra);
-    if (l1 == c1 && l2 == c2) {
-        cpu_stw_be_data_ra(env, a1, u1, ra);
-        cpu_stw_be_data_ra(env, a2, u2, ra);
+    bool mmu030 = m68k_feature(env, M68K_FEATURE_M68030);
+    bool completed = mmu030 && state->fault_data_complete &&
+                     state->fault_data_write && state->fault_rmw;
+    bool read_completed = mmu030 && state->fault_data_complete &&
+                          !state->fault_data_write && state->fault_rmw;
+    unsigned read_phase = state->fault_rmw_phase;
+    /* CAS2 is a sequence of independently restartable bus cycles in the
+     * serial execution path.  Keep completed reads in the internal latch so
+     * a fault on the second read or either write does not repeat a device
+     * access after RTE. */
+    if (completed) {
+        /* RM-only with DF clear means the handler supplied the complete
+         * operation.  Preserve the successful comparison result without
+         * issuing either read or write bus cycle a second time. */
+        l1 = c1;
+        l2 = c2;
+    } else if (!mmu030) {
+        l1 = cpu_lduw_be_data_ra(env, a1, ra);
+        l2 = cpu_lduw_be_data_ra(env, a2, ra);
+    } else {
+        if (!state->fault_rmw_data_valid) {
+            state->fault_rmw_phase = 0;
+        }
+        if (state->fault_rmw_phase < 1) {
+            if (read_completed && read_phase == 0 &&
+                state->fault_data_input_valid) {
+                l1 = state->fault_data_input;
+                m68k_mmu030_consume_data_input(state);
+            } else {
+                l1 = cpu_lduw_be_data_ra(env, a1, ra);
+            }
+            state->fault_rmw_data1 = (uint16_t)l1;
+            state->fault_rmw_data_valid = true;
+            state->fault_rmw_phase = 1;
+        } else {
+            l1 = state->fault_rmw_data1;
+        }
+        if (state->fault_rmw_phase < 2) {
+            if (read_completed && read_phase == 1 &&
+                state->fault_data_input_valid) {
+                l2 = state->fault_data_input;
+                m68k_mmu030_consume_data_input(state);
+            } else {
+                l2 = cpu_lduw_be_data_ra(env, a2, ra);
+            }
+            state->fault_rmw_data2 = (uint16_t)l2;
+            state->fault_rmw_phase = 2;
+        } else {
+            l2 = state->fault_rmw_data2;
+        }
+    }
+    if (!completed && l1 == c1 && l2 == c2) {
+        if (!mmu030) {
+            cpu_stw_be_data_ra(env, a1, u1, ra);
+            cpu_stw_be_data_ra(env, a2, u2, ra);
+        } else {
+            if (state->fault_rmw_phase < 3) {
+                cpu_stw_be_data_ra(env, a1, u1, ra);
+                state->fault_rmw_phase = 3;
+            }
+            if (state->fault_rmw_phase < 4) {
+                cpu_stw_be_data_ra(env, a2, u2, ra);
+                state->fault_rmw_phase = 4;
+            }
+        }
     }
 
     if (c1 != l1) {
@@ -859,11 +1505,22 @@ void HELPER(cas2w)(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2)
     env->cc_op = CC_OP_CMPW;
     env->dregs[Dc2] = deposit32(env->dregs[Dc2], 0, 16, l2);
     env->dregs[Dc1] = deposit32(env->dregs[Dc1], 0, 16, l1);
+    if (mmu030) {
+        state->fault_data_complete = false;
+        state->fault_data_input = 0;
+        state->fault_data_input_address = 0;
+        state->fault_data_input_valid = false;
+        state->fault_data_write = false;
+        state->fault_rmw = false;
+        state->fault_rmw_phase = 0;
+        state->fault_rmw_data_valid = false;
+    }
 }
 
 static void do_cas2l(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2,
                      bool parallel)
 {
+    M68KMMU030State *state = &env->mmu030;
     uint32_t Dc1 = extract32(regs, 9, 3);
     uint32_t Dc2 = extract32(regs, 6, 3);
     uint32_t Du1 = extract32(regs, 3, 3);
@@ -876,7 +1533,12 @@ static void do_cas2l(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2,
     uintptr_t ra = GETPC();
     int mmu_idx = cpu_mmu_index(env_cpu(env), 0);
     MemOpIdx oi = make_memop_idx(MO_BEUQ, mmu_idx);
-
+    bool mmu030 = m68k_feature(env, M68K_FEATURE_M68030);
+    bool completed = mmu030 && !parallel && state->fault_data_complete &&
+                     state->fault_data_write && state->fault_rmw;
+    bool read_completed = mmu030 && !parallel && state->fault_data_complete &&
+                          !state->fault_data_write && state->fault_rmw;
+    unsigned read_phase = state->fault_rmw_phase;
     if (parallel) {
         /* We're executing in a parallel context -- must be atomic.  */
         uint64_t c, u, l;
@@ -898,11 +1560,58 @@ static void do_cas2l(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2,
         }
     } else {
         /* We're executing in a serial context -- no need to be atomic.  */
-        l1 = cpu_ldl_be_data_ra(env, a1, ra);
-        l2 = cpu_ldl_be_data_ra(env, a2, ra);
-        if (l1 == c1 && l2 == c2) {
-            cpu_stl_be_data_ra(env, a1, u1, ra);
-            cpu_stl_be_data_ra(env, a2, u2, ra);
+        if (completed) {
+            l1 = c1;
+            l2 = c2;
+        } else if (!mmu030) {
+            l1 = cpu_ldl_be_data_ra(env, a1, ra);
+            l2 = cpu_ldl_be_data_ra(env, a2, ra);
+        } else {
+            if (!state->fault_rmw_data_valid) {
+                state->fault_rmw_phase = 0;
+            }
+            if (state->fault_rmw_phase < 1) {
+                if (read_completed && read_phase == 0 &&
+                    state->fault_data_input_valid) {
+                    l1 = state->fault_data_input;
+                    m68k_mmu030_consume_data_input(state);
+                } else {
+                    l1 = cpu_ldl_be_data_ra(env, a1, ra);
+                }
+                state->fault_rmw_data1 = l1;
+                state->fault_rmw_data_valid = true;
+                state->fault_rmw_phase = 1;
+            } else {
+                l1 = state->fault_rmw_data1;
+            }
+            if (state->fault_rmw_phase < 2) {
+                if (read_completed && read_phase == 1 &&
+                    state->fault_data_input_valid) {
+                    l2 = state->fault_data_input;
+                    m68k_mmu030_consume_data_input(state);
+                } else {
+                    l2 = cpu_ldl_be_data_ra(env, a2, ra);
+                }
+                state->fault_rmw_data2 = l2;
+                state->fault_rmw_phase = 2;
+            } else {
+                l2 = state->fault_rmw_data2;
+            }
+        }
+        if (!completed && l1 == c1 && l2 == c2) {
+            if (!mmu030) {
+                cpu_stl_be_data_ra(env, a1, u1, ra);
+                cpu_stl_be_data_ra(env, a2, u2, ra);
+            } else {
+                if (state->fault_rmw_phase < 3) {
+                    cpu_stl_be_data_ra(env, a1, u1, ra);
+                    state->fault_rmw_phase = 3;
+                }
+                if (state->fault_rmw_phase < 4) {
+                    cpu_stl_be_data_ra(env, a2, u2, ra);
+                    state->fault_rmw_phase = 4;
+                }
+            }
         }
     }
 
@@ -916,6 +1625,16 @@ static void do_cas2l(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2,
     env->cc_op = CC_OP_CMPL;
     env->dregs[Dc2] = l2;
     env->dregs[Dc1] = l1;
+    if (mmu030) {
+        state->fault_data_complete = false;
+        state->fault_data_input = 0;
+        state->fault_data_input_address = 0;
+        state->fault_data_input_valid = false;
+        state->fault_data_write = false;
+        state->fault_rmw = false;
+        state->fault_rmw_phase = 0;
+        state->fault_rmw_data_valid = false;
+    }
 }
 
 void HELPER(cas2l)(CPUM68KState *env, uint32_t regs, uint32_t a1, uint32_t a2)
