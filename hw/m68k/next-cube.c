@@ -66,12 +66,20 @@
 
 #define NEXT_DMA_BASE        0x02000000
 #define NEXT_NBIC_BASE       0x02020000
-#define NEXT_OPTICAL_BASE    0x02112000
+#define NEXT_MB8795_BASE     0x02006000
+#define NEXT_MEMCTL_BASE     0x02006010
+#define NEXT_DSP_BASE        0x02008000
+#define NEXT_OPTICAL_BASE    0x02012000
 #define NEXT_OPTICAL_SIZE    0x20
 #define NEXT_SCSI_ROM_CSR_BASE 0x02014020
-#define NEXT_SCSI_BASE       0x02114000
+#define NEXT_SCSI_BASE       0x02014000
 #define NEXT_SCSI_CSR_OFFSET 0x20
 #define NEXT_SCSI_CSR_BASE   (NEXT_SCSI_BASE + NEXT_SCSI_CSR_OFFSET)
+#define NEXT_FDC_BASE        0x02014100
+#define NEXT_FLOPPY_CTRL_BASE 0x02014108
+#define NEXT_SYSTEM_TIMER_BASE 0x02016000
+#define NEXT_SERIAL_BASE     0x02018000
+#define NEXT_EVENTC_BASE     0x0201a000
 #define NEXT_ESP_CLOCK_HZ    20000000
 
 #define NEXT_TIMER_ENABLE       0x80
@@ -147,6 +155,7 @@ struct NeXTPC {
     uint32_t int_mask;
     uint32_t int_status;
     uint32_t led;
+    hwaddr byte_device_offset;
 
     QEMUTimer system_timer;
     uint16_t timer_latch;
@@ -317,6 +326,12 @@ static uint32_t next_profile_scr1(const NeXTBoardProfile *profile)
            ((uint32_t)(profile->video_memory_speed & 0x3) << 6) |
            ((uint32_t)(profile->main_memory_speed & 0x3) << 4) |
            (uint32_t)(profile->cpu_clock & 0x3);
+}
+
+static hwaddr next_profile_byte_device_address(
+    const NeXTBoardProfile *profile, hwaddr base)
+{
+    return base + profile->byte_device_offset;
 }
 
 static const QEnumLookup next_machine_rtc_chip_lookup = {
@@ -665,6 +680,13 @@ static void nextscsi_write(void *opaque, uint8_t *buf, int size)
     next_dma_scsi_write(opaque, buf, size);
 }
 
+static hwaddr next_scsi_csr_trace_address(const NeXTSCSI *s, hwaddr addr)
+{
+    const NeXTPC *pc = container_of(s, const NeXTPC, next_scsi);
+
+    return NEXT_SCSI_CSR_BASE + pc->byte_device_offset + addr;
+}
+
 static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
 {
@@ -730,7 +752,7 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         }
         DPRINTF("SCSICSR1 Write: %"PRIx64 "\n", val);
         trace_next_scsi_csr_write(
-            NEXT_SCSI_CSR_BASE + addr, old, val,
+            next_scsi_csr_trace_address(s, addr), old, val,
             !!(val & SCSICSR_ENABLE),
             !!(val & SCSICSR_RESET), !!(val & SCSICSR_FIFOFL),
             !!(val & SCSICSR_DMADIR), !!(val & SCSICSR_CPUDMA),
@@ -743,7 +765,7 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
         old = s->scsi_csr_2;
         DPRINTF("SCSICSR2 Write: %"PRIx64 "\n", val);
         trace_next_scsi_csr_write(
-            NEXT_SCSI_CSR_BASE + addr, old, val,
+            next_scsi_csr_trace_address(s, addr), old, val,
             0, 0, 0, 0, 0, 0);
         s->scsi_csr_2 = val;
         break;
@@ -774,7 +796,7 @@ static uint64_t next_scsi_csr_read(void *opaque, hwaddr addr, unsigned size)
     }
 
     if (trace_event_get_state_backends(TRACE_NEXT_SCSI_CSR_READ)) {
-        hwaddr trace_addr = NEXT_SCSI_CSR_BASE + addr;
+        hwaddr trace_addr = next_scsi_csr_trace_address(s, addr);
 
         if (next_trace_read_sample(&s->trace_csr_read, trace_addr, val)) {
             trace_next_scsi_csr_read(trace_addr, val,
@@ -1240,6 +1262,7 @@ static void next_pc_init(Object *obj)
 static const Property next_pc_properties[] = {
     DEFINE_PROP_LINK("cpu", NeXTPC, cpu, TYPE_M68K_CPU, M68kCPU *),
     DEFINE_PROP_LINK("dma", NeXTPC, dma, TYPE_NEXT_DMA, NextDMAState *),
+    DEFINE_PROP_UINT64("byte-device-offset", NeXTPC, byte_device_offset, 0),
     DEFINE_PROP_UINT32("scr1-reset", NeXTPC, scr1_reset, 0x00011002),
     DEFINE_PROP_UINT32("system-timer-frequency", NeXTPC,
                        system_timer_frequency,
@@ -1329,7 +1352,7 @@ static const TypeInfo next_pc_info = {
 };
 
 static void next_machine_create_fdc_and_flpctl(
-    MachineState *machine G_GNUC_UNUSED, NeXTState *m, DeviceState *pcdev)
+    NeXTState *m, DeviceState *pcdev, const NeXTBoardProfile *profile)
 {
     DeviceState *fdc_dev;
     DeviceState *floppy_ctrl_dev;
@@ -1339,7 +1362,8 @@ static void next_machine_create_fdc_and_flpctl(
     fds[0] = drive_get(IF_FLOPPY, 0, 0);
     fds[1] = drive_get(IF_FLOPPY, 0, 1);
     fdc_dev = fdctrl_init_sysbus_dma(
-        qdev_get_gpio_in(pcdev, NEXT_FD_I), 0x02114100, fds,
+        qdev_get_gpio_in(pcdev, NEXT_FD_I),
+        next_profile_byte_device_address(profile, NEXT_FDC_BASE), fds,
         ISADMA(m->dma), NEXT_DMA_SCSI, true);
 
     floppy_ctrl_dev = qdev_new(TYPE_NEXT_FLOPPY_CTRL);
@@ -1348,7 +1372,9 @@ static void next_machine_create_fdc_and_flpctl(
     object_property_set_link(OBJECT(floppy_ctrl_dev), "dma",
                              OBJECT(m->dma), &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(floppy_ctrl_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(floppy_ctrl_dev), 0, 0x02114108);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(floppy_ctrl_dev), 0,
+        next_profile_byte_device_address(profile, NEXT_FLOPPY_CTRL_BASE));
 }
 
 static void next_machine_init(MachineState *machine)
@@ -1415,6 +1441,8 @@ static void next_machine_init(MachineState *machine)
     object_property_set_link(OBJECT(pcdev), "cpu", OBJECT(cpu), &error_abort);
     object_property_set_link(OBJECT(pcdev), "dma", OBJECT(m->dma),
                              &error_abort);
+    qdev_prop_set_uint64(pcdev, "byte-device-offset",
+                         profile->byte_device_offset);
     qdev_prop_set_uint32(pcdev, "scr1-reset", next_profile_scr1(profile));
     if (m->nvram_file && m->nvram_file[0]) {
         qdev_prop_set_string(DEVICE(&NEXT_PC(pcdev)->rtc), "nvram-file",
@@ -1427,6 +1455,9 @@ static void next_machine_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(pcdev), &error_fatal);
     m->rtc_chip_locked = true;
 
+    /* Map the shared controller before profile-specific byte devices. */
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 0, 0x02005000);
+
     sysbus_mmio_map(SYS_BUS_DEVICE(m->dma), 0, NEXT_DMA_BASE);
     for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
         if (dma_irq_inputs[channel] >= 0) {
@@ -1438,14 +1469,8 @@ static void next_machine_init(MachineState *machine)
 
     switch (profile->disk_mux_kind) {
     case NEXT_DISK_MUX_FLPCTL:
-        next_machine_create_fdc_and_flpctl(machine, m, pcdev);
-        break;
     case NEXT_DISK_MUX_CUBE_OD:
-        /*
-         * The original Cube shares the legacy FDC setup until its
-         * profile-specific disk mux is modeled.
-         */
-        next_machine_create_fdc_and_flpctl(machine, m, pcdev);
+        next_machine_create_fdc_and_flpctl(m, pcdev, profile);
         break;
     default:
         g_assert_not_reached();
@@ -1458,14 +1483,18 @@ static void next_machine_init(MachineState *machine)
         object_property_set_link(OBJECT(optical_dev), "dma",
                                  OBJECT(m->dma), &error_abort);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(optical_dev), &error_fatal);
-        sysbus_mmio_map(SYS_BUS_DEVICE(optical_dev), 0, NEXT_OPTICAL_BASE);
+        sysbus_mmio_map(
+            SYS_BUS_DEVICE(optical_dev), 0,
+            next_profile_byte_device_address(profile, NEXT_OPTICAL_BASE));
     } else {
         /*
          * The ROM resets P_DISK before mon_setup identifies the machine,
          * then accesses offsets 4, 5, and 7 unconditionally.
          */
         empty_slot_init("next.p-disk-compat",
-                        NEXT_OPTICAL_BASE, NEXT_OPTICAL_SIZE);
+                        next_profile_byte_device_address(profile,
+                                                         NEXT_OPTICAL_BASE),
+                        NEXT_OPTICAL_SIZE);
     }
 
     /* Serial ports and clock select */
@@ -1475,7 +1504,9 @@ static void next_machine_init(MachineState *machine)
     qdev_prop_set_chr(serial_dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(serial_dev, "chrB", serial_hd(1));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(serial_dev), 0, 0x02118000);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(serial_dev), 0,
+        next_profile_byte_device_address(profile, NEXT_SERIAL_BASE));
     sysbus_connect_irq(SYS_BUS_DEVICE(serial_dev), 0,
                        qdev_get_gpio_in(pcdev, NEXT_SCC_I));
 
@@ -1501,7 +1532,9 @@ static void next_machine_init(MachineState *machine)
                              OBJECT(m->dma), &error_abort);
     qemu_configure_nic_device(mbdev, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mbdev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(m->mb8795), 0, 0x02106000);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(m->mb8795), 0,
+        next_profile_byte_device_address(profile, NEXT_MB8795_BASE));
     sysbus_connect_irq(SYS_BUS_DEVICE(m->mb8795), 0,
                        qdev_get_gpio_in(pcdev, NEXT_ENTX_I));
     sysbus_connect_irq(SYS_BUS_DEVICE(m->mb8795), 1,
@@ -1514,7 +1547,9 @@ static void next_machine_init(MachineState *machine)
     object_property_add_child(OBJECT(machine), "memctl",
                               OBJECT(memctl_dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(memctl_dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(memctl_dev), 0, 0x02106010);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(memctl_dev), 0,
+        next_profile_byte_device_address(profile, NEXT_MEMCTL_BASE));
 
     if (profile->has_nextbus) {
         nbic_dev = qdev_new(TYPE_NEXT_NBIC);
@@ -1543,33 +1578,54 @@ static void next_machine_init(MachineState *machine)
 
         sysbus_realize_and_unref(color_video_sbd, &error_fatal);
         sysbus_mmio_map(color_video_sbd, 0, 0x2c000000);
-        sysbus_mmio_map(color_video_sbd, 1, 0x02118100);
-        sysbus_mmio_map(color_video_sbd, 2, 0x02118180);
-        sysbus_mmio_map(color_video_sbd, 3, 0x02118190);
-        sysbus_mmio_map(color_video_sbd, 4, 0x02118198);
+        sysbus_mmio_map(
+            color_video_sbd, 1,
+            next_profile_byte_device_address(profile, NEXT_SERIAL_BASE +
+                                              0x100));
+        sysbus_mmio_map(
+            color_video_sbd, 2,
+            next_profile_byte_device_address(profile, NEXT_SERIAL_BASE +
+                                              0x180));
+        sysbus_mmio_map(
+            color_video_sbd, 3,
+            next_profile_byte_device_address(profile, NEXT_SERIAL_BASE +
+                                              0x190));
+        sysbus_mmio_map(
+            color_video_sbd, 4,
+            next_profile_byte_device_address(profile, NEXT_SERIAL_BASE +
+                                              0x198));
         sysbus_connect_irq(color_video_sbd, 0,
                            qdev_get_gpio_in(pcdev, NEXT_C16_VIDEO_I));
     }
 
-    /* MMIO */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 0, 0x02005000);
-
     /* DSP host interface */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 1, 0x02108000);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(pcdev), 1,
+        next_profile_byte_device_address(profile, NEXT_DSP_BASE));
 
     /* Printer interface */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, 0x0200f000);
 
     /* unknown: Brightness control register? */
-    empty_slot_init("next.unknown.0", 0x02110000, 0x10);
+    empty_slot_init("next.unknown.0",
+                    next_profile_byte_device_address(profile, 0x02010000),
+                    0x10);
 
     /* SCSI */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, NEXT_SCSI_BASE);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(pcdev), 3,
+        next_profile_byte_device_address(profile, NEXT_SCSI_BASE));
     /* System timer and event counter */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 4, 0x02116000);
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 5, 0x0211a000);
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(pcdev), 4,
+        next_profile_byte_device_address(profile, NEXT_SYSTEM_TIMER_BASE));
+    sysbus_mmio_map(
+        SYS_BUS_DEVICE(pcdev), 5,
+        next_profile_byte_device_address(profile, NEXT_EVENTC_BASE));
     /* The v66 ROM and NeXT floppy driver use this SCSI CSR decode. */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, NEXT_SCSI_ROM_CSR_BASE);
+    if (profile->byte_device_offset) {
+        sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 6, NEXT_SCSI_ROM_CSR_BASE);
+    }
 
     /* BMAP memory */
     memory_region_init_ram_flags_nomigrate(&m->bmapm1, NULL, "next.bmapmem",

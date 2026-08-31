@@ -4,6 +4,7 @@
 #include "libqtest.h"
 
 #define NEXT_OPTICAL_BASE       0x02112000
+#define NEXT_COMPUTER_OPTICAL_BASE 0x02012000
 #define NEXT_OPTICAL_SIZE       0x20
 #define NEXT_DISR               (NEXT_OPTICAL_BASE + 0x04)
 #define NEXT_DIMR               (NEXT_OPTICAL_BASE + 0x05)
@@ -55,6 +56,8 @@
     "0000000002112000-000000000211201f (prio 0, i/o): next-optical"
 #define NEXT_P_DISK_COMPAT_MTREE \
     "0000000002112000-000000000211201f (prio -10000, i/o): empty-slot"
+#define NEXT_COMPUTER_OPTICAL_MTREE \
+    "0000000002012000-000000000201201f (prio 0, i/o): next-optical"
 
 typedef struct TestROM {
     int fd;
@@ -314,6 +317,29 @@ static void test_machine_mapping(void)
         g_assert_cmphex(qtest_readb(qts, NEXT_CONTROL1), ==, 0);
         qtest_quit(qts);
     }
+}
+
+static void test_original_computer_mapping(void)
+{
+    QTestState *computer = next_machine_start("next-computer", NULL);
+    g_autofree char *computer_mtree = qtest_hmp(computer, "info mtree -f");
+    size_t i;
+
+    g_assert_nonnull(strstr(computer_mtree, NEXT_COMPUTER_OPTICAL_MTREE));
+    g_assert_null(strstr(computer_mtree, NEXT_OPTICAL_MTREE));
+
+    for (i = 0; i < NEXT_OPTICAL_SIZE; i++) {
+        g_assert_cmphex(qtest_readb(computer,
+                                    NEXT_COMPUTER_OPTICAL_BASE + i), ==, 0);
+    }
+    qtest_writeb(computer, NEXT_COMPUTER_OPTICAL_BASE + 0, 0x12);
+    qtest_writeb(computer, NEXT_COMPUTER_OPTICAL_BASE + 8, 0x34);
+    g_assert_cmphex(qtest_readb(computer,
+                                NEXT_COMPUTER_OPTICAL_BASE + 0), ==, 0x12);
+    g_assert_cmphex(qtest_readb(computer,
+                                NEXT_COMPUTER_OPTICAL_BASE + 8), ==, 0x34);
+
+    qtest_quit(computer);
 }
 
 static void test_registers_and_reset(void)
@@ -751,6 +777,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/next-optical/machine-mapping", test_machine_mapping);
+    qtest_add_func("/next-optical/original-computer-mapping",
+                   test_original_computer_mapping);
     qtest_add_func("/next-optical/registers-and-reset",
                    test_registers_and_reset);
     qtest_add_func("/next-optical/v66-sequence-both-orderings",

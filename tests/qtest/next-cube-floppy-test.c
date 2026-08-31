@@ -41,10 +41,19 @@
 #define NEXT_FDC_FIFO          (NEXT_FDC_BASE + 5)
 #define NEXT_FDC_CCR           (NEXT_FDC_BASE + 7)
 #define NEXT_FLOPPY_CONTROL    (NEXT_FDC_BASE + 8)
+#define NEXT_COMPUTER_FDC_BASE 0x02014100
+#define NEXT_COMPUTER_FDC_DOR  (NEXT_COMPUTER_FDC_BASE + 2)
+#define NEXT_COMPUTER_FDC_MSR_DSR (NEXT_COMPUTER_FDC_BASE + 4)
+#define NEXT_COMPUTER_FLOPPY_CONTROL (NEXT_COMPUTER_FDC_BASE + 8)
 #define NEXT_SCSI_CONTROL      0x02114020
 #define NEXT_SCSI_STATUS       0x02114021
 #define NEXT_ROM_SCSI_CONTROL  0x02014020
 #define NEXT_ROM_SCSI_STATUS   0x02014021
+
+#define NEXT_COMPUTER_FLOPPY_MTREE \
+    "0000000002014100-0000000002014107 (prio 0, i/o): fdc"
+#define NEXT_COMPUTER_FLOPPY_CTRL_MTREE \
+    "0000000002014108-0000000002014108 (prio 0, i/o): next-floppy-ctrl"
 
 #define NEXT_DMA_CSR           0x02000010
 #define NEXT_DMA_NEXT          0x02004010
@@ -170,6 +179,22 @@ static QTestState *next_cube_start(TestFixture *fixture, bool with_media)
     return qtest_initf("-machine next-cube -bios %s", quoted_rom_path);
 }
 
+static QTestState *next_computer_start(TestFixture *fixture, bool with_media)
+{
+    g_autofree char *quoted_rom_path = g_shell_quote(fixture->rom_path);
+
+    if (with_media) {
+        g_autofree char *quoted_floppy_path =
+            g_shell_quote(fixture->floppy_path);
+
+        return qtest_initf("-machine next-computer -bios %s "
+                           "-drive if=floppy,format=raw,file=%s",
+                           quoted_rom_path, quoted_floppy_path);
+    }
+
+    return qtest_initf("-machine next-computer -bios %s", quoted_rom_path);
+}
+
 static QTestState *next_cube_start_readonly(TestFixture *fixture)
 {
     g_autofree char *quoted_rom_path = g_shell_quote(fixture->rom_path);
@@ -201,6 +226,30 @@ static void assert_controller_mapped(TestFixture *fixture)
 
     qtest_writeb(qts, NEXT_FDC_DOR, 0x04);
     g_assert_cmphex(qtest_readb(qts, NEXT_FDC_MSR_DSR), ==, FDC_MSR_RQM);
+    qtest_quit(qts);
+}
+
+static void test_original_computer_mapping(void)
+{
+    TestFixture *fixture = fixture_new();
+    QTestState *qts = next_computer_start(fixture, true);
+    g_autofree char *mtree = qtest_hmp(qts, "info mtree -f");
+
+    g_assert_nonnull(strstr(mtree, NEXT_COMPUTER_FLOPPY_MTREE));
+    g_assert_nonnull(strstr(mtree, NEXT_COMPUTER_FLOPPY_CTRL_MTREE));
+
+    qtest_writeb(qts, NEXT_COMPUTER_FDC_DOR, 0x04);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COMPUTER_FDC_MSR_DSR), ==,
+                    FDC_MSR_RQM);
+    qtest_writeb(qts, NEXT_COMPUTER_FLOPPY_CONTROL, 0x40);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COMPUTER_FLOPPY_CONTROL), ==,
+                    0x42);
+
+    qtest_writeb(qts, NEXT_ROM_SCSI_CONTROL, 0x50);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ROM_SCSI_CONTROL), ==, 0x50);
+    g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_RELEVANT_IRQS,
+                    ==, 0);
+
     qtest_quit(qts);
 }
 
@@ -1030,6 +1079,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/floppy/controller-and-media",
                    test_controller_and_media);
+    qtest_add_func("/next-computer/floppy/original-computer-mapping",
+                   test_original_computer_mapping);
     qtest_add_func("/next-cube/floppy/sra-write-protect-tracks-backend",
                    test_sra_write_protect_tracks_backend);
     qtest_add_func("/next-cube/floppy/rom-reset-configure-recalibrate",

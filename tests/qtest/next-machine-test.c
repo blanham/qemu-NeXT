@@ -33,6 +33,67 @@ typedef struct MachineTest {
     bool has_mono_framebuffer;
 } MachineTest;
 
+typedef struct ByteDeviceMappingTest {
+    const char *machine;
+    const char * const *ranges;
+} ByteDeviceMappingTest;
+
+static const char * const next_computer_byte_device_ranges[] = {
+    "0000000002006000-000000000200600f (prio 0, i/o): next.mb8795",
+    "0000000002006010-0000000002006014 (prio 0, i/o): next.memctl",
+    "0000000002008000-0000000002008007 (prio 0, i/o): next.dsp",
+    "0000000002012000-000000000201201f (prio 0, i/o): next-optical",
+    "0000000002014000-000000000201400f (prio 0, i/o): esp-regs",
+    "0000000002014100-0000000002014107 (prio 0, i/o): fdc",
+    "0000000002014108-0000000002014108 (prio 0, i/o): next-floppy-ctrl",
+    "0000000002016000-0000000002016004 (prio 0, i/o): next.system-timer",
+    "0000000002018000-0000000002018003 (prio 0, i/o): escc",
+    "000000000201a000-000000000201a003 (prio 0, i/o): next.event-counter",
+    NULL,
+};
+
+static const char * const next_cube_byte_device_ranges[] = {
+    "0000000002106000-000000000210600f (prio 0, i/o): next.mb8795",
+    "0000000002106010-0000000002106014 (prio 0, i/o): next.memctl",
+    "0000000002108000-0000000002108007 (prio 0, i/o): next.dsp",
+    "0000000002112000-000000000211201f (prio 0, i/o): next-optical",
+    "0000000002114000-000000000211400f (prio 0, i/o): esp-regs",
+    "0000000002114100-0000000002114107 (prio 0, i/o): fdc",
+    "0000000002114108-0000000002114108 (prio 0, i/o): next-floppy-ctrl",
+    "0000000002116000-0000000002116004 (prio 0, i/o): next.system-timer",
+    "0000000002118000-0000000002118003 (prio 0, i/o): escc",
+    "000000000211a000-000000000211a003 (prio 0, i/o): next.event-counter",
+    NULL,
+};
+
+static const char * const next_station_byte_device_ranges[] = {
+    "0000000002106000-000000000210600f (prio 0, i/o): next.mb8795",
+    "0000000002106010-0000000002106014 (prio 0, i/o): next.memctl",
+    "0000000002108000-0000000002108007 (prio 0, i/o): next.dsp",
+    "0000000002110000-000000000211000f (prio -10000, i/o): empty-slot",
+    "0000000002114000-000000000211400f (prio 0, i/o): esp-regs",
+    "0000000002114100-0000000002114107 (prio 0, i/o): fdc",
+    "0000000002114108-0000000002114108 (prio 0, i/o): next-floppy-ctrl",
+    "0000000002116000-0000000002116004 (prio 0, i/o): next.system-timer",
+    "0000000002118000-0000000002118003 (prio 0, i/o): escc",
+    "000000000211a000-000000000211a003 (prio 0, i/o): next.event-counter",
+    NULL,
+};
+
+static const char * const next_station_color_byte_device_ranges[] = {
+    "0000000002106000-000000000210600f (prio 0, i/o): next.mb8795",
+    "0000000002106010-0000000002106014 (prio 0, i/o): next.memctl",
+    "0000000002108000-0000000002108007 (prio 0, i/o): next.dsp",
+    "0000000002110000-000000000211000f (prio -10000, i/o): empty-slot",
+    "0000000002114000-000000000211400f (prio 0, i/o): esp-regs",
+    "0000000002114100-0000000002114107 (prio 0, i/o): fdc",
+    "0000000002114108-0000000002114108 (prio 0, i/o): next-floppy-ctrl",
+    "0000000002116000-0000000002116004 (prio 0, i/o): next.system-timer",
+    "0000000002118000-0000000002118003 (prio 0, i/o): escc",
+    "000000000211a000-000000000211a003 (prio 0, i/o): next.event-counter",
+    NULL,
+};
+
 static void cleanup_test_rom(void *opaque)
 {
     TestROM *rom = opaque;
@@ -122,6 +183,21 @@ static void test_ram_and_framebuffer(gconstpointer opaque)
         g_assert_nonnull(strstr(flatview, NEXT_FB_RANGE));
     } else {
         g_assert_null(strstr(flatview, NEXT_FB_RANGE));
+    }
+
+    qtest_quit(qts);
+}
+
+static void test_byte_device_mapping(gconstpointer opaque)
+{
+    const ByteDeviceMappingTest *test = opaque;
+    g_autofree char *mtree = NULL;
+    QTestState *qts = next_machine_start(test->machine, NULL);
+    size_t i;
+
+    mtree = qtest_hmp(qts, "info mtree -f");
+    for (i = 0; test->ranges[i]; i++) {
+        g_assert_nonnull(strstr(mtree, test->ranges[i]));
     }
 
     qtest_quit(qts);
@@ -301,6 +377,21 @@ int main(int argc, char **argv)
             .has_mono_framebuffer = true,
         },
     };
+    static ByteDeviceMappingTest byte_device_mapping_tests[] = {
+        {
+            .machine = "next-computer",
+            .ranges = next_computer_byte_device_ranges,
+        }, {
+            .machine = "next-cube",
+            .ranges = next_cube_byte_device_ranges,
+        }, {
+            .machine = "next-station",
+            .ranges = next_station_byte_device_ranges,
+        }, {
+            .machine = "next-station-color",
+            .ranges = next_station_color_byte_device_ranges,
+        },
+    };
     size_t i;
 
     g_test_init(&argc, &argv, NULL);
@@ -325,6 +416,14 @@ int main(int argc, char **argv)
                                  test_ram_and_framebuffer, NULL);
         qtest_add_data_func_full(reject_path, &machine_tests[i],
                                  test_ram_rejection, NULL);
+    }
+    for (i = 0; i < ARRAY_SIZE(byte_device_mapping_tests); i++) {
+        g_autofree char *path =
+            g_strdup_printf("/next-machine/%s/byte-device-mapping",
+                            byte_device_mapping_tests[i].machine);
+
+        qtest_add_data_func_full(path, &byte_device_mapping_tests[i],
+                                 test_byte_device_mapping, NULL);
     }
     qtest_add_func("/next-machine/next-cube/reject-m68030",
                    test_invalid_cpu);
