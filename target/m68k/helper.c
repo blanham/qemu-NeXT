@@ -460,7 +460,43 @@ void m68k_switch_sp(CPUM68KState *env)
 }
 
 #if !defined(CONFIG_USER_ONLY)
-/* MMU: 68040 only */
+/* MMU: 68030 and 68040 */
+
+static bool m68k_mmu030_address_space_readl(void *opaque, uint32_t address,
+                                             uint32_t *value)
+{
+    AddressSpace *as = opaque;
+    MemTxResult txres;
+
+    *value = address_space_ldl_be(as, address, MEMTXATTRS_UNSPECIFIED,
+                                  &txres);
+    return txres == MEMTX_OK;
+}
+
+static bool m68k_mmu030_address_space_writel(void *opaque, uint32_t address,
+                                              uint32_t value)
+{
+    AddressSpace *as = opaque;
+    MemTxResult txres;
+
+    address_space_stl_be(as, address, value, MEMTXATTRS_UNSPECIFIED, &txres);
+    return txres == MEMTX_OK;
+}
+
+int m68k_mmu030_translate(CPUArchState *env, uint32_t logical_address,
+                          int access_type, uint8_t function_code, bool probe,
+                          M68KMMU030TranslateResult *result)
+{
+    CPUState *cs = env_cpu(env);
+    M68KMMU030MemoryOps ops = {
+        .readl = m68k_mmu030_address_space_readl,
+        .writel = m68k_mmu030_address_space_writel,
+        .opaque = cs->as,
+    };
+
+    return m68k_mmu030_walk(&env->mmu030, &ops, logical_address, access_type,
+                            function_code, probe, result);
+}
 
 static void print_address_zone(uint32_t logical, uint32_t physical,
                                uint32_t size, int attr)
@@ -918,6 +954,23 @@ hwaddr m68k_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
     int access_type;
     target_ulong page_size;
 
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030TranslateResult result;
+        uint8_t function_code;
+
+        access_type = ACCESS_DATA | ACCESS_DEBUG;
+        if (env->sr & SR_S) {
+            access_type |= ACCESS_SUPER;
+        }
+        function_code = (access_type & ACCESS_SUPER ? 4 : 0) |
+                        (access_type & ACCESS_CODE ? 2 : 1);
+        if (m68k_mmu030_translate(env, addr, access_type, function_code,
+                                  true, &result) != 0) {
+            return -1;
+        }
+        return result.physical;
+    }
+
     if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
         /* MMU disabled */
         return addr;
@@ -966,6 +1019,49 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     int access_type;
     int ret;
     target_ulong page_size;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030TranslateResult result;
+        uint8_t function_code;
+
+        if (qemu_access_type == MMU_INST_FETCH) {
+            access_type = ACCESS_CODE;
+        } else {
+            access_type = ACCESS_DATA;
+            if (qemu_access_type == MMU_DATA_STORE) {
+                access_type |= ACCESS_STORE;
+            }
+        }
+        if (mmu_idx != MMU_USER_IDX) {
+            access_type |= ACCESS_SUPER;
+        }
+        function_code = (access_type & ACCESS_SUPER ? 4 : 0) |
+                        (access_type & ACCESS_CODE ? 2 : 1);
+
+        ret = m68k_mmu030_translate(env, address, access_type, function_code,
+                                    probe, &result);
+        if (likely(ret == 0)) {
+            tlb_set_page(cs, address & TARGET_PAGE_MASK,
+                         result.physical & TARGET_PAGE_MASK, result.prot,
+                         mmu_idx, result.page_size);
+            return true;
+        }
+        if (probe) {
+            return false;
+        }
+
+        /* Capture the faulting instruction, rather than the TB entry PC. */
+        cpu_restore_state(cs, retaddr);
+        env->mmu030.fault_pending = true;
+        env->mmu030.fault_address = address;
+        env->mmu030.fault_pc = env->pc;
+        env->mmu030.fault_ssw = m68k_mmu030_make_ssw(
+            size, qemu_access_type == MMU_DATA_STORE,
+            access_type & ACCESS_CODE, function_code);
+        env->mmu030.fault_status = result.mmusr;
+        cs->exception_index = EXCP_ACCESS;
+        cpu_loop_exit(cs);
+    }
 
     if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
         /* MMU disabled */
@@ -1464,6 +1560,27 @@ void HELPER(ptest)(CPUM68KState *env, uint32_t addr, uint32_t is_read)
     int prot;
     int ret;
     target_ulong page_size;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        M68KMMU030TranslateResult result;
+        uint8_t function_code = env->dfc & 7;
+
+        access_type = ACCESS_PTEST;
+        if (function_code & 4) {
+            access_type |= ACCESS_SUPER;
+        }
+        if ((function_code & 3) == 2) {
+            access_type |= ACCESS_CODE;
+        }
+        if (!is_read) {
+            access_type |= ACCESS_STORE;
+        }
+
+        env->mmu030.mmusr = 0;
+        m68k_mmu030_translate(env, addr, access_type, function_code, true,
+                              &result);
+        return;
+    }
 
     access_type = ACCESS_PTEST;
     if (env->dfc & 4) {

@@ -22,6 +22,7 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
+#include "qemu/bswap.h"
 #include "semihosting/semihost.h"
 #include "qemu/plugin.h"
 
@@ -73,6 +74,11 @@ throwaway:
             break;
         case 7:
             sp += 52;
+            break;
+        case 0xa:
+            if (m68k_feature(env, M68K_FEATURE_M68030)) {
+                sp += m68k_mmu030_rte_frame_tail_size(fmt);
+            }
             break;
         }
     }
@@ -292,6 +298,52 @@ static inline void do_stack_frame(CPUM68KState *env, uint32_t *sp,
     cpu_stw_be_mmuidx_ra(env, *sp, sr, MMU_KERNEL_IDX, 0);
 }
 
+static void m68k_mmu030_access_error_frame(CPUM68KState *env, uint32_t *sp,
+                                           uint16_t saved_sr,
+                                           uint32_t vector)
+{
+    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE];
+
+    /*
+     * Task 3 handles the ordinary instruction-boundary format-$A frame.
+     * Format-$B pipeline/rerun recovery and format-$9 coprocessor frames are
+     * intentionally deferred to Task 7; they must not use the 68040 frame.
+     */
+    if (!m68k_mmu030_build_short_access_frame(&env->mmu030, saved_sr,
+                                              vector, frame)) {
+        cpu_abort(env_cpu(env),
+                  "MC68030 access fault without pending MMU context\n");
+    }
+
+    *sp -= M68K_MMU030_ACCESS_FRAME_SIZE;
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x00, lduw_be_p(frame + 0x00),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stl_be_mmuidx_ra(env, *sp + 0x02, ldl_be_p(frame + 0x02),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x06, lduw_be_p(frame + 0x06),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x08, lduw_be_p(frame + 0x08),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x0a, lduw_be_p(frame + 0x0a),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x0c, lduw_be_p(frame + 0x0c),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x0e, lduw_be_p(frame + 0x0e),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stl_be_mmuidx_ra(env, *sp + 0x10, ldl_be_p(frame + 0x10),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x14, lduw_be_p(frame + 0x14),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x16, lduw_be_p(frame + 0x16),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stl_be_mmuidx_ra(env, *sp + 0x18, ldl_be_p(frame + 0x18),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x1c, lduw_be_p(frame + 0x1c),
+                         MMU_KERNEL_IDX, 0);
+    cpu_stw_be_mmuidx_ra(env, *sp + 0x1e, lduw_be_p(frame + 0x1e),
+                         MMU_KERNEL_IDX, 0);
+}
+
 static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
 {
     CPUState *cs = env_cpu(env);
@@ -342,6 +394,10 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
 
     switch (cs->exception_index) {
     case EXCP_ACCESS:
+        if (m68k_feature(env, M68K_FEATURE_M68030)) {
+            m68k_mmu030_access_error_frame(env, &sp, oldsr, vector);
+            break;
+        }
         if (env->mmu.fault) {
             cpu_abort(cs, "DOUBLE MMU FAULT\n");
         }

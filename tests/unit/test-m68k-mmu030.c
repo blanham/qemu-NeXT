@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 
+#include "exec/page-protection.h"
 #include "target/m68k/mmu030.h"
 #include "io/channel-buffer.h"
 #include "migration/qemu-file.h"
@@ -15,6 +16,62 @@
 #include "migration/vmstate.h"
 #include "qemu/module.h"
 #include "../qtest/libqtest.h"
+
+typedef struct M68KMMU030TestMemory {
+    uint8_t data[0x10000];
+    bool fail_read;
+    bool fail_write;
+    unsigned read_count;
+    unsigned write_count;
+} M68KMMU030TestMemory;
+
+static bool mmu030_test_readl(void *opaque, uint32_t address, uint32_t *value)
+{
+    M68KMMU030TestMemory *memory = opaque;
+
+    memory->read_count++;
+    if (memory->fail_read || address > sizeof(memory->data) - 4) {
+        return false;
+    }
+
+    *value = ((uint32_t)memory->data[address] << 24) |
+             ((uint32_t)memory->data[address + 1] << 16) |
+             ((uint32_t)memory->data[address + 2] << 8) |
+             memory->data[address + 3];
+    return true;
+}
+
+static bool mmu030_test_writel(void *opaque, uint32_t address, uint32_t value)
+{
+    M68KMMU030TestMemory *memory = opaque;
+
+    memory->write_count++;
+    if (memory->fail_write || address > sizeof(memory->data) - 4) {
+        return false;
+    }
+
+    memory->data[address] = value >> 24;
+    memory->data[address + 1] = value >> 16;
+    memory->data[address + 2] = value >> 8;
+    memory->data[address + 3] = value;
+    return true;
+}
+
+static void mmu030_test_putl(M68KMMU030TestMemory *memory, uint32_t address,
+                              uint32_t value)
+{
+    g_assert_true(mmu030_test_writel(memory, address, value));
+    memory->write_count--;
+}
+
+static M68KMMU030MemoryOps mmu030_test_ops(M68KMMU030TestMemory *memory)
+{
+    return (M68KMMU030MemoryOps) {
+        .readl = mmu030_test_readl,
+        .writel = mmu030_test_writel,
+        .opaque = memory,
+    };
+}
 
 #define M68K_MMU030_TC_E        (UINT32_C(1) << 31)
 #define M68K_MMU030_TC_PS_SHIFT 20
@@ -198,6 +255,568 @@ static uint32_t mmu030_tc(unsigned ps, unsigned is, unsigned tia,
            (tib << M68K_MMU030_TC_TIB_SHIFT) |
            (tic << M68K_MMU030_TC_TIC_SHIFT) |
            tid;
+}
+
+enum {
+    MMU030_TEST_ACCESS_SUPER = 0x01,
+    MMU030_TEST_ACCESS_STORE = 0x02,
+    MMU030_TEST_ACCESS_PTEST = 0x08,
+    MMU030_TEST_ACCESS_CODE = 0x10,
+    MMU030_TEST_ACCESS_DATA = 0x20,
+};
+
+static uint32_t mmu030_test_getl(M68KMMU030TestMemory *memory,
+                                  uint32_t address)
+{
+    uint32_t value = 0;
+
+    g_assert_true(mmu030_test_readl(memory, address, &value));
+    memory->read_count--;
+    return value;
+}
+
+static void test_mmu030_descriptor_walker(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned root_index = (logical >> 22) & 0x3ff;
+    const unsigned page_index = (logical >> 12) & 0x3ff;
+    uint32_t root_entry = UINT32_C(0x1000) + root_index * 4;
+    uint32_t page_entry = UINT32_C(0x2000) + page_index * 4;
+
+    /* A 4 KiB tree using short descriptors at both levels. */
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x2002));
+    mmu030_test_putl(&memory, page_entry, UINT32_C(0x00abc001));
+
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00abc678));
+    g_assert_cmpuint(result.page_size, ==, UINT32_C(4096));
+    g_assert_cmpint(result.prot, ==, PAGE_READ | PAGE_WRITE);
+    g_assert_false(result.cache_inhibit);
+    g_assert_cmpuint(mmu030_test_getl(&memory, root_entry), ==,
+                     UINT32_C(0x200a));
+    g_assert_cmpuint(mmu030_test_getl(&memory, page_entry), ==,
+                     UINT32_C(0x00abc009));
+}
+
+static void test_mmu030_descriptor_roots_and_fcl(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned tia_index = (logical >> 22) & 0x3ff;
+    const unsigned tib_index = (logical >> 12) & 0x3ff;
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0) | M68K_MMU030_TC_SRE;
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    state.srp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x3000);
+
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, 0x2002);
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 4, 0x00a00001);
+    mmu030_test_putl(&memory, 0x3000 + tia_index * 4, 0x4002);
+    mmu030_test_putl(&memory, 0x4000 + tib_index * 4, 0x00b00001);
+
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00a00678));
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA | \
+                                     MMU030_TEST_ACCESS_SUPER, 5, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00b00678));
+
+    /* With FCL set, FC selects the root entry and the root limit is ignored. */
+    memset(&memory, 0, sizeof(memory));
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0) | M68K_MMU030_TC_FCL;
+    state.crp = (UINT64_C(0x00010002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + 5 * 4, 0x5002);
+    mmu030_test_putl(&memory, 0x5000 + tia_index * 4, 0x6002);
+    mmu030_test_putl(&memory, 0x6000 + tib_index * 4, 0x00c00001);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 5, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00c00678));
+}
+
+static void test_mmu030_descriptor_long_direct_and_early(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned tia_index = (logical >> 22) & 0x3ff;
+    const unsigned tib_index = (logical >> 12) & 0x3ff;
+    uint32_t root_entry = 0x1000 + tia_index * 8;
+    uint32_t page_entry = 0x2000 + tib_index * 8;
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0003) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x7fff0003));
+    mmu030_test_putl(&memory, root_entry + 4, UINT32_C(0x2010));
+    page_entry = UINT32_C(0x2010) + tib_index * 8;
+    mmu030_test_putl(&memory, page_entry, M68K_MMU030_DESC_PAGE |
+                     M68K_MMU030_DESC_CI | M68K_MMU030_DESC_M);
+    mmu030_test_putl(&memory, page_entry + 4, UINT32_C(0x00def000));
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA | \
+                                     MMU030_TEST_ACCESS_SUPER, 5, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00def678));
+    g_assert_cmpuint(result.page_size, ==, UINT32_C(4096));
+    g_assert_cmpint(result.prot, ==, PAGE_READ | PAGE_WRITE);
+    g_assert_true(result.cache_inhibit);
+
+    /* A DT=1 root pointer maps the entire logical address with an offset. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0001) << 32) | UINT32_C(0x00100000);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x12445678));
+    g_assert_cmpuint(memory.read_count, ==, 0);
+
+    /* A direct root checks LIMIT even when FCL selects the root entry. */
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0) |
+               M68K_MMU030_TC_FCL;
+    state.crp = (UINT64_C(0x00000001) << 32) | UINT32_C(0x00100000);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, -1);
+    g_assert_true(result.limit_violation);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I);
+
+    /* DT=1 in a pointer table maps all remaining index bits contiguously. */
+    memset(&memory, 0, sizeof(memory));
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, 0x00600001);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==,
+                     UINT32_C(0x00600000) + (logical & UINT32_C(0x003fffff)));
+}
+
+static void test_mmu030_descriptor_indirect_and_8k(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned tia_index = (logical >> 22) & 0x3ff;
+    const unsigned tib_index = (logical >> 12) & 0x3ff;
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, 0x2002);
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 4, 0x7002);
+    mmu030_test_putl(&memory, 0x7000, 0x00900001);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00900678));
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x7000), ==,
+                     UINT32_C(0x00900009));
+
+    memset(&memory, 0, sizeof(memory));
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, UINT32_C(0x2002));
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 4, UINT32_C(0x7002));
+    mmu030_test_putl(&memory, 0x7000, M68K_MMU030_DESC_PAGE);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_STORE, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x7000), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_U |
+                     M68K_MMU030_DESC_M);
+
+    /* Long indirection uses the descriptor's second word as its address. */
+    memset(&memory, 0, sizeof(memory));
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0003) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 8,
+                     UINT32_C(0x7fff0003));
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 8 + 4,
+                     UINT32_C(0x2000));
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 8,
+                     M68K_MMU030_DESC_VALID8);
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 8 + 4,
+                     UINT32_C(0x7000));
+    mmu030_test_putl(&memory, 0x7000, M68K_MMU030_DESC_PAGE);
+    mmu030_test_putl(&memory, 0x7004, UINT32_C(0x00900000));
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_STORE, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00900678));
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x7000), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_U |
+                     M68K_MMU030_DESC_M);
+
+    /* NeXT's 8 KiB layout is 13 + 7 + 7 + 5 address bits. */
+    memset(&memory, 0, sizeof(memory));
+    state.tc = mmu030_tc(13, 0, 7, 7, 5, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    const unsigned a = (logical >> 25) & 0x7f;
+    const unsigned b = (logical >> 18) & 0x7f;
+    const unsigned c = (logical >> 13) & 0x1f;
+    mmu030_test_putl(&memory, 0x1000 + a * 4, 0x2002);
+    mmu030_test_putl(&memory, 0x2000 + b * 4, 0x3002);
+    mmu030_test_putl(&memory, 0x3000 + c * 4, 0x00e00001);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00e01678));
+    g_assert_cmpuint(result.page_size, ==, UINT32_C(8192));
+}
+
+static void test_mmu030_descriptor_status_and_errors(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    M68KMMU030TranslateResult result;
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned tia_index = (logical >> 22) & 0x3ff;
+    const unsigned tib_index = (logical >> 12) & 0x3ff;
+    const uint32_t root_entry = 0x1000 + tia_index * 8;
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0003) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x7fff0003) |
+                     M68K_MMU030_DESC_S | M68K_MMU030_DESC_WP);
+    mmu030_test_putl(&memory, root_entry + 4, UINT32_C(0x2000));
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_S | M68K_MMU030_MMUSR_WP | 1);
+    g_assert_cmpuint(state.mmusr, ==, result.mmusr);
+    g_assert_cmpuint(mmu030_test_getl(&memory, root_entry), ==,
+                     UINT32_C(0x7fff0003) | M68K_MMU030_DESC_S |
+                     M68K_MMU030_DESC_WP);
+
+    /* Normal user access still faults on the same supervisor-only table. */
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, -1);
+    g_assert_true(result.fault);
+
+    /* An indirect long page accumulates S and M for a user PTEST. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0003) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x7fff0003));
+    mmu030_test_putl(&memory, root_entry + 4, UINT32_C(0x2000));
+    const uint32_t indirect_entry = 0x2000 + tib_index * 8;
+    mmu030_test_putl(&memory, indirect_entry, M68K_MMU030_DESC_VALID8);
+    mmu030_test_putl(&memory, indirect_entry + 4, UINT32_C(0x7000));
+    mmu030_test_putl(&memory, 0x7000,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_S |
+                     M68K_MMU030_DESC_M);
+    mmu030_test_putl(&memory, 0x7004, UINT32_C(0x00900000));
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_S | M68K_MMU030_MMUSR_M | 2);
+    g_assert_cmpuint(state.mmusr, ==, result.mmusr);
+    g_assert_cmpuint(mmu030_test_getl(&memory, root_entry), ==,
+                     UINT32_C(0x7fff0003));
+    g_assert_cmpuint(mmu030_test_getl(&memory, indirect_entry), ==,
+                     M68K_MMU030_DESC_VALID8);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x7000), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_S |
+                     M68K_MMU030_DESC_M);
+
+    /* PTESTW reports WP status without taking the write-protect fault. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, 0x2002);
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 4,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_WP);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_STORE |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, 0);
+    g_assert_false(result.fault);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00000678));
+    g_assert_cmpint(result.prot, ==, PAGE_READ);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_WP | 2);
+    g_assert_cmpuint(state.mmusr, ==, result.mmusr);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x2000 + tib_index * 4), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_WP);
+
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, 0);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00000678));
+    g_assert_cmpint(result.prot, ==, PAGE_READ);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_WP | 2);
+
+    /* Probe history is read-only: a clear U/M descriptor remains untouched. */
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x2000 + tib_index * 4), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_WP);
+
+    /* An ancestor WP is accumulated through the walk before the retry. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4,
+                     UINT32_C(0x2000) | M68K_MMU030_DESC_VALID4 |
+                     M68K_MMU030_DESC_WP);
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 4,
+                     M68K_MMU030_DESC_PAGE);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_STORE, 1, false,
+                                     &result), ==, -1);
+    g_assert_true(result.fault);
+    g_assert_false(result.bus_error);
+    g_assert_cmpuint(result.physical, ==, UINT32_C(0x00000678));
+    g_assert_cmpint(result.prot, ==, PAGE_READ);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_WP | 2);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x1000 + tia_index * 4), ==,
+                     UINT32_C(0x2000) | M68K_MMU030_DESC_VALID4 |
+                     M68K_MMU030_DESC_WP |
+                     M68K_MMU030_DESC_U);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x2000 + tib_index * 4), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_U);
+
+    /* The CRP upper limit rejects the first logical index without a read. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x00000002) << 32) | UINT32_C(0x1000);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, -1);
+    g_assert_true(result.limit_violation);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I);
+    g_assert_cmpuint(memory.read_count, ==, 0);
+
+    /* A long pointer descriptor limits its next logical index. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0003) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x00000003) |
+                     (UINT32_C(0x20) << 16));
+    mmu030_test_putl(&memory, root_entry + 4, UINT32_C(0x2000));
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, -1);
+    g_assert_true(result.limit_violation);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_L | M68K_MMU030_MMUSR_I | 1);
+
+    /* A successful write sets U and M; PTEST above did not set either. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, UINT32_C(0x2002));
+    mmu030_test_putl(&memory, 0x2000 + tib_index * 4,
+                     M68K_MMU030_DESC_PAGE);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_STORE, 1, false,
+                                     &result), ==, 0);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x1000 + tia_index * 4), ==,
+                     UINT32_C(0x200a));
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x2000 + tib_index * 4), ==,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_U |
+                     M68K_MMU030_DESC_M);
+
+    /* A failed physical write while setting U is a table bus error. */
+    memset(&memory, 0, sizeof(memory));
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, UINT32_C(0x2002));
+    memory.fail_write = true;
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, -1);
+    g_assert_true(result.bus_error);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I | 1);
+
+    /* Invalid descriptors and table bus errors are reported distinctly. */
+    memset(&memory, 0, sizeof(memory));
+    mmu030_test_putl(&memory, 0x1000 + tia_index * 4, 0);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, -1);
+    g_assert_cmpuint(result.mmusr, ==, M68K_MMU030_MMUSR_I | 1);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x1000 + tia_index * 4), ==,
+                     0);
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA, 1, false,
+                                     &result), ==, -1);
+    g_assert_cmpuint(mmu030_test_getl(&memory, 0x1000 + tia_index * 4), ==,
+                     0);
+
+    memset(&memory, 0, sizeof(memory));
+    memory.fail_read = true;
+    g_assert_cmpint(m68k_mmu030_walk(&state, &ops, logical,
+                                     MMU030_TEST_ACCESS_DATA |
+                                     MMU030_TEST_ACCESS_PTEST, 1, true,
+                                     &result), ==, -1);
+    g_assert_true(result.bus_error);
+    g_assert_cmpuint(result.mmusr, ==,
+                     M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I | 1);
+}
+
+static void mmu030_assert_short_access_frame(
+    M68KMMU030State *state, M68KMMU030MemoryOps *ops,
+    uint32_t logical_address, int access_type, uint8_t function_code,
+    unsigned size, uint16_t expected_status, uint16_t saved_sr,
+    uint32_t fault_pc)
+{
+    M68KMMU030TranslateResult result;
+    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE];
+
+    g_assert_cmpint(m68k_mmu030_walk(state, ops, logical_address,
+                                     access_type, function_code, false,
+                                     &result), ==, -1);
+    g_assert_true(result.fault);
+    g_assert_cmpuint(result.mmusr, ==, expected_status);
+
+    state->fault_pending = true;
+    state->fault_address = logical_address;
+    state->fault_pc = fault_pc;
+    state->fault_ssw = m68k_mmu030_make_ssw(size,
+                                            access_type &
+                                            MMU030_TEST_ACCESS_STORE,
+                                            access_type &
+                                            MMU030_TEST_ACCESS_CODE,
+                                            function_code);
+    state->fault_status = result.mmusr;
+    g_assert_true(m68k_mmu030_build_short_access_frame(state, saved_sr, 8,
+                                                       frame));
+    g_assert_false(state->fault_pending);
+
+    /* Format $A is the MC68030 short bus-cycle fault frame. */
+    g_assert_cmpuint(lduw_be_p(frame + 0x00), ==, saved_sr);
+    g_assert_cmpuint(ldl_be_p(frame + 0x02), ==, fault_pc);
+    g_assert_cmpuint(lduw_be_p(frame + 0x06), ==, UINT16_C(0xa008));
+    g_assert_cmpuint(lduw_be_p(frame + 0x08), ==, 0);
+    g_assert_cmpuint(lduw_be_p(frame + 0x0a), ==, state->fault_ssw);
+    g_assert_cmpuint(lduw_be_p(frame + 0x0c), ==, 0);
+    g_assert_cmpuint(lduw_be_p(frame + 0x0e), ==, 0);
+    g_assert_cmpuint(ldl_be_p(frame + 0x10), ==, logical_address);
+    g_assert_cmpuint(lduw_be_p(frame + 0x14), ==, 0);
+    g_assert_cmpuint(lduw_be_p(frame + 0x16), ==, 0);
+    g_assert_cmpuint(ldl_be_p(frame + 0x18), ==, 0);
+    g_assert_cmpuint(lduw_be_p(frame + 0x1c), ==, 0);
+    g_assert_cmpuint(lduw_be_p(frame + 0x1e), ==, 0);
+}
+
+static void test_mmu030_access_error_frame(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030TestMemory memory = { 0 };
+    M68KMMU030MemoryOps ops = mmu030_test_ops(&memory);
+    const uint32_t logical = UINT32_C(0x12345678);
+    const unsigned tia_index = (logical >> 22) & 0x3ff;
+    const unsigned tib_index = (logical >> 12) & 0x3ff;
+    const uint32_t root_entry = UINT32_C(0x1000) + tia_index * 4;
+    const uint32_t page_entry = UINT32_C(0x2000) + tib_index * 4;
+    const uint16_t saved_sr = UINT16_C(0x2015);
+
+    state.tc = mmu030_tc(12, 0, 10, 10, 0, 0);
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+
+    /* The real walker supplies the invalid-descriptor status. */
+    mmu030_test_putl(&memory, root_entry, 0);
+    mmu030_assert_short_access_frame(
+        &state, &ops, logical, MMU030_TEST_ACCESS_DATA, 1, 4,
+        M68K_MMU030_MMUSR_I | 1, saved_sr, UINT32_C(0x00123456));
+
+    /* Write protection is a format-A access fault, not a probe result. */
+    memset(&memory, 0, sizeof(memory));
+    mmu030_test_putl(&memory, root_entry, UINT32_C(0x2002));
+    mmu030_test_putl(&memory, page_entry,
+                     M68K_MMU030_DESC_PAGE | M68K_MMU030_DESC_WP);
+    mmu030_assert_short_access_frame(
+        &state, &ops, logical,
+        MMU030_TEST_ACCESS_DATA | MMU030_TEST_ACCESS_STORE, 1, 2,
+        M68K_MMU030_MMUSR_WP | 2, saved_sr, UINT32_C(0x00123458));
+
+    /* A user access to a long supervisor-only descriptor reports S. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0003) << 32) | UINT32_C(0x1000);
+    mmu030_test_putl(&memory, UINT32_C(0x1000) + tia_index * 8,
+                     M68K_MMU030_DESC_VALID8 | M68K_MMU030_DESC_S);
+    mmu030_test_putl(&memory, UINT32_C(0x1000) + tia_index * 8 + 4,
+                     UINT32_C(0x2000));
+    mmu030_assert_short_access_frame(
+        &state, &ops, logical, MMU030_TEST_ACCESS_DATA, 1, 1,
+        M68K_MMU030_MMUSR_S | 1, saved_sr, UINT32_C(0x0012345a));
+
+    /* A table read bus error is reported with B and the table level. */
+    memset(&memory, 0, sizeof(memory));
+    state.crp = (UINT64_C(0x7fff0002) << 32) | UINT32_C(0x1000);
+    memory.fail_read = true;
+    mmu030_assert_short_access_frame(
+        &state, &ops, logical, MMU030_TEST_ACCESS_DATA, 5, 4,
+        M68K_MMU030_MMUSR_B | M68K_MMU030_MMUSR_I | 1, saved_sr,
+        UINT32_C(0x0012345c));
+
+    g_assert_cmpuint(m68k_mmu030_make_ssw(1, false, false, 1), ==,
+                     UINT16_C(0x0151));
+    g_assert_cmpuint(m68k_mmu030_make_ssw(2, true, false, 5), ==,
+                     UINT16_C(0x0125));
+    g_assert_cmpuint(m68k_mmu030_make_ssw(4, false, false, 5), ==,
+                     UINT16_C(0x0145));
+    g_assert_cmpuint(m68k_mmu030_make_ssw(3, true, false, 5), ==,
+                     UINT16_C(0x0135));
+    /* Instruction-pipe faults do not claim a data-cycle rerun. */
+    g_assert_cmpuint(m68k_mmu030_make_ssw(2, false, true, 2), ==, 0);
+}
+
+static void test_mmu030_access_error_rte_roundtrip(void)
+{
+    M68KMMU030State state = {
+        .fault_pending = true,
+        .fault_address = UINT32_C(0x00abcdef),
+        .fault_pc = UINT32_C(0x00123456),
+        .fault_ssw = UINT16_C(0x0141),
+    };
+    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE];
+    const uint32_t stack_top = UINT32_C(0x00001000);
+    const uint32_t frame_sp = stack_top - M68K_MMU030_ACCESS_FRAME_SIZE;
+    uint32_t rte_sp = frame_sp + 8;
+    uint16_t format;
+
+    g_assert_true(m68k_mmu030_build_short_access_frame(
+        &state, UINT16_C(0x2015), 8, frame));
+    g_assert_false(state.fault_pending);
+
+    /* Model m68k_rte's common SR/PC/format reads and format-$A tail skip. */
+    g_assert_cmpuint(lduw_be_p(frame + 0x00), ==, UINT16_C(0x2015));
+    g_assert_cmpuint(ldl_be_p(frame + 0x02), ==, UINT32_C(0x00123456));
+    format = lduw_be_p(frame + 0x06);
+    g_assert_cmpuint(format, ==, UINT16_C(0xa008));
+    rte_sp += m68k_mmu030_rte_frame_tail_size(format);
+    g_assert_cmpuint(rte_sp, ==, stack_top);
+    g_assert_cmpuint(rte_sp - frame_sp, ==, M68K_MMU030_ACCESS_FRAME_SIZE);
+    g_assert_cmpuint(m68k_mmu030_rte_frame_tail_size(UINT16_C(0x7008)), ==,
+                     0);
 }
 
 static uint32_t mmu030_tt(uint8_t address_base, uint8_t address_mask,
@@ -515,6 +1134,20 @@ int main(int argc, char **argv)
                     test_mmu030_tc_validation);
     g_test_add_func("/m68k/mmu030/tt-matching",
                     test_mmu030_tt_matching);
+    g_test_add_func("/m68k/mmu030/descriptor-walker",
+                    test_mmu030_descriptor_walker);
+    g_test_add_func("/m68k/mmu030/descriptor-roots-fcl",
+                    test_mmu030_descriptor_roots_and_fcl);
+    g_test_add_func("/m68k/mmu030/descriptor-long-direct-early",
+                    test_mmu030_descriptor_long_direct_and_early);
+    g_test_add_func("/m68k/mmu030/descriptor-indirect-8k",
+                    test_mmu030_descriptor_indirect_and_8k);
+    g_test_add_func("/m68k/mmu030/descriptor-status-errors",
+                    test_mmu030_descriptor_status_and_errors);
+    g_test_add_func("/m68k/mmu030/access-error-frame",
+                    test_mmu030_access_error_frame);
+    g_test_add_func("/m68k/mmu030/access-error-rte-roundtrip",
+                    test_mmu030_access_error_rte_roundtrip);
     if (g_getenv("QTEST_QEMU_BINARY")) {
         g_test_add_func("/m68k/mmu030/cpu-vmstate-gating",
                         test_cpu_vmstate_gating);
