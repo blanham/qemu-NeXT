@@ -89,6 +89,7 @@ struct NextMB8795State {
     uint8_t tx_mode;
     uint8_t rx_mode;
     uint8_t station[6];
+    bool wide_station_access;
     bool reset;
     bool rx_turnaround;
 };
@@ -135,6 +136,15 @@ static void next_mb8795_leave_reset(NextMB8795State *s)
     }
 }
 
+static bool next_mb8795_station_wide_access(const NextMB8795State *s,
+                                            hwaddr addr, unsigned int size)
+{
+    return s->wide_station_access && size > 1 && size <= 4 &&
+           addr >= NEXT_MB8795_ADDR &&
+           addr <= NEXT_MB8795_ADDR + NEXT_MB8795_ADDR_SIZE - size &&
+           !(addr & (size - 1));
+}
+
 static uint64_t next_mb8795_read(void *opaque, hwaddr addr,
                                  unsigned int size)
 {
@@ -156,6 +166,14 @@ static uint64_t next_mb8795_read(void *opaque, hwaddr addr,
     case NEXT_MB8795_RESET:
         return s->reset ? NEXT_MB8795_RESET_MODE : 0;
     case NEXT_MB8795_ADDR ... NEXT_MB8795_ADDR + NEXT_MB8795_ADDR_SIZE - 1:
+        if (next_mb8795_station_wide_access(s, addr, size)) {
+            uint32_t value = 0;
+
+            for (unsigned int i = 0; i < size; i++) {
+                value = (value << 8) | s->station[addr - NEXT_MB8795_ADDR + i];
+            }
+            return value;
+        }
         return s->station[addr - NEXT_MB8795_ADDR];
     default:
         return 0;
@@ -200,6 +218,13 @@ static void next_mb8795_write(void *opaque, hwaddr addr, uint64_t value,
         }
         break;
     case NEXT_MB8795_ADDR ... NEXT_MB8795_ADDR + NEXT_MB8795_ADDR_SIZE - 1:
+        if (next_mb8795_station_wide_access(s, addr, size)) {
+            for (unsigned int i = 0; i < size; i++) {
+                s->station[addr - NEXT_MB8795_ADDR + i] =
+                    value >> ((size - i - 1) * 8);
+            }
+            break;
+        }
         s->station[addr - NEXT_MB8795_ADDR] = value;
         break;
     default:
@@ -211,7 +236,9 @@ static bool next_mb8795_access_valid(void *opaque, hwaddr addr,
                                      unsigned int size, bool is_write,
                                      MemTxAttrs attrs)
 {
-    return size == 1;
+    NextMB8795State *s = NEXT_MB8795(opaque);
+
+    return size == 1 || next_mb8795_station_wide_access(s, addr, size);
 }
 
 static const MemoryRegionOps next_mb8795_ops = {
@@ -267,8 +294,7 @@ static bool next_mb8795_accept(NextMB8795State *s,
            NEXT_MB8795_RXMODE_RESETENABLE |
            NEXT_MB8795_RXMODE_TEST |
            NEXT_MB8795_RXMODE_MASK)) ||
-        (s->rx_mode &
-         (NEXT_MB8795_RXMODE_TEST | NEXT_MB8795_RXMODE_RESETENABLE))) {
+        (s->rx_mode & NEXT_MB8795_RXMODE_TEST)) {
         return false;
     }
 
@@ -537,6 +563,8 @@ static void next_mb8795_init(Object *obj)
 static const Property next_mb8795_properties[] = {
     DEFINE_PROP_LINK("dma", NextMB8795State, dma,
                      TYPE_NEXT_DMA, NextDMAState *),
+    DEFINE_PROP_BOOL("wide-station-access", NextMB8795State,
+                     wide_station_access, false),
     DEFINE_NIC_PROPERTIES(NextMB8795State, conf),
 };
 

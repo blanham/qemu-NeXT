@@ -1717,10 +1717,12 @@ static void test_cpu_vmstate_gating(void)
     static const struct {
         const char *model;
         unsigned expected_mmu030_subsections;
+        unsigned expected_caar_subsections;
         unsigned expected_mmu040_subsections;
     } cases[] = {
-        { "m68030", 1, 0 },
-        { "m68040", 0, 1 },
+        { "m68020", 0, 1, 0 },
+        { "m68030", 1, 1, 0 },
+        { "m68040", 0, 0, 1 },
     };
 
     for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -1732,6 +1734,7 @@ static void test_cpu_vmstate_gating(void)
         gsize wire_size;
         size_t payload_offset;
         size_t subsection_count;
+        size_t caar_count;
         size_t mmu040_count;
 
         migrate_to_file(source, path);
@@ -1741,6 +1744,17 @@ static void test_cpu_vmstate_gating(void)
             &payload_offset);
         g_assert_cmpuint(cases[i].expected_mmu030_subsections, ==,
                          subsection_count);
+        caar_count = migration_find_subsection(
+            (const uint8_t *)wire, wire_size, "cpu/68020_caar",
+            &payload_offset);
+        g_assert_cmpuint(cases[i].expected_caar_subsections, ==,
+                         caar_count);
+        if (caar_count) {
+            g_assert_cmpuint(payload_offset + sizeof(uint32_t), <=,
+                             wire_size);
+            g_assert_cmphex(ldl_be_p((const uint8_t *)wire + payload_offset),
+                            ==, 0);
+        }
         mmu040_count = migration_find_subsection(
             (const uint8_t *)wire, wire_size, "cpu/68040_mmu",
             &payload_offset);

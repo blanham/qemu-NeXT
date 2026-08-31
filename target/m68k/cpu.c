@@ -176,6 +176,10 @@ static void m68k_cpu_reset_hold(Object *obj, ResetType type)
     }
     cpu_m68k_set_fpcr(env, 0);
     env->fpsr = 0;
+    /* Hardware reset leaves an external 68882 in its NULL state. */
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        env->fp_state_null = true;
+    }
 
     /* TODO: We should set PC from the interrupt vector.  */
     env->pc = 0;
@@ -492,6 +496,8 @@ static int fpu_pre_load(void *opaque)
 
     /* Older streams have no NULL-state subsection. */
     s->env.fp_state_null = false;
+    memset(&s->env.fp_state[M68K_FP_STATE_MIGRATION_MAX], 0,
+           M68K_FP_STATE_MAX - M68K_FP_STATE_MIGRATION_MAX);
     return 0;
 }
 
@@ -535,6 +541,33 @@ static const VMStateDescription vmstate_fpu_null_state = {
     }
 };
 
+static bool fpu_external_state_needed(void *opaque)
+{
+    M68kCPU *s = opaque;
+
+    return m68k_feature(&s->env, M68K_FEATURE_M68030) &&
+           s->env.fp_state_size > M68K_FP_STATE_MIGRATION_MAX;
+}
+
+/*
+ * The original cpu/fpu section contains a fixed 100-byte state array.  Keep
+ * that field unchanged so existing migration streams remain readable, and
+ * carry only the additional MC68882 busy-frame bytes in a gated subsection.
+ */
+static const VMStateDescription vmstate_fpu_external_state = {
+    .name = "cpu/fpu/external_state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = fpu_external_state_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_SUB_ARRAY(env.fp_state, M68kCPU,
+                                M68K_FP_STATE_MIGRATION_MAX,
+                                M68K_FP_STATE_MAX -
+                                M68K_FP_STATE_MIGRATION_MAX),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmmstate_fpu = {
     .name = "cpu/fpu",
     .version_id = 4,
@@ -547,7 +580,9 @@ const VMStateDescription vmmstate_fpu = {
         VMSTATE_UINT32(env.fpcr, M68kCPU),
         VMSTATE_UINT32(env.fpsr, M68kCPU),
         VMSTATE_UINT32_V(env.fpiar, M68kCPU, 2),
-        VMSTATE_UINT8_ARRAY_V(env.fp_state, M68kCPU, M68K_FP_STATE_MAX, 3),
+        VMSTATE_SUB_ARRAY(env.fp_state, M68kCPU, 0,
+                          M68K_FP_STATE_MIGRATION_MAX, 3,
+                          vmstate_info_uint8, uint8_t),
         VMSTATE_UINT8_V(env.fp_state_size, M68kCPU, 3),
         VMSTATE_UINT8_V(env.fp_pending_vector, M68kCPU, 4),
         VMSTATE_UINT32_V(env.fp_pending_pc, M68kCPU, 4),
@@ -557,6 +592,7 @@ const VMStateDescription vmmstate_fpu = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_fpu_null_state,
+        &vmstate_fpu_external_state,
         NULL
     }
 };
@@ -686,6 +722,25 @@ const VMStateDescription vmstate_68030_mmu = {
     }
 };
 
+static bool cpu_68020_caar_needed(void *opaque)
+{
+    M68kCPU *cpu = opaque;
+
+    return m68k_feature(&cpu->env, M68K_FEATURE_M68020) ||
+           m68k_feature(&cpu->env, M68K_FEATURE_M68030);
+}
+
+const VMStateDescription vmstate_68020_caar = {
+    .name = "cpu/68020_caar",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cpu_68020_caar_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(env.caar, M68kCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool cpu_68040_spregs_needed(void *opaque)
 {
     M68kCPU *s = opaque;
@@ -732,6 +787,7 @@ static const VMStateDescription vmstate_m68k_cpu = {
         &vmmstate_fpu,
         &vmstate_cf_spregs,
         &vmstate_68030_mmu,
+        &vmstate_68020_caar,
         &vmstate_68040_mmu,
         &vmstate_68040_spregs,
         NULL

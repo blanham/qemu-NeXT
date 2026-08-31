@@ -37,6 +37,8 @@
 #define NEXT_INTR_MASK   0x02007800
 #define NEXT_SCC_BASE    0x02118000
 #define NEXT_SCC_CLOCK   (NEXT_SCC_BASE + 4)
+#define NEXT_COMPUTER_SCC_BASE  0x02018000
+#define NEXT_COMPUTER_SCC_CLOCK (NEXT_COMPUTER_SCC_BASE + 4)
 #define NEXT_INTR_SCC    (1U << 17)
 #define NEXT_ROM_SIZE    (128 * 1024)
 
@@ -69,7 +71,7 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static char *next_cube_serial_args(void)
+static char *next_serial_args(const char *machine)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -85,12 +87,24 @@ static char *next_cube_serial_args(void)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    return g_strdup_printf("-machine next-cube -bios %s", quoted_rom_path);
+    return g_strdup_printf("-machine %s -bios %s", machine, quoted_rom_path);
+}
+
+static char *next_cube_serial_args(void)
+{
+    return next_serial_args("next-cube");
 }
 
 static QTestState *next_cube_serial_start(void)
 {
     g_autofree char *args = next_cube_serial_args();
+
+    return qtest_init(args);
+}
+
+static QTestState *next_computer_serial_start(void)
+{
+    g_autofree char *args = next_serial_args("next-computer");
 
     return qtest_init(args);
 }
@@ -201,6 +215,47 @@ static void test_clock_select(void)
     g_assert_nonnull(rtxc_trace);
     g_unlink(log_path);
 #endif
+}
+
+static void test_clock_select_rejects_long(void)
+{
+    QTestState *qts = next_cube_serial_start();
+
+    /* The X15 serial clock register remains byte-wide. */
+    qtest_writel(qts, NEXT_SCC_CLOCK, 0x0000000a);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCC_CLOCK), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_computer_clock_select_long(void)
+{
+    QTestState *qts = next_computer_serial_start();
+
+    /* Rev. 1.0 v41 writes the clock-select register with move.l. */
+    qtest_writel(qts, NEXT_COMPUTER_SCC_CLOCK, 0x0000000a);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COMPUTER_SCC_CLOCK), ==, 0x0a);
+    g_assert_cmphex(qtest_readl(qts, NEXT_COMPUTER_SCC_CLOCK), ==, 0x0a);
+
+    qtest_quit(qts);
+}
+
+static void test_computer_clock_select_rejects_byte_offsets(void)
+{
+    QTestState *qts = next_computer_serial_start();
+    unsigned offset;
+
+    qtest_writeb(qts, NEXT_COMPUTER_SCC_CLOCK, 0x5a);
+    g_assert_cmphex(qtest_readb(qts, NEXT_COMPUTER_SCC_CLOCK), ==, 0x5a);
+
+    for (offset = 1; offset <= 3; offset++) {
+        qtest_writeb(qts, NEXT_COMPUTER_SCC_CLOCK + offset, 0xa5);
+        g_assert_cmphex(qtest_readb(qts, NEXT_COMPUTER_SCC_CLOCK), ==, 0x5a);
+        g_assert_cmphex(qtest_readb(qts,
+                                    NEXT_COMPUTER_SCC_CLOCK + offset), ==, 0);
+    }
+
+    qtest_quit(qts);
 }
 
 static void test_local_loopback(uint64_t control, uint64_t data)
@@ -376,6 +431,12 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     qtest_add_func("/next-cube/serial/clock-select", test_clock_select);
+    qtest_add_func("/next-cube/serial/clock-select-rejects-long",
+                   test_clock_select_rejects_long);
+    qtest_add_func("/next-computer/serial/clock-select-long",
+                   test_computer_clock_select_long);
+    qtest_add_func("/next-computer/serial/clock-select-rejects-byte-offsets",
+                   test_computer_clock_select_rejects_byte_offsets);
     qtest_add_func("/next-cube/serial/channel-b-loopback",
                    test_channel_b_loopback);
     qtest_add_func("/next-cube/serial/channel-a-loopback",

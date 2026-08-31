@@ -36,7 +36,13 @@
 #define OS_PACKED   6
 #define OS_UNSIZED  7
 
-#define M68K_FP_STATE_MAX 100
+/*
+ * The 68040 state frame is at most 100 bytes, while an MC68882 busy frame
+ * is 216 bytes.  Keep the former size separately for migration compatibility
+ * (the base FPU VMState field has always contained 100 bytes).
+ */
+#define M68K_FP_STATE_MIGRATION_MAX 100
+#define M68K_FP_STATE_MAX           216
 
 #define EXCP_ACCESS         2   /* Access (MMU) error.  */
 #define EXCP_ADDRESS        3   /* Address error.  */
@@ -153,6 +159,7 @@ typedef struct CPUArchState {
     uint32_t mbar;
     uint32_t rambar0;
     uint32_t cacr;
+    uint32_t caar;
     uint32_t sfc;
     uint32_t dfc;
 

@@ -672,6 +672,59 @@ static bool next_dma_resolve_register(NextDMAState *s, hwaddr addr,
     return false;
 }
 
+static bool next_dma_csr_address(hwaddr addr)
+{
+    NextDMAChannel channel;
+
+    for (channel = 0; channel < NEXT_DMA_CHANNEL_COUNT; channel++) {
+        if (addr == next_dma_channels[channel].csr + NEXT_DMA_REG_CSR) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool next_dma_access_valid(void *opaque, hwaddr addr, unsigned size,
+                                  bool is_write, MemTxAttrs attrs)
+{
+    /*
+     * The board exposes byte command/status cycles only at a channel CSR.
+     * Pointer and saved-pointer registers remain longword-only.
+     */
+    return size == 4 || ((size == 1 || size == 2) &&
+                         next_dma_csr_address(addr));
+}
+
+static uint32_t next_dma_csr_write_value(hwaddr addr, uint64_t value,
+                                         unsigned size)
+{
+    if (size == 1 && next_dma_csr_address(addr)) {
+        /*
+         * The NeXT DMA command byte is the middle byte of the CSR.  A byte
+         * write at the register address therefore carries the same command
+         * bits as a 16-bit write of that byte.
+         */
+        return (uint32_t)value << 16;
+    }
+    if (size == 2 && next_dma_csr_address(addr)) {
+        return (uint32_t)value << 16;
+    }
+    return value;
+}
+
+static uint64_t next_dma_csr_read_value(hwaddr addr, uint32_t value,
+                                        unsigned size)
+{
+    if (size == 1 && next_dma_csr_address(addr)) {
+        /* Status is presented in the high byte for a byte read at CSR. */
+        return value >> 24;
+    }
+    if (size == 2 && next_dma_csr_address(addr)) {
+        return value >> 16;
+    }
+    return value;
+}
+
 static void next_dma_clear_staging(NextDMAChannelState *c)
 {
     c->scsi_stage_len = 0;
@@ -762,7 +815,8 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t value,
     }
 
     if (resolved.reg == NEXT_DMA_REGISTER_CSR) {
-        next_dma_write_csr(s, resolved.channel, value);
+        next_dma_write_csr(s, resolved.channel,
+                           next_dma_csr_write_value(addr, value, size));
     } else {
         *resolved.value = value;
         if (resolved.reg == NEXT_DMA_REGISTER_NEXT_INIT) {
@@ -820,6 +874,9 @@ static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
         }
     }
 
+    if (resolved.reg == NEXT_DMA_REGISTER_CSR) {
+        return next_dma_csr_read_value(addr, value, size);
+    }
     return value;
 }
 
@@ -828,12 +885,13 @@ static const MemoryRegionOps next_dma_ops = {
     .write = next_dma_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
-        .min_access_size = 4,
+        .accepts = next_dma_access_valid,
+        .min_access_size = 1,
         .max_access_size = 4,
         .unaligned = false,
     },
     .impl = {
-        .min_access_size = 4,
+        .min_access_size = 1,
         .max_access_size = 4,
     },
 };

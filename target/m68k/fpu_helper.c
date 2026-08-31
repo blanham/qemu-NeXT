@@ -370,12 +370,112 @@ static bool valid_fp_state_frame(uint8_t version, unsigned size)
     }
 }
 
+/*
+ * The 68030 uses an external MC68882 for floating-point instructions.  Its
+ * state frame format is not the 68040 format handled above.  The initial
+ * production device uses version 0x1f, while the v41 hardware uses version
+ * 0x3f; both revisions use the documented MC68882 idle and busy state sizes.
+ * Keep this validation separate so a 68040 frame is never accepted on the
+ * external-FPU path (or vice versa).
+ */
+#define M68K_68882_INITIAL_VERSION 0x1f
+#define M68K_68882_V41_VERSION     0x3f
+#define M68K_68882_IDLE_FORMAT     0x3f380000
+#define M68K_68882_BUSY_FORMAT     0x3fd40000
+#define M68K_68882_IDLE_SIZE       60
+#define M68K_68882_BUSY_SIZE       216
+
+static bool m68882_supported_version(uint8_t version)
+{
+    return version == M68K_68882_INITIAL_VERSION ||
+           version == M68K_68882_V41_VERSION;
+}
+
+static unsigned m68882_state_frame_size(uint32_t format)
+{
+    uint8_t version = format >> 24;
+    uint8_t state_size = format >> 16;
+
+    if (version == 0) {
+        return 4; /* null state; the state-size and reserved word are ignored */
+    }
+
+    if (!m68882_supported_version(version)) {
+        return 0;
+    }
+
+    switch (state_size) {
+    case M68K_68882_IDLE_FORMAT >> 16 & 0xff:
+        return M68K_68882_IDLE_SIZE;
+    case M68K_68882_BUSY_FORMAT >> 16 & 0xff:
+        return M68K_68882_BUSY_SIZE;
+    default:
+        return 0; /* Do not guess an undocumented instruction frame. */
+    }
+}
+
+static void fsave_68882(CPUM68KState *env, uint32_t addr, uintptr_t ra,
+                        unsigned *size)
+{
+    unsigned i;
+
+    if (env->fp_state_null) {
+        *size = 4;
+        cpu_stl_be_data_ra(env, addr, 0, ra);
+        return;
+    }
+
+    if (m68882_state_frame_size(ldl_be_p(env->fp_state)) ==
+        env->fp_state_size) {
+        *size = env->fp_state_size;
+        for (i = 0; i < *size; i++) {
+            cpu_stb_data_ra(env, addr + i, env->fp_state[i], ra);
+        }
+        return;
+    }
+
+    /*
+     * A normal external-FPU instruction leaves QEMU with no saved frame.
+     * The legacy 100-byte internal frame can also arrive through an old
+     * migration stream.  Neither is an MC68882 frame, so emit a valid idle
+     * image rather than exposing an invented format to the guest.
+     */
+    *size = M68K_68882_IDLE_SIZE;
+    cpu_stl_be_data_ra(env, addr, M68K_68882_IDLE_FORMAT, ra);
+    /*
+     * The remaining idle-frame fields are internal 68882 state.  They are
+     * not visible to the m68k programming model, and a canonical zero image
+     * is sufficient for the current emulated idle state.  Write every byte
+     * so the architectural 60-byte transfer and its fault boundaries are
+     * preserved.
+     */
+    for (i = sizeof(uint32_t); i < M68K_68882_IDLE_SIZE; i++) {
+        cpu_stb_data_ra(env, addr + i, 0, ra);
+    }
+}
+
 uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
 {
     uintptr_t ra = GETPC();
-    unsigned size = env->fp_state_null ? 4 :
-                    env->fp_state_size ? env->fp_state_size : 4;
+    unsigned size;
     unsigned i;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        size = env->fp_state_null ? 4 : M68K_68882_IDLE_SIZE;
+        if (!env->fp_state_null &&
+            m68882_state_frame_size(ldl_be_p(env->fp_state)) ==
+            env->fp_state_size) {
+            size = env->fp_state_size;
+        }
+        if (mode == 4) {
+            addr -= size;
+        }
+        fsave_68882(env, addr, ra, &size);
+        goto done;
+    }
+
+    size = env->fp_state_null ? 4 :
+           env->fp_state_size ? env->fp_state_size : 4;
 
     if (mode == 4) {
         addr -= size;
@@ -391,6 +491,7 @@ uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
         cpu_stl_be_data_ra(env, addr, 0x41000000, ra);
     }
 
+done:
     /* FSAVE leaves the floating-point unit in the idle state. */
     env->fp_state_null = false;
     env->fp_state_size = 0;
@@ -404,10 +505,52 @@ uint32_t HELPER(frestore)(CPUM68KState *env, uint32_t addr)
 {
     uintptr_t ra = GETPC();
     CPUState *cs = env_cpu(env);
-    uint8_t version = cpu_ldub_data_ra(env, addr, ra);
-    unsigned size = version == 0 ? 4 :
-                    cpu_ldub_data_ra(env, addr + 1, ra) + 4;
+    uint8_t version;
+    unsigned size;
     unsigned i;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        uint32_t format = cpu_ldl_be_data_ra(env, addr, ra);
+
+        size = m68882_state_frame_size(format);
+        if (!size) {
+            cs->exception_index = EXCP_FORMAT;
+            cpu_loop_exit_restore(cs, ra);
+        }
+
+        if (size == 4) {
+            floatx80 nan = floatx80_default_nan(&env->fp_status);
+
+            for (i = 0; i < ARRAY_SIZE(env->fregs); i++) {
+                env->fregs[i].d = nan;
+            }
+            cpu_m68k_set_fpcr(env, 0);
+            env->fpsr = 0;
+            env->fpiar = 0;
+            env->fp_pending_vector = 0;
+            env->fp_pending_pc = 0;
+            set_float_exception_flags(0, &env->fp_status);
+            memset(env->fp_state, 0, sizeof(env->fp_state));
+            env->fp_state_size = 0;
+            env->fp_state_null = true;
+        } else {
+            stl_be_p(env->fp_state, format);
+            for (i = sizeof(uint32_t); i < size; i++) {
+                env->fp_state[i] = cpu_ldub_data_ra(env, addr + i, ra);
+            }
+            memset(&env->fp_state[size], 0,
+                   sizeof(env->fp_state) - size);
+            env->fp_pending_vector = 0;
+            env->fp_pending_pc = 0;
+            env->fp_state_size = size;
+            env->fp_state_null = false;
+        }
+        return size;
+    }
+
+    version = cpu_ldub_data_ra(env, addr, ra);
+    size = version == 0 ? 4 :
+           cpu_ldub_data_ra(env, addr + 1, ra) + 4;
 
     if (!valid_fp_state_frame(version, size)) {
         cs->exception_index = EXCP_FORMAT;
@@ -588,11 +731,21 @@ uint32_t HELPER(get_fpsr)(CPUM68KState *env)
 static void make_busy_fp_state(CPUM68KState *env, uint32_t pc)
 {
     memset(env->fp_state, 0, sizeof(env->fp_state));
-    env->fp_state[0] = 0x40;
-    env->fp_state[1] = 0x60;
-    stl_be_p(&env->fp_state[36], cpu_m68k_get_fpsr(env));
-    stl_be_p(&env->fp_state[40], pc);
-    env->fp_state_size = 100;
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        /*
+         * QEMU does not emulate the MC68882's volatile CU pipeline.  Keep
+         * the documented v41 BUSY format and canonicalize its opaque
+         * internal bytes; an externally restored frame remains byte-for-byte
+         * opaque until the next FSAVE.
+         */
+        stl_be_p(env->fp_state, M68K_68882_BUSY_FORMAT);
+        env->fp_state_size = M68K_68882_BUSY_SIZE;
+    } else {
+        stl_be_p(&env->fp_state[0], 0x40600000);
+        stl_be_p(&env->fp_state[36], cpu_m68k_get_fpsr(env));
+        stl_be_p(&env->fp_state[40], pc);
+        env->fp_state_size = 100;
+    }
     env->fp_state_null = false;
 }
 
@@ -620,6 +773,7 @@ void HELPER(fpu_check_pending)(CPUM68KState *env, uint32_t pc)
 void HELPER(fpu_null_to_idle)(CPUM68KState *env)
 {
     env->fp_state_null = false;
+    env->fp_state_size = 0;
 }
 
 void HELPER(fpu_begin)(CPUM68KState *env, uint32_t pc)

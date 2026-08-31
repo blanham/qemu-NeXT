@@ -23,7 +23,13 @@ The AN5206 emulation includes the following devices:
 NeXT system emulators
 ---------------------
 
-QEMU provides three 68040 NeXT machine types:
+QEMU provides the original 68030 NeXT Computer and three 68040 NeXT machine
+types:
+
+``next-computer``
+  A 25 MHz 68030 NeXT Computer (machine type 0), with up to 64 MiB of RAM,
+  a monochrome display, NextBus, the original ``0x020xxxxx`` byte-device
+  map, and the MC68HC68T1 RTC used by its firmware.
 
 ``next-cube``
   A 25 MHz 68040 X15 NeXTcube (machine type 2), with up to 64 MiB of
@@ -45,15 +51,31 @@ QEMU provides three 68040 NeXT machine types:
   the DAC at ``0x02118100``.  The display has an independent 68 Hz retrace
   interrupt on status bit 13.  It has no NextBus.
 
-The name ``next-computer`` is reserved for the original 68030 NeXT
-Computer/Cube (machine type 0).  It is not available because QEMU does
-not yet implement the 68030 PMMU required by that machine.
-
-The default firmware for all three machines is the known v66 ROM image
-conventionally named ``Rev_2.5_v66.bin``.  Its SHA-1 is
+The default firmware for ``next-computer`` is conventionally named
+``Rev_1.0_v41.bin``.  The verified image has SHA-256
+``bdccecc045c1af09d0962e02e30e737e8571a81ec6a4458be63d57189d79eb92``.
+The three 68040 machines default to the known v66 ROM image conventionally
+named ``Rev_2.5_v66.bin``.  Its SHA-1 is
 ``b3534796abae238a0111299fc406a9349f7fee24``.  QEMU does not bundle this
 firmware; the user must supply it.  ``-bios FILE`` may be used to override
 the default firmware filename.
+
+Rev 1.0 v41 uses a calibrated 25 MHz busy loop while checking that its
+one-Hz RTC advances.  Unthrottled TCG can finish that loop before one host
+second has elapsed and the ROM then reports RTC error ``91`` even though the
+clock registers are working.  Pace the firmware diagnostics to the original
+machine with::
+
+  qemu-system-m68k \
+    -M next-computer -cpu m68030 -m 64M \
+    -bios Rev_1.0_v41.bin \
+    -icount shift=8,align=on,sleep=on \
+    -display gtk -no-reboot
+
+With the verified ROM this completes the normal and extended SCSI tests,
+prints ``System test passed.``, and enters the ``NeXT>`` monitor.  The
+``QTEST_NEXT_030_ROM`` opt-in qtest verifies both the exact ROM hash and this
+passed framebuffer.
 
 The implemented devices shared by these machines include one DMA controller,
 ESP SCSI, an 82077 floppy controller, two serial channels, Ethernet,

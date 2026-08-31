@@ -5,12 +5,25 @@
 #include "qemu/units.h"
 #include "libqtest.h"
 
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#endif
+
 #define NEXT_SCR1             0x0200c000
 #define NEXT_RAM_BASE         0x04000000
 #define NEXT_ROM_SIZE         (128 * KiB)
 #define NEXT_FB_RANGE         \
     "000000000b000000-000000000b1cb0ff"
 #define TEST_TIMEOUT          (5 * G_USEC_PER_SEC)
+#define NEXT_030_ROM_SHA256   \
+    "bdccecc045c1af09d0962e02e30e737e8571a81ec6a4458be63d57189d79eb92"
+#define NEXT_030_PASS_SHA256  \
+    "9e3c391867f05f3e7a14263ec569c997cd5924cd1ab156f13c813b9e851db3b9"
+#define NEXT_030_V41_DEADLINE_USEC (40 * G_USEC_PER_SEC)
+#define NEXT_030_V41_POLL_USEC     (500 * G_TIME_SPAN_MILLISECOND)
+#define NEXT_030_V41_SHUTDOWN_USEC (2 * G_USEC_PER_SEC)
 
 typedef struct TestROM {
     int fd;
@@ -321,6 +334,374 @@ static void test_missing_firmware(void)
     g_test_trap_assert_passed();
 }
 
+#ifndef _WIN32
+typedef struct Next030V41Child {
+    GPid pid;
+    int monitor_fd;
+    int wait_status;
+    int wait_errno;
+    bool reaped;
+    bool wait_failed;
+    bool pid_closed;
+} Next030V41Child;
+
+static void next_030_v41_close_monitor(Next030V41Child *child)
+{
+    if (child->monitor_fd >= 0) {
+        close(child->monitor_fd);
+        child->monitor_fd = -1;
+    }
+}
+
+static void next_030_v41_mark_reaped(Next030V41Child *child)
+{
+    child->reaped = true;
+    if (!child->pid_closed) {
+        g_spawn_close_pid(child->pid);
+        child->pid_closed = true;
+    }
+}
+
+static bool next_030_v41_write_monitor(int fd, const char *command)
+{
+    const char *data = command;
+    size_t remaining = strlen(command);
+
+    while (remaining) {
+        ssize_t written;
+
+#ifdef MSG_NOSIGNAL
+        written = send(fd, data, remaining, MSG_NOSIGNAL);
+#else
+        written = write(fd, data, remaining);
+#endif
+        if (written > 0) {
+            data += written;
+            remaining -= written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool next_030_v41_screen_matches(const char *screen_path)
+{
+    struct stat before;
+    struct stat after;
+    g_autofree char *screen_data = NULL;
+    g_autofree char *screen_hash = NULL;
+    gsize screen_size;
+
+    if (stat(screen_path, &before) < 0 || !S_ISREG(before.st_mode) ||
+        before.st_size <= 0) {
+        return false;
+    }
+    if (!g_file_get_contents(screen_path, &screen_data, &screen_size, NULL)) {
+        return false;
+    }
+    if (stat(screen_path, &after) < 0 ||
+        before.st_size != after.st_size ||
+        before.st_mtime != after.st_mtime ||
+        (off_t)screen_size != before.st_size) {
+        return false;
+    }
+
+    screen_hash = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, (const guchar *)screen_data, screen_size);
+    return g_str_equal(screen_hash, NEXT_030_PASS_SHA256);
+}
+
+static bool next_030_v41_poll_child(Next030V41Child *child)
+{
+    pid_t result;
+
+    do {
+        result = waitpid(child->pid, &child->wait_status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+
+    if (result == child->pid) {
+        next_030_v41_mark_reaped(child);
+        return true;
+    }
+    if (result < 0) {
+        child->wait_errno = errno;
+        child->wait_failed = true;
+        g_test_message("waitpid(%" G_PID_FORMAT "): %s", child->pid,
+                       g_strerror(child->wait_errno));
+        return true;
+    }
+    return false;
+}
+
+static bool next_030_v41_wait_child(Next030V41Child *child,
+                                    gint64 timeout_usec)
+{
+    const gint64 deadline = g_get_monotonic_time() + timeout_usec;
+
+    while (!child->reaped && !child->wait_failed) {
+        gint64 remaining;
+
+        if (next_030_v41_poll_child(child)) {
+            break;
+        }
+        remaining = deadline - g_get_monotonic_time();
+        if (remaining <= 0) {
+            break;
+        }
+        g_usleep(MIN((gint64)NEXT_030_V41_POLL_USEC, remaining));
+    }
+    return child->reaped;
+}
+
+static bool next_030_v41_stop_child(Next030V41Child *child)
+{
+    pid_t result;
+
+    if (child->pid <= 0) {
+        return true;
+    }
+    if (!child->reaped && !child->wait_failed) {
+        next_030_v41_wait_child(child, NEXT_030_V41_SHUTDOWN_USEC);
+    }
+    if (!child->reaped) {
+        if (kill(child->pid, SIGTERM) < 0 && errno != ESRCH) {
+            g_test_message("could not terminate v41 QEMU (pid %" G_PID_FORMAT
+                           "): %s", child->pid, g_strerror(errno));
+        }
+        if (!child->wait_failed) {
+            next_030_v41_wait_child(child, NEXT_030_V41_SHUTDOWN_USEC);
+        }
+    }
+    if (!child->reaped) {
+        if (kill(child->pid, SIGKILL) < 0 && errno != ESRCH) {
+            g_test_message("could not kill v41 QEMU (pid %" G_PID_FORMAT
+                           "): %s", child->pid, g_strerror(errno));
+        }
+        do {
+            result = waitpid(child->pid, &child->wait_status, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result == child->pid) {
+            next_030_v41_mark_reaped(child);
+        } else if (result < 0) {
+            child->wait_errno = errno;
+            child->wait_failed = true;
+            g_test_message("waitpid(%" G_PID_FORMAT ") after kill: %s",
+                           child->pid, g_strerror(child->wait_errno));
+        }
+    }
+    if (!child->pid_closed) {
+        g_spawn_close_pid(child->pid);
+        child->pid_closed = true;
+    }
+    return child->reaped;
+}
+
+static bool next_030_v41_child_exited_ok(const Next030V41Child *child)
+{
+    if (!child->reaped) {
+        return false;
+    }
+    if (WIFEXITED(child->wait_status)) {
+        if (WEXITSTATUS(child->wait_status) == 0) {
+            return true;
+        }
+        g_test_message("v41 QEMU exited with status %d",
+                       WEXITSTATUS(child->wait_status));
+    } else if (WIFSIGNALED(child->wait_status)) {
+        g_test_message("v41 QEMU terminated by signal %d",
+                       WTERMSIG(child->wait_status));
+    } else {
+        g_test_message("v41 QEMU returned unexpected wait status 0x%x",
+                       child->wait_status);
+    }
+    return false;
+}
+
+static bool next_030_v41_spawn_child(const char *qemu_binary,
+                                     const char *rom_path,
+                                     Next030V41Child *child)
+{
+    int monitor_pair[2] = { -1, -1 };
+    int dev_null = -1;
+    GError *error = NULL;
+    char *argv[] = {
+        (char *)qemu_binary,
+        (char *)"-M", (char *)"next-computer",
+        (char *)"-cpu", (char *)"m68030",
+        (char *)"-m", (char *)"64M",
+        (char *)"-bios", (char *)rom_path,
+        (char *)"-display", (char *)"none",
+        (char *)"-audio", (char *)"none",
+        (char *)"-no-reboot",
+        (char *)"-monitor", (char *)"stdio",
+        (char *)"-icount", (char *)"shift=8,align=on,sleep=on",
+        NULL,
+    };
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, monitor_pair) < 0) {
+        g_test_message("socketpair for v41 QEMU monitor failed: %s",
+                       g_strerror(errno));
+        return false;
+    }
+#ifdef SO_NOSIGPIPE
+    {
+        int no_sigpipe = 1;
+
+        setsockopt(monitor_pair[1], SOL_SOCKET, SO_NOSIGPIPE,
+                   &no_sigpipe, sizeof(no_sigpipe));
+    }
+#endif
+    dev_null = open("/dev/null", O_WRONLY);
+    if (dev_null < 0) {
+        g_test_message("open /dev/null for v41 QEMU failed: %s",
+                       g_strerror(errno));
+        goto fail;
+    }
+
+    if (!g_spawn_async_with_fds(NULL, argv, NULL,
+                                G_SPAWN_DO_NOT_REAP_CHILD,
+                                NULL, NULL, &child->pid,
+                                monitor_pair[0], dev_null, dev_null,
+                                &error)) {
+        g_test_message("could not spawn v41 QEMU: %s", error->message);
+        g_clear_error(&error);
+        goto fail;
+    }
+
+    close(monitor_pair[0]);
+    close(dev_null);
+    child->monitor_fd = monitor_pair[1];
+    monitor_pair[0] = -1;
+    monitor_pair[1] = -1;
+    dev_null = -1;
+    return true;
+
+fail:
+    if (monitor_pair[0] >= 0) {
+        close(monitor_pair[0]);
+    }
+    if (monitor_pair[1] >= 0) {
+        close(monitor_pair[1]);
+    }
+    if (dev_null >= 0) {
+        close(dev_null);
+    }
+    return false;
+}
+
+static bool next_030_v41_run(const char *qemu_binary, const char *rom_path,
+                             const char *screen_path)
+{
+    g_autofree char *screendump_command =
+        g_strdup_printf("screendump %s\n", screen_path);
+    Next030V41Child child = {
+        .pid = -1,
+        .monitor_fd = -1,
+    };
+    const gint64 deadline =
+        g_get_monotonic_time() + NEXT_030_V41_DEADLINE_USEC;
+    gint64 next_screendump = 0;
+    bool screen_matches = false;
+
+    if (!next_030_v41_spawn_child(qemu_binary, rom_path, &child)) {
+        return false;
+    }
+
+    while (g_get_monotonic_time() < deadline) {
+        const gint64 now = g_get_monotonic_time();
+        gint64 remaining;
+
+        if (next_030_v41_screen_matches(screen_path)) {
+            screen_matches = true;
+            break;
+        }
+        if (next_030_v41_poll_child(&child)) {
+            if (child.reaped) {
+                g_test_message("v41 QEMU exited before the expected screen "
+                               "hash appeared");
+            }
+            break;
+        }
+        if (now >= next_screendump) {
+            if (!next_030_v41_write_monitor(child.monitor_fd,
+                                             screendump_command)) {
+                g_test_message("could not send v41 screendump command");
+                break;
+            }
+            next_screendump = now + NEXT_030_V41_POLL_USEC;
+        }
+        remaining = deadline - g_get_monotonic_time();
+        if (remaining > 0) {
+            g_usleep(MIN((gint64)NEXT_030_V41_POLL_USEC, remaining));
+        }
+    }
+
+    if (!screen_matches && g_get_monotonic_time() >= deadline) {
+        g_test_message("v41 screen hash deadline expired after %d seconds",
+                       NEXT_030_V41_DEADLINE_USEC / G_USEC_PER_SEC);
+    }
+
+    if (child.monitor_fd >= 0) {
+        if (!next_030_v41_write_monitor(child.monitor_fd, "quit\n") &&
+            screen_matches) {
+            g_test_message("could not send v41 QEMU quit command");
+            screen_matches = false;
+        }
+        next_030_v41_close_monitor(&child);
+    }
+    next_030_v41_stop_child(&child);
+    return screen_matches && next_030_v41_child_exited_ok(&child);
+}
+#endif
+
+static void test_next_computer_v41_rom(void)
+{
+#ifdef _WIN32
+    g_test_skip("v41 firmware smoke test requires POSIX process APIs");
+#else
+    const char *rom_path = g_getenv("QTEST_NEXT_030_ROM");
+    const char *qemu_binary = g_getenv("QTEST_QEMU_BINARY");
+    g_autofree char *rom_data = NULL;
+    g_autofree char *rom_hash = NULL;
+    TestROM *screen = NULL;
+    gsize rom_size;
+    bool passed;
+
+    if (!rom_path || !rom_path[0]) {
+        g_test_skip("set QTEST_NEXT_030_ROM to run the Rev 1.0 v41 smoke test");
+        return;
+    }
+
+    g_assert_true(g_file_get_contents(rom_path, &rom_data, &rom_size, NULL));
+    rom_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+                                            (const guchar *)rom_data,
+                                            rom_size);
+    g_assert_cmpstr(rom_hash, ==, NEXT_030_ROM_SHA256);
+    g_assert_nonnull(qemu_binary);
+
+    screen = g_new0(TestROM, 1);
+    screen->fd = -1;
+    qtest_add_abrt_handler(cleanup_test_rom, screen);
+    g_test_queue_destroy(cleanup_test_rom, screen);
+    screen->fd = g_file_open_tmp("next-v41-XXXXXX", &screen->path, NULL);
+    g_assert_cmpint(screen->fd, >=, 0);
+    close(screen->fd);
+    screen->fd = -1;
+    g_assert_cmpint(g_unlink(screen->path), ==, 0);
+
+    passed = next_030_v41_run(qemu_binary, rom_path, screen->path);
+    if (g_unlink(screen->path) < 0 && errno != ENOENT) {
+        g_test_message("could not remove v41 screenshot %s: %s",
+                       screen->path, g_strerror(errno));
+        passed = false;
+    }
+    g_assert_true(passed);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     static ExpectedSCR1 scr1_tests[] = {
@@ -434,6 +815,8 @@ int main(int argc, char **argv)
                    test_computer_invalid_cpu);
     qtest_add_func("/next-machine/next-cube/missing-firmware",
                    test_missing_firmware);
+    qtest_add_func("/next-machine/next-computer/v41-rom",
+                   test_next_computer_v41_rom);
 
     return g_test_run();
 }

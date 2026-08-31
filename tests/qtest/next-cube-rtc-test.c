@@ -80,8 +80,9 @@ static void cleanup_test_migration_files(void *opaque)
     g_free(files);
 }
 
-static QTestState *next_cube_rtc_start_full(const char *machine_options,
-                                            const char *args)
+static QTestState *next_machine_rtc_start_full(const char *machine,
+                                               const char *machine_options,
+                                               const char *args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -99,9 +100,15 @@ static QTestState *next_cube_rtc_start_full(const char *machine_options,
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    qts = qtest_initf("-machine next-cube%s -bios %s %s",
+    qts = qtest_initf("-machine %s%s -bios %s %s", machine,
                       machine_options ?: "", quoted_rom_path, args ?: "");
     return qts;
+}
+
+static QTestState *next_cube_rtc_start_full(const char *machine_options,
+                                            const char *args)
+{
+    return next_machine_rtc_start_full("next-cube", machine_options, args);
 }
 
 static QTestState *next_cube_rtc_start_with_args(const char *args)
@@ -469,6 +476,35 @@ static void test_rtc_chip_selection_and_calendar_reads(void)
 
     qtest_quit(new_qts);
     qtest_quit(old_qts);
+}
+
+static void assert_machine_rtc_chip(QTestState *qts, const char *expected)
+{
+    g_autoptr(QDict) response = qtest_qmp(
+        qts, "{ 'execute': 'qom-get', 'arguments': { "
+        "'path': '/machine', 'property': 'rtc-chip' } }");
+
+    g_assert_nonnull(response);
+    g_assert_true(qdict_haskey(response, "return"));
+    g_assert_cmpstr(qdict_get_str(response, "return"), ==, expected);
+}
+
+static void test_machine_rtc_chip_profile_defaults(void)
+{
+    QTestState *qts;
+
+    qts = next_machine_rtc_start_full("next-computer", NULL, NULL);
+    assert_machine_rtc_chip(qts, "mc68hc68t1");
+    qtest_quit(qts);
+
+    qts = next_machine_rtc_start_full("next-computer",
+                                      ",rtc-chip=mcs1850", NULL);
+    assert_machine_rtc_chip(qts, "mcs1850");
+    qtest_quit(qts);
+
+    qts = next_machine_rtc_start_full("next-cube", NULL, NULL);
+    assert_machine_rtc_chip(qts, "mcs1850");
+    qtest_quit(qts);
 }
 
 static void test_old_calendar_stop_program_and_rollover(void)
@@ -1021,6 +1057,8 @@ int main(int argc, char **argv)
                    test_mcs1850_counter_lsb);
     qtest_add_func("/next-cube/rtc/chip-selection-and-calendar-reads",
                    test_rtc_chip_selection_and_calendar_reads);
+    qtest_add_func("/next-machine/rtc/profile-defaults",
+                   test_machine_rtc_chip_profile_defaults);
     qtest_add_func("/next-cube/rtc/old-calendar-stop-program-and-rollover",
                    test_old_calendar_stop_program_and_rollover);
     qtest_add_func("/next-cube/rtc/old-stopped-calendar-programming",

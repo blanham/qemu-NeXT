@@ -7,6 +7,14 @@
         .text
         .globl  _start
 _start:
+        /* A reset 68040 must retain its historical four-byte IDLE frame. */
+        lea     reset_saved_frame+4,%a1
+        fsave  -(%a1)
+        cmpa.l  #reset_saved_frame,%a1
+        bne.w   fail
+        cmpi.l  #0x41000000,(%a1)
+        bne.w   fail
+
         lea     busy_frame,%a0
         frestore (%a0)+
         cmpa.l  #busy_frame+100,%a0
@@ -193,3 +201,5 @@ fmovem_saved_frame:
         .long   0
 fmovem_saved:
         .long   0, 0, 0
+reset_saved_frame:
+        .long   0

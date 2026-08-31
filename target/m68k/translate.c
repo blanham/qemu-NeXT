@@ -6162,7 +6162,8 @@ DISAS_INSN(frestore)
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
         return;
     }
-    if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
+    if (m68k_feature(s->env, M68K_FEATURE_M68040)
+     || m68k_feature(s->env, M68K_FEATURE_M68030)) {
         if (mode == 3) {
             addr = get_areg(s, REG(insn, 0));
         } else {
@@ -6192,7 +6193,8 @@ DISAS_INSN(fsave)
         return;
     }
 
-    if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
+    if (m68k_feature(s->env, M68K_FEATURE_M68040)
+     || m68k_feature(s->env, M68K_FEATURE_M68030)) {
         if (mode == 3 || mode == 4) {
             addr = get_areg(s, REG(insn, 0));
         } else {
