@@ -27,6 +27,80 @@
 #define M68K_MMU030_TT_RW            (UINT32_C(1) << 9)
 #define M68K_MMU030_TT_RW_MASK       (UINT32_C(1) << 8)
 
+bool m68k_mmu030_pmove_decode(uint16_t extension, unsigned *reg,
+                              unsigned *size, bool *direction, bool *fd)
+{
+    unsigned top = (extension >> 13) & 7;
+    unsigned p = (extension >> 10) & 7;
+    bool is_memory_to_register = (extension & UINT16_C(0x0200)) == 0;
+    bool is_fd = (extension & UINT16_C(0x0100)) != 0;
+    unsigned register_id;
+    unsigned transfer_size;
+
+    /* Bits 7:0 are reserved in all PMOVE forms. */
+    if ((extension & UINT16_C(0x00ff)) != 0) {
+        return false;
+    }
+
+    switch (top) {
+    case 0:
+        /* P=010 and P=011 select TT0 and TT1 respectively. */
+        if (p == 2) {
+            register_id = M68K_MMU030_PMOVE_TT0;
+        } else if (p == 3) {
+            register_id = M68K_MMU030_PMOVE_TT1;
+        } else {
+            return false;
+        }
+        transfer_size = sizeof(uint32_t);
+        break;
+    case 2:
+        /* P=000, P=010, and P=011 select TC, SRP, and CRP. */
+        if (p == 0) {
+            register_id = M68K_MMU030_PMOVE_TC;
+            transfer_size = sizeof(uint32_t);
+        } else if (p == 2) {
+            register_id = M68K_MMU030_PMOVE_SRP;
+            transfer_size = sizeof(uint64_t);
+        } else if (p == 3) {
+            register_id = M68K_MMU030_PMOVE_CRP;
+            transfer_size = sizeof(uint64_t);
+        } else {
+            return false;
+        }
+        break;
+    case 3:
+        /* The MMUSR form has no FD bit and is a word transfer. */
+        if (p != 0 || is_fd) {
+            return false;
+        }
+        register_id = M68K_MMU030_PMOVE_MMUSR;
+        transfer_size = sizeof(uint16_t);
+        break;
+    default:
+        return false;
+    }
+
+    /* PMOVEFD is defined only for memory-to-register transfers. */
+    if (is_fd && !is_memory_to_register) {
+        return false;
+    }
+
+    if (reg) {
+        *reg = register_id;
+    }
+    if (size) {
+        *size = transfer_size;
+    }
+    if (direction) {
+        *direction = !is_memory_to_register;
+    }
+    if (fd) {
+        *fd = is_fd;
+    }
+    return true;
+}
+
 static unsigned m68k_mmu030_atc_page_bits(uint32_t status)
 {
     unsigned page_bits = (status & M68K_MMU030_ATC_PAGE_BITS_MASK) >>
@@ -441,6 +515,26 @@ void m68k_mmu030_atc_flush_page_coherent(
 
         flush_range(opaque, page_address, page_size);
     }
+}
+
+bool m68k_mmu030_write_tt(M68KMMU030State *state, unsigned index,
+                          uint32_t value,
+                          M68KMMU030ATCFlushAllFn flush_derived,
+                          void *opaque)
+{
+    if (!state || index >= ARRAY_SIZE(state->tt)) {
+        return false;
+    }
+    if (state->tt[index] == value) {
+        return true;
+    }
+
+    /* TT has priority over the ATC; invalidate only derived translations. */
+    if (flush_derived) {
+        flush_derived(opaque);
+    }
+    state->tt[index] = value;
+    return true;
 }
 
 bool m68k_mmu030_reconfigure(

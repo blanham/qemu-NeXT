@@ -25,6 +25,7 @@
 #include "exec/target_page.h"
 #include "exec/gdbstub.h"
 #include "exec/helper-proto.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "accel/tcg/cpu-loop.h"
 #include "system/memory.h"
 #include "gdbstub/helpers.h"
@@ -1554,6 +1555,184 @@ void HELPER(set_mac_extu)(CPUM68KState *env, uint32_t val, uint32_t acc)
 }
 
 #if !defined(CONFIG_USER_ONLY)
+static void m68k_pmove_flush_all(void *opaque)
+{
+    tlb_flush(opaque);
+}
+
+static uint64_t m68k_pmove_load(CPUM68KState *env, uint32_t address,
+                                unsigned size, uintptr_t ra)
+{
+    switch (size) {
+    case sizeof(uint16_t):
+        return cpu_lduw_be_mmuidx_ra(env, address, MMU_KERNEL_IDX, ra);
+    case sizeof(uint32_t):
+        return cpu_ldl_be_mmuidx_ra(env, address, MMU_KERNEL_IDX, ra);
+    case sizeof(uint64_t): {
+        uint32_t high = cpu_ldl_be_mmuidx_ra(env, address,
+                                             MMU_KERNEL_IDX, ra);
+        uint32_t low = cpu_ldl_be_mmuidx_ra(env, address + 4,
+                                            MMU_KERNEL_IDX, ra);
+        return ((uint64_t)high << 32) | low;
+    }
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void m68k_pmove_store(CPUM68KState *env, uint32_t address,
+                             unsigned size, uint64_t value, uintptr_t ra)
+{
+    switch (size) {
+    case sizeof(uint16_t):
+        cpu_stw_be_mmuidx_ra(env, address, value, MMU_KERNEL_IDX, ra);
+        break;
+    case sizeof(uint32_t):
+        cpu_stl_be_mmuidx_ra(env, address, value, MMU_KERNEL_IDX, ra);
+        break;
+    case sizeof(uint64_t):
+        cpu_stl_be_mmuidx_ra(env, address, value >> 32,
+                             MMU_KERNEL_IDX, ra);
+        cpu_stl_be_mmuidx_ra(env, address + 4, value,
+                             MMU_KERNEL_IDX, ra);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void m68k_pmove_write_control(CPUM68KState *env, unsigned reg,
+                                     uint64_t value, bool fd, uintptr_t ra)
+{
+    M68KMMU030State *state = &env->mmu030;
+    M68KMMU030ControlState control = {
+        .crp = state->crp,
+        .srp = state->srp,
+        .tc = state->tc,
+        .tt = { state->tt[0], state->tt[1] },
+    };
+    bool configuration_error = false;
+
+    switch (reg) {
+    case M68K_MMU030_PMOVE_TC:
+        control.tc = (uint32_t)value;
+        if ((control.tc & M68K_MMU030_TC_ENABLE) &&
+            !m68k_mmu030_validate_tc(control.tc)) {
+            /* The MC68030 stores an invalid TC with E cleared first. */
+            control.tc &= ~M68K_MMU030_TC_ENABLE;
+            configuration_error = true;
+        }
+        break;
+    case M68K_MMU030_PMOVE_TT0:
+        control.tt[0] = (uint32_t)value;
+        if (fd) {
+            if (!m68k_mmu030_write_tt(state, 0, control.tt[0],
+                                      m68k_pmove_flush_all,
+                                      env_cpu(env))) {
+                raise_exception_ra(env, EXCP_MMU_CONF, ra);
+            }
+            return;
+        }
+        break;
+    case M68K_MMU030_PMOVE_TT1:
+        control.tt[1] = (uint32_t)value;
+        if (fd) {
+            if (!m68k_mmu030_write_tt(state, 1, control.tt[1],
+                                      m68k_pmove_flush_all,
+                                      env_cpu(env))) {
+                raise_exception_ra(env, EXCP_MMU_CONF, ra);
+            }
+            return;
+        }
+        break;
+    case M68K_MMU030_PMOVE_SRP:
+        control.srp = value & ~UINT64_C(0xf);
+        configuration_error = ((control.srp >> 32) &
+                               M68K_MMU030_DESC_DT_MASK) == 0;
+        break;
+    case M68K_MMU030_PMOVE_CRP:
+        control.crp = value & ~UINT64_C(0xf);
+        configuration_error = ((control.crp >> 32) &
+                               M68K_MMU030_DESC_DT_MASK) == 0;
+        break;
+    case M68K_MMU030_PMOVE_MMUSR:
+        state->mmusr = (uint16_t)value;
+        return;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (configuration_error) {
+        if (!fd) {
+            m68k_mmu030_atc_flush_all_coherent(
+                state, m68k_pmove_flush_all, env_cpu(env));
+        }
+        state->crp = control.crp;
+        state->srp = control.srp;
+        state->tc = control.tc;
+        state->tt[0] = control.tt[0];
+        state->tt[1] = control.tt[1];
+        raise_exception_ra(env, EXCP_MMU_CONF, ra);
+    }
+
+    if (!m68k_mmu030_reconfigure(state, &control, !fd,
+                                 m68k_pmove_flush_all, env_cpu(env))) {
+        /* The consistency check above makes this unreachable for PMOVE. */
+        raise_exception_ra(env, EXCP_MMU_CONF, ra);
+    }
+}
+
+void HELPER(m68k_pmove)(CPUM68KState *env, uint32_t extension,
+                        uint32_t address, uint32_t direction, uint32_t fd)
+{
+    unsigned reg;
+    unsigned size;
+    bool encoded_direction;
+    bool encoded_fd;
+    uintptr_t ra = GETPC();
+
+    if (!m68k_feature(env, M68K_FEATURE_M68030) ||
+        !m68k_mmu030_pmove_decode(extension, &reg, &size,
+                                  &encoded_direction, &encoded_fd) ||
+        encoded_direction != (direction != 0) ||
+        encoded_fd != (fd != 0)) {
+        /* Keep reserved PMMU extension words emulatable as F-line traps. */
+        raise_exception_ra(env, EXCP_LINEF, ra);
+    }
+
+    if (direction) {
+        uint64_t value;
+
+        switch (reg) {
+        case M68K_MMU030_PMOVE_TC:
+            value = env->mmu030.tc;
+            break;
+        case M68K_MMU030_PMOVE_TT0:
+            value = env->mmu030.tt[0];
+            break;
+        case M68K_MMU030_PMOVE_TT1:
+            value = env->mmu030.tt[1];
+            break;
+        case M68K_MMU030_PMOVE_SRP:
+            value = env->mmu030.srp;
+            break;
+        case M68K_MMU030_PMOVE_CRP:
+            value = env->mmu030.crp;
+            break;
+        case M68K_MMU030_PMOVE_MMUSR:
+            value = env->mmu030.mmusr;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+        m68k_pmove_store(env, address, size, value, ra);
+    } else {
+        uint64_t value = m68k_pmove_load(env, address, size, ra);
+
+        m68k_pmove_write_control(env, reg, value, fd, ra);
+    }
+}
+
 void HELPER(ptest)(CPUM68KState *env, uint32_t addr, uint32_t is_read)
 {
     hwaddr physical;

@@ -92,6 +92,82 @@ static M68KMMU030MemoryOps mmu030_test_ops(M68KMMU030TestMemory *memory)
      sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint32_t) + \
      sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t))
 
+static void test_mmu030_pmove_extension_decode(void)
+{
+    static const struct {
+        uint16_t extension;
+        M68KMMU030PMOVERegister reg;
+        unsigned size;
+        bool direction;
+        bool fd;
+    } valid[] = {
+        { UINT16_C(0x4000), M68K_MMU030_PMOVE_TC, sizeof(uint32_t),
+          false, false },
+        { UINT16_C(0x4100), M68K_MMU030_PMOVE_TC, sizeof(uint32_t),
+          false, true },
+        { UINT16_C(0x4200), M68K_MMU030_PMOVE_TC, sizeof(uint32_t),
+          true, false },
+        { UINT16_C(0x0800), M68K_MMU030_PMOVE_TT0, sizeof(uint32_t),
+          false, false },
+        { UINT16_C(0x0900), M68K_MMU030_PMOVE_TT0, sizeof(uint32_t),
+          false, true },
+        { UINT16_C(0x0a00), M68K_MMU030_PMOVE_TT0, sizeof(uint32_t),
+          true, false },
+        { UINT16_C(0x0c00), M68K_MMU030_PMOVE_TT1, sizeof(uint32_t),
+          false, false },
+        { UINT16_C(0x0d00), M68K_MMU030_PMOVE_TT1, sizeof(uint32_t),
+          false, true },
+        { UINT16_C(0x0e00), M68K_MMU030_PMOVE_TT1, sizeof(uint32_t),
+          true, false },
+        { UINT16_C(0x4800), M68K_MMU030_PMOVE_SRP, sizeof(uint64_t),
+          false, false },
+        { UINT16_C(0x4900), M68K_MMU030_PMOVE_SRP, sizeof(uint64_t),
+          false, true },
+        { UINT16_C(0x4a00), M68K_MMU030_PMOVE_SRP, sizeof(uint64_t),
+          true, false },
+        { UINT16_C(0x4c00), M68K_MMU030_PMOVE_CRP, sizeof(uint64_t),
+          false, false },
+        { UINT16_C(0x4d00), M68K_MMU030_PMOVE_CRP, sizeof(uint64_t),
+          false, true },
+        { UINT16_C(0x4e00), M68K_MMU030_PMOVE_CRP, sizeof(uint64_t),
+          true, false },
+        { UINT16_C(0x6000), M68K_MMU030_PMOVE_MMUSR, sizeof(uint16_t),
+          false, false },
+        { UINT16_C(0x6200), M68K_MMU030_PMOVE_MMUSR, sizeof(uint16_t),
+          true, false },
+    };
+    static const uint16_t invalid[] = {
+        UINT16_C(0x0b00), /* PMOVEFD TT0,(ea) */
+        UINT16_C(0x0f00), /* PMOVEFD TT1,(ea) */
+        UINT16_C(0x4300), /* PMOVEFD TC,(ea) */
+        UINT16_C(0x4b00), /* PMOVEFD SRP,(ea) */
+        UINT16_C(0x4f00), /* PMOVEFD CRP,(ea) */
+        UINT16_C(0x4400), /* undefined P-register */
+        UINT16_C(0x4600), /* undefined P-register */
+        UINT16_C(0x5000), /* undefined operation */
+        UINT16_C(0x6100), /* FD is not defined for MMUSR */
+        UINT16_C(0x6300), /* FD is not defined for MMUSR */
+        UINT16_C(0x4001), /* reserved low bits */
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(valid); i++) {
+        unsigned reg, size;
+        bool direction, fd;
+
+        g_assert_true(m68k_mmu030_pmove_decode(
+            valid[i].extension, &reg, &size, &direction, &fd));
+        g_assert_cmpuint(reg, ==, valid[i].reg);
+        g_assert_cmpuint(size, ==, valid[i].size);
+        g_assert_cmpint(direction, ==, valid[i].direction);
+        g_assert_cmpint(fd, ==, valid[i].fd);
+    }
+
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid); i++) {
+        g_assert_false(m68k_mmu030_pmove_decode(
+            invalid[i], NULL, NULL, NULL, NULL));
+    }
+}
+
 typedef struct MigrationSubsection {
     uint8_t *data;
     size_t size;
@@ -1545,6 +1621,37 @@ static void test_mmu030_atc_flush_scopes(void)
     g_assert_cmpuint(state.atc_next, ==, 19);
 }
 
+static void test_mmu030_tt_derived_flush(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030FlushTrace trace = { .state = &state };
+    M68KMMU030TranslateResult mapping;
+    const uint32_t old_tt = UINT32_C(0x00008007);
+    const uint32_t new_tt = UINT32_C(0x00008107);
+
+    state.tt[0] = old_tt;
+    mapping = mmu030_test_atc_result(UINT32_C(0x30000000), 4096,
+                                     PAGE_READ | PAGE_WRITE);
+    m68k_mmu030_atc_fill(&state, UINT32_C(0x00401000), 1, &mapping);
+
+    /* A same-value PMOVEFD TT write preserves both derived state and ATC. */
+    g_assert_true(m68k_mmu030_write_tt(
+        &state, 0, old_tt, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 0);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+
+    /* A changed TT write flushes only QEMU's derived TLB. */
+    g_assert_true(m68k_mmu030_write_tt(
+        &state, 0, new_tt, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 1);
+    g_assert_cmpuint(state.tt[0], ==, new_tt);
+    g_assert_cmpuint(mmu030_test_atc_valid_count(&state), ==, 1);
+
+    g_assert_false(m68k_mmu030_write_tt(
+        &state, 2, new_tt, mmu030_test_flush_all, &trace));
+    g_assert_cmpuint(trace.all_count, ==, 1);
+}
+
 int main(int argc, char **argv)
 {
     module_call_init(MODULE_INIT_QOM);
@@ -1580,8 +1687,12 @@ int main(int argc, char **argv)
                     test_mmu030_atc_preload_and_level_zero_ptest);
     g_test_add_func("/m68k/mmu030/atc-coherent-flush-wrappers",
                     test_mmu030_atc_coherent_flush_wrappers);
+    g_test_add_func("/m68k/mmu030/pmove-extension-decode",
+                    test_mmu030_pmove_extension_decode);
     g_test_add_func("/m68k/mmu030/control-reconfigure",
                     test_mmu030_control_reconfigure);
+    g_test_add_func("/m68k/mmu030/tt-derived-flush",
+                    test_mmu030_tt_derived_flush);
     g_test_add_func("/m68k/mmu030/atc-flush-scopes",
                     test_mmu030_atc_flush_scopes);
     if (g_getenv("QTEST_QEMU_BINARY")) {

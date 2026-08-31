@@ -137,6 +137,20 @@ typedef struct M68KMMU030ControlState {
     uint32_t tt[2];
 } M68KMMU030ControlState;
 
+/* PMOVE extension register identifiers used by the MC68030 decoder. */
+typedef enum M68KMMU030PMOVERegister {
+    M68K_MMU030_PMOVE_TC,
+    M68K_MMU030_PMOVE_TT0,
+    M68K_MMU030_PMOVE_TT1,
+    M68K_MMU030_PMOVE_SRP,
+    M68K_MMU030_PMOVE_CRP,
+    M68K_MMU030_PMOVE_MMUSR,
+} M68KMMU030PMOVERegister;
+
+/* Decode the PMOVE extension word described by MC68030 Section 9.3. */
+bool m68k_mmu030_pmove_decode(uint16_t extension, unsigned *reg,
+                              unsigned *size, bool *direction, bool *fd);
+
 void m68k_mmu030_reset(M68KMMU030State *state);
 
 bool m68k_mmu030_validate_tc(uint32_t tc);
@@ -191,6 +205,12 @@ void m68k_mmu030_atc_flush_page(M68KMMU030State *state,
 typedef void (*M68KMMU030ATCFlushAllFn)(void *opaque);
 typedef void (*M68KMMU030ATCFlushRangeFn)(void *opaque, uint32_t address,
                                          uint32_t size);
+
+/* Update a TT without touching architectural ATC entries. */
+bool m68k_mmu030_write_tt(M68KMMU030State *state, unsigned index,
+                          uint32_t value,
+                          M68KMMU030ATCFlushAllFn flush_derived,
+                          void *opaque);
 
 /* Flush an architectural scope and its derived QEMU TLB through callbacks. */
 void m68k_mmu030_atc_flush_all_coherent(

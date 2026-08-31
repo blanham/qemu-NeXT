@@ -4653,6 +4653,65 @@ DISAS_INSN(ptest)
     is_read = tcg_constant_i32((insn >> 5) & 1);
     gen_helper_ptest(tcg_env, AREG(insn, 0), is_read);
 }
+
+/* MC68030 PMMU instructions accept only control-alterable EAs. */
+static bool m68k_pmove_ea_valid(uint16_t insn)
+{
+    unsigned mode = extract32(insn, 3, 3);
+    unsigned reg = extract32(insn, 0, 3);
+
+    return mode == 2 || mode == 5 || mode == 6 ||
+           (mode == 7 && reg < 4);
+}
+
+DISAS_INSN(pmove)
+{
+    uint16_t extension = read_im16(env, s);
+    unsigned reg;
+    unsigned size;
+    bool direction;
+    bool fd;
+    TCGv address;
+    int opsize;
+
+    if (IS_USER(s)) {
+        gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
+        return;
+    }
+    /*
+     * F000 is the 68030 PMMU/F-line escape.  Reserved PMMU extension
+     * encodings remain emulatable through the F-line vector.
+     */
+    if (!m68k_pmove_ea_valid(insn) ||
+        !m68k_mmu030_pmove_decode(extension, &reg, &size,
+                                  &direction, &fd)) {
+        gen_exception(s, s->base.pc_next, EXCP_LINEF);
+        return;
+    }
+
+    switch (size) {
+    case sizeof(uint16_t):
+        opsize = OS_WORD;
+        break;
+    case sizeof(uint32_t):
+        opsize = OS_LONG;
+        break;
+    case sizeof(uint64_t):
+        opsize = OS_DOUBLE;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    address = gen_lea(env, s, insn, opsize);
+    if (IS_NULL_QREG(address)) {
+        gen_exception(s, s->base.pc_next, EXCP_ILLEGAL);
+        return;
+    }
+
+    gen_helper_m68k_pmove(tcg_env, tcg_constant_i32(extension), address,
+                          tcg_constant_i32(direction), tcg_constant_i32(fd));
+}
 #endif
 
 DISAS_INSN(wddata)
@@ -6051,6 +6110,9 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(bfop_mem, e8c0, ffc0, BITFIELD);   /* bftst */
     INSN(bfop_reg, e8c0, fff8, BITFIELD);   /* bftst */
     BASE(undef_fpu, f000, f000);
+#if !defined(CONFIG_USER_ONLY)
+    INSN(pmove,      f000, ffc0, M68030);
+#endif
     INSN(fpu,       f200, ffc0, CF_FPU);
     INSN(fbcc,      f280, ffc0, CF_FPU);
     INSN(fpu,       f200, ffc0, FPU);
