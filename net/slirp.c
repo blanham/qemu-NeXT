@@ -265,6 +265,7 @@ static const SlirpUdpCallbacks slirp_udp_callbacks = {
 
 static int slirp_udp_backend_listen(
     void *opaque, struct in_addr address, uint16_t port,
+    QemuSlirpUdpListenFlags flags,
     const QemuSlirpUdpBackendCallbacks *callbacks, void *callbacks_opaque,
     void **backend_listener_out)
 {
@@ -274,8 +275,18 @@ static int slirp_udp_backend_listen(
     backend_listener = g_new0(SlirpUdpBackendListener, 1);
     backend_listener->callbacks = callbacks;
     backend_listener->callbacks_opaque = callbacks_opaque;
+#ifdef CONFIG_SLIRP_UDP_LISTEN_FULL
+    backend_listener->listener = slirp_udp_listen_full(
+        s->slirp, address, port, (SlirpUdpListenFlags)flags,
+        &slirp_udp_callbacks, backend_listener);
+#else
+    if (flags != QEMU_SLIRP_UDP_LISTEN_DEFAULT) {
+        g_free(backend_listener);
+        return -1;
+    }
     backend_listener->listener = slirp_udp_listen(
         s->slirp, address, port, &slirp_udp_callbacks, backend_listener);
+#endif
     if (!backend_listener->listener) {
         g_free(backend_listener);
         return -1;
@@ -1606,9 +1617,10 @@ static SlirpState *qemu_slirp_named_find(const char *netdev_id, Error **errp)
 }
 #endif
 
-int qemu_slirp_udp_listen(const char *netdev_id, uint16_t port,
-                          const QemuSlirpUdpListenerOps *ops, void *opaque,
-                          QemuSlirpUdpListener **listener, Error **errp)
+int qemu_slirp_udp_listen_full(const char *netdev_id, uint16_t port,
+                               QemuSlirpUdpListenFlags flags,
+                               const QemuSlirpUdpListenerOps *ops, void *opaque,
+                               QemuSlirpUdpListener **listener, Error **errp)
 {
     if (listener) {
         *listener = NULL;
@@ -1616,15 +1628,35 @@ int qemu_slirp_udp_listen(const char *netdev_id, uint16_t port,
 #ifndef CONFIG_SLIRP_UDP_SERVICE
     (void)netdev_id;
     (void)port;
+    (void)flags;
     (void)ops;
     (void)opaque;
     return qemu_slirp_udp_listen_unavailable(listener, errp);
 #else
+    if ((unsigned)flags & ~(unsigned)QEMU_SLIRP_UDP_LISTEN_BROADCAST) {
+        error_setg(errp, "Unknown SLiRP UDP listener flags");
+        return -1;
+    }
+#ifndef CONFIG_SLIRP_UDP_LISTEN_FULL
+    if (flags != QEMU_SLIRP_UDP_LISTEN_DEFAULT) {
+        return qemu_slirp_udp_listen_full_unavailable(listener, errp);
+    }
+#endif
     SlirpState *s = qemu_slirp_named_find(netdev_id, errp);
 
-    return s ? qemu_slirp_udp_registry_listen(s->udp_registry, port, ops,
-                                               opaque, listener, errp) : -1;
+    return s ? qemu_slirp_udp_registry_listen_full(
+                   s->udp_registry, port, flags, ops, opaque, listener, errp)
+             : -1;
 #endif
+}
+
+int qemu_slirp_udp_listen(const char *netdev_id, uint16_t port,
+                          const QemuSlirpUdpListenerOps *ops, void *opaque,
+                          QemuSlirpUdpListener **listener, Error **errp)
+{
+    return qemu_slirp_udp_listen_full(
+        netdev_id, port, QEMU_SLIRP_UDP_LISTEN_DEFAULT, ops, opaque, listener,
+        errp);
 }
 
 bool qemu_slirp_bootp_root_claim(const char *netdev_id, const char *root_path,

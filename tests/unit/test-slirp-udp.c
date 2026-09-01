@@ -17,6 +17,7 @@ typedef struct FakeUdpBackend {
     unsigned listens;
     unsigned removes;
     unsigned sends;
+    QemuSlirpUdpListenFlags last_flags;
     struct sockaddr_in last_peer;
     uint8_t last_data[32];
     size_t last_len;
@@ -25,6 +26,7 @@ typedef struct FakeUdpBackend {
 } FakeUdpBackend;
 
 static int fake_udp_listen(void *opaque, struct in_addr address, uint16_t port,
+                           QemuSlirpUdpListenFlags flags,
                            const QemuSlirpUdpBackendCallbacks *callbacks,
                            void *callbacks_opaque, void **backend_listener)
 {
@@ -34,6 +36,7 @@ static int fake_udp_listen(void *opaque, struct in_addr address, uint16_t port,
     g_assert_cmpuint(backend->nlisteners, <,
                      G_N_ELEMENTS(backend->listeners));
     backend->listens++;
+    backend->last_flags = flags;
     if (backend->listen_result < 0) {
         return backend->listen_result;
     }
@@ -150,6 +153,73 @@ static void assert_udp_listen_fails(QemuSlirpUdpRegistry *registry,
                         registry, port, ops, NULL, &listener, &err), ==, -1);
     g_assert_null(listener);
     g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void assert_udp_listen_full_fails(QemuSlirpUdpRegistry *registry,
+                                         uint16_t port,
+                                         QemuSlirpUdpListenFlags flags,
+                                         const QemuSlirpUdpListenerOps *ops)
+{
+    QemuSlirpUdpListener *listener = (void *)0x1;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_udp_registry_listen_full(
+                        registry, port, flags, ops, NULL, &listener, &err),
+                    ==, -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_udp_full_flags_and_default_wrapper(void)
+{
+    FakeUdpBackend backend = {0};
+    QemuSlirpUdpRegistry *registry = new_udp_registry(&backend, true);
+    QemuSlirpUdpListener *listener = NULL;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_udp_registry_listen_full(
+                        registry, 2049, QEMU_SLIRP_UDP_LISTEN_BROADCAST,
+                        &udp_listener_ops, NULL, &listener, &err), ==, 0);
+    g_assert_cmpuint(backend.last_flags, ==,
+                     QEMU_SLIRP_UDP_LISTEN_BROADCAST);
+    qemu_slirp_udp_listener_remove(listener);
+
+    g_assert_cmpint(qemu_slirp_udp_registry_listen(
+                        registry, 2049, &udp_listener_ops, NULL, &listener,
+                        &err), ==, 0);
+    g_assert_cmpuint(backend.last_flags, ==, QEMU_SLIRP_UDP_LISTEN_DEFAULT);
+    qemu_slirp_udp_listener_remove(listener);
+
+    assert_udp_listen_full_fails(
+        registry, 2049, (QemuSlirpUdpListenFlags)(1U << 1),
+        &udp_listener_ops);
+    g_assert_cmpuint(backend.listens, ==, 2);
+    qemu_slirp_udp_registry_free(registry);
+}
+
+static void test_udp_unavailable_stub(void)
+{
+    QemuSlirpUdpListener *listener = (void *)0x1;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_udp_listen_unavailable(&listener, &err), ==,
+                    -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    error_free(err);
+
+    listener = (void *)0x1;
+    err = NULL;
+    g_assert_cmpint(qemu_slirp_udp_listen_full_unavailable(&listener, &err),
+                    ==, -1);
+    g_assert_null(listener);
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err),
+                            "UDP broadcast listeners are unavailable"));
+    g_assert_nonnull(strstr(error_get_pretty(err),
+                            "slirp_udp_listen_full API"));
     error_free(err);
 }
 
@@ -380,6 +450,10 @@ static void test_bootp_unwind_invalidate_and_unavailable(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/slirp-udp/full-flags-default-wrapper",
+                    test_udp_full_flags_and_default_wrapper);
+    g_test_add_func("/slirp-udp/unavailable-stub",
+                    test_udp_unavailable_stub);
     g_test_add_func("/slirp-udp/validation-fixed-host",
                     test_udp_validation_and_fixed_host);
     g_test_add_func("/slirp-udp/ipv4-disabled-unavailable",

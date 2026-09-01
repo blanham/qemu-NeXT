@@ -1291,6 +1291,7 @@ endif
 slirp_il = false
 slirp_plan9_bootp = false
 slirp_udp_service = false
+slirp_udp_listen_full = false
 slirp_bootp_root = false
 if slirp.found()
   if slirp.type_name() == 'internal'
@@ -1298,9 +1299,12 @@ if slirp.found()
     # and BOOTP root APIs.  Normal QEMU targets compile and link against its
     # exported public dependency, which validates that contract without
     # crossing Meson's subproject sandbox.
+    # Keep the optional full-listen API disabled until the pinned wrap revision
+    # exports it as part of that contract.
     slirp_il = true
     slirp_plan9_bootp = true
     slirp_udp_service = true
+    slirp_udp_listen_full = false
     slirp_bootp_root = true
   else
     slirp_il = cc.links('''
@@ -1352,6 +1356,17 @@ if slirp.found()
           slirp_set_bootp_root;
         return !set_root;
       }''', dependencies: slirp, name: 'libslirp BOOTP root API')
+    slirp_udp_listen_full = cc.links('''
+      #include <libslirp.h>
+      int main(void)
+      {
+        SlirpUdpListener *(*listen)(Slirp *, struct in_addr, uint16_t,
+                                   SlirpUdpListenFlags,
+                                   const SlirpUdpCallbacks *, void *) =
+          slirp_udp_listen_full;
+        return !listen;
+      }''', dependencies: slirp,
+      name: 'libslirp guest UDP listen-full API')
   endif
 endif
 
@@ -2547,6 +2562,7 @@ config_host_data.set('CONFIG_SLIRP', slirp.found())
 config_host_data.set('CONFIG_SLIRP_IL', slirp_il)
 config_host_data.set('CONFIG_SLIRP_PLAN9_BOOTP', slirp_plan9_bootp)
 config_host_data.set('CONFIG_SLIRP_UDP_SERVICE', slirp_udp_service)
+config_host_data.set('CONFIG_SLIRP_UDP_LISTEN_FULL', slirp_udp_listen_full)
 config_host_data.set('CONFIG_SLIRP_BOOTP_ROOT', slirp_bootp_root)
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
 config_host_data.set('CONFIG_SOLARIS', host_os == 'sunos')

@@ -14,6 +14,7 @@ typedef struct QemuSlirpUdpBackendCallbacks {
 
 typedef struct QemuSlirpUdpBackendOps {
     int (*listen)(void *opaque, struct in_addr address, uint16_t port,
+                  QemuSlirpUdpListenFlags flags,
                   const QemuSlirpUdpBackendCallbacks *callbacks,
                   void *callbacks_opaque, void **backend_listener);
     void (*listener_remove)(void *opaque, void *backend_listener);
@@ -27,6 +28,10 @@ QemuSlirpUdpRegistry *qemu_slirp_udp_registry_new(
     const QemuSlirpUdpBackendOps *ops, void *backend_opaque);
 void qemu_slirp_udp_registry_set_ipv4_enabled_for_test(
     QemuSlirpUdpRegistry *registry, bool enabled);
+int qemu_slirp_udp_registry_listen_full(
+    QemuSlirpUdpRegistry *registry, uint16_t port,
+    QemuSlirpUdpListenFlags flags, const QemuSlirpUdpListenerOps *ops,
+    void *opaque, QemuSlirpUdpListener **listener, Error **errp);
 int qemu_slirp_udp_registry_listen(QemuSlirpUdpRegistry *registry,
                                    uint16_t port,
                                    const QemuSlirpUdpListenerOps *ops,
@@ -37,5 +42,7 @@ void qemu_slirp_udp_registry_invalidate(QemuSlirpUdpRegistry *registry);
 void qemu_slirp_udp_registry_free(QemuSlirpUdpRegistry *registry);
 int qemu_slirp_udp_listen_unavailable(QemuSlirpUdpListener **listener,
                                       Error **errp);
+int qemu_slirp_udp_listen_full_unavailable(QemuSlirpUdpListener **listener,
+                                           Error **errp);
 
 #endif /* QEMU_NET_SLIRP_UDP_INTERNAL_H */
