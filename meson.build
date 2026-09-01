@@ -1292,6 +1292,7 @@ slirp_il = false
 slirp_plan9_bootp = false
 slirp_udp_service = false
 slirp_udp_listen_full = false
+slirp_tcp_service = false
 slirp_bootp_root = false
 if slirp.found()
   if slirp.type_name() == 'internal'
@@ -1367,6 +1368,42 @@ if slirp.found()
         return !listen;
       }''', dependencies: slirp,
       name: 'libslirp guest UDP listen-full API')
+    slirp_tcp_service = cc.links('''
+      #include <libslirp.h>
+      #ifndef SLIRP_HAVE_TCP_SERVICE
+      #error libslirp was built without guest TCP stream services
+      #endif
+      static void accepted(SlirpTcpListener *listener,
+                           SlirpTcpConnection *connection,
+                           const struct sockaddr_in *peer, void *opaque) { }
+      static void receive(SlirpTcpConnection *connection,
+                          const uint8_t *data, size_t len, void *opaque) { }
+      static void can_send(SlirpTcpConnection *connection, void *opaque) { }
+      static void closed(SlirpTcpConnection *connection, void *opaque) { }
+      int main(void)
+      {
+        SlirpTcpListener *(*listen)(Slirp *, struct in_addr, uint16_t,
+                                    const SlirpTcpCallbacks *, void *) =
+          slirp_tcp_listen;
+        void (*remove_listener)(SlirpTcpListener *) =
+          slirp_tcp_listener_remove;
+        size_t (*can_send_bytes)(SlirpTcpConnection *) =
+          slirp_tcp_connection_can_send;
+        int (*send_bytes)(SlirpTcpConnection *, const uint8_t *, size_t) =
+          slirp_tcp_connection_send;
+        void (*close_connection)(SlirpTcpConnection *) =
+          slirp_tcp_connection_close;
+        SlirpTcpCallbacks callbacks = {
+          .accepted = accepted,
+          .receive = receive,
+          .can_send = can_send,
+          .closed = closed,
+        };
+        return !(listen && remove_listener && can_send_bytes && send_bytes &&
+                 close_connection && callbacks.accepted && callbacks.receive &&
+                 callbacks.can_send && callbacks.closed);
+      }''', dependencies: slirp,
+      name: 'libslirp TCP stream service API')
   endif
 endif
 
@@ -2563,6 +2600,7 @@ config_host_data.set('CONFIG_SLIRP_IL', slirp_il)
 config_host_data.set('CONFIG_SLIRP_PLAN9_BOOTP', slirp_plan9_bootp)
 config_host_data.set('CONFIG_SLIRP_UDP_SERVICE', slirp_udp_service)
 config_host_data.set('CONFIG_SLIRP_UDP_LISTEN_FULL', slirp_udp_listen_full)
+config_host_data.set('CONFIG_SLIRP_TCP_SERVICE', slirp_tcp_service)
 config_host_data.set('CONFIG_SLIRP_BOOTP_ROOT', slirp_bootp_root)
 config_host_data.set('CONFIG_SNAPPY', snappy.found())
 config_host_data.set('CONFIG_SOLARIS', host_os == 'sunos')

@@ -32,6 +32,8 @@
 #include "net/slirp-plan9.h"
 #include "net/slirp-plan9-internal.h"
 #include "net/slirp-il-internal.h"
+#include "net/slirp-stream.h"
+#include "net/slirp-stream-internal.h"
 #include "net/slirp-udp.h"
 #include "net/slirp-udp-internal.h"
 
@@ -106,6 +108,7 @@ typedef struct SlirpState {
     struct in_addr vnetmask;
     struct in_addr vhost;
     struct in_addr vnameserver;
+    QemuSlirpStreamRegistry *stream_registry;
     QemuSlirpUdpRegistry *udp_registry;
     QemuSlirpBootpRegistry *bootp_registry;
     QemuSlirpGuestFwdRegistry *guestfwds;
@@ -128,6 +131,9 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str, Error **errp);
 static const QemuSlirpGuestFwdBackendOps slirp_guestfwd_backend_ops;
 #ifdef CONFIG_SLIRP_UDP_SERVICE
 static const QemuSlirpUdpBackendOps slirp_udp_backend_ops;
+#endif
+#ifdef CONFIG_SLIRP_TCP_SERVICE
+static const QemuSlirpStreamBackendOps slirp_stream_backend_ops;
 #endif
 #ifdef CONFIG_SLIRP_BOOTP_ROOT
 static const QemuSlirpBootpBackendOps slirp_bootp_backend_ops;
@@ -321,6 +327,118 @@ static const QemuSlirpUdpBackendOps slirp_udp_backend_ops = {
 };
 #endif
 
+#ifdef CONFIG_SLIRP_TCP_SERVICE
+#ifndef SLIRP_HAVE_TCP_SERVICE
+#error "CONFIG_SLIRP_TCP_SERVICE requires libslirp's TCP service API"
+#endif
+typedef struct SlirpStreamBackendListener {
+    SlirpTcpListener *listener;
+    const QemuSlirpStreamBackendCallbacks *callbacks;
+    void *callbacks_opaque;
+} SlirpStreamBackendListener;
+
+static void slirp_stream_backend_connected(
+    SlirpTcpListener *listener, SlirpTcpConnection *connection,
+    const struct sockaddr_in *peer, void *opaque)
+{
+    SlirpStreamBackendListener *backend_listener = opaque;
+
+    backend_listener->callbacks->connected(connection, peer,
+                                            backend_listener->callbacks_opaque);
+}
+
+static void slirp_stream_backend_receive(SlirpTcpConnection *connection,
+                                          const uint8_t *data, size_t len,
+                                          void *opaque)
+{
+    SlirpStreamBackendListener *backend_listener = opaque;
+
+    backend_listener->callbacks->receive(connection, data, len,
+                                         backend_listener->callbacks_opaque);
+}
+
+static void slirp_stream_backend_ready(SlirpTcpConnection *connection,
+                                        void *opaque)
+{
+    SlirpStreamBackendListener *backend_listener = opaque;
+
+    backend_listener->callbacks->can_send(connection,
+                                          backend_listener->callbacks_opaque);
+}
+
+static void slirp_stream_backend_closed(SlirpTcpConnection *connection,
+                                         void *opaque)
+{
+    SlirpStreamBackendListener *backend_listener = opaque;
+
+    backend_listener->callbacks->closed(connection,
+                                        backend_listener->callbacks_opaque);
+}
+
+static const SlirpTcpCallbacks slirp_stream_callbacks = {
+    .accepted = slirp_stream_backend_connected,
+    .receive = slirp_stream_backend_receive,
+    .can_send = slirp_stream_backend_ready,
+    .closed = slirp_stream_backend_closed,
+};
+
+static int slirp_stream_backend_listen(
+    void *opaque, struct in_addr address, uint16_t port,
+    const QemuSlirpStreamBackendCallbacks *callbacks, void *callbacks_opaque,
+    void **backend_listener_out)
+{
+    SlirpState *s = opaque;
+    SlirpStreamBackendListener *backend_listener;
+
+    backend_listener = g_new0(SlirpStreamBackendListener, 1);
+    backend_listener->callbacks = callbacks;
+    backend_listener->callbacks_opaque = callbacks_opaque;
+    backend_listener->listener = slirp_tcp_listen(
+        s->slirp, address, port, &slirp_stream_callbacks, backend_listener);
+    if (!backend_listener->listener) {
+        g_free(backend_listener);
+        return -1;
+    }
+    *backend_listener_out = backend_listener;
+    return 0;
+}
+
+static void slirp_stream_backend_listener_remove(
+    void *opaque, void *backend_listener_opaque)
+{
+    SlirpStreamBackendListener *backend_listener = backend_listener_opaque;
+
+    slirp_tcp_listener_remove(backend_listener->listener);
+    g_free(backend_listener);
+}
+
+static size_t slirp_stream_backend_send_capacity(void *opaque,
+                                                 void *backend_connection)
+{
+    return slirp_tcp_connection_can_send(backend_connection);
+}
+
+static int slirp_stream_backend_send(void *opaque, void *backend_connection,
+                                     const uint8_t *data, size_t len)
+{
+    return slirp_tcp_connection_send(backend_connection, data, len);
+}
+
+static void slirp_stream_backend_connection_close(void *opaque,
+                                                   void *backend_connection)
+{
+    slirp_tcp_connection_close(backend_connection);
+}
+
+static const QemuSlirpStreamBackendOps slirp_stream_backend_ops = {
+    .listen = slirp_stream_backend_listen,
+    .listener_remove = slirp_stream_backend_listener_remove,
+    .can_send = slirp_stream_backend_send_capacity,
+    .send = slirp_stream_backend_send,
+    .connection_close = slirp_stream_backend_connection_close,
+};
+#endif
+
 #ifdef CONFIG_SLIRP_BOOTP_ROOT
 #ifndef SLIRP_HAVE_BOOTP_ROOT
 #error "CONFIG_SLIRP_BOOTP_ROOT requires libslirp's BOOTP root API"
@@ -400,6 +518,7 @@ static void net_slirp_cleanup(NetClientState *nc)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
+    qemu_slirp_stream_registry_invalidate(s->stream_registry);
     qemu_slirp_guestfwd_registry_invalidate(s->guestfwds);
     qemu_slirp_udp_registry_invalidate(s->udp_registry);
     qemu_slirp_bootp_registry_invalidate(s->bootp_registry);
@@ -417,6 +536,7 @@ static void net_slirp_cleanup(NetClientState *nc)
 #else
     slirp_cleanup(s->slirp);
 #endif
+    qemu_slirp_stream_registry_free(s->stream_registry);
     if (s->exit_notifier.notify) {
         qemu_remove_exit_notifier(&s->exit_notifier);
     }
@@ -932,6 +1052,13 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
+#ifdef CONFIG_SLIRP_TCP_SERVICE
+    s->stream_registry = qemu_slirp_stream_registry_new(
+        ipv4, host, &slirp_stream_backend_ops, s);
+#else
+    s->stream_registry = qemu_slirp_stream_registry_new(ipv4, host, NULL,
+                                                         NULL);
+#endif
     s->guestfwds = qemu_slirp_guestfwd_registry_new(
         ipv4, net, mask, host, dns, &slirp_guestfwd_backend_ops, s);
 #ifdef CONFIG_SLIRP_UDP_SERVICE
@@ -1599,7 +1726,8 @@ void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle)
     qemu_slirp_guestfwd_registry_remove(handle);
 }
 
-#if defined(CONFIG_SLIRP_UDP_SERVICE) || defined(CONFIG_SLIRP_BOOTP_ROOT)
+#if defined(CONFIG_SLIRP_TCP_SERVICE) || defined(CONFIG_SLIRP_UDP_SERVICE) || \
+    defined(CONFIG_SLIRP_BOOTP_ROOT)
 static SlirpState *qemu_slirp_named_find(const char *netdev_id, Error **errp)
 {
     NetClientState *nc = netdev_id ? qemu_find_netdev(netdev_id) : NULL;
@@ -1616,6 +1744,29 @@ static SlirpState *qemu_slirp_named_find(const char *netdev_id, Error **errp)
     return DO_UPCAST(SlirpState, nc, nc);
 }
 #endif
+
+int qemu_slirp_stream_listen(const char *netdev_id, uint16_t port,
+                             const QemuSlirpStreamOps *ops, void *opaque,
+                             QemuSlirpStreamListener **listener,
+                             Error **errp)
+{
+    if (listener) {
+        *listener = NULL;
+    }
+#ifndef CONFIG_SLIRP_TCP_SERVICE
+    (void)netdev_id;
+    (void)port;
+    (void)ops;
+    (void)opaque;
+    return qemu_slirp_stream_listen_unavailable(listener, errp);
+#else
+    SlirpState *s = qemu_slirp_named_find(netdev_id, errp);
+
+    return s ? qemu_slirp_stream_registry_listen(
+                   s->stream_registry, port, ops, opaque, listener, errp)
+             : -1;
+#endif
+}
 
 int qemu_slirp_udp_listen_full(const char *netdev_id, uint16_t port,
                                QemuSlirpUdpListenFlags flags,

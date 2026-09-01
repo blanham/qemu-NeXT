@@ -41,6 +41,7 @@ endif
 system_ss.add(files(
   'slirp-bootp.c',
   'slirp-il.c',
+  'slirp-stream.c',
   'slirp-udp.c',
 ))
 system_ss.add(when: slirp, if_true: files(
