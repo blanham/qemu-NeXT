@@ -11,6 +11,29 @@
 #include "qemu/main-loop.h"
 #include "qemu/xattr.h"
 
+typedef struct Fixture Fixture;
+
+/*
+ * The server unit target deliberately does not link the SLiRP registry. Use
+ * a small request/registration double so every test still exercises the
+ * decoded OncRpcRequest ownership contract.
+ */
+struct OncRpcRequest {
+    OncRpcCall call;
+    struct sockaddr_in peer;
+    uint8_t *data;
+    size_t data_length;
+    GByteArray *reply;
+    Fixture *fixture;
+    unsigned refs;
+    bool retained;
+    bool terminal;
+};
+
+struct QemuSlirpRpcRegistration {
+    OncRpcProgram program;
+};
+
 typedef struct FakeOpen {
     bool directory;
     bool emitted;
@@ -21,7 +44,7 @@ typedef struct FakeOpen {
     struct dirent entry;
 } FakeOpen;
 
-typedef struct Fixture {
+struct Fixture {
     FsDriverEntry fse;
     Nfs2Server *server;
     GByteArray *reply;
@@ -72,6 +95,8 @@ typedef struct Fixture {
     unsigned int clock_calls;
     unsigned int request_refs;
     unsigned int request_unrefs;
+    unsigned int owner_refs;
+    unsigned int owner_unrefs;
     int64_t clock_ms;
     int mutation_error;
     bool reset_on_send;
@@ -103,9 +128,112 @@ typedef struct Fixture {
     bool replace_temp_before_publish;
     uint64_t created_open_ino;
     unsigned int named_exclusive_creates;
-} Fixture;
+};
 
 static Fixture *current;
+
+int qemu_slirp_rpc_register(const char *netdev_id,
+                            const OncRpcProgram *program,
+                            QemuSlirpRpcRegistration **registration,
+                            Error **errp)
+{
+    QemuSlirpRpcRegistration *entry;
+
+    (void)netdev_id;
+    if (!program || !registration) {
+        error_setg(errp, "invalid fake RPC registration");
+        return -1;
+    }
+    entry = g_new0(QemuSlirpRpcRegistration, 1);
+    entry->program = *program;
+    *registration = entry;
+    return 0;
+}
+
+void qemu_slirp_rpc_unregister(QemuSlirpRpcRegistration *registration)
+{
+    g_free(registration);
+}
+
+const OncRpcCall *onc_rpc_request_call(const OncRpcRequest *request)
+{
+    return request ? &request->call : NULL;
+}
+
+const uint8_t *onc_rpc_request_data(const OncRpcRequest *request,
+                                    size_t *length)
+{
+    if (length) {
+        *length = request ? request->data_length : 0;
+    }
+    return request ? request->data : NULL;
+}
+
+const struct sockaddr_in *onc_rpc_request_peer(const OncRpcRequest *request)
+{
+    return request ? &request->peer : NULL;
+}
+
+bool onc_rpc_request_is_tcp(const OncRpcRequest *request)
+{
+    return false;
+}
+
+OncRpcRequest *onc_rpc_request_ref(OncRpcRequest *request)
+{
+    if (request) {
+        g_assert_cmpuint(request->refs, >, 0);
+        if (request->refs == 1 && !request->retained) {
+            request->retained = true;
+            request->fixture->request_refs++;
+        }
+        request->refs++;
+    }
+    return request;
+}
+
+void onc_rpc_request_unref(OncRpcRequest *request)
+{
+    if (!request) {
+        return;
+    }
+    g_assert_cmpuint(request->refs, >, 0);
+    if (request->refs == 1 && request->retained) {
+        request->fixture->request_unrefs++;
+    }
+    if (--request->refs) {
+        return;
+    }
+    g_clear_pointer(&request->reply, g_byte_array_unref);
+    g_free(request->data);
+    g_free(request);
+}
+
+bool onc_rpc_request_reply(OncRpcRequest *request, const uint8_t *data,
+                           size_t length)
+{
+    if (!request || request->terminal || (length && !data)) {
+        return false;
+    }
+    g_byte_array_set_size(request->reply, 0);
+    g_byte_array_append(request->reply, data, length);
+    request->terminal = true;
+    request->fixture->send_count++;
+    g_byte_array_set_size(request->fixture->reply, 0);
+    g_byte_array_append(request->fixture->reply, data, length);
+    if (request->fixture->reset_on_send) {
+        request->fixture->reset_on_send = false;
+        nfs2_server_reset(request->fixture->server);
+    }
+    return true;
+}
+
+void onc_rpc_request_drop(OncRpcRequest *request)
+{
+    if (request) {
+        request->terminal = true;
+    }
+}
 
 FsDriverEntry *get_fsdev_fsentry(const char *id)
 {
@@ -930,21 +1058,6 @@ static FileOperations fake_ops = {
     .flinkat = fake_flinkat,
 };
 
-static int send_reply(Nfs2Service service, const struct sockaddr_in *peer,
-                      const uint8_t *data, size_t len, void *opaque)
-{
-    Fixture *f = opaque;
-
-    g_byte_array_set_size(f->reply, 0);
-    g_byte_array_append(f->reply, data, len);
-    f->send_count++;
-    if (f->reset_on_send) {
-        f->reset_on_send = false;
-        nfs2_server_reset(f->server);
-    }
-    return 0;
-}
-
 static int64_t fake_clock_ms(void *opaque)
 {
     Fixture *f = opaque;
@@ -957,18 +1070,17 @@ static void fake_request_ref(void *opaque)
 {
     Fixture *f = opaque;
 
-    f->request_refs++;
+    f->owner_refs++;
 }
 
 static void fake_request_unref(void *opaque)
 {
     Fixture *f = opaque;
 
-    f->request_unrefs++;
+    f->owner_unrefs++;
 }
 
 static const Nfs2TransportOps transport = {
-    .send = send_reply,
     .clock_ms = fake_clock_ms,
     .request_ref = fake_request_ref,
     .request_unref = fake_request_unref,
@@ -994,7 +1106,7 @@ static void setup(Fixture *f, gconstpointer opaque)
     f->kernel_mode = S_IFREG | 0555;
     f->kernel_size = 6;
     f->object_ino = 100;
-    f->server = nfs2_server_new("fake-nfs", false, &transport, f,
+    f->server = nfs2_server_new("fake-nfs", "testnet", false, &transport, f,
                                 &error_abort);
     f->backend_on_main = false;
 }
@@ -1026,6 +1138,48 @@ static size_t rpc_call(uint8_t *buf, size_t capacity, uint32_t program,
     g_assert_true(onc_rpc_xdr_put_u32(&w, 0));
     g_assert_true(onc_rpc_xdr_put_opaque(&w, body, body_len));
     return onc_rpc_xdr_writer_size(&w);
+}
+
+static OncRpcRequest *test_request_new(Fixture *f,
+                                       const struct sockaddr_in *peer,
+                                       const uint8_t *data, size_t length)
+{
+    OncRpcRequest *request = g_new0(OncRpcRequest, 1);
+
+    request->data = g_memdup2(data, length);
+    request->data_length = length;
+    request->peer = *peer;
+    request->reply = g_byte_array_new();
+    request->fixture = f;
+    request->refs = 1;
+    /* Keep body pointers in the decoded call inside the owned raw request. */
+    g_assert_cmpint(onc_rpc_decode_call(request->data, length,
+                                        &request->call), ==,
+                    ONC_RPC_DECODE_OK);
+    return request;
+}
+
+static OncRpcRequest *test_request_new_synthetic(
+    Fixture *f, const struct sockaddr_in *peer, const uint8_t *data,
+    size_t length, uint32_t xid, uint32_t procedure)
+{
+    OncRpcRequest *request = g_new0(OncRpcRequest, 1);
+
+    request->data = g_memdup2(data, length);
+    request->data_length = length;
+    request->peer = *peer;
+    request->reply = g_byte_array_new();
+    request->fixture = f;
+    request->refs = 1;
+    request->call.xid = xid;
+    request->call.program = NFS2_NFS_PROGRAM;
+    request->call.version = 3;
+    request->call.procedure = procedure;
+    request->call.auth_flavor = ONC_RPC_AUTH_NULL;
+    request->call.data = request->data;
+    request->call.data_length = length;
+    onc_rpc_xdr_reader_init(&request->call.body, request->data, length);
+    return request;
 }
 
 static size_t rpc_call_auth_sys(uint8_t *buf, size_t capacity,
@@ -1061,19 +1215,22 @@ static size_t rpc_call_auth_sys(uint8_t *buf, size_t capacity,
     return onc_rpc_xdr_writer_size(&w);
 }
 
-static void request_peer(Fixture *f, Nfs2Service service, const void *data,
-                         size_t len, uint16_t port)
+static void request_peer(Fixture *f, const void *data, size_t len,
+                         uint16_t port)
 {
     const struct sockaddr_in peer = {
         .sin_family = AF_INET,
         .sin_port = htons(port),
         .sin_addr.s_addr = htonl(0x0a00020f),
     };
+    OncRpcRequest *request;
     unsigned int polls = 0;
 
     g_byte_array_set_size(f->reply, 0);
-    g_assert_cmpint(nfs2_server_receive(f->server, service, &peer, data, len,
-                                        &error_abort), ==, 0);
+    request = test_request_new(f, &peer, data, len);
+    g_assert_cmpint(nfs2_server_receive(f->server, request, &error_abort), ==,
+                    0);
+    onc_rpc_request_unref(request);
     while (nfs2_server_busy(f->server)) {
         g_assert_cmpuint(polls++, <, 10000);
         aio_poll(qemu_get_aio_context(), true);
@@ -1081,10 +1238,9 @@ static void request_peer(Fixture *f, Nfs2Service service, const void *data,
     g_assert_cmpuint(f->reply->len, >=, 24);
 }
 
-static void request(Fixture *f, Nfs2Service service, const void *data,
-                    size_t len)
+static void request(Fixture *f, const void *data, size_t len)
 {
-    request_peer(f, service, data, len, 900);
+    request_peer(f, data, len, 900);
 }
 
 static uint32_t reply_word(Fixture *f, size_t word)
@@ -1103,7 +1259,7 @@ static Nfs2FileHandle mount_root(Fixture *f, uint32_t version)
     body[4] = '/';
     len = rpc_call(call, sizeof(call), NFS2_MOUNT_PROGRAM, version,
                    NFS2_MOUNT_MNT, body, sizeof(body));
-    request(f, NFS2_SERVICE_MOUNT, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_SUCCESS);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     if (version == 3) {
@@ -1137,7 +1293,7 @@ static Nfs2FileHandle lookup(Fixture *f, uint32_t version,
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
                    version == 3 ? 3 : NFS2_NFSPROC_LOOKUP,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     if (version == 3) {
         g_assert_cmpuint(reply_word(f, 7), ==, 32);
@@ -1146,31 +1302,6 @@ static Nfs2FileHandle lookup(Fixture *f, uint32_t version,
         memcpy(result.bytes, f->reply->data + 28, sizeof(result.bytes));
     }
     return result;
-}
-
-static void test_portmap_dual(Fixture *f, gconstpointer opaque)
-{
-    uint8_t call[128], body[16];
-    const uint32_t versions[] = { 1, 2, 3, 3 };
-    const uint32_t programs[] = {
-        NFS2_MOUNT_PROGRAM, NFS2_NFS_PROGRAM,
-        NFS2_MOUNT_PROGRAM, NFS2_NFS_PROGRAM,
-    };
-    const uint32_t ports[] = {
-        NFS2_PORT_MOUNT, NFS2_PORT_NFS, NFS2_PORT_MOUNT, NFS2_PORT_NFS,
-    };
-
-    for (size_t i = 0; i < G_N_ELEMENTS(versions); i++) {
-        stl_be_p(body, programs[i]);
-        stl_be_p(body + 4, versions[i]);
-        stl_be_p(body + 8, NFS2_IPPROTO_UDP);
-        stl_be_p(body + 12, 0);
-        size_t len = rpc_call(call, sizeof(call), NFS2_PMAP_PROGRAM,
-                              NFS2_PMAP_VERSION, NFS2_PMAP_GETPORT,
-                              body, sizeof(body));
-        request(f, NFS2_SERVICE_PORTMAP, call, len);
-        g_assert_cmpuint(reply_word(f, 6), ==, ports[i]);
-    }
 }
 
 static void test_v2_bootstrap(Fixture *f, gconstpointer opaque)
@@ -1186,7 +1317,7 @@ static void test_v2_bootstrap(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 40, 1024);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READ, body, sizeof(body));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 24), ==, 6);
     g_assert_cmpmem(f->reply->data + 100, 6, "NetBSD", 6);
@@ -1204,13 +1335,13 @@ static void test_v3_kernel_flow(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, root.bytes, 32, 32));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, NFS2_NFDIR);
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 19,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 29), ==, NFS2_MAX_DATA);
 
@@ -1219,7 +1350,7 @@ static void test_v3_kernel_flow(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, 0x3f));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 4,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 29) & 0x1c, ==, 0);
 
@@ -1232,7 +1363,7 @@ static void test_v3_kernel_flow(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, 4096));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 17,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, 1);
     g_assert_false(f->backend_on_main);
@@ -1250,7 +1381,7 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
     memcpy(body, root2.bytes, 32);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, body, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, NFS2_NFDIR);
 
@@ -1258,13 +1389,13 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 36, 1024);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READDIR, body, 40);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, 1);
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_STATFS, body, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 7), ==, NFS2_MAX_DATA);
 
     for (uint32_t proc = NFS2_NFSPROC_ROOT;
@@ -1272,7 +1403,7 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
          proc += NFS2_NFSPROC_WRITECACHE - NFS2_NFSPROC_ROOT) {
         len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                        proc, NULL, 0);
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_SUCCESS);
     }
 
@@ -1281,7 +1412,7 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
     for (uint32_t proc = 18; proc <= 20; proc += 2) {
         len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, proc,
                        body, onc_rpc_xdr_writer_size(&w));
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 6), ==, 0);
     }
 
@@ -1293,7 +1424,7 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, 1024));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 16,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, 1);
 
@@ -1304,13 +1435,13 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, "link", 4, 255));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 3,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     memcpy(link.bytes, f->reply->data + 32, 32);
     onc_rpc_xdr_writer_init(&w, body, sizeof(body));
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, link.bytes, 32, 32));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 5,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 29), ==, 6);
 }
@@ -1318,24 +1449,22 @@ static void test_read_metadata_surfaces(Fixture *f, gconstpointer opaque)
 static void test_bounds_and_errors(Fixture *f, gconstpointer opaque)
 {
     uint8_t call[128], body[16] = { 0 };
-    g_autofree uint8_t *too_big = g_malloc0(ONC_RPC_MAX_DATAGRAM + 1);
-    Error *err = NULL;
     size_t len;
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 4, 0, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_PROG_MISMATCH);
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 99, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_PROC_UNAVAIL);
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_GARBAGE_ARGS);
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 21, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 30);
     g_assert_cmpuint(f->reply->len, ==, 36);
 
@@ -1343,16 +1472,9 @@ static void test_bounds_and_errors(Fixture *f, gconstpointer opaque)
     memcpy(body + 4, "/bad", 4);
     len = rpc_call(call, sizeof(call), NFS2_MOUNT_PROGRAM, 3,
                    NFS2_MOUNT_MNT, body, 8);
-    request(f, NFS2_SERVICE_MOUNT, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_ACCES);
 
-    g_assert_cmpint(nfs2_server_receive(f->server, NFS2_SERVICE_NFS,
-                                        &(struct sockaddr_in) {
-                                            .sin_family = AF_INET,
-                                        }, too_big,
-                                        ONC_RPC_MAX_DATAGRAM + 1, &err), <, 0);
-    g_assert_nonnull(err);
-    error_free(err);
 }
 
 static void test_stale_identity_and_access(Fixture *f, gconstpointer opaque)
@@ -1369,14 +1491,14 @@ static void test_stale_identity_and_access(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, file.bytes, 32, 32));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
     f->kernel_ino--;
 
     /* Task 8 is read-only even if a later writable export is configured. */
     nfs2_server_free(f->server);
     f->fse.export_flags = V9FS_SM_MAPPED;
-    f->server = nfs2_server_new("fake-nfs", true, &transport, f,
+    f->server = nfs2_server_new("fake-nfs", "testnet", true, &transport, f,
                                 &error_abort);
     root = mount_root(f, 3);
     file = lookup(f, 3, &root, "kernel");
@@ -1385,7 +1507,7 @@ static void test_stale_identity_and_access(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, 0x3f));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 4,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 29) & 0x1c, ==, 0);
 }
@@ -1409,7 +1531,7 @@ static void readdir3(Fixture *f, const Nfs2FileHandle *dir, bool plus,
     g_assert_true(onc_rpc_xdr_put_u32(&w, maxcount));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3,
                    plus ? 17 : 16, body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
 }
 
 static void test_readdir3_bounds(Fixture *f, gconstpointer opaque)
@@ -1461,35 +1583,21 @@ static void test_protocol_vectors(Fixture *f, gconstpointer opaque)
     Nfs2FileHandle root, file, link;
     size_t len;
 
-    len = rpc_call(call, sizeof(call), NFS2_PMAP_PROGRAM, NFS2_PMAP_VERSION,
-                   NFS2_PMAP_NULL, NULL, 0);
-    request(f, NFS2_SERVICE_PORTMAP, call, len);
-    g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_SUCCESS);
-    stl_be_p(body, NFS2_NFS_PROGRAM); stl_be_p(body + 4, 4);
-    stl_be_p(body + 8, NFS2_IPPROTO_UDP);
-    len = rpc_call(call, sizeof(call), NFS2_PMAP_PROGRAM, NFS2_PMAP_VERSION,
-                   NFS2_PMAP_GETPORT, body, 16);
-    request(f, NFS2_SERVICE_PORTMAP, call, len);
-    g_assert_cmpuint(reply_word(f, 6), ==, 0);
-    len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2, 0, NULL, 0);
-    request(f, NFS2_SERVICE_PORTMAP, call, len);
-    g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_PROG_UNAVAIL);
-
     stl_be_p(body, 4); memcpy(body + 4, "/bad", 4);
     len = rpc_call(call, sizeof(call), NFS2_MOUNT_PROGRAM, 1,
                    NFS2_MOUNT_MNT, body, 8);
-    request(f, NFS2_SERVICE_MOUNT, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_ACCES);
 
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_NULL, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_SUCCESS);
     root = mount_root(f, 1);
     link = lookup(f, 2, &root, "link");
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READLINK, link.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, 6);
 
@@ -1498,24 +1606,24 @@ static void test_protocol_vectors(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 36, 8192); stl_be_p(body + 40, 8192);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READ, body, 44);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 24), ==, 0);
     stl_be_p(body + 36, 8193);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READ, body, 44);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_GARBAGE_ARGS);
 
     f->lstat_error = EIO;
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, file.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_IO);
     f->lstat_error = 0;
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, file.bytes, 4);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_GARBAGE_ARGS);
 
 }
@@ -1537,12 +1645,12 @@ static void test_open_identity_race(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, 8));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 6,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
 
     f->kernel_ino--;
     f->fail_replaced_open = true;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
 
     root = mount_root(f, 3);
@@ -1573,12 +1681,12 @@ static void test_path_identity_race(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, link.bytes, 32, 32));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 5,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
 
     f->link_ino--;
     f->fail_replaced_readlink = true;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
 
     onc_rpc_xdr_writer_init(&w, body, sizeof(body));
@@ -1586,7 +1694,7 @@ static void test_path_identity_race(Fixture *f, gconstpointer opaque)
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 18,
                    body, onc_rpc_xdr_writer_size(&w));
     f->fail_replaced_statfs = true;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
     f->root_ino--;
 
@@ -1596,12 +1704,12 @@ static void test_path_identity_race(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, "kernel", 6, 255));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 3,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
 
     f->root_ino--;
     f->remove_child_on_lookup = true;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 70);
 
     f->root_ino--;
@@ -1633,7 +1741,7 @@ static void test_v2_component_validation(Fixture *f, gconstpointer opaque)
         size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                               NFS2_NFSPROC_LOOKUP, body,
                               onc_rpc_xdr_writer_size(&w));
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_GARBAGE_ARGS);
         g_assert_cmpuint(f->name_to_path_calls, ==, calls);
     }
@@ -1644,7 +1752,7 @@ static void test_v2_component_validation(Fixture *f, gconstpointer opaque)
         size_t len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                               NFS2_NFSPROC_LOOKUP, body, 32 + 4 + 256);
 
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_GARBAGE_ARGS);
         g_assert_cmpuint(f->name_to_path_calls, ==, calls);
     }
@@ -1664,12 +1772,12 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
                            sizeof(kernel.bytes)), !=, 0);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     kernel_fileid = reply_word(f, 17);
     g_assert_cmpuint(reply_word(f, 8), ==, S_IFREG | 0555);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, collision.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     collision_fileid = reply_word(f, 17);
     g_assert_cmpuint(kernel_fileid, !=, collision_fileid);
     g_assert_cmpuint(kernel_fileid, !=, UINT32_MAX);
@@ -1677,7 +1785,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     f->kernel_resolution_notdir = true;
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
     f->kernel_resolution_notdir = false;
 
@@ -1685,7 +1793,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     f->kernel_ino = 2;
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
 
     f->kernel_dev = 9;
@@ -1696,7 +1804,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     f->kernel_resolution_notdir = true;
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     f->kernel_resolution_notdir = false;
     f->kernel_dev = 8;
@@ -1706,7 +1814,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
                     replacement.bytes, sizeof(replacement.bytes));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_GETATTR, kernel.bytes, 32);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
 
     f->kernel_dev = 9;
@@ -1717,7 +1825,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 36, 32);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READDIR, body, 40);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 8), ==, kernel_fileid);
     wire_cookie = reply_word(f, 12);
@@ -1725,7 +1833,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 32, wire_cookie);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READDIR, body, 40);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(f->last_seek_cookie, ==, f->backend_cookie);
 
@@ -1734,7 +1842,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 32, 0);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READDIR, body, 40);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     wire_cookie = reply_word(f, 12);
     g_assert_cmpuint(wire_cookie, !=, 0);
@@ -1742,7 +1850,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 32, wire_cookie);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READDIR, body, 40);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(f->last_seek_cookie, ==, 0);
 
@@ -1750,7 +1858,7 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 36, 4);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_READDIR, body, 40);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 5), ==, ONC_RPC_GARBAGE_ARGS);
 
     f->replace_child_after_lstat = true;
@@ -1759,14 +1867,14 @@ static void test_identity_and_v2_mappings(Fixture *f, gconstpointer opaque)
     memcpy(body + 36, "kernel", 6);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_LOOKUP, body, 44);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
 
     f->replace_parent_on_second_child_lstat = true;
     f->child_lstat_calls = 0;
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_LOOKUP, body, 44);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_STALE);
 }
 
@@ -1782,7 +1890,7 @@ static void test_v3_wire_semantics(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_counted_opaque(&w, file.bytes, 32, 32));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 1,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 8), ==, 0555);
 
     onc_rpc_xdr_writer_init(&w, body, sizeof(body));
@@ -1792,7 +1900,7 @@ static void test_v3_wire_semantics(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, 8));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 6,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 22);
 }
 
@@ -1800,7 +1908,7 @@ static void make_writable(Fixture *f)
 {
     nfs2_server_free(f->server);
     f->fse.export_flags = V9FS_SM_MAPPED;
-    f->server = nfs2_server_new("fake-nfs", true, &transport, f,
+    f->server = nfs2_server_new("fake-nfs", "testnet", true, &transport, f,
                                 &error_abort);
 }
 
@@ -1815,11 +1923,11 @@ static void test_mutations(Fixture *f, gconstpointer opaque)
     /* Read-only rejection precedes even a missing procedure body. */
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_SETATTR, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_ROFS);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3,
                    7, NULL, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 30);
     g_assert_cmpuint(f->mutation_calls, ==, 0);
 
@@ -1839,7 +1947,7 @@ static void test_mutations(Fixture *f, gconstpointer opaque)
     stl_be_p(body + 60, 13);
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_SETATTR, body, 64);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFS_OK);
     g_assert_cmpuint(f->kernel_mode & 07777, ==, 0640);
     g_assert_cmpint(f->kernel_size, ==, 9);
@@ -1855,7 +1963,7 @@ static void test_mutations(Fixture *f, gconstpointer opaque)
                                                NFS2_MAX_DATA));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 7,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(reply_word(f, 7), ==, 1);  /* pre-op WCC */
     g_assert_cmpuint(reply_word(f, 14), ==, 1); /* post-op attrs */
@@ -1871,7 +1979,7 @@ static void test_mutations(Fixture *f, gconstpointer opaque)
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 21,
                    body, onc_rpc_xdr_writer_size(&w));
     stl_be_p(call, 0x434f4d4d);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpmem(f->reply->data + f->reply->len - 8, 8,
                     verifier, sizeof(verifier));
@@ -1945,11 +2053,11 @@ static void send_nfs(Fixture *f, uint32_t version, uint32_t proc,
                           proc, body, body_len);
 
     stl_be_p(call, ++f->mutation_xid);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, expected);
     g_byte_array_append(first_reply, f->reply->data, f->reply->len);
     calls = f->mutation_calls;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(f->mutation_calls, ==, calls);
     g_assert_cmpmem(f->reply->data, f->reply->len,
                     first_reply->data, first_reply->len);
@@ -2193,10 +2301,11 @@ static void receive_async(Fixture *f, const uint8_t *call, size_t len,
         .sin_family = AF_INET, .sin_port = htons(port),
         .sin_addr.s_addr = htonl(0x0a00020f),
     };
+    OncRpcRequest *request = test_request_new(f, &peer, call, len);
 
-    g_assert_cmpint(nfs2_server_receive(f->server, NFS2_SERVICE_NFS,
-                                        &peer, call, len, &error_abort), ==,
+    g_assert_cmpint(nfs2_server_receive(f->server, request, &error_abort), ==,
                     0);
+    onc_rpc_request_unref(request);
 }
 
 static void drain(Fixture *f)
@@ -2222,40 +2331,40 @@ static void test_duplicate_cache(Fixture *f, gconstpointer opaque)
     kernel = lookup(f, 3, &root, "kernel");
     len = commit_call(call, sizeof(call), &kernel, 0xabc, 0);
 
-    request_peer(f, NFS2_SERVICE_NFS, call, len, 900);
+    request_peer(f, call, len, 900);
     calls = f->mutation_calls;
     g_byte_array_append(first_reply, f->reply->data, f->reply->len);
-    request_peer(f, NFS2_SERVICE_NFS, call, len, 900);
+    request_peer(f, call, len, 900);
     g_assert_cmpuint(f->mutation_calls, ==, calls);
     g_assert_cmpmem(f->reply->data, f->reply->len,
                     first_reply->data, first_reply->len);
 
     memcpy(changed, call, len);
     stl_be_p(changed + len - 4, 1);
-    request_peer(f, NFS2_SERVICE_NFS, changed, len, 900);
+    request_peer(f, changed, len, 900);
     g_assert_cmpuint(f->mutation_calls, ==, ++calls);
-    request_peer(f, NFS2_SERVICE_NFS, call, len, 901);
+    request_peer(f, call, len, 901);
     g_assert_cmpuint(f->mutation_calls, ==, ++calls);
 
     f->clock_ms = 60000;
-    request_peer(f, NFS2_SERVICE_NFS, call, len, 900);
+    request_peer(f, call, len, 900);
     g_assert_cmpuint(f->mutation_calls, ==, ++calls);
 
     len = commit_call(call, sizeof(call), &kernel, 0xabd, 0);
     f->mutation_error = EIO;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 5);
     calls = f->mutation_calls;
     g_byte_array_set_size(first_reply, 0);
     g_byte_array_append(first_reply, f->reply->data, f->reply->len);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(f->mutation_calls, ==, calls);
     g_assert_cmpmem(f->reply->data, f->reply->len,
                     first_reply->data, first_reply->len);
     f->mutation_error = 0;
 
     nfs2_server_reset(f->server);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(f->mutation_calls, ==, calls + 1);
 
     /* Completed-only LRU: the 257th key evicts the oldest completed key. */
@@ -2266,11 +2375,11 @@ static void test_duplicate_cache(Fixture *f, gconstpointer opaque)
         if (xid == 1) {
             memcpy(first, call, len);
         }
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
     }
     len = commit_call(call, sizeof(call), &kernel, 257, 0);
-    request(f, NFS2_SERVICE_NFS, call, len);
-    request(f, NFS2_SERVICE_NFS, first, len);
+    request(f, call, len);
+    request(f, first, len);
     g_assert_cmpuint(f->mutation_calls, ==, calls + 258);
 
     /* All entries in flight: refuse the 257th without executing it. */
@@ -2294,6 +2403,63 @@ static void test_duplicate_cache(Fixture *f, gconstpointer opaque)
     g_assert_cmpuint(f->mutation_calls, ==, calls + 256);
 }
 
+static void test_duplicate_key_includes_call_identity(Fixture *f,
+                                                       gconstpointer opaque)
+{
+    const struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_port = htons(900),
+        .sin_addr.s_addr = htonl(0x0a00020f),
+    };
+    Nfs2FileHandle root;
+    uint8_t body[64];
+    OncRpcXdrWriter writer;
+    OncRpcRequest *request;
+    unsigned int calls;
+
+    make_writable(f);
+    root = mount_root(f, 3);
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, root.bytes,
+                                                 sizeof(root.bytes),
+                                                 sizeof(root.bytes)));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, "kernel", 6,
+                                                 NFS2_MAX_NAME));
+
+    request = test_request_new_synthetic(f, &peer, body,
+                                         onc_rpc_xdr_writer_size(&writer),
+                                         0x4444, 12); /* REMOVE */
+    g_assert_cmpint(nfs2_server_receive(f->server, request, &error_abort), ==,
+                    0);
+    onc_rpc_request_unref(request);
+    drain(f);
+    calls = f->mutation_calls;
+
+    request = test_request_new_synthetic(f, &peer, body,
+                                         onc_rpc_xdr_writer_size(&writer),
+                                         0x4444, 13); /* RMDIR */
+    g_assert_cmpint(nfs2_server_receive(f->server, request, &error_abort), ==,
+                    0);
+    onc_rpc_request_unref(request);
+    drain(f);
+    g_assert_cmpuint(f->mutation_calls, >, calls);
+}
+
+static void test_transport_ownership_hooks_pair(Fixture *f,
+                                                gconstpointer opaque)
+{
+    Nfs2TransportOps unpaired = transport;
+    Error *error = NULL;
+    Nfs2Server *server;
+
+    unpaired.request_unref = NULL;
+    server = nfs2_server_new("fake-nfs", "testnet", false, &unpaired, f,
+                             &error);
+    g_assert_null(server);
+    g_assert_nonnull(error);
+    error_free(error);
+}
+
 static void test_auth_sys_and_readonly_fsdev(Fixture *f,
                                              gconstpointer opaque)
 {
@@ -2306,7 +2472,8 @@ static void test_auth_sys_and_readonly_fsdev(Fixture *f,
     gid_t gid = getgid();
     size_t len;
 
-    rejected = nfs2_server_new("fake-nfs", true, &transport, f, &error);
+    rejected = nfs2_server_new("fake-nfs", "testnet", true, &transport, f,
+                                &error);
     g_assert_null(rejected);
     g_assert_nonnull(error);
     error_free(error);
@@ -2321,7 +2488,7 @@ static void test_auth_sys_and_readonly_fsdev(Fixture *f,
     g_assert_true(onc_rpc_xdr_put_u32(&w, 0));
     len = rpc_call_auth_sys(call, sizeof(call), 3, 21, body,
                             onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
     g_assert_cmpuint(getuid(), ==, uid);
     g_assert_cmpuint(getgid(), ==, gid);
@@ -2336,6 +2503,8 @@ static void test_mutation_lifetime(Fixture *f, gconstpointer opaque)
     unsigned int sends;
     unsigned int refs;
     unsigned int unrefs;
+    unsigned int owner_refs;
+    unsigned int owner_unrefs;
 
     make_writable(f);
     root = mount_root(f, 3);
@@ -2343,6 +2512,8 @@ static void test_mutation_lifetime(Fixture *f, gconstpointer opaque)
     sends = f->send_count;
     refs = f->request_refs;
     unrefs = f->request_unrefs;
+    owner_refs = f->owner_refs;
+    owner_unrefs = f->owner_unrefs;
     len = commit_call(call, sizeof(call), &kernel, 0x1001, 0);
     receive_async(f, call, len, 900);
     len = commit_call(call, sizeof(call), &kernel, 0x1002, 0);
@@ -2350,11 +2521,14 @@ static void test_mutation_lifetime(Fixture *f, gconstpointer opaque)
     g_assert_true(nfs2_server_busy(f->server));
     g_assert_cmpuint(f->request_refs, ==, refs + 2);
     g_assert_cmpuint(f->request_unrefs, ==, unrefs);
+    g_assert_cmpuint(f->owner_refs, ==, owner_refs + 2);
+    g_assert_cmpuint(f->owner_unrefs, ==, owner_unrefs);
     nfs2_server_reset(f->server);
     nfs2_server_begin_close(f->server);
     drain(f);
     g_assert_cmpuint(f->send_count, ==, sends);
     g_assert_cmpuint(f->request_unrefs, ==, unrefs + 2);
+    g_assert_cmpuint(f->owner_unrefs, ==, owner_unrefs + 2);
     nfs2_server_free(f->server);
     f->server = NULL;
 }
@@ -2377,7 +2551,7 @@ static void test_review_commit_vector(Fixture *f, gconstpointer opaque)
     g_assert_true(onc_rpc_xdr_put_u32(&w, UINT32_MAX));
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 3, 21,
                    body, onc_rpc_xdr_writer_size(&w));
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, 0);
 }
 
@@ -2401,7 +2575,7 @@ static void test_review_v2_write_totalcount(Fixture *f,
     len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, 2,
                    NFS2_NFSPROC_WRITE, body, onc_rpc_xdr_writer_size(&w));
     stl_be_p(call, 0x56454354);
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFS_OK);
 }
 
@@ -2420,7 +2594,7 @@ static void test_review_unregistered_remove_inode_zero(Fixture *f,
     f->object_mode = S_IFREG | 0600;
     g_strlcpy(f->object_name, "preexisting", sizeof(f->object_name));
     f->fse.export_flags = V9FS_SM_MAPPED;
-    f->server = nfs2_server_new("fake-nfs", true, &transport, f,
+    f->server = nfs2_server_new("fake-nfs", "testnet", true, &transport, f,
                                 &error_abort);
     root = mount_root(f, 3);
 
@@ -2450,11 +2624,11 @@ static void test_review_readonly_mutation_cache(Fixture *f,
                               v2_procs[i], NULL, 0);
 
         stl_be_p(call, 0x2000 + i);
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 6), ==, NFS2_NFSERR_ROFS);
         g_byte_array_set_size(first, 0);
         g_byte_array_append(first, f->reply->data, f->reply->len);
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpmem(f->reply->data, f->reply->len,
                         first->data, first->len);
         expected_clock_calls += 3;
@@ -2465,11 +2639,11 @@ static void test_review_readonly_mutation_cache(Fixture *f,
                               v3_procs[i], NULL, 0);
 
         stl_be_p(call, 0x3000 + i);
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 6), ==, 30);
         g_byte_array_set_size(first, 0);
         g_byte_array_append(first, f->reply->data, f->reply->len);
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpmem(f->reply->data, f->reply->len,
                         first->data, first->len);
         expected_clock_calls += 3;
@@ -2497,7 +2671,7 @@ static void test_review_reset_suppresses_and_reentrant(Fixture *f,
 
     stl_be_p(call, 0x52535432);
     f->reset_on_send = true;
-    request(f, NFS2_SERVICE_NFS, call, len);
+    request(f, call, len);
     g_assert_false(f->reset_on_send);
     g_assert_false(nfs2_server_busy(f->server));
 }
@@ -2903,7 +3077,7 @@ static void test_review_link_alias_lifecycle(Fixture *f,
         len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
                        NFS2_NFSPROC_GETATTR, body,
                        onc_rpc_xdr_writer_size(&w));
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 6), ==, 0);
 
         onc_rpc_xdr_writer_init(&w, body, sizeof(body));
@@ -2922,7 +3096,7 @@ static void test_review_link_alias_lifecycle(Fixture *f,
         len = rpc_call(call, sizeof(call), NFS2_NFS_PROGRAM, version,
                        NFS2_NFSPROC_READ, body,
                        onc_rpc_xdr_writer_size(&w));
-        request(f, NFS2_SERVICE_NFS, call, len);
+        request(f, call, len);
         g_assert_cmpuint(reply_word(f, 6), ==, 0);
         g_assert_cmpmem(f->reply->data + f->reply->len - 8, 6,
                         "NetBSD", 6);
@@ -2942,8 +3116,6 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qemu_init_main_loop(&error_abort);
-    g_test_add("/nfs/server/portmap-dual", Fixture, NULL, setup,
-               test_portmap_dual, teardown);
     g_test_add("/nfs/server/v2-bootstrap", Fixture, NULL, setup,
                test_v2_bootstrap, teardown);
     g_test_add("/nfs/server/v3-kernel-flow", Fixture, NULL, setup,
@@ -2980,6 +3152,10 @@ int main(int argc, char **argv)
                setup, test_auth_sys_and_readonly_fsdev, teardown);
     g_test_add("/nfs/cache/reset-close-inflight-lifetime", Fixture, NULL,
                setup, test_mutation_lifetime, teardown);
+    g_test_add("/nfs/cache/key-includes-call-identity", Fixture, NULL,
+               setup, test_duplicate_key_includes_call_identity, teardown);
+    g_test_add("/nfs/server/transport-ownership-hooks-pair", Fixture, NULL,
+               setup, test_transport_ownership_hooks_pair, teardown);
     g_test_add("/nfs/review/commit-vector", Fixture, NULL, setup,
                test_review_commit_vector, teardown);
     g_test_add("/nfs/review/v2-write-totalcount", Fixture, NULL, setup,

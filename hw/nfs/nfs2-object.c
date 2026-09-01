@@ -5,8 +5,8 @@
 #include "hw/nfs/nfs2-server.h"
 #include "migration/blocker.h"
 #include "net/slirp-bootp.h"
-#include "net/slirp-udp.h"
 #include "qapi/error.h"
+#include "system/qtest.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
@@ -15,17 +15,6 @@
 
 #define TYPE_NFS_SERVER "nfs-server"
 OBJECT_DECLARE_SIMPLE_TYPE(NfsServerObject, NFS_SERVER)
-
-typedef struct NfsEndpoint {
-    Nfs2Service service;
-    uint16_t port;
-} NfsEndpoint;
-
-static const NfsEndpoint endpoints[] = {
-    { NFS2_SERVICE_PORTMAP, 111 },
-    { NFS2_SERVICE_MOUNT, 635 },
-    { NFS2_SERVICE_NFS, 2049 },
-};
 
 struct NfsServerObject {
     Object parent_obj;
@@ -36,11 +25,58 @@ struct NfsServerObject {
     bool completed;
     bool reset_registered;
     Nfs2Server *server;
+    QemuSlirpRpcRegistration *test_rpc_registration;
     QemuSlirpBootpRootLease *bootp_lease;
-    QemuSlirpUdpListener *listeners[G_N_ELEMENTS(endpoints)];
     Error *migration_blocker;
     ResettableState reset_state;
 };
+
+#define NFS_TEST_RPC_PROGRAM 200001U
+#define NFS_TEST_RPC_VERSION 1U
+#define NFS_TEST_RPC_PORT 4001U
+
+static OncRpcDispatchResult nfs_test_rpc_dispatch(
+    OncRpcRequest *request, const OncRpcCall *call, void *opaque)
+{
+    uint8_t reply[32];
+    OncRpcXdrWriter writer;
+
+    (void)opaque;
+    onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
+    if (!onc_rpc_reply_success(&writer, call->xid) ||
+        !onc_rpc_request_reply(request, reply,
+                               onc_rpc_xdr_writer_size(&writer))) {
+        return ONC_RPC_DISPATCH_DROP;
+    }
+    return ONC_RPC_DISPATCH_REPLIED;
+}
+
+static bool nfs_test_rpc_enabled(void)
+{
+    return qtest_enabled() &&
+           g_strcmp0(g_getenv("QEMU_NFS_TEST_RPC"), "1") == 0;
+}
+
+static bool nfs_test_rpc_register(NfsServerObject *object, Error **errp)
+{
+    const OncRpcProgram program = {
+        .program = NFS_TEST_RPC_PROGRAM,
+        .version_low = NFS_TEST_RPC_VERSION,
+        .version_high = NFS_TEST_RPC_VERSION,
+        .port = NFS_TEST_RPC_PORT,
+        .transports = ONC_RPC_TRANSPORT_UDP,
+        .dispatch = nfs_test_rpc_dispatch,
+    };
+
+    return qemu_slirp_rpc_register(object->netdev_id, &program,
+                                   &object->test_rpc_registration, errp) == 0;
+}
+
+static void nfs_test_rpc_unregister(NfsServerObject *object)
+{
+    qemu_slirp_rpc_unregister(object->test_rpc_registration);
+    object->test_rpc_registration = NULL;
+}
 
 static bool nfs_server_properties_mutable(NfsServerObject *object,
                                           Error **errp)
@@ -116,21 +152,6 @@ static void nfs_server_set_writable(Object *obj, bool value, Error **errp)
     }
 }
 
-static int nfs_server_transport_send(Nfs2Service service,
-                                     const struct sockaddr_in *peer,
-                                     const uint8_t *data, size_t len,
-                                     void *opaque)
-{
-    NfsServerObject *object = opaque;
-
-    for (size_t i = 0; i < G_N_ELEMENTS(endpoints); i++) {
-        if (endpoints[i].service == service && object->listeners[i]) {
-            return qemu_slirp_udp_send(object->listeners[i], peer, data, len);
-        }
-    }
-    return -ENOTCONN;
-}
-
 static int64_t nfs_server_clock_ms(void *opaque)
 {
     return qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
@@ -147,41 +168,14 @@ static void nfs_server_request_unref(void *opaque)
 }
 
 static const Nfs2TransportOps nfs_server_transport_ops = {
-    .send = nfs_server_transport_send,
     .clock_ms = nfs_server_clock_ms,
     .request_ref = nfs_server_request_ref,
     .request_unref = nfs_server_request_unref,
 };
 
-static void nfs_server_datagram(QemuSlirpUdpListener *listener,
-                                const struct sockaddr_in *peer,
-                                const uint8_t *data, size_t len,
-                                void *opaque)
-{
-    NfsServerObject *object = opaque;
-    Error *local_err = NULL;
-
-    if (!object->completed || !object->server) {
-        return;
-    }
-    for (size_t i = 0; i < G_N_ELEMENTS(endpoints); i++) {
-        if (object->listeners[i] != listener) {
-            continue;
-        }
-        if (nfs2_server_receive(object->server, endpoints[i].service, peer,
-                                data, len, &local_err) < 0) {
-            error_free(local_err);
-        }
-        return;
-    }
-}
-
-static const QemuSlirpUdpListenerOps nfs_server_listener_ops = {
-    .datagram = nfs_server_datagram,
-};
-
 static void nfs_server_cleanup(NfsServerObject *object)
 {
+    nfs_test_rpc_unregister(object);
     if (object->server) {
         nfs2_server_begin_close(object->server);
     }
@@ -191,12 +185,6 @@ static void nfs_server_cleanup(NfsServerObject *object)
     }
     if (object->migration_blocker) {
         migrate_del_blocker(&object->migration_blocker);
-    }
-    for (size_t i = G_N_ELEMENTS(endpoints); i > 0; i--) {
-        QemuSlirpUdpListener *listener = object->listeners[i - 1];
-
-        object->listeners[i - 1] = NULL;
-        qemu_slirp_udp_listener_remove(listener);
     }
     qemu_slirp_bootp_root_release(&object->bootp_lease);
     if (object->server && !nfs2_server_busy(object->server)) {
@@ -247,21 +235,25 @@ static void nfs_server_complete(UserCreatable *uc, Error **errp)
         return;
     }
 
-    object->server = nfs2_server_new(object->fsdev_id, object->writable,
-                                     &nfs_server_transport_ops, object, errp);
-    if (!object->server) {
-        return;
-    }
     if (!qemu_slirp_bootp_root_claim(object->netdev_id, object->root_path,
                                      &object->bootp_lease, errp)) {
+        return;
+    }
+    object->server = nfs2_server_new(object->fsdev_id, object->netdev_id,
+                                     object->writable,
+                                     &nfs_server_transport_ops, object, errp);
+    if (!object->server) {
         goto fail;
     }
-    for (size_t i = 0; i < G_N_ELEMENTS(endpoints); i++) {
-        if (qemu_slirp_udp_listen(object->netdev_id, endpoints[i].port,
-                                  &nfs_server_listener_ops, object,
-                                  &object->listeners[i], errp) < 0) {
-            goto fail;
-        }
+    /*
+     * qtest runs in a separate process from its test code, so it cannot call
+     * the registry API directly.  A test-only environment switch adds one
+     * independent registration to this object; the qtest then exercises the
+     * real shared PMAP DUMP with NFS and this second program in one SLiRP
+     * stack.  Normal QEMU invocations never enable it.
+     */
+    if (nfs_test_rpc_enabled() && !nfs_test_rpc_register(object, errp)) {
+        goto fail;
     }
     error_setg(&object->migration_blocker,
                "NFS server listener and file-handle state is not migratable");

@@ -3,24 +3,6 @@
 
 #include "hw/nfs/nfs2-xdr.h"
 
-bool nfs2_xdr_decode_pmap_getport(OncRpcXdrReader *r,
-                                  Nfs2PmapGetPortArgs *args)
-{
-    OncRpcXdrReader tmp = *r;
-    Nfs2PmapGetPortArgs value;
-
-    if (!onc_rpc_xdr_u32(&tmp, &value.program) ||
-        !onc_rpc_xdr_u32(&tmp, &value.version) ||
-        !onc_rpc_xdr_u32(&tmp, &value.protocol) ||
-        !onc_rpc_xdr_u32(&tmp, &value.port) ||
-        !onc_rpc_xdr_reader_empty(&tmp)) {
-        return false;
-    }
-    *args = value;
-    *r = tmp;
-    return true;
-}
-
 bool nfs2_xdr_decode_mount_mnt(OncRpcXdrReader *r, Nfs2MountMntArgs *args)
 {
     OncRpcXdrReader tmp = *r;

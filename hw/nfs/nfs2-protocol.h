@@ -1,18 +1,11 @@
 #ifndef HW_NFS_NFS2_PROTOCOL_H
 #define HW_NFS_NFS2_PROTOCOL_H
 
-#define NFS2_PMAP_PROGRAM 100000U
 #define NFS2_NFS_PROGRAM 100003U
 #define NFS2_MOUNT_PROGRAM 100005U
 
-#define NFS2_PMAP_VERSION 2U
 #define NFS2_MOUNT_VERSION 1U
 #define NFS2_NFS_VERSION 2U
-
-#define NFS2_PORT_PMAP 111U
-#define NFS2_PORT_MOUNT 635U
-#define NFS2_PORT_NFS 2049U
-#define NFS2_IPPROTO_UDP 17U
 
 #define NFS2_MAX_DATA (8U * 1024U)
 #define NFS2_MAX_PATH 1024U
@@ -21,15 +14,6 @@
 #define NFS2_MAX_HANDLE_RECORDS 65536U
 #define NFS2_DUP_CACHE_SIZE 256U
 #define NFS2_DUP_CACHE_SECONDS 60U
-
-typedef enum Nfs2PmapProcedure {
-    NFS2_PMAP_NULL = 0,
-    NFS2_PMAP_SET = 1,
-    NFS2_PMAP_UNSET = 2,
-    NFS2_PMAP_GETPORT = 3,
-    NFS2_PMAP_DUMP = 4,
-    NFS2_PMAP_CALLIT = 5,
-} Nfs2PmapProcedure;
 
 typedef enum Nfs2MountProcedure {
     NFS2_MOUNT_NULL = 0,
@@ -94,13 +78,6 @@ typedef enum Nfs2FileType {
 typedef struct Nfs2FileHandle {
     uint8_t bytes[NFS2_FHSIZE];
 } Nfs2FileHandle;
-
-typedef struct Nfs2PmapGetPortArgs {
-    uint32_t program;
-    uint32_t version;
-    uint32_t protocol;
-    uint32_t port;
-} Nfs2PmapGetPortArgs;
 
 typedef struct Nfs2MountMntArgs {
     char path[NFS2_MAX_PATH + 1];

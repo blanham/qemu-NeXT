@@ -39,6 +39,9 @@ typedef struct NfsDuplicateEntry {
     uint32_t address;
     uint16_t port;
     uint32_t xid;
+    uint32_t program;
+    uint32_t version;
+    uint32_t procedure;
     uint8_t digest[32];
     int64_t completed_at;
     uint64_t last_used;
@@ -137,11 +140,8 @@ typedef struct BackendWork {
 
 typedef struct Nfs2Request {
     Nfs2Server *server;
-    Nfs2Service service;
-    struct sockaddr_in peer;
-    size_t length;
+    OncRpcRequest *rpc_request;
     NfsDuplicateEntry *duplicate;
-    uint8_t data[];
 } Nfs2Request;
 
 typedef struct NfsIdentityKey {
@@ -165,6 +165,8 @@ struct Nfs2Server {
     Nfs2FileHandle root_handle;
     Nfs2TransportOps transport;
     void *transport_opaque;
+    QemuSlirpRpcRegistration *mount_registration;
+    QemuSlirpRpcRegistration *nfs_registration;
     unsigned int pending;
     bool writable;
     bool closing;
@@ -190,11 +192,15 @@ static int64_t server_now_ms(Nfs2Server *server)
 }
 
 static bool duplicate_matches(const NfsDuplicateEntry *entry,
-                              const struct sockaddr_in *peer, uint32_t xid,
+                              const struct sockaddr_in *peer,
+                              const OncRpcCall *call,
                               const uint8_t digest[32])
 {
     return !entry->abandoned && entry->address == peer->sin_addr.s_addr &&
-           entry->port == peer->sin_port && entry->xid == xid &&
+           entry->port == peer->sin_port && entry->xid == call->xid &&
+           entry->program == call->program &&
+           entry->version == call->version &&
+           entry->procedure == call->procedure &&
            !memcmp(entry->digest, digest, 32);
 }
 
@@ -212,21 +218,19 @@ static void duplicate_expire(Nfs2Server *server, int64_t now)
     }
 }
 
-static bool request_is_mutation(Nfs2Server *server, Nfs2Service service,
-                                const uint8_t *data, size_t len,
+static bool request_is_mutation(const OncRpcRequest *request,
                                 uint32_t *xid)
 {
-    OncRpcCall call;
+    const OncRpcCall *call;
 
-    if (service != NFS2_SERVICE_NFS ||
-        onc_rpc_decode_call(data, len, &call) != ONC_RPC_DECODE_OK ||
-        call.program != NFS2_NFS_PROGRAM) {
+    call = onc_rpc_request_call(request);
+    if (!call || call->program != NFS2_NFS_PROGRAM) {
         return false;
     }
-    *xid = call.xid;
-    return (call.version == NFS2_NFS_VERSION &&
-            is_v2_mutator(call.procedure)) ||
-           (call.version == NFS3_VERSION && is_v3_mutator(call.procedure));
+    *xid = call->xid;
+    return (call->version == NFS2_NFS_VERSION &&
+            is_v2_mutator(call->procedure)) ||
+           (call->version == NFS3_VERSION && is_v3_mutator(call->procedure));
 }
 
 static void path_clear(V9fsPath *path)
@@ -1467,71 +1471,9 @@ static bool write_nfs_status(OncRpcXdrWriter *w, uint32_t status)
     return onc_rpc_xdr_put_u32(w, status);
 }
 
-static int service_program(Nfs2Service service)
-{
-    switch (service) {
-    case NFS2_SERVICE_PORTMAP: return NFS2_PMAP_PROGRAM;
-    case NFS2_SERVICE_MOUNT: return NFS2_MOUNT_PROGRAM;
-    case NFS2_SERVICE_NFS: return NFS2_NFS_PROGRAM;
-    default: return -1;
-    }
-}
-
-static bool service_version(Nfs2Service service, uint32_t version)
-{
-    if (service == NFS2_SERVICE_PORTMAP) {
-        return version == NFS2_PMAP_VERSION;
-    }
-    if (service == NFS2_SERVICE_MOUNT) {
-        return version == NFS2_MOUNT_VERSION || version == MOUNT3_VERSION;
-    }
-    return version == NFS2_NFS_VERSION || version == NFS3_VERSION;
-}
-
 static bool body_empty(const OncRpcCall *call)
 {
     return onc_rpc_xdr_reader_empty(&call->body);
-}
-
-static int port_for_mapping(const Nfs2PmapGetPortArgs *args)
-{
-    if (args->protocol != NFS2_IPPROTO_UDP) {
-        return 0;
-    }
-    if (args->program == NFS2_PMAP_PROGRAM &&
-        args->version == NFS2_PMAP_VERSION) {
-        return NFS2_PORT_PMAP;
-    }
-    if (args->program == NFS2_MOUNT_PROGRAM &&
-        (args->version == NFS2_MOUNT_VERSION ||
-         args->version == MOUNT3_VERSION)) {
-        return NFS2_PORT_MOUNT;
-    }
-    if (args->program == NFS2_NFS_PROGRAM &&
-        (args->version == NFS2_NFS_VERSION || args->version == NFS3_VERSION)) {
-        return NFS2_PORT_NFS;
-    }
-    return 0;
-}
-
-static bool coroutine_fn dispatch_portmap(OncRpcCall *call,
-                                          OncRpcXdrWriter *w)
-{
-    Nfs2PmapGetPortArgs args;
-
-    switch (call->procedure) {
-    case NFS2_PMAP_NULL:
-        return body_empty(call) ? onc_rpc_reply_success(w, call->xid) :
-                                  onc_rpc_reply_garbage_args(w, call->xid);
-    case NFS2_PMAP_GETPORT:
-        if (!nfs2_xdr_decode_pmap_getport(&call->body, &args)) {
-            return onc_rpc_reply_garbage_args(w, call->xid);
-        }
-        return onc_rpc_reply_success(w, call->xid) &&
-               onc_rpc_xdr_put_u32(w, port_for_mapping(&args));
-    default:
-        return onc_rpc_reply_proc_unavail(w, call->xid);
-    }
 }
 
 static bool coroutine_fn dispatch_mount(Nfs2Server *server,
@@ -1539,6 +1481,13 @@ static bool coroutine_fn dispatch_mount(Nfs2Server *server,
                                         OncRpcXdrWriter *w)
 {
     Nfs2MountMntArgs args;
+
+    if (call->version != NFS2_MOUNT_VERSION &&
+        call->version != MOUNT3_VERSION) {
+        return onc_rpc_reply_prog_mismatch(w, call->xid,
+                                           NFS2_MOUNT_VERSION,
+                                           MOUNT3_VERSION);
+    }
 
     switch (call->procedure) {
     case NFS2_MOUNT_NULL:
@@ -3300,7 +3249,13 @@ static bool coroutine_fn dispatch_nfs_mutation(Nfs2Server *server,
 static bool coroutine_fn dispatch_nfs(Nfs2Server *server, OncRpcCall *call,
                                       OncRpcXdrWriter *w)
 {
-    bool v3 = call->version == NFS3_VERSION;
+    bool v3;
+
+    if (call->version != NFS2_NFS_VERSION && call->version != NFS3_VERSION) {
+        return onc_rpc_reply_prog_mismatch(w, call->xid, NFS2_NFS_VERSION,
+                                           NFS3_VERSION);
+    }
+    v3 = call->version == NFS3_VERSION;
 
     if ((!v3 && is_v2_mutator(call->procedure)) ||
         (v3 && is_v3_mutator(call->procedure))) {
@@ -3366,39 +3321,19 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, OncRpcCall *call,
 }
 
 static bool coroutine_fn dispatch_request(Nfs2Request *request,
+                                          const OncRpcCall *incoming,
                                           OncRpcXdrWriter *w)
 {
     OncRpcCall call;
-    OncRpcDecodeResult decode;
-    int expected_program = service_program(request->service);
 
-    decode = onc_rpc_decode_call(request->data, request->length, &call);
-    if (decode != ONC_RPC_DECODE_OK) {
-        uint32_t xid = request->length >= 4 ? ldl_be_p(request->data) : 0;
-
-        if (decode == ONC_RPC_DECODE_RPC_MISMATCH) {
-            return onc_rpc_reply_rpc_mismatch(w, xid, ONC_RPC_VERSION,
-                                                ONC_RPC_VERSION);
-        }
-        if (decode == ONC_RPC_DECODE_AUTH_ERROR) {
-            return onc_rpc_reply_auth_error(w, xid, ONC_RPC_AUTH_BADCRED);
-        }
-        return onc_rpc_reply_garbage_args(w, xid);
+    if (!incoming) {
+        return false;
     }
-    if (call.program != expected_program) {
-        return onc_rpc_reply_prog_unavail(w, call.xid);
-    }
-    if (!service_version(request->service, call.version)) {
-        uint32_t low = request->service == NFS2_SERVICE_PORTMAP ? 2 : 1;
-        uint32_t high = request->service == NFS2_SERVICE_PORTMAP ? 2 : 3;
-        return onc_rpc_reply_prog_mismatch(w, call.xid, low, high);
-    }
-    switch (request->service) {
-    case NFS2_SERVICE_PORTMAP:
-        return dispatch_portmap(&call, w);
-    case NFS2_SERVICE_MOUNT:
+    call = *incoming;
+    switch (call.program) {
+    case NFS2_MOUNT_PROGRAM:
         return dispatch_mount(request->server, &call, w);
-    case NFS2_SERVICE_NFS:
+    case NFS2_NFS_PROGRAM:
         return dispatch_nfs(request->server, &call, w);
     default:
         return onc_rpc_reply_prog_unavail(w, call.xid);
@@ -3411,15 +3346,14 @@ static void coroutine_fn request_entry(void *opaque)
     Nfs2Server *server = request->server;
     void (*request_unref)(void *opaque) = server->transport.request_unref;
     void *transport_opaque = server->transport_opaque;
+    const OncRpcCall *call = onc_rpc_request_call(request->rpc_request);
     uint8_t reply[ONC_RPC_MAX_DATAGRAM];
     OncRpcXdrWriter writer;
 
     onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
-    if (!dispatch_request(request, &writer)) {
+    if (!dispatch_request(request, call, &writer)) {
         onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
-        onc_rpc_reply_system_err(&writer,
-                                  request->length >= 4 ?
-                                  ldl_be_p(request->data) : 0);
+        onc_rpc_reply_system_err(&writer, call ? call->xid : 0);
     }
     if (request->duplicate) {
         NfsDuplicateEntry *entry = request->duplicate;
@@ -3436,9 +3370,8 @@ static void coroutine_fn request_entry(void *opaque)
         if (request->duplicate) {
             request->duplicate->sending = true;
         }
-        server->transport.send(request->service, &request->peer, reply,
-                               onc_rpc_xdr_writer_size(&writer),
-                               server->transport_opaque);
+        onc_rpc_request_reply(request->rpc_request, reply,
+                              onc_rpc_xdr_writer_size(&writer));
         if (request->duplicate) {
             request->duplicate->sending = false;
         }
@@ -3447,22 +3380,44 @@ static void coroutine_fn request_entry(void *opaque)
         g_ptr_array_remove(server->duplicates, request->duplicate);
     }
     server->pending--;
+    onc_rpc_request_unref(request->rpc_request);
     g_free(request);
     if (request_unref) {
         request_unref(transport_opaque);
     }
 }
 
-Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
+static OncRpcDispatchResult nfs2_rpc_dispatch(OncRpcRequest *request,
+                                               const OncRpcCall *call,
+                                               void *opaque)
+{
+    Nfs2Server *server = opaque;
+    Error *local_err = NULL;
+
+    (void)call;
+    if (nfs2_server_receive(server, request, &local_err) < 0) {
+        error_free(local_err);
+        return ONC_RPC_DISPATCH_DROP;
+    }
+    return ONC_RPC_DISPATCH_ASYNC;
+}
+
+Nfs2Server *nfs2_server_new(const char *fsdev_id, const char *netdev_id,
+                            bool writable,
                             const Nfs2TransportOps *transport,
                             void *transport_opaque, Error **errp)
 {
     Nfs2Server *server;
     uint32_t root_identity;
 
-    if (!fsdev_id || !fsdev_id[0] || !transport || !transport->send ||
-        (!!transport->request_ref != !!transport->request_unref)) {
+    if (!fsdev_id || !fsdev_id[0] || !netdev_id || !netdev_id[0] ||
+        !transport) {
         error_setg(errp, "NFS server configuration is incomplete");
+        return NULL;
+    }
+    if ((transport->request_ref == NULL) !=
+        (transport->request_unref == NULL)) {
+        error_setg(errp, "NFS request ownership callbacks must be paired");
         return NULL;
     }
     server = g_new0(Nfs2Server, 1);
@@ -3508,31 +3463,72 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, bool writable,
         nfs2_server_free(server);
         return NULL;
     }
+    {
+        const OncRpcProgram mount_program = {
+            .program = NFS2_MOUNT_PROGRAM,
+            .version_low = NFS2_MOUNT_VERSION,
+            .version_high = MOUNT3_VERSION,
+            .port = 635,
+            .transports = ONC_RPC_TRANSPORT_UDP,
+            .dispatch = nfs2_rpc_dispatch,
+            .opaque = server,
+        };
+        const OncRpcProgram nfs_program = {
+            .program = NFS2_NFS_PROGRAM,
+            .version_low = NFS2_NFS_VERSION,
+            .version_high = NFS3_VERSION,
+            .port = 2049,
+            .transports = ONC_RPC_TRANSPORT_UDP,
+            .dispatch = nfs2_rpc_dispatch,
+            .opaque = server,
+        };
+
+        if (qemu_slirp_rpc_register(netdev_id, &mount_program,
+                                    &server->mount_registration, errp) < 0 ||
+            qemu_slirp_rpc_register(netdev_id, &nfs_program,
+                                    &server->nfs_registration, errp) < 0) {
+            nfs2_server_free(server);
+            return NULL;
+        }
+    }
     return server;
 }
 
-int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
-                        const struct sockaddr_in *peer,
-                        const uint8_t *data, size_t len, Error **errp)
+int nfs2_server_receive(Nfs2Server *server, OncRpcRequest *rpc_request,
+                        Error **errp)
 {
     Nfs2Request *request;
     Coroutine *co;
     NfsDuplicateEntry *duplicate = NULL;
+    const OncRpcCall *call;
+    const struct sockaddr_in *peer;
+    const uint8_t *data;
+    size_t len;
 
-    if (!server || server->closing || !peer || peer->sin_family != AF_INET ||
-        (!data && len) || service > NFS2_SERVICE_NFS) {
-        error_setg(errp, "invalid NFS datagram");
+    if (!server || server->closing || !rpc_request) {
+        error_setg(errp, "invalid NFS RPC request");
+        return -1;
+    }
+    call = onc_rpc_request_call(rpc_request);
+    peer = onc_rpc_request_peer(rpc_request);
+    data = onc_rpc_request_data(rpc_request, &len);
+    if (!call || !peer ||
+        peer->sin_family != AF_INET || (!data && len) ||
+        onc_rpc_request_is_tcp(rpc_request) ||
+        (call->program != NFS2_MOUNT_PROGRAM &&
+         call->program != NFS2_NFS_PROGRAM)) {
+        error_setg(errp, "invalid NFS RPC request");
         return -1;
     }
     if (len > ONC_RPC_MAX_DATAGRAM) {
-        error_setg(errp, "NFS RPC datagram exceeds %u bytes",
+        error_setg(errp, "NFS RPC request exceeds %u bytes",
                    ONC_RPC_MAX_DATAGRAM);
         return -1;
     }
     {
         uint32_t xid;
 
-        if (request_is_mutation(server, service, data, len, &xid)) {
+        if (request_is_mutation(rpc_request, &xid)) {
             g_autofree uint8_t *allocated_digest = NULL;
             uint8_t *digest = allocated_digest;
             size_t digest_len = 0;
@@ -3549,7 +3545,7 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
                 NfsDuplicateEntry *entry =
                     g_ptr_array_index(server->duplicates, i);
 
-                if (!duplicate_matches(entry, peer, xid, digest)) {
+                if (!duplicate_matches(entry, peer, call, digest)) {
                     continue;
                 }
                 entry->last_used = ++server->duplicate_sequence;
@@ -3558,10 +3554,8 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
                 }
                 if (!server->closing) {
                     entry->sending = true;
-                    server->transport.send(service, peer,
-                                           entry->reply->data,
-                                           entry->reply->len,
-                                           server->transport_opaque);
+                    onc_rpc_request_reply(rpc_request, entry->reply->data,
+                                          entry->reply->len);
                     entry->sending = false;
                     if (entry->abandoned) {
                         g_ptr_array_remove(server->duplicates, entry);
@@ -3589,9 +3583,8 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
 
                     onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
                     onc_rpc_reply_system_err(&writer, xid);
-                    server->transport.send(service, peer, reply,
-                                           onc_rpc_xdr_writer_size(&writer),
-                                           server->transport_opaque);
+                    onc_rpc_request_reply(rpc_request, reply,
+                                          onc_rpc_xdr_writer_size(&writer));
                     return 0;
                 }
                 g_ptr_array_remove_index(server->duplicates, oldest_index);
@@ -3600,6 +3593,9 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
             duplicate->address = peer->sin_addr.s_addr;
             duplicate->port = peer->sin_port;
             duplicate->xid = xid;
+            duplicate->program = call->program;
+            duplicate->version = call->version;
+            duplicate->procedure = call->procedure;
             memcpy(duplicate->digest, digest, 32);
             duplicate->in_flight = true;
             duplicate->last_used = ++server->duplicate_sequence;
@@ -3607,17 +3603,14 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
             g_ptr_array_add(server->duplicates, duplicate);
         }
     }
-    request = g_malloc(sizeof(*request) + len);
+    request = g_new0(Nfs2Request, 1);
     request->server = server;
-    request->service = service;
-    request->peer = *peer;
-    request->length = len;
+    request->rpc_request = onc_rpc_request_ref(rpc_request);
     request->duplicate = duplicate;
-    memcpy(request->data, data, len);
+    server->pending++;
     if (server->transport.request_ref) {
         server->transport.request_ref(server->transport_opaque);
     }
-    server->pending++;
     co = qemu_coroutine_create(request_entry, request);
     aio_co_schedule(qemu_get_aio_context(), co);
     return 0;
@@ -3659,6 +3652,10 @@ void nfs2_server_free(Nfs2Server *server)
     }
     g_assert(!server->pending);
     server->closing = true;
+    qemu_slirp_rpc_unregister(server->nfs_registration);
+    server->nfs_registration = NULL;
+    qemu_slirp_rpc_unregister(server->mount_registration);
+    server->mount_registration = NULL;
     g_ptr_array_unref(server->duplicates);
     nfs2_handle_table_free(server->handles);
     g_hash_table_destroy(server->cookies_by_wire);

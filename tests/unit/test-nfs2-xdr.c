@@ -4,13 +4,6 @@
 #include "hw/nfs/nfs2-protocol.h"
 #include "hw/nfs/nfs2-xdr.h"
 
-static const uint8_t pmap_getport[] = {
-    0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0, 0, 2,
-    0, 1, 0x86, 0xa0, 0, 0, 0, 2, 0, 0, 0, 3,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 1, 0x86, 0xa3, 0, 0, 0, 2, 0, 0, 0, 17, 0, 0, 0, 0,
-};
-
 static const uint8_t mount_mnt_root[] = {
     0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 0, 0, 0, 0, 2,
     0, 1, 0x86, 0xa5, 0, 0, 0, 1, 0, 0, 0, 1,
@@ -56,18 +49,10 @@ static OncRpcCall decode_ok(const uint8_t *data, size_t len)
 static void test_nfs_argument_codecs(void)
 {
     OncRpcCall call;
-    Nfs2PmapGetPortArgs pmap;
     Nfs2MountMntArgs mount;
     Nfs2FileHandle handle;
     Nfs2Diropargs diropargs;
     Nfs2ReadArgs read;
-
-    call = decode_ok(pmap_getport, sizeof(pmap_getport));
-    g_assert_true(nfs2_xdr_decode_pmap_getport(&call.body, &pmap));
-    g_assert_cmpuint(pmap.program, ==, NFS2_NFS_PROGRAM);
-    g_assert_cmpuint(pmap.version, ==, NFS2_NFS_VERSION);
-    g_assert_cmpuint(pmap.protocol, ==, NFS2_IPPROTO_UDP);
-    g_assert_cmpuint(pmap.port, ==, 0);
 
     call = decode_ok(mount_mnt_root, sizeof(mount_mnt_root));
     g_assert_true(nfs2_xdr_decode_mount_mnt(&call.body, &mount));
@@ -101,11 +86,6 @@ static void test_procedure_rejections(void)
     Nfs2FileHandle handle;
     Nfs2ReadArgs read_args;
     Nfs2MountMntArgs mount_args;
-    Nfs2PmapGetPortArgs pmap_args;
-
-    call = decode_ok(pmap_getport, sizeof(pmap_getport) - 1);
-    g_assert_false(nfs2_xdr_decode_pmap_getport(&call.body, &pmap_args));
-
     memcpy(trailing, nfs_getattr, sizeof(nfs_getattr));
     memset(trailing + sizeof(nfs_getattr), 0, 4);
     call = decode_ok(trailing, sizeof(trailing));
