@@ -36,6 +36,7 @@
 #include "net/slirp-stream-internal.h"
 #include "net/slirp-udp.h"
 #include "net/slirp-udp-internal.h"
+#include "net/slirp-rpc-internal.h"
 
 
 #if defined(CONFIG_SMBD_COMMAND)
@@ -110,6 +111,7 @@ typedef struct SlirpState {
     struct in_addr vnameserver;
     QemuSlirpStreamRegistry *stream_registry;
     QemuSlirpUdpRegistry *udp_registry;
+    QemuSlirpRpcRegistry *rpc_registry;
     QemuSlirpBootpRegistry *bootp_registry;
     QemuSlirpGuestFwdRegistry *guestfwds;
     QemuSlirpPlan9Registry *plan9;
@@ -518,6 +520,7 @@ static void net_slirp_cleanup(NetClientState *nc)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
+    qemu_slirp_rpc_registry_invalidate(s->rpc_registry);
     qemu_slirp_stream_registry_invalidate(s->stream_registry);
     qemu_slirp_guestfwd_registry_invalidate(s->guestfwds);
     qemu_slirp_udp_registry_invalidate(s->udp_registry);
@@ -528,6 +531,7 @@ static void net_slirp_cleanup(NetClientState *nc)
     main_loop_poll_remove_notifier(&s->poll_notifier);
     unregister_savevm(NULL, "slirp", s->slirp);
     qemu_slirp_guestfwd_registry_free(s->guestfwds);
+    qemu_slirp_rpc_registry_free(s->rpc_registry);
     qemu_slirp_udp_registry_free(s->udp_registry);
     qemu_slirp_bootp_registry_free(s->bootp_registry);
     qemu_slirp_plan9_registry_free(s->plan9);
@@ -1067,6 +1071,8 @@ static int net_slirp_init(NetClientState *peer, const char *model,
 #else
     s->udp_registry = qemu_slirp_udp_registry_new(ipv4, host, NULL, NULL);
 #endif
+    s->rpc_registry = qemu_slirp_rpc_registry_new(s->udp_registry,
+                                                   s->stream_registry);
 #ifdef CONFIG_SLIRP_BOOTP_ROOT
     s->bootp_registry = qemu_slirp_bootp_registry_new(
         ipv4, host, &slirp_bootp_backend_ops, s);
@@ -1726,8 +1732,6 @@ void qemu_slirp_guestfwd_remove(QemuSlirpGuestFwd *handle)
     qemu_slirp_guestfwd_registry_remove(handle);
 }
 
-#if defined(CONFIG_SLIRP_TCP_SERVICE) || defined(CONFIG_SLIRP_UDP_SERVICE) || \
-    defined(CONFIG_SLIRP_BOOTP_ROOT)
 static SlirpState *qemu_slirp_named_find(const char *netdev_id, Error **errp)
 {
     NetClientState *nc = netdev_id ? qemu_find_netdev(netdev_id) : NULL;
@@ -1743,7 +1747,26 @@ static SlirpState *qemu_slirp_named_find(const char *netdev_id, Error **errp)
     }
     return DO_UPCAST(SlirpState, nc, nc);
 }
-#endif
+
+int qemu_slirp_rpc_register(const char *netdev_id,
+                            const OncRpcProgram *program,
+                            QemuSlirpRpcRegistration **registration,
+                            Error **errp)
+{
+    SlirpState *s = qemu_slirp_named_find(netdev_id, errp);
+
+    if (registration) {
+        *registration = NULL;
+    }
+    return s ? qemu_slirp_rpc_registry_register(
+                   s->rpc_registry, program, registration, errp)
+             : -1;
+}
+
+void qemu_slirp_rpc_unregister(QemuSlirpRpcRegistration *registration)
+{
+    qemu_slirp_rpc_registry_unregister(registration);
+}
 
 int qemu_slirp_stream_listen(const char *netdev_id, uint16_t port,
                              const QemuSlirpStreamOps *ops, void *opaque,

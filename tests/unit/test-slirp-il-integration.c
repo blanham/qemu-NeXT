@@ -4,6 +4,7 @@
 #include "net/slirp-bootp.h"
 #include "net/slirp-il.h"
 #include "net/slirp-plan9.h"
+#include "net/slirp-rpc-internal.h"
 #include "net/slirp-stream.h"
 #include "net/slirp-udp.h"
 #include "net/slirp.h"
@@ -464,20 +465,19 @@ static void prime_tcp_guest_arp(SlirpState *s)
     slirp_input(s->slirp, frame, sizeof(frame));
 }
 
-static StreamConnectionState *establish_tcp_stream_connection(
-    SlirpState *s, StreamState *state, uint16_t source_port)
+static uint32_t establish_tcp_guest_connection(SlirpState *s,
+                                               uint16_t source_port,
+                                               uint16_t destination_port)
 {
     const struct in_addr guest = { htonl(TCP_GUEST_ADDRESS) };
     const struct in_addr service = { htonl(TCP_SERVICE_ADDRESS) };
     uint8_t packet[SENT_PACKET_CAPACITY];
-    StreamConnectionState *connection;
     uint32_t service_seq;
-    unsigned connected_before = state->nconnections;
 
     prime_tcp_guest_arp(s);
     sent_packet_count = 0;
     sent_packet_len = 0;
-    build_tcp_packet(packet, guest, source_port, service, TCP_SERVICE_PORT,
+    build_tcp_packet(packet, guest, source_port, service, destination_port,
                      1000, 0, 0x02, NULL, 0);
     s->nc.info->receive(&s->nc, packet,
                         ETHERNET_HEADER_LEN + IPV4_HEADER_LEN +
@@ -486,29 +486,42 @@ static StreamConnectionState *establish_tcp_stream_connection(
     g_assert_cmpuint(tcp_frame_flags(), ==, 0x12);
     service_seq = tcp_frame_seq();
 
-    build_tcp_packet(packet, guest, source_port, service, TCP_SERVICE_PORT,
+    build_tcp_packet(packet, guest, source_port, service, destination_port,
                      1001, service_seq + 1, 0x10, NULL, 0);
     s->nc.info->receive(&s->nc, packet,
                         ETHERNET_HEADER_LEN + IPV4_HEADER_LEN +
                         TCP_HEADER_LEN);
+    return service_seq + 1;
+}
+
+static StreamConnectionState *establish_tcp_stream_connection(
+    SlirpState *s, StreamState *state, uint16_t source_port)
+{
+    StreamConnectionState *connection;
+    unsigned connected_before = state->nconnections;
+
+    uint32_t service_next = establish_tcp_guest_connection(
+        s, source_port, TCP_SERVICE_PORT);
+
     g_assert_cmpuint(state->nconnections, ==, connected_before + 1);
     connection = &state->connections[connected_before];
     connection->guest_next_seq = 1001;
-    connection->service_next_seq = service_seq + 1;
+    connection->service_next_seq = service_next;
     return connection;
 }
 
-static void send_tcp_guest_segment(SlirpState *s,
-                                   StreamConnectionState *connection,
-                                   uint8_t flags, const uint8_t *payload,
-                                   size_t payload_len)
+static void send_tcp_guest_segment_to(SlirpState *s,
+                                      StreamConnectionState *connection,
+                                      uint16_t destination_port, uint8_t flags,
+                                      const uint8_t *payload,
+                                      size_t payload_len)
 {
     const struct in_addr guest = { htonl(TCP_GUEST_ADDRESS) };
     const struct in_addr service = { htonl(TCP_SERVICE_ADDRESS) };
     uint8_t packet[SENT_PACKET_CAPACITY];
 
     build_tcp_packet(packet, guest, connection->source_port, service,
-                     TCP_SERVICE_PORT, connection->guest_next_seq,
+                     destination_port, connection->guest_next_seq,
                      connection->service_next_seq, flags, payload,
                      payload_len);
     s->nc.info->receive(&s->nc, packet,
@@ -520,20 +533,36 @@ static void send_tcp_guest_segment(SlirpState *s,
     }
 }
 
-static void send_tcp_guest_ack(SlirpState *s,
-                               StreamConnectionState *connection,
-                               uint32_t ack)
+static void send_tcp_guest_segment(SlirpState *s,
+                                   StreamConnectionState *connection,
+                                   uint8_t flags, const uint8_t *payload,
+                                   size_t payload_len)
+{
+    send_tcp_guest_segment_to(s, connection, TCP_SERVICE_PORT, flags, payload,
+                              payload_len);
+}
+
+static void send_tcp_guest_ack_to(SlirpState *s,
+                                  StreamConnectionState *connection,
+                                  uint16_t destination_port, uint32_t ack)
 {
     const struct in_addr guest = { htonl(TCP_GUEST_ADDRESS) };
     const struct in_addr service = { htonl(TCP_SERVICE_ADDRESS) };
     uint8_t packet[SENT_PACKET_CAPACITY];
 
     build_tcp_packet(packet, guest, connection->source_port, service,
-                     TCP_SERVICE_PORT, connection->guest_next_seq, ack, 0x10,
+                     destination_port, connection->guest_next_seq, ack, 0x10,
                      NULL, 0);
     s->nc.info->receive(&s->nc, packet,
                         ETHERNET_HEADER_LEN + IPV4_HEADER_LEN +
                         TCP_HEADER_LEN);
+}
+
+static void send_tcp_guest_ack(SlirpState *s,
+                               StreamConnectionState *connection,
+                               uint32_t ack)
+{
+    send_tcp_guest_ack_to(s, connection, TCP_SERVICE_PORT, ack);
 }
 #endif
 
@@ -582,24 +611,31 @@ static void learn_client_arp(SlirpState *s)
     sent_packet_len = 0;
 }
 
-static void send_udp_request(SlirpState *s, uint16_t port,
-                             const uint8_t *payload, size_t payload_len)
+static void send_udp_request_to(SlirpState *s, uint32_t destination,
+                                uint16_t port, const uint8_t *payload,
+                                size_t payload_len)
 {
     static const uint8_t mac[] = { 0x00, 0x00, 0x0f, 0x12, 0x34, 0x56 };
-    uint8_t packet[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN + 32]
-        = {0};
+    bool directed_broadcast = destination == 0x0a0002ffU;
+    uint8_t packet[SENT_PACKET_CAPACITY] = {0};
     uint8_t *ip_header = packet + ETHERNET_HEADER_LEN;
     uint8_t *udp = ip_header + IPV4_HEADER_LEN;
     size_t length = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN +
                     payload_len;
 
-    g_assert_cmpuint(payload_len, <=, 32);
-    packet[0] = 0x52;
-    packet[1] = 0x55;
-    packet[2] = 10;
-    packet[3] = 0;
-    packet[4] = 2;
-    packet[5] = 2;
+    g_assert_cmpuint(payload_len, <=,
+                     SENT_PACKET_CAPACITY - ETHERNET_HEADER_LEN -
+                     IPV4_HEADER_LEN - UDP_HEADER_LEN);
+    if (directed_broadcast) {
+        memset(packet, 0xff, 6);
+    } else {
+        packet[0] = 0x52;
+        packet[1] = 0x55;
+        packet[2] = 10;
+        packet[3] = 0;
+        packet[4] = 2;
+        packet[5] = 2;
+    }
     memcpy(packet + 6, mac, sizeof(mac));
     store_be16(packet + 12, 0x0800);
     ip_header[0] = 0x45;
@@ -610,10 +646,10 @@ static void send_udp_request(SlirpState *s, uint16_t port,
     ip_header[13] = 0;
     ip_header[14] = 2;
     ip_header[15] = 15;
-    ip_header[16] = 10;
-    ip_header[17] = 0;
-    ip_header[18] = 2;
-    ip_header[19] = 2;
+    ip_header[16] = destination >> 24;
+    ip_header[17] = destination >> 16;
+    ip_header[18] = destination >> 8;
+    ip_header[19] = destination;
     store_be16(ip_header + 10,
                ipv4_checksum(ip_header, IPV4_HEADER_LEN));
     store_be16(udp, 49152);
@@ -622,6 +658,12 @@ static void send_udp_request(SlirpState *s, uint16_t port,
     memcpy(udp + UDP_HEADER_LEN, payload, payload_len);
 
     s->nc.info->receive(&s->nc, packet, length);
+}
+
+static void send_udp_request(SlirpState *s, uint16_t port,
+                             const uint8_t *payload, size_t payload_len)
+{
+    send_udp_request_to(s, 0x0a000202U, port, payload, payload_len);
 }
 #endif
 
@@ -750,6 +792,9 @@ static SlirpState *new_user_netdev(void)
 #else
     s->udp_registry = qemu_slirp_udp_registry_new(true, host, NULL, NULL);
 #endif
+    s->rpc_registry = qemu_slirp_rpc_registry_new(s->udp_registry,
+                                                   s->stream_registry);
+    g_assert_nonnull(s->rpc_registry);
 #ifdef CONFIG_SLIRP_BOOTP_ROOT
     s->bootp_registry = qemu_slirp_bootp_registry_new(
         true, host, &slirp_bootp_backend_ops, s);
@@ -782,6 +827,293 @@ static void destroy_user_netdev(SlirpState *s)
     g_free(s);
     test_netdev = NULL;
 }
+
+#if defined(CONFIG_SLIRP_UDP_SERVICE) && defined(CONFIG_SLIRP_TCP_SERVICE)
+typedef struct RpcIntegrationState {
+    unsigned calls;
+    uint32_t result;
+} RpcIntegrationState;
+
+static OncRpcDispatchResult rpc_integration_dispatch(
+    OncRpcRequest *request, const OncRpcCall *call, void *opaque)
+{
+    RpcIntegrationState *state = opaque;
+    uint8_t reply[32];
+    OncRpcXdrWriter writer;
+
+    state->calls++;
+    onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
+    g_assert_true(onc_rpc_reply_success(&writer, call->xid));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, state->result));
+    g_assert_true(onc_rpc_request_reply(request, reply,
+                                        onc_rpc_xdr_writer_size(&writer)));
+    return ONC_RPC_DISPATCH_REPLIED;
+}
+
+static size_t build_rpc_call(uint8_t *buffer, size_t capacity, uint32_t xid,
+                             uint32_t program, uint32_t version,
+                             uint32_t procedure, const uint8_t *body,
+                             size_t body_length)
+{
+    OncRpcXdrWriter writer;
+
+    g_assert_cmpuint(capacity, >=, 40 + body_length);
+    onc_rpc_xdr_writer_init(&writer, buffer, capacity);
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, xid));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_CALL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_VERSION));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, version));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, procedure));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_AUTH_NULL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_AUTH_NULL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    g_assert_true(onc_rpc_xdr_put_opaque(&writer, body, body_length));
+    return onc_rpc_xdr_writer_size(&writer);
+}
+
+static size_t build_rpc_record(uint8_t *buffer, size_t capacity,
+                               const uint8_t *payload, size_t length)
+{
+    g_assert_cmpuint(capacity, >=, length + 4);
+    tcp_store_be32(buffer, UINT32_C(0x80000000) | length);
+    memcpy(buffer + 4, payload, length);
+    return length + 4;
+}
+
+static uint32_t rpc_integration_reply_status(const uint8_t *data, size_t len,
+                                             OncRpcXdrReader *body)
+{
+    OncRpcXdrReader reader;
+    uint32_t xid, type, status, flavor, auth_length;
+
+    onc_rpc_xdr_reader_init(&reader, data, len);
+    g_assert_true(onc_rpc_xdr_u32(&reader, &xid));
+    g_assert_true(onc_rpc_xdr_u32(&reader, &type));
+    g_assert_true(onc_rpc_xdr_u32(&reader, &status));
+    g_assert_cmpuint(type, ==, ONC_RPC_REPLY);
+    g_assert_cmpuint(status, ==, ONC_RPC_MSG_ACCEPTED);
+    g_assert_true(onc_rpc_xdr_u32(&reader, &flavor));
+    g_assert_true(onc_rpc_xdr_u32(&reader, &auth_length));
+    g_assert_cmpuint(flavor, ==, ONC_RPC_AUTH_NULL);
+    g_assert_cmpuint(auth_length, ==, 0);
+    g_assert_true(onc_rpc_xdr_u32(&reader, &status));
+    *body = reader;
+    return status;
+}
+
+static unsigned open_fd_count(void)
+{
+    GDir *dir;
+    const char *name;
+    unsigned count = 0;
+
+    dir = g_dir_open("/proc/self/fd", 0, NULL);
+    if (!dir) {
+        return 0;
+    }
+    while ((name = g_dir_read_name(dir))) {
+        count++;
+    }
+    g_dir_close(dir);
+    return count;
+}
+
+static const uint8_t *udp_frame_payload(size_t *length)
+{
+    const uint8_t *ip = sent_packet + ETHERNET_HEADER_LEN;
+    const uint8_t *udp = ip + IPV4_HEADER_LEN;
+
+    *length = load_be16(udp + 4) - UDP_HEADER_LEN;
+    return udp + UDP_HEADER_LEN;
+}
+
+static uint32_t rpc_load_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void test_named_netdev_rpc_portmapper(void)
+{
+    enum { RPC_PROGRAM = 200030, RPC_VERSION = 1, RPC_PORT = 4020 };
+    SlirpState *s = new_user_netdev();
+    RpcIntegrationState state = { .result = 0xfeedbeef };
+    OncRpcProgram program = {
+        .program = RPC_PROGRAM,
+        .version_low = RPC_VERSION,
+        .version_high = RPC_VERSION,
+        .port = RPC_PORT,
+        .transports = ONC_RPC_TRANSPORT_UDP | ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_integration_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    QemuSlirpUdpListener *udp111 = NULL;
+    QemuSlirpStreamListener *tcp111 = NULL;
+    StreamConnectionState connection = { .source_port = 40003 };
+    OncRpcXdrWriter writer;
+    OncRpcXdrReader reply;
+    Error *err = NULL;
+    uint8_t body[64], call[128], record[132];
+    size_t body_len, call_len, record_len, reply_len;
+    uint32_t port, service_next;
+    unsigned fds_before;
+
+    fds_before = open_fd_count();
+    g_assert_cmpint(qemu_slirp_rpc_register("user0", &program,
+                                            &registration, &err), ==, 0);
+    g_assert_nonnull(registration);
+    g_assert_null(err);
+    g_assert_cmpuint(open_fd_count(), ==, fds_before);
+
+    /* A guest UDP GETPORT request reaches the in-stack portmapper. */
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_PROGRAM));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_VERSION));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_UDP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = build_rpc_call(call, sizeof(call), 1, 100000, 2, 3, body,
+                              body_len);
+    learn_client_arp(s);
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    send_udp_request(s, 111, call, call_len);
+    g_assert_cmpuint(sent_packet_count, >, 0);
+    g_assert_cmphex(rpc_load_be32(sent_packet + ETHERNET_HEADER_LEN + 12), ==,
+                    0x0a000202);
+    g_assert_cmpuint(load_be16(sent_packet + ETHERNET_HEADER_LEN +
+                               IPV4_HEADER_LEN), ==, 111);
+    g_assert_cmpuint(load_be16(sent_packet + ETHERNET_HEADER_LEN +
+                               IPV4_HEADER_LEN + 2), ==, 49152);
+    reply_len = 0;
+    {
+        const uint8_t *payload = udp_frame_payload(&reply_len);
+
+        port = rpc_integration_reply_status(payload, reply_len, &reply);
+        g_assert_cmpuint(port, ==, ONC_RPC_SUCCESS);
+    }
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, RPC_PORT);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    /*
+     * The broadcast-enabled portmapper also handles directed broadcast
+     * GETPORT and CALLIT traffic entirely inside the user-mode stack.
+     */
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    send_udp_request_to(s, 0x0a0002ffU, 111, call, call_len);
+    g_assert_cmpuint(sent_packet_count, >, 0);
+    reply_len = 0;
+    {
+        const uint8_t *payload = udp_frame_payload(&reply_len);
+
+        port = rpc_integration_reply_status(payload, reply_len, &reply);
+        g_assert_cmpuint(port, ==, ONC_RPC_SUCCESS);
+    }
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, RPC_PORT);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_PROGRAM));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_VERSION));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 7));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, NULL, 0, 0));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = build_rpc_call(call, sizeof(call), 4, 100000, 2, 5, body,
+                              body_len);
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    send_udp_request_to(s, 0x0a0002ffU, 111, call, call_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(sent_packet_count, >, 0);
+    reply_len = 0;
+    {
+        const uint8_t *payload = udp_frame_payload(&reply_len);
+
+        port = rpc_integration_reply_status(payload, reply_len, &reply);
+        g_assert_cmpuint(port, ==, ONC_RPC_SUCCESS);
+    }
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, RPC_PORT);
+    {
+        const uint8_t *result;
+        size_t result_len;
+
+        g_assert_true(onc_rpc_xdr_counted_opaque(&reply, &result,
+                                                  &result_len, 32));
+        g_assert_cmpuint(result_len, ==, 4);
+        g_assert_cmphex(rpc_load_be32(result), ==, state.result);
+    }
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    /* The advertised UDP endpoint is also reachable without a host socket. */
+    call_len = build_rpc_call(call, sizeof(call), 2, RPC_PROGRAM,
+                              RPC_VERSION, 7, NULL, 0);
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    send_udp_request(s, RPC_PORT, call, call_len);
+    g_assert_cmpuint(state.calls, ==, 2);
+    reply_len = 0;
+    {
+        const uint8_t *payload = udp_frame_payload(&reply_len);
+
+        port = rpc_integration_reply_status(payload, reply_len, &reply);
+        g_assert_cmpuint(port, ==, ONC_RPC_SUCCESS);
+    }
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmphex(port, ==, state.result);
+
+    /* TCP GETPORT uses the same portmapper registration. */
+    service_next = establish_tcp_guest_connection(s, connection.source_port,
+                                                   111);
+    connection.guest_next_seq = 1001;
+    connection.service_next_seq = service_next;
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_PROGRAM));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_VERSION));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_TCP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = build_rpc_call(call, sizeof(call), 3, 100000, 2, 3, body,
+                              body_len);
+    record_len = build_rpc_record(record, sizeof(record), call, call_len);
+    sent_packet_count = 0;
+    sent_packet_len = 0;
+    send_tcp_guest_segment_to(s, &connection, 111, 0x18, record, record_len);
+    g_assert_cmpuint(sent_packet_count, >, 0);
+    g_assert_cmpuint(tcp_frame_payload_len(), >=, 4);
+    g_assert_cmphex(rpc_load_be32(tcp_frame_payload()) & 0x7fffffff, ==,
+                    tcp_frame_payload_len() - 4);
+    {
+        const uint8_t *payload = tcp_frame_payload() + 4;
+        size_t payload_len = tcp_frame_payload_len() - 4;
+
+        port = rpc_integration_reply_status(payload, payload_len, &reply);
+        g_assert_cmpuint(port, ==, ONC_RPC_SUCCESS);
+    }
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, RPC_PORT);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    qemu_slirp_rpc_unregister(registration);
+    g_assert_cmpuint(open_fd_count(), ==, fds_before);
+    /* Both port-111 transports are free after the final registration. */
+    g_assert_cmpint(qemu_slirp_udp_listen("user0", 111,
+                                          &udp_listener_ops, NULL, &udp111,
+                                          &err), ==, 0);
+    qemu_slirp_udp_listener_remove(udp111);
+    g_assert_cmpint(qemu_slirp_stream_listen("user0", 111, &stream_ops, NULL,
+                                             &tcp111, &err), ==, 0);
+    qemu_slirp_stream_listener_remove(tcp111);
+    destroy_user_netdev(s);
+    error_free(err);
+}
+#endif
 
 #ifdef CONFIG_SLIRP_TCP_SERVICE
 static void test_named_netdev_stream_packet_lifecycle(void)
@@ -1093,6 +1425,10 @@ static void test_user_netdev_lifecycle_paths(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+#if defined(CONFIG_SLIRP_UDP_SERVICE) && defined(CONFIG_SLIRP_TCP_SERVICE)
+    g_test_add_func("/slirp-il-integration/named-netdev-rpc-portmapper",
+                    test_named_netdev_rpc_portmapper);
+#endif
 #ifdef CONFIG_SLIRP_TCP_SERVICE
     g_test_add_func("/slirp-il-integration/named-netdev-stream-packets",
                     test_named_netdev_stream_packet_lifecycle);

@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct sockaddr_in;
+struct OncRpcCall;
+typedef struct Error Error;
+
 /* ONC RPC v2 and the bounds shared by the in-process services. */
 #define ONC_RPC_VERSION 2U
 #define ONC_RPC_MAX_DATAGRAM (32U * 1024U)
@@ -61,6 +65,40 @@ typedef enum OncRpcDecodeResult {
     ONC_RPC_DECODE_AUTH_ERROR,
     ONC_RPC_DECODE_TOO_LARGE,
 } OncRpcDecodeResult;
+
+typedef struct OncRpcRequest OncRpcRequest;
+typedef struct QemuSlirpRpcRegistration QemuSlirpRpcRegistration;
+
+typedef enum OncRpcTransport {
+    ONC_RPC_TRANSPORT_UDP = 1U << 0,
+    ONC_RPC_TRANSPORT_TCP = 1U << 1,
+} OncRpcTransport;
+
+typedef enum OncRpcDispatchResult {
+    ONC_RPC_DISPATCH_ASYNC,
+    ONC_RPC_DISPATCH_REPLIED,
+    ONC_RPC_DISPATCH_DROP,
+} OncRpcDispatchResult;
+
+typedef struct OncRpcProgram {
+    uint32_t program;
+    uint32_t version_low;
+    uint32_t version_high;
+    uint16_t port;
+    unsigned transports;
+    OncRpcDispatchResult (*dispatch)(OncRpcRequest *, const struct OncRpcCall *,
+                                     void *opaque);
+    void *opaque;
+} OncRpcProgram;
+
+/* Register a program on the named user-mode network stack. */
+int qemu_slirp_rpc_register(const char *netdev_id,
+                            const OncRpcProgram *program,
+                            QemuSlirpRpcRegistration **registration,
+                            Error **errp);
+
+/* Consumes the caller-owned registration handle; passing NULL is safe. */
+void qemu_slirp_rpc_unregister(QemuSlirpRpcRegistration *registration);
 
 typedef struct OncRpcXdrReader {
     const uint8_t *cursor;
@@ -191,5 +229,19 @@ bool onc_rpc_tcp_record_decoder_feed(OncRpcTcpRecordDecoder *decoder,
                                      void *opaque);
 bool onc_rpc_tcp_record_decoder_finish(const OncRpcTcpRecordDecoder *decoder);
 void onc_rpc_tcp_record_decoder_cleanup(OncRpcTcpRecordDecoder *decoder);
+
+/* Borrowed request metadata is valid until the request is unreferenced. */
+const OncRpcCall *onc_rpc_request_call(const OncRpcRequest *request);
+const uint8_t *onc_rpc_request_data(const OncRpcRequest *request,
+                                    size_t *length);
+const struct sockaddr_in *onc_rpc_request_peer(const OncRpcRequest *request);
+bool onc_rpc_request_is_tcp(const OncRpcRequest *request);
+
+/* A request may be retained by an asynchronous program dispatch. */
+OncRpcRequest *onc_rpc_request_ref(OncRpcRequest *request);
+void onc_rpc_request_unref(OncRpcRequest *request);
+bool onc_rpc_request_reply(OncRpcRequest *request, const uint8_t *data,
+                           size_t length);
+void onc_rpc_request_drop(OncRpcRequest *request);
 
 #endif /* QEMU_NET_ONC_RPC_H */

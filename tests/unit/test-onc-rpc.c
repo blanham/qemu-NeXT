@@ -2,6 +2,10 @@
 #include "qemu/osdep.h"
 
 #include "net/onc-rpc.h"
+#include "net/slirp-rpc-internal.h"
+#include "net/slirp-stream-internal.h"
+#include "net/slirp-udp-internal.h"
+#include "qapi/error.h"
 #include "qemu/bswap.h"
 
 static const uint8_t pmap_getport[] = {
@@ -581,6 +585,1150 @@ static void test_record_callback_failure(void)
     onc_rpc_tcp_record_decoder_cleanup(&decoder);
 }
 
+typedef struct RpcFakeUdp RpcFakeUdp;
+typedef struct RpcFakeUdpEndpoint {
+    RpcFakeUdp *fake;
+    QemuSlirpUdpBackendCallbacks callbacks;
+    void *callbacks_opaque;
+    uint16_t port;
+    QemuSlirpUdpListenFlags flags;
+    bool active;
+} RpcFakeUdpEndpoint;
+
+struct RpcFakeUdp {
+    RpcFakeUdpEndpoint endpoints[8];
+    unsigned nendpoints;
+    unsigned listens;
+    unsigned removes;
+    GByteArray *reply;
+    struct sockaddr_in peer;
+};
+
+typedef struct RpcFakeTcp RpcFakeTcp;
+typedef struct RpcFakeTcpEndpoint {
+    RpcFakeTcp *fake;
+    QemuSlirpStreamBackendCallbacks callbacks;
+    void *callbacks_opaque;
+    uint16_t port;
+    bool active;
+} RpcFakeTcpEndpoint;
+
+struct RpcFakeTcp {
+    RpcFakeTcpEndpoint endpoints[8];
+    unsigned nendpoints;
+    unsigned listens;
+    unsigned removes;
+    GByteArray *reply;
+    void *connection;
+    RpcFakeTcpEndpoint *connection_endpoint;
+    struct sockaddr_in peer;
+    bool close_on_remove;
+    bool send_eagain_once;
+    bool send_eio_once;
+    unsigned sends;
+};
+
+static int rpc_fake_udp_listen(
+    void *opaque, struct in_addr address, uint16_t port,
+    QemuSlirpUdpListenFlags flags,
+    const QemuSlirpUdpBackendCallbacks *callbacks, void *callbacks_opaque,
+    void **backend_listener)
+{
+    RpcFakeUdp *fake = opaque;
+    RpcFakeUdpEndpoint *endpoint = NULL;
+    unsigned i;
+
+    (void)address;
+    for (i = 0; i < G_N_ELEMENTS(fake->endpoints); i++) {
+        if (!fake->endpoints[i].active) {
+            endpoint = &fake->endpoints[i];
+            break;
+        }
+    }
+    g_assert_nonnull(endpoint);
+    endpoint->fake = fake;
+    endpoint->port = port;
+    endpoint->flags = flags;
+    endpoint->callbacks = *callbacks;
+    endpoint->callbacks_opaque = callbacks_opaque;
+    endpoint->active = true;
+    fake->nendpoints = MAX(fake->nendpoints, i + 1);
+    fake->listens++;
+    *backend_listener = endpoint;
+    return 0;
+}
+
+static void rpc_fake_udp_remove(void *opaque, void *backend_listener)
+{
+    RpcFakeUdp *fake = opaque;
+    RpcFakeUdpEndpoint *endpoint = backend_listener;
+
+    g_assert_true(endpoint->fake == fake);
+    g_assert_true(endpoint->active);
+    fake->removes++;
+    endpoint->active = false;
+    endpoint->callbacks_opaque = NULL;
+}
+
+static int rpc_fake_udp_send(void *opaque, void *backend_listener,
+                             const struct sockaddr_in *peer,
+                             const uint8_t *data, size_t len)
+{
+    RpcFakeUdpEndpoint *endpoint = backend_listener;
+    RpcFakeUdp *fake = endpoint->fake;
+
+    g_assert_true(opaque == fake);
+    g_assert_true(endpoint->active);
+    g_byte_array_set_size(fake->reply, 0);
+    g_byte_array_append(fake->reply, data, len);
+    fake->peer = *peer;
+    return 0;
+}
+
+static const QemuSlirpUdpBackendOps rpc_fake_udp_ops = {
+    .listen = rpc_fake_udp_listen,
+    .listener_remove = rpc_fake_udp_remove,
+    .send = rpc_fake_udp_send,
+};
+
+static int rpc_fake_tcp_listen(
+    void *opaque, struct in_addr address, uint16_t port,
+    const QemuSlirpStreamBackendCallbacks *callbacks, void *callbacks_opaque,
+    void **backend_listener)
+{
+    RpcFakeTcp *fake = opaque;
+    RpcFakeTcpEndpoint *endpoint = NULL;
+    unsigned i;
+
+    (void)address;
+    for (i = 0; i < G_N_ELEMENTS(fake->endpoints); i++) {
+        if (!fake->endpoints[i].active) {
+            endpoint = &fake->endpoints[i];
+            break;
+        }
+    }
+    g_assert_nonnull(endpoint);
+    endpoint->fake = fake;
+    endpoint->port = port;
+    endpoint->callbacks = *callbacks;
+    endpoint->callbacks_opaque = callbacks_opaque;
+    endpoint->active = true;
+    fake->nendpoints = MAX(fake->nendpoints, i + 1);
+    fake->listens++;
+    *backend_listener = endpoint;
+    return 0;
+}
+
+static void rpc_fake_tcp_remove(void *opaque, void *backend_listener)
+{
+    RpcFakeTcp *fake = opaque;
+    RpcFakeTcpEndpoint *endpoint = backend_listener;
+
+    g_assert_true(endpoint->fake == fake);
+    g_assert_true(endpoint->active);
+    fake->removes++;
+    if (fake->close_on_remove && fake->connection_endpoint == endpoint &&
+        fake->connection) {
+        endpoint->callbacks.closed(fake->connection,
+                                   endpoint->callbacks_opaque);
+    }
+    endpoint->active = false;
+    endpoint->callbacks_opaque = NULL;
+}
+
+static size_t rpc_fake_tcp_can_send(void *opaque, void *backend_connection)
+{
+    (void)opaque;
+    (void)backend_connection;
+    return ONC_RPC_MAX_TCP_RECORD + 4;
+}
+
+static int rpc_fake_tcp_send(void *opaque, void *backend_connection,
+                             const uint8_t *data, size_t len)
+{
+    RpcFakeTcp *fake = opaque;
+
+    g_assert_nonnull(fake->connection_endpoint);
+    g_assert_true(backend_connection == fake->connection);
+    fake->sends++;
+    if (fake->send_eagain_once) {
+        fake->send_eagain_once = false;
+        return -EAGAIN;
+    }
+    if (fake->send_eio_once) {
+        fake->send_eio_once = false;
+        return -EIO;
+    }
+    g_byte_array_set_size(fake->reply, 0);
+    g_byte_array_append(fake->reply, data, len);
+    return 0;
+}
+
+static void rpc_fake_tcp_close(void *opaque, void *backend_connection)
+{
+    RpcFakeTcp *fake = opaque;
+
+    g_assert_nonnull(fake->connection_endpoint);
+    g_assert_true(backend_connection == fake->connection);
+    fake->connection_endpoint->callbacks.closed(
+        backend_connection, fake->connection_endpoint->callbacks_opaque);
+}
+
+static const QemuSlirpStreamBackendOps rpc_fake_tcp_ops = {
+    .listen = rpc_fake_tcp_listen,
+    .listener_remove = rpc_fake_tcp_remove,
+    .can_send = rpc_fake_tcp_can_send,
+    .send = rpc_fake_tcp_send,
+    .connection_close = rpc_fake_tcp_close,
+};
+
+typedef struct RpcHarness {
+    RpcFakeUdp udp;
+    RpcFakeTcp tcp;
+    QemuSlirpUdpRegistry *udp_registry;
+    QemuSlirpStreamRegistry *stream_registry;
+    QemuSlirpRpcRegistry *rpc;
+    struct in_addr vhost;
+} RpcHarness;
+
+static void rpc_harness_init(RpcHarness *harness)
+{
+    memset(harness, 0, sizeof(*harness));
+    harness->vhost.s_addr = htonl(0x0a000202);
+    harness->udp.reply = g_byte_array_new();
+    harness->tcp.reply = g_byte_array_new();
+    harness->udp_registry = qemu_slirp_udp_registry_new(
+        true, harness->vhost, &rpc_fake_udp_ops, &harness->udp);
+    harness->stream_registry = qemu_slirp_stream_registry_new(
+        true, harness->vhost, &rpc_fake_tcp_ops, &harness->tcp);
+    harness->rpc = qemu_slirp_rpc_registry_new(harness->udp_registry,
+                                               harness->stream_registry);
+    g_assert_nonnull(harness->rpc);
+}
+
+static void rpc_harness_cleanup(RpcHarness *harness)
+{
+    qemu_slirp_rpc_registry_free(harness->rpc);
+    qemu_slirp_udp_registry_free(harness->udp_registry);
+    qemu_slirp_stream_registry_free(harness->stream_registry);
+    g_byte_array_unref(harness->udp.reply);
+    g_byte_array_unref(harness->tcp.reply);
+}
+
+static size_t rpc_build_call(uint8_t *buffer, size_t capacity, uint32_t xid,
+                             uint32_t program, uint32_t version,
+                             uint32_t procedure, const uint8_t *body,
+                             size_t body_length)
+{
+    OncRpcXdrWriter writer;
+
+    g_assert_cmpuint(capacity, >=, 40 + body_length);
+    onc_rpc_xdr_writer_init(&writer, buffer, capacity);
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, xid));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_CALL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_VERSION));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, version));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, procedure));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_AUTH_NULL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_AUTH_NULL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    g_assert_true(onc_rpc_xdr_put_opaque(&writer, body, body_length));
+    return onc_rpc_xdr_writer_size(&writer);
+}
+
+static size_t rpc_build_call_auth_sys(uint8_t *buffer, size_t capacity,
+                                      uint32_t xid, uint32_t program,
+                                      uint32_t version, uint32_t procedure,
+                                      const uint8_t *body, size_t body_length)
+{
+    uint8_t credential[128];
+    OncRpcXdrWriter credential_writer;
+    OncRpcXdrWriter writer;
+
+    onc_rpc_xdr_writer_init(&credential_writer, credential,
+                            sizeof(credential));
+    g_assert_true(onc_rpc_xdr_put_u32(&credential_writer, 0x01020304));
+    g_assert_true(onc_rpc_xdr_put_string(&credential_writer, "outer", 255));
+    g_assert_true(onc_rpc_xdr_put_u32(&credential_writer, 1000));
+    g_assert_true(onc_rpc_xdr_put_u32(&credential_writer, 1001));
+    g_assert_true(onc_rpc_xdr_put_u32(&credential_writer, 1));
+    g_assert_true(onc_rpc_xdr_put_u32(&credential_writer, 1002));
+    onc_rpc_xdr_writer_init(&writer, buffer, capacity);
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, xid));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_CALL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_VERSION));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, version));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, procedure));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_AUTH_SYS));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(
+        &writer, credential, onc_rpc_xdr_writer_size(&credential_writer),
+        ONC_RPC_MAX_AUTH_BYTES));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, ONC_RPC_AUTH_NULL));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    g_assert_true(onc_rpc_xdr_put_opaque(&writer, body, body_length));
+    return onc_rpc_xdr_writer_size(&writer);
+}
+
+static size_t rpc_build_record(uint8_t *buffer, size_t capacity,
+                               const uint8_t *payload, size_t length)
+{
+    g_assert_cmpuint(capacity, >=, length + 4);
+    stl_be_p(buffer, UINT32_C(0x80000000) | length);
+    memcpy(buffer + 4, payload, length);
+    return length + 4;
+}
+
+static uint32_t rpc_reply_status(const uint8_t *data, size_t length,
+                                 OncRpcXdrReader *body)
+{
+    OncRpcXdrReader reader;
+    uint32_t xid, type, status, flavor, auth_length;
+
+    onc_rpc_xdr_reader_init(&reader, data, length);
+    g_assert_true(onc_rpc_xdr_u32(&reader, &xid));
+    g_assert_true(onc_rpc_xdr_u32(&reader, &type));
+    g_assert_true(onc_rpc_xdr_u32(&reader, &status));
+    g_assert_cmpuint(type, ==, ONC_RPC_REPLY);
+    g_assert_cmpuint(status, ==, ONC_RPC_MSG_ACCEPTED);
+    g_assert_true(onc_rpc_xdr_u32(&reader, &flavor));
+    g_assert_true(onc_rpc_xdr_u32(&reader, &auth_length));
+    g_assert_cmpuint(flavor, ==, ONC_RPC_AUTH_NULL);
+    g_assert_cmpuint(auth_length, ==, 0);
+    g_assert_true(onc_rpc_xdr_u32(&reader, &status));
+    *body = reader;
+    return status;
+}
+
+typedef struct RpcProgramState {
+    unsigned calls;
+    uint32_t last_procedure;
+    uint32_t last_auth_flavor;
+    uint32_t last_uid;
+    uint32_t last_gid;
+    size_t last_group_count;
+    char last_machine[ONC_RPC_MAX_AUTH_MACHINE + 1];
+    uint32_t result;
+    bool async;
+    bool teardown;
+    bool error_reply;
+    bool malformed_reply;
+    QemuSlirpRpcRegistry *registry;
+    OncRpcRequest *pending;
+} RpcProgramState;
+
+static OncRpcDispatchResult rpc_program_dispatch(
+    OncRpcRequest *request, const OncRpcCall *call, void *opaque)
+{
+    RpcProgramState *state = opaque;
+    uint8_t reply[128];
+    OncRpcXdrWriter writer;
+
+    state->calls++;
+    state->last_procedure = call->procedure;
+    state->last_auth_flavor = call->auth_flavor;
+    state->last_uid = call->uid;
+    state->last_gid = call->gid;
+    state->last_group_count = call->group_count;
+    g_strlcpy(state->last_machine, call->machine,
+              sizeof(state->last_machine));
+    if (state->teardown) {
+        if (state->registry) {
+            qemu_slirp_rpc_registry_invalidate(state->registry);
+        }
+        return ONC_RPC_DISPATCH_DROP;
+    }
+    if (state->async) {
+        state->pending = onc_rpc_request_ref(request);
+        return ONC_RPC_DISPATCH_ASYNC;
+    }
+    onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
+    if (state->malformed_reply) {
+        static const uint8_t malformed[] = { 0, 0, 0, 1 };
+
+        g_assert_false(onc_rpc_request_reply(request, malformed,
+                                             sizeof(malformed)));
+        return ONC_RPC_DISPATCH_REPLIED;
+    }
+    if (state->error_reply) {
+        g_assert_true(onc_rpc_reply_proc_unavail(&writer, call->xid));
+    } else {
+        g_assert_true(onc_rpc_reply_success(&writer, call->xid));
+    }
+    if (state->error_reply) {
+        g_assert_false(onc_rpc_request_reply(request, reply,
+                                             onc_rpc_xdr_writer_size(&writer)));
+        return ONC_RPC_DISPATCH_REPLIED;
+    }
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, state->result));
+    g_assert_true(onc_rpc_request_reply(request, reply,
+                                        onc_rpc_xdr_writer_size(&writer)));
+    return ONC_RPC_DISPATCH_REPLIED;
+}
+
+static OncRpcProgram rpc_program(uint32_t program, uint32_t low,
+                                 uint32_t high, uint16_t port,
+                                 unsigned transports,
+                                 RpcProgramState *state)
+{
+    return (OncRpcProgram) {
+        .program = program,
+        .version_low = low,
+        .version_high = high,
+        .port = port,
+        .transports = transports,
+        .dispatch = rpc_program_dispatch,
+        .opaque = state,
+    };
+}
+
+static RpcFakeUdpEndpoint *rpc_fake_udp_endpoint(RpcFakeUdp *fake,
+                                                  uint16_t port)
+{
+    unsigned i;
+
+    for (i = 0; i < fake->nendpoints; i++) {
+        if (fake->endpoints[i].active && fake->endpoints[i].port == port) {
+            return &fake->endpoints[i];
+        }
+    }
+    return NULL;
+}
+
+static RpcFakeTcpEndpoint *rpc_fake_tcp_endpoint(RpcFakeTcp *fake,
+                                                  uint16_t port)
+{
+    unsigned i;
+
+    for (i = 0; i < fake->nendpoints; i++) {
+        if (fake->endpoints[i].active && fake->endpoints[i].port == port) {
+            return &fake->endpoints[i];
+        }
+    }
+    return NULL;
+}
+
+static void rpc_send_udp(RpcHarness *harness, const uint8_t *data, size_t len)
+{
+    RpcFakeUdpEndpoint *endpoint = rpc_fake_udp_endpoint(&harness->udp, 111);
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(0x0a00020f),
+        .sin_port = htons(49152),
+    };
+
+    g_assert_nonnull(endpoint);
+    endpoint->callbacks.datagram(&peer, data, len,
+                                 endpoint->callbacks_opaque);
+}
+
+static void rpc_send_udp_port(RpcHarness *harness, uint16_t port,
+                              const uint8_t *data, size_t len)
+{
+    RpcFakeUdpEndpoint *endpoint = rpc_fake_udp_endpoint(&harness->udp, port);
+    struct sockaddr_in peer = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(0x0a00020f),
+        .sin_port = htons(49152),
+    };
+
+    g_assert_nonnull(endpoint);
+    endpoint->callbacks.datagram(&peer, data, len,
+                                 endpoint->callbacks_opaque);
+}
+
+static void rpc_connect_tcp_port(RpcHarness *harness, uint16_t port)
+{
+    RpcFakeTcpEndpoint *endpoint = rpc_fake_tcp_endpoint(&harness->tcp, port);
+
+    harness->tcp.connection = GINT_TO_POINTER(0x1234);
+    harness->tcp.peer = (struct sockaddr_in) {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(0x0a00020f),
+        .sin_port = htons(49153),
+    };
+    g_assert_nonnull(endpoint);
+    harness->tcp.connection_endpoint = endpoint;
+    endpoint->callbacks.connected(harness->tcp.connection,
+                                  &harness->tcp.peer,
+                                  endpoint->callbacks_opaque);
+}
+
+static void rpc_connect_tcp(RpcHarness *harness)
+{
+    rpc_connect_tcp_port(harness, 111);
+}
+
+static void rpc_send_tcp(RpcHarness *harness, const uint8_t *data, size_t len)
+{
+    g_assert_nonnull(harness->tcp.connection_endpoint);
+    harness->tcp.connection_endpoint->callbacks.receive(
+        harness->tcp.connection, data, len,
+        harness->tcp.connection_endpoint->callbacks_opaque);
+}
+
+static void rpc_close_tcp(RpcHarness *harness)
+{
+    g_assert_nonnull(harness->tcp.connection_endpoint);
+    rpc_fake_tcp_close(&harness->tcp, harness->tcp.connection);
+}
+
+static void rpc_ready_tcp(RpcHarness *harness)
+{
+    g_assert_nonnull(harness->tcp.connection_endpoint);
+    harness->tcp.connection_endpoint->callbacks.can_send(
+        harness->tcp.connection,
+        harness->tcp.connection_endpoint->callbacks_opaque);
+}
+
+static void test_rpc_registry_registration(void)
+{
+    RpcHarness harness;
+    RpcProgramState one = { .result = 11 };
+    RpcProgramState two = { .result = 22 };
+    RpcProgramState overlap = { .result = 33 };
+    OncRpcProgram p1 = rpc_program(200001, 1, 2, 4001,
+                                   ONC_RPC_TRANSPORT_UDP, &one);
+    OncRpcProgram p2 = rpc_program(200001, 3, 4, 4001,
+                                   ONC_RPC_TRANSPORT_UDP, &two);
+    OncRpcProgram p_overlap = rpc_program(200001, 2, 3, 4001,
+                                          ONC_RPC_TRANSPORT_UDP, &overlap);
+    QemuSlirpRpcRegistration *r1 = NULL;
+    QemuSlirpRpcRegistration *r2 = NULL;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &p1, &r1, &err), ==, 0);
+    g_assert_nonnull(r1);
+    g_assert_cmpuint(harness.udp.listens, ==, 2);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &p1, &r2, &err), ==, -1);
+    g_assert_null(r2);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &p_overlap, &r2, &err), ==, -1);
+    g_assert_null(r2);
+    g_assert_nonnull(err);
+    error_free(err);
+    err = NULL;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &p2, &r2, &err), ==, 0);
+    g_assert_nonnull(r2);
+    qemu_slirp_rpc_registry_unregister(r1);
+    g_assert_cmpuint(harness.udp.removes, ==, 0);
+    qemu_slirp_rpc_registry_unregister(r2);
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_portmapper(void)
+{
+    RpcHarness harness;
+    RpcProgramState udp_state = { .result = 17 };
+    RpcProgramState tcp_state = { .result = 23 };
+    OncRpcProgram udp = rpc_program(200010, 1, 3, 4010,
+                                    ONC_RPC_TRANSPORT_UDP, &udp_state);
+    OncRpcProgram tcp = rpc_program(200011, 3, 3, 4011,
+                                    ONC_RPC_TRANSPORT_TCP, &tcp_state);
+    QemuSlirpRpcRegistration *udp_reg = NULL;
+    QemuSlirpRpcRegistration *tcp_reg = NULL;
+    uint8_t body[64], call[128], record[132];
+    size_t body_len, call_len, record_len;
+    OncRpcXdrWriter writer;
+    OncRpcXdrReader reply;
+    uint32_t value, port;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &udp, &udp_reg, &err), ==, 0);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &tcp, &tcp_reg, &err), ==, 0);
+    g_assert_cmpuint(harness.udp.listens, ==, 2);
+    g_assert_cmpuint(harness.tcp.listens, ==, 2);
+    g_assert_cmpuint(rpc_fake_udp_endpoint(&harness.udp, 111)->flags, ==,
+                     QEMU_SLIRP_UDP_LISTEN_BROADCAST);
+
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, udp.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 2));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_UDP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = rpc_build_call(call, sizeof(call), 1, 100000, 2, 3, body,
+                              body_len);
+    rpc_send_udp(&harness, call, call_len);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, udp.port);
+
+    /* The TCP portmapper endpoint answers with the same GETPORT semantics. */
+    rpc_connect_tcp(&harness);
+    body_len = rpc_build_call(body, sizeof(body), 2, 100000, 2, 3,
+                              (const uint8_t[]) {
+                                  0, 3, 0x0d, 0x4b,
+                                  0, 0, 0, 3,
+                                  0, 0, 0, 6,
+                                  0, 0, 0, 0,
+                              }, 16);
+    record_len = rpc_build_record(record, sizeof(record), body, body_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(harness.tcp.reply->len, >, 4);
+    g_assert_cmpuint(ldl_be_p(harness.tcp.reply->data) & 0x7fffffff, ==,
+                     harness.tcp.reply->len - 4);
+    value = rpc_reply_status(harness.tcp.reply->data + 4,
+                             harness.tcp.reply->len - 4, &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, tcp.port);
+
+    /* DUMP preserves registration order and includes every transport entry. */
+    g_byte_array_set_size(harness.udp.reply, 0);
+    call_len = rpc_build_call(call, sizeof(call), 3, 100000, 2, 4, NULL, 0);
+    rpc_send_udp(&harness, call, call_len);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    for (value = udp.version_low; value <= udp.version_high; value++) {
+        bool more;
+
+        g_assert_true(onc_rpc_xdr_bool(&reply, &more));
+        g_assert_true(more);
+        g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+        g_assert_cmpuint(port, ==, udp.program);
+        g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+        g_assert_cmpuint(port, ==, value);
+        g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+        g_assert_cmpuint(port, ==, IPPROTO_UDP);
+        g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+        g_assert_cmpuint(port, ==, udp.port);
+    }
+    {
+        bool more;
+
+        g_assert_true(onc_rpc_xdr_bool(&reply, &more));
+        g_assert_true(more);
+    }
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, tcp.program);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, tcp.version_low);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, IPPROTO_TCP);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, tcp.port);
+    {
+        bool more;
+
+        g_assert_true(onc_rpc_xdr_bool(&reply, &more));
+        g_assert_false(more);
+    }
+
+    qemu_slirp_rpc_registry_unregister(udp_reg);
+    qemu_slirp_rpc_registry_unregister(tcp_reg);
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    g_assert_cmpuint(harness.tcp.removes, ==, 2);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_dump_uint32_max(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 43 };
+    OncRpcProgram program = rpc_program(200018, UINT32_MAX - 1, UINT32_MAX,
+                                         4018, ONC_RPC_TRANSPORT_UDP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128];
+    size_t call_len;
+    OncRpcXdrReader reply;
+    uint32_t value;
+    bool more;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    call_len = rpc_build_call(call, sizeof(call), 7, 100000, 2, 4, NULL, 0);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_cmpuint(rpc_reply_status(harness.udp.reply->data,
+                                      harness.udp.reply->len, &reply), ==,
+                     ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_bool(&reply, &more));
+    g_assert_true(more);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, program.program);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, UINT32_MAX - 1);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, IPPROTO_UDP);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, program.port);
+    g_assert_true(onc_rpc_xdr_bool(&reply, &more));
+    g_assert_true(more);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, program.program);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, UINT32_MAX);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, IPPROTO_UDP);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, program.port);
+    g_assert_true(onc_rpc_xdr_bool(&reply, &more));
+    g_assert_false(more);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_dump_overflow(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 44 };
+    OncRpcProgram program = rpc_program(200019, 1, 2000, 4019,
+                                         ONC_RPC_TRANSPORT_UDP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128];
+    size_t call_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    call_len = rpc_build_call(call, sizeof(call), 8, 100000, 2, 4, NULL, 0);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_cmpuint(harness.udp.reply->len, ==, 0);
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_version_mismatch(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 41 };
+    OncRpcProgram program = rpc_program(200012, 2, 3, 4012,
+                                         ONC_RPC_TRANSPORT_UDP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128];
+    size_t call_len;
+    OncRpcXdrReader reply;
+    uint32_t value, low, high;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    call_len = rpc_build_call(call, sizeof(call), 4, program.program, 4, 1,
+                              NULL, 0);
+    rpc_send_udp_port(&harness, program.port, call, call_len);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_PROG_MISMATCH);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &low));
+    g_assert_true(onc_rpc_xdr_u32(&reply, &high));
+    g_assert_cmpuint(low, ==, program.version_low);
+    g_assert_cmpuint(high, ==, program.version_high);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+    qemu_slirp_rpc_registry_unregister(registration);
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_udp_request_endpoint_lifetime(void)
+{
+    RpcHarness harness;
+    RpcProgramState shared_one = { .result = 45, .async = true };
+    RpcProgramState shared_two = { .result = 46 };
+    RpcProgramState final_state = { .result = 47, .async = true };
+    OncRpcProgram one = rpc_program(200015, 1, 1, 4015,
+                                    ONC_RPC_TRANSPORT_UDP, &shared_one);
+    OncRpcProgram two = rpc_program(200015, 2, 2, 4015,
+                                    ONC_RPC_TRANSPORT_UDP, &shared_two);
+    OncRpcProgram final = rpc_program(200016, 1, 1, 4016,
+                                      ONC_RPC_TRANSPORT_UDP, &final_state);
+    QemuSlirpRpcRegistration *one_registration = NULL;
+    QemuSlirpRpcRegistration *two_registration = NULL;
+    QemuSlirpRpcRegistration *final_registration = NULL;
+    uint8_t call[128], reply_bytes[64];
+    size_t call_len;
+    OncRpcXdrWriter writer;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &one, &one_registration, &err), ==, 0);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &two, &two_registration, &err), ==, 0);
+    call_len = rpc_build_call(call, sizeof(call), 9, one.program, 1, 1,
+                              NULL, 0);
+    rpc_send_udp_port(&harness, one.port, call, call_len);
+    g_assert_nonnull(shared_one.pending);
+    qemu_slirp_rpc_registry_unregister(one_registration);
+    onc_rpc_xdr_writer_init(&writer, reply_bytes, sizeof(reply_bytes));
+    g_assert_true(onc_rpc_reply_success(&writer, 9));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, shared_one.result));
+    g_assert_true(onc_rpc_request_reply(shared_one.pending, reply_bytes,
+                                        onc_rpc_xdr_writer_size(&writer)));
+    onc_rpc_request_unref(shared_one.pending);
+    shared_one.pending = NULL;
+    qemu_slirp_rpc_registry_unregister(two_registration);
+
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &final, &final_registration, &err), ==, 0);
+    call_len = rpc_build_call(call, sizeof(call), 10, final.program, 1, 1,
+                              NULL, 0);
+    rpc_send_udp_port(&harness, final.port, call, call_len);
+    g_assert_nonnull(final_state.pending);
+    qemu_slirp_rpc_registry_unregister(final_registration);
+    g_assert_false(onc_rpc_request_reply(final_state.pending, reply_bytes, 4));
+    onc_rpc_request_unref(final_state.pending);
+    final_state.pending = NULL;
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_callback_teardown(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .teardown = true };
+    OncRpcProgram program = rpc_program(200013, 1, 1, 4013,
+                                         ONC_RPC_TRANSPORT_UDP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128];
+    size_t call_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    state.registry = harness.rpc;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    g_byte_array_set_size(harness.udp.reply, 0);
+    call_len = rpc_build_call(call, sizeof(call), 5, program.program, 1, 1,
+                              NULL, 0);
+    rpc_send_udp_port(&harness, program.port, call, call_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(harness.udp.reply->len, ==, 0);
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_teardown_during_receive(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .teardown = true };
+    OncRpcProgram program = rpc_program(200014, 1, 1, 4014,
+                                         ONC_RPC_TRANSPORT_TCP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    size_t call_len, record_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.close_on_remove = true;
+    state.registry = harness.rpc;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 6, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(harness.tcp.removes, ==, 2);
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_callit_async_and_cancel(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 99 };
+    RpcProgramState tcp_state = { .result = 100 };
+    OncRpcProgram program = rpc_program(200020, 1, 1, 4020,
+                                         ONC_RPC_TRANSPORT_UDP, &state);
+    OncRpcProgram tcp_program = rpc_program(200021, 1, 1, 4021,
+                                             ONC_RPC_TRANSPORT_TCP,
+                                             &tcp_state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    QemuSlirpRpcRegistration *tcp_registration = NULL;
+    uint8_t body[128], call[192], record[196], reply_bytes[64];
+    size_t body_len, callit_body_len, call_len, record_len;
+    OncRpcXdrWriter writer;
+    OncRpcXdrReader reply;
+    const uint8_t *opaque;
+    uint32_t value;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &tcp_program, &tcp_registration, &err),
+                    ==, 0);
+
+    /* CALLIT invokes UDP only and wraps the target's encoded result. */
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.version_low));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 7));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, "arg", 3, 128));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    callit_body_len = body_len;
+    call_len = rpc_build_call_auth_sys(call, sizeof(call), 10, 100000, 2, 5,
+                                       body, body_len);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(state.last_procedure, ==, 7);
+    g_assert_cmpuint(state.last_auth_flavor, ==, ONC_RPC_AUTH_NULL);
+    g_assert_cmpuint(state.last_uid, ==, 0);
+    g_assert_cmpuint(state.last_gid, ==, 0);
+    g_assert_cmpuint(state.last_group_count, ==, 0);
+    g_assert_cmpstr(state.last_machine, ==, "");
+    g_assert_cmpuint(harness.udp.reply->len, >, 0);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, program.port);
+    g_assert_true(onc_rpc_xdr_counted_opaque(&reply, &opaque, &body_len,
+                                              sizeof(reply_bytes)));
+    g_assert_cmpuint(body_len, ==, 4);
+    g_assert_cmphex(ldl_be_p(opaque), ==, state.result);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    /* Target errors and malformed target replies are silent CALLIT drops. */
+    state.error_reply = true;
+    g_byte_array_set_size(harness.udp.reply, 0);
+    call_len = rpc_build_call(call, sizeof(call), 17, 100000, 2, 5, body,
+                              callit_body_len);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_cmpuint(harness.udp.reply->len, ==, 0);
+    state.error_reply = false;
+    state.malformed_reply = true;
+    g_byte_array_set_size(harness.udp.reply, 0);
+    call_len = rpc_build_call(call, sizeof(call), 18, 100000, 2, 5, body,
+                              callit_body_len);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_cmpuint(harness.udp.reply->len, ==, 0);
+    state.malformed_reply = false;
+
+    /* CALLIT silently drops a request whose UDP target is not registered. */
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 200099));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 1));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 7));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, "arg", 3, 128));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = rpc_build_call(call, sizeof(call), 10, 100000, 2, 5, body,
+                              body_len);
+    g_byte_array_set_size(harness.udp.reply, 0);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_cmpuint(harness.udp.reply->len, ==, 0);
+
+    /*
+     * An asynchronous CALLIT keeps the outer request until its child replies.
+     */
+    state.async = true;
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.version_low));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 8));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, "async", 5, 128));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = rpc_build_call(call, sizeof(call), 11, 100000, 2, 5, body,
+                              body_len);
+    g_byte_array_set_size(harness.udp.reply, 0);
+    rpc_send_udp(&harness, call, call_len);
+    g_assert_nonnull(state.pending);
+    onc_rpc_xdr_writer_init(&writer, reply_bytes, sizeof(reply_bytes));
+    g_assert_true(onc_rpc_reply_success(&writer, 11));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, state.result));
+    g_assert_true(onc_rpc_request_reply(state.pending, reply_bytes,
+                                        onc_rpc_xdr_writer_size(&writer)));
+    g_assert_cmpuint(harness.udp.reply->len, >, 0);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, program.port);
+    g_assert_true(onc_rpc_xdr_counted_opaque(&reply, &opaque, &body_len,
+                                              sizeof(reply_bytes)));
+    g_assert_cmpuint(body_len, ==, 4);
+    g_assert_cmphex(ldl_be_p(opaque), ==, state.result);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+    onc_rpc_request_unref(state.pending);
+    state.pending = NULL;
+    state.async = false;
+
+    /* CALLIT over TCP is unavailable even when UDP targets are registered. */
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.version_low));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 7));
+    g_assert_true(onc_rpc_xdr_put_counted_opaque(&writer, "arg", 3, 128));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = rpc_build_call(call, sizeof(call), 12, 100000, 2, 5, body,
+                              body_len);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    g_byte_array_set_size(harness.tcp.reply, 0);
+    rpc_connect_tcp(&harness);
+    rpc_send_tcp(&harness, record, record_len);
+    value = rpc_reply_status(harness.tcp.reply->data + 4,
+                             harness.tcp.reply->len - 4, &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_PROC_UNAVAIL);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+    rpc_close_tcp(&harness);
+
+    /* An asynchronous request survives dispatch and can be replied later. */
+    state.async = true;
+    g_byte_array_set_size(harness.udp.reply, 0);
+    call_len = rpc_build_call(call, sizeof(call), 13, program.program, 1, 8,
+                              NULL, 0);
+    rpc_send_udp_port(&harness, program.port, call, call_len);
+    g_assert_nonnull(state.pending);
+    onc_rpc_xdr_writer_init(&writer, reply_bytes, sizeof(reply_bytes));
+    g_assert_true(onc_rpc_reply_success(&writer, 13));
+    g_assert_true(onc_rpc_request_reply(state.pending, reply_bytes,
+                                        onc_rpc_xdr_writer_size(&writer)));
+    g_assert_cmpuint(harness.udp.reply->len, >, 0);
+    onc_rpc_request_unref(state.pending);
+    state.pending = NULL;
+
+    /* A retained TCP request is cancelled when its connection closes. */
+    tcp_state.async = true;
+    rpc_connect_tcp_port(&harness, tcp_program.port);
+    call_len = rpc_build_call(call, sizeof(call), 13, tcp_program.program, 1,
+                              9, NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_nonnull(tcp_state.pending);
+    rpc_close_tcp(&harness);
+    g_assert_false(onc_rpc_request_reply(tcp_state.pending, reply_bytes, 4));
+    onc_rpc_request_unref(tcp_state.pending);
+    tcp_state.pending = NULL;
+
+    /* Invalidation cancels retained requests and removes both endpoints. */
+    state.async = true;
+    call_len = rpc_build_call(call, sizeof(call), 12, program.program, 1, 9,
+                              NULL, 0);
+    rpc_send_udp_port(&harness, program.port, call, call_len);
+    g_assert_nonnull(state.pending);
+    qemu_slirp_rpc_registry_invalidate(harness.rpc);
+    g_assert_false(onc_rpc_request_reply(state.pending, reply_bytes, 4));
+    onc_rpc_request_unref(state.pending);
+    state.pending = NULL;
+    qemu_slirp_rpc_registry_unregister(registration);
+    qemu_slirp_rpc_registry_unregister(tcp_registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_eagain(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 101 };
+    OncRpcProgram program = rpc_program(200022, 1, 1, 4022,
+                                         ONC_RPC_TRANSPORT_TCP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132], reply_bytes[64];
+    size_t call_len, record_len;
+    OncRpcXdrWriter writer;
+    OncRpcXdrReader reply;
+    uint32_t value;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    harness.tcp.send_eagain_once = true;
+    call_len = rpc_build_call(call, sizeof(call), 15, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(harness.tcp.sends, ==, 1);
+    g_assert_cmpuint(harness.tcp.reply->len, ==, 0);
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, 2);
+    g_assert_cmpuint(harness.tcp.reply->len, >, 0);
+    value = rpc_reply_status(harness.tcp.reply->data + 4,
+                             harness.tcp.reply->len - 4, &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &value));
+    g_assert_cmpuint(value, ==, state.result);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    state.async = true;
+    g_byte_array_set_size(harness.tcp.reply, 0);
+    call_len = rpc_build_call(call, sizeof(call), 16, program.program, 1, 2,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_nonnull(state.pending);
+    onc_rpc_xdr_writer_init(&writer, reply_bytes, sizeof(reply_bytes));
+    g_assert_true(onc_rpc_reply_success(&writer, 16));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, state.result));
+    harness.tcp.send_eagain_once = true;
+    g_assert_true(onc_rpc_request_reply(state.pending, reply_bytes,
+                                        onc_rpc_xdr_writer_size(&writer)));
+    g_assert_cmpuint(harness.tcp.sends, ==, 3);
+    g_assert_cmpuint(harness.tcp.reply->len, ==, 0);
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, 4);
+    g_assert_cmpuint(harness.tcp.reply->len, >, 0);
+    onc_rpc_request_unref(state.pending);
+    state.pending = NULL;
+    rpc_close_tcp(&harness);
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_fatal_closes_after_iteration(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 102 };
+    OncRpcProgram program = rpc_program(200023, 1, 1, 4023,
+                                         ONC_RPC_TRANSPORT_TCP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    size_t call_len, record_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+
+    /* Queue two requests without caller-owned references. */
+    harness.tcp.send_eagain_once = true;
+    call_len = rpc_build_call(call, sizeof(call), 17, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    harness.tcp.send_eagain_once = true;
+    call_len = rpc_build_call(call, sizeof(call), 18, program.program, 1, 2,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.calls, ==, 2);
+    g_assert_cmpuint(harness.tcp.sends, ==, 2);
+
+    /* The first retry fails; the fake close callback cancels the second. */
+    harness.tcp.send_eio_once = true;
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, 3);
+    g_assert_cmpuint(harness.tcp.reply->len, ==, 0);
+
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -607,5 +1755,27 @@ int main(int argc, char **argv)
                     test_record_callback_reentry);
     g_test_add_func("/onc-rpc/tcp/callback-failure",
                     test_record_callback_failure);
+    g_test_add_func("/onc-rpc/registry/registration",
+                    test_rpc_registry_registration);
+    g_test_add_func("/onc-rpc/registry/portmapper",
+                    test_rpc_registry_portmapper);
+    g_test_add_func("/onc-rpc/registry/dump-uint32-max",
+                    test_rpc_registry_dump_uint32_max);
+    g_test_add_func("/onc-rpc/registry/dump-overflow",
+                    test_rpc_registry_dump_overflow);
+    g_test_add_func("/onc-rpc/registry/version-mismatch",
+                    test_rpc_registry_version_mismatch);
+    g_test_add_func("/onc-rpc/registry/udp-request-endpoint-lifetime",
+                    test_rpc_udp_request_endpoint_lifetime);
+    g_test_add_func("/onc-rpc/registry/callback-teardown",
+                    test_rpc_registry_callback_teardown);
+    g_test_add_func("/onc-rpc/registry/tcp-teardown-during-receive",
+                    test_rpc_tcp_teardown_during_receive);
+    g_test_add_func("/onc-rpc/registry/callit-async-cancel",
+                    test_rpc_registry_callit_async_and_cancel);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-eagain",
+                    test_rpc_tcp_reply_eagain);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-fatal-close",
+                    test_rpc_tcp_reply_fatal_closes_after_iteration);
     return g_test_run();
 }

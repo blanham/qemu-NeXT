@@ -59,6 +59,9 @@ tests = {
   ],
   'test-onc-rpc': [
     meson.project_source_root() / 'net/onc-rpc-xdr.c',
+    meson.project_source_root() / 'net/slirp-rpc.c',
+    meson.project_source_root() / 'net/slirp-stream.c',
+    meson.project_source_root() / 'net/slirp-udp.c',
   ],
   'test-nfs2-xdr': [
     meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
@@ -249,6 +252,8 @@ if have_system
       meson.project_source_root() / 'net/slirp-il.c',
       meson.project_source_root() / 'net/slirp-guestfwd.c',
       meson.project_source_root() / 'net/slirp-plan9.c',
+      meson.project_source_root() / 'net/onc-rpc-xdr.c',
+      meson.project_source_root() / 'net/slirp-rpc.c',
       meson.project_source_root() / 'net/slirp-stream.c',
       meson.project_source_root() / 'net/slirp-udp.c',
       slirp,

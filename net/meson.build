@@ -42,6 +42,7 @@ system_ss.add(files(
   'slirp-bootp.c',
   'slirp-il.c',
   'onc-rpc-xdr.c',
+  'slirp-rpc.c',
   'slirp-stream.c',
   'slirp-udp.c',
 ))
