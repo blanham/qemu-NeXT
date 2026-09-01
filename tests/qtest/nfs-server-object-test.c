@@ -281,7 +281,8 @@ static bool is_pmap_reply(const uint8_t *frame, size_t len,
         len < ETHERNET_HEADER_LEN + ip_header_len + UDP_HEADER_LEN ||
         get_be16(ip + 2) < ip_header_len + UDP_HEADER_LEN ||
         get_be16(ip + 2) > len - ETHERNET_HEADER_LEN ||
-        internet_checksum(ip, ip_header_len) != 0 || ip[9] != UDP_PROTOCOL ||
+        internet_checksum(ip, ip_header_len) != 0 ||
+        (get_be16(ip + 6) & 0x3fff) || ip[9] != UDP_PROTOCOL ||
         get_be32(ip + 12) != SLIRP_HOST_IP ||
         get_be32(ip + 16) != GUEST_IP) {
         return false;
@@ -326,6 +327,7 @@ static size_t parse_pmap_dump(const uint8_t *rpc, size_t len,
     g_assert_cmpuint(get_be32(rpc + 20), ==, 0); /* SUCCESS */
     while (true) {
         g_assert_cmpuint(offset + 4, <=, len);
+        g_assert_cmpuint(get_be32(rpc + offset), <=, 1);
         if (!get_be32(rpc + offset)) {
             offset += 4;
             break;
@@ -341,6 +343,84 @@ static size_t parse_pmap_dump(const uint8_t *rpc, size_t len,
     }
     g_assert_cmpuint(offset, ==, len);
     return count;
+}
+
+static size_t build_pmap_success_reply(uint8_t *frame, const uint8_t *host_mac)
+{
+    uint8_t *ip = frame + ETHERNET_HEADER_LEN;
+    uint8_t *udp = ip + IPV4_HEADER_LEN;
+    uint8_t *rpc = udp + UDP_HEADER_LEN;
+    const size_t rpc_len = 24;
+    const size_t ip_len = IPV4_HEADER_LEN + UDP_HEADER_LEN + rpc_len;
+
+    memset(frame, 0, ETHERNET_HEADER_LEN + ip_len);
+    memcpy(frame, guest_mac, sizeof(guest_mac));
+    memcpy(frame + 6, host_mac, sizeof(guest_mac));
+    put_be16(frame + 12, 0x0800);
+
+    ip[0] = 0x45;
+    put_be16(ip + 2, ip_len);
+    ip[8] = 64;
+    ip[9] = UDP_PROTOCOL;
+    put_be32(ip + 12, SLIRP_HOST_IP);
+    put_be32(ip + 16, GUEST_IP);
+    put_be16(ip + 10, internet_checksum(ip, IPV4_HEADER_LEN));
+
+    put_be16(udp, PMAP_PORT);
+    put_be16(udp + 2, GUEST_RPC_PORT);
+    put_be16(udp + 4, UDP_HEADER_LEN + rpc_len);
+
+    put_be32(rpc, RPC_TEST_XID);
+    put_be32(rpc + 4, 1);              /* REPLY */
+    put_be32(rpc + 8, 0);              /* MSG_ACCEPTED */
+    put_be32(rpc + 12, 0);             /* AUTH_NULL */
+    put_be32(rpc + 16, 0);             /* verifier length */
+    put_be32(rpc + 20, 0);             /* SUCCESS */
+    return ETHERNET_HEADER_LEN + ip_len;
+}
+
+static void test_pmap_dump_rejects_noncanonical_boolean(void)
+{
+    if (g_test_subprocess()) {
+        uint8_t rpc[48] = { 0 };
+        RpcMapping mapping;
+
+        put_be32(rpc, RPC_TEST_XID);
+        put_be32(rpc + 4, 1);           /* REPLY */
+        put_be32(rpc + 8, 0);           /* MSG_ACCEPTED */
+        put_be32(rpc + 12, 0);          /* AUTH_NULL */
+        put_be32(rpc + 16, 0);          /* verifier length */
+        put_be32(rpc + 20, 0);          /* SUCCESS */
+        put_be32(rpc + 24, 2);          /* invalid TRUE */
+        put_be32(rpc + 28, RPC_TEST_PROGRAM);
+        put_be32(rpc + 32, RPC_TEST_VERSION);
+        put_be32(rpc + 36, UDP_PROTOCOL);
+        put_be32(rpc + 40, RPC_TEST_PORT);
+        put_be32(rpc + 44, 0);          /* FALSE */
+        parse_pmap_dump(rpc, sizeof(rpc), &mapping, 1);
+        return;
+    }
+
+    g_test_trap_subprocess(NULL, 0, 0);
+    g_test_trap_assert_failed();
+}
+
+static void test_pmap_reply_rejects_ipv4_fragments(void)
+{
+    static const uint8_t host_mac[6] = { 0x02, 0xaa, 0xbb, 0xcc, 0xdd,
+                                         0xee };
+    uint8_t frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN +
+                  24];
+    const uint8_t *rpc;
+    size_t rpc_len;
+    uint8_t *ip = frame + ETHERNET_HEADER_LEN;
+
+    build_pmap_success_reply(frame, host_mac);
+    put_be16(ip + 6, 0x2000);          /* IPv4 more-fragments flag */
+    put_be16(ip + 10, 0);
+    put_be16(ip + 10, internet_checksum(ip, IPV4_HEADER_LEN));
+    g_assert_false(is_pmap_reply(frame, sizeof(frame), host_mac,
+                                 &rpc, &rpc_len));
 }
 
 static QTestState *start_vm(const char *extra)
@@ -666,6 +746,10 @@ int main(int argc, char **argv)
                    test_migration_blocker_unwind);
     qtest_add_func("nfs-server-object/no-host-listener",
                    test_no_host_listener);
+    qtest_add_func("nfs-server-object/pmap-dump-rejects-noncanonical-boolean",
+                   test_pmap_dump_rejects_noncanonical_boolean);
+    qtest_add_func("nfs-server-object/pmap-reply-rejects-ipv4-fragments",
+                   test_pmap_reply_rejects_ipv4_fragments);
     qtest_add_func("nfs-server-object/shared-pmap-dump",
                    test_shared_pmap_dump);
     ret = g_test_run();
