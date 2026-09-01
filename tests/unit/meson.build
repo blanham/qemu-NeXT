@@ -57,8 +57,12 @@ tests = {
   'test-plan9-9p1-codec': [
     meson.project_source_root() / 'hw/9pfs/plan9-9p1-codec.c',
   ],
+  'test-onc-rpc': [
+    meson.project_source_root() / 'net/onc-rpc-xdr.c',
+  ],
   'test-nfs2-xdr': [
     meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+    meson.project_source_root() / 'net/onc-rpc-xdr.c',
   ],
   'test-nfs2-handle': [
     meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
@@ -68,6 +72,7 @@ tests = {
   'test-nfs2-server': [
     meson.project_source_root() / 'hw/9pfs/9p-backend.c',
     meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+    meson.project_source_root() / 'net/onc-rpc-xdr.c',
     meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
     meson.project_source_root() / 'hw/nfs/nfs2-server.c',
     crypto,
@@ -213,6 +218,7 @@ if have_system
         meson.project_source_root() / 'hw/9pfs/9p-xattr.c',
         meson.project_source_root() / 'hw/9pfs/9p-xattr-user.c',
         meson.project_source_root() / 'hw/nfs/nfs2-xdr.c',
+        meson.project_source_root() / 'net/onc-rpc-xdr.c',
         meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
         meson.project_source_root() / 'hw/nfs/nfs2-server.c',
         plan9p1_local_test_sources,

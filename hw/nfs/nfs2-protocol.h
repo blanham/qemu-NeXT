@@ -8,64 +8,19 @@
 #define NFS2_PMAP_VERSION 2U
 #define NFS2_MOUNT_VERSION 1U
 #define NFS2_NFS_VERSION 2U
-#define NFS2_RPC_VERSION 2U
 
 #define NFS2_PORT_PMAP 111U
 #define NFS2_PORT_MOUNT 635U
 #define NFS2_PORT_NFS 2049U
 #define NFS2_IPPROTO_UDP 17U
 
-#define NFS2_MAX_RPC_DATAGRAM (32U * 1024U)
 #define NFS2_MAX_DATA (8U * 1024U)
 #define NFS2_MAX_PATH 1024U
 #define NFS2_MAX_NAME 255U
-#define NFS2_MAX_AUTH_MACHINE 255U
-#define NFS2_MAX_AUTH_GROUPS 16U
-#define NFS2_MAX_AUTH_BYTES 400U
 #define NFS2_FHSIZE 32U
 #define NFS2_MAX_HANDLE_RECORDS 65536U
 #define NFS2_DUP_CACHE_SIZE 256U
 #define NFS2_DUP_CACHE_SECONDS 60U
-
-typedef enum Nfs2RpcMessageType {
-    NFS2_RPC_CALL = 0,
-    NFS2_RPC_REPLY = 1,
-} Nfs2RpcMessageType;
-
-typedef enum Nfs2RpcReplyStatus {
-    NFS2_RPC_MSG_ACCEPTED = 0,
-    NFS2_RPC_MSG_DENIED = 1,
-} Nfs2RpcReplyStatus;
-
-typedef enum Nfs2RpcAcceptStatus {
-    NFS2_RPC_SUCCESS = 0,
-    NFS2_RPC_PROG_UNAVAIL = 1,
-    NFS2_RPC_PROG_MISMATCH = 2,
-    NFS2_RPC_PROC_UNAVAIL = 3,
-    NFS2_RPC_GARBAGE_ARGS = 4,
-    NFS2_RPC_SYSTEM_ERR = 5,
-} Nfs2RpcAcceptStatus;
-
-typedef enum Nfs2RpcRejectStatus {
-    NFS2_RPC_REJECT_MISMATCH = 0,
-    NFS2_RPC_REJECT_AUTH_ERROR = 1,
-} Nfs2RpcRejectStatus;
-
-typedef enum Nfs2RpcAuthFlavor {
-    NFS2_AUTH_NULL = 0,
-    NFS2_AUTH_SYS = 1,
-} Nfs2RpcAuthFlavor;
-
-typedef enum Nfs2RpcAuthStatus {
-    NFS2_RPC_AUTH_OK = 0,
-    NFS2_RPC_AUTH_BADCRED = 1,
-    NFS2_RPC_AUTH_REJECTEDCRED = 2,
-    NFS2_RPC_AUTH_BADVERF = 3,
-    NFS2_RPC_AUTH_REJECTEDVERF = 4,
-    NFS2_RPC_AUTH_TOOWEAK = 5,
-    NFS2_RPC_AUTH_INVALIDRESP = 6,
-    NFS2_RPC_AUTH_FAILED = 7,
-} Nfs2RpcAuthStatus;
 
 typedef enum Nfs2PmapProcedure {
     NFS2_PMAP_NULL = 0,

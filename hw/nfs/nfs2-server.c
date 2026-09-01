@@ -216,10 +216,10 @@ static bool request_is_mutation(Nfs2Server *server, Nfs2Service service,
                                 const uint8_t *data, size_t len,
                                 uint32_t *xid)
 {
-    Nfs2RpcCall call;
+    OncRpcCall call;
 
     if (service != NFS2_SERVICE_NFS ||
-        nfs2_rpc_decode_call(data, len, &call) != NFS2_RPC_DECODE_OK ||
+        onc_rpc_decode_call(data, len, &call) != ONC_RPC_DECODE_OK ||
         call.program != NFS2_NFS_PROGRAM) {
         return false;
     }
@@ -1055,24 +1055,24 @@ static uint32_t file_type(mode_t mode, bool v3)
     return NFS2_NFNON;
 }
 
-static bool put_u64(Nfs2XdrWriter *w, uint64_t value)
+static bool put_u64(OncRpcXdrWriter *w, uint64_t value)
 {
-    return nfs2_xdr_put_u32(w, value >> 32) &&
-           nfs2_xdr_put_u32(w, value);
+    return onc_rpc_xdr_put_u32(w, value >> 32) &&
+           onc_rpc_xdr_put_u32(w, value);
 }
 
-static bool get_u64(Nfs2XdrReader *r, uint64_t *value)
+static bool get_u64(OncRpcXdrReader *r, uint64_t *value)
 {
     uint32_t high, low;
 
-    if (!nfs2_xdr_u32(r, &high) || !nfs2_xdr_u32(r, &low)) {
+    if (!onc_rpc_xdr_u32(r, &high) || !onc_rpc_xdr_u32(r, &low)) {
         return false;
     }
     *value = ((uint64_t)high << 32) | low;
     return true;
 }
 
-static bool put_v2_attr(Nfs2Server *server, Nfs2XdrWriter *w,
+static bool put_v2_attr(Nfs2Server *server, OncRpcXdrWriter *w,
                         const struct stat *st)
 {
     uint64_t size = st->st_size < 0 ? 0 : st->st_size;
@@ -1080,65 +1080,67 @@ static bool put_v2_attr(Nfs2Server *server, Nfs2XdrWriter *w,
     uint32_t identity;
 
     return identity_id(server, st, false, &identity) &&
-           nfs2_xdr_put_u32(w, file_type(st->st_mode, false)) &&
-           nfs2_xdr_put_u32(w, st->st_mode) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_nlink)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_uid)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_gid)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(size)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_blksize)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_rdev)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(blocks)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_dev)) &&
-           nfs2_xdr_put_u32(w, identity) &&
-           nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_atim.tv_sec, 0))) &&
-           nfs2_xdr_put_u32(w, st->st_atim.tv_nsec / 1000) &&
-           nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_mtim.tv_sec, 0))) &&
-           nfs2_xdr_put_u32(w, st->st_mtim.tv_nsec / 1000) &&
-           nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_ctim.tv_sec, 0))) &&
-           nfs2_xdr_put_u32(w, st->st_ctim.tv_nsec / 1000);
+           onc_rpc_xdr_put_u32(w, file_type(st->st_mode, false)) &&
+           onc_rpc_xdr_put_u32(w, st->st_mode) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_nlink)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_uid)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_gid)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(size)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_blksize)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_rdev)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(blocks)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_dev)) &&
+           onc_rpc_xdr_put_u32(w, identity) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(MAX(st->st_atim.tv_sec, 0))) &&
+           onc_rpc_xdr_put_u32(w, st->st_atim.tv_nsec / 1000) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(MAX(st->st_mtim.tv_sec, 0))) &&
+           onc_rpc_xdr_put_u32(w, st->st_mtim.tv_nsec / 1000) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(MAX(st->st_ctim.tv_sec, 0))) &&
+           onc_rpc_xdr_put_u32(w, st->st_ctim.tv_nsec / 1000);
 }
 
-static bool put_v3_attr(Nfs2XdrWriter *w, const struct stat *st)
+static bool put_v3_attr(OncRpcXdrWriter *w, const struct stat *st)
 {
     uint64_t size = st->st_size < 0 ? 0 : st->st_size;
     uint64_t used = st->st_blocks < 0 ? 0 : (uint64_t)st->st_blocks * 512;
 
-    return nfs2_xdr_put_u32(w, file_type(st->st_mode, true)) &&
-           nfs2_xdr_put_u32(w, st->st_mode & 07777) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_nlink)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_uid)) &&
-           nfs2_xdr_put_u32(w, clamp_u32(st->st_gid)) &&
+    return onc_rpc_xdr_put_u32(w, file_type(st->st_mode, true)) &&
+           onc_rpc_xdr_put_u32(w, st->st_mode & 07777) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_nlink)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_uid)) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(st->st_gid)) &&
            put_u64(w, size) && put_u64(w, used) &&
-           nfs2_xdr_put_u32(w, major(st->st_rdev)) &&
-           nfs2_xdr_put_u32(w, minor(st->st_rdev)) &&
+           onc_rpc_xdr_put_u32(w, major(st->st_rdev)) &&
+           onc_rpc_xdr_put_u32(w, minor(st->st_rdev)) &&
            put_u64(w, st->st_dev) && put_u64(w, st->st_ino) &&
-           nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_atim.tv_sec, 0))) &&
-           nfs2_xdr_put_u32(w, st->st_atim.tv_nsec) &&
-           nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_mtim.tv_sec, 0))) &&
-           nfs2_xdr_put_u32(w, st->st_mtim.tv_nsec) &&
-           nfs2_xdr_put_u32(w, clamp_u32(MAX(st->st_ctim.tv_sec, 0))) &&
-           nfs2_xdr_put_u32(w, st->st_ctim.tv_nsec);
+           onc_rpc_xdr_put_u32(w, clamp_u32(MAX(st->st_atim.tv_sec, 0))) &&
+           onc_rpc_xdr_put_u32(w, st->st_atim.tv_nsec) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(MAX(st->st_mtim.tv_sec, 0))) &&
+           onc_rpc_xdr_put_u32(w, st->st_mtim.tv_nsec) &&
+           onc_rpc_xdr_put_u32(w, clamp_u32(MAX(st->st_ctim.tv_sec, 0))) &&
+           onc_rpc_xdr_put_u32(w, st->st_ctim.tv_nsec);
 }
 
-static bool put_post_attr(Nfs2XdrWriter *w, const struct stat *st, bool valid)
+static bool put_post_attr(OncRpcXdrWriter *w, const struct stat *st, bool valid)
 {
-    return nfs2_xdr_put_u32(w, valid) && (!valid || put_v3_attr(w, st));
+    return onc_rpc_xdr_put_u32(w, valid) && (!valid || put_v3_attr(w, st));
 }
 
-static bool put_wcc(Nfs2XdrWriter *w, const struct stat *before,
+static bool put_wcc(OncRpcXdrWriter *w, const struct stat *before,
                     bool before_valid, const struct stat *after,
                     bool after_valid)
 {
     uint64_t size = before_valid && before->st_size > 0 ? before->st_size : 0;
 
-    return nfs2_xdr_put_u32(w, before_valid) &&
+    return onc_rpc_xdr_put_u32(w, before_valid) &&
            (!before_valid ||
             (put_u64(w, size) &&
-             nfs2_xdr_put_u32(w, clamp_u32(MAX(before->st_mtim.tv_sec, 0))) &&
-             nfs2_xdr_put_u32(w, before->st_mtim.tv_nsec) &&
-             nfs2_xdr_put_u32(w, clamp_u32(MAX(before->st_ctim.tv_sec, 0))) &&
-             nfs2_xdr_put_u32(w, before->st_ctim.tv_nsec))) &&
+             onc_rpc_xdr_put_u32(w,
+                                 clamp_u32(MAX(before->st_mtim.tv_sec, 0))) &&
+             onc_rpc_xdr_put_u32(w, before->st_mtim.tv_nsec) &&
+             onc_rpc_xdr_put_u32(w,
+                                 clamp_u32(MAX(before->st_ctim.tv_sec, 0))) &&
+             onc_rpc_xdr_put_u32(w, before->st_ctim.tv_nsec))) &&
            put_post_attr(w, after, after_valid);
 }
 
@@ -1151,23 +1153,23 @@ typedef struct NfsSetAttr {
     struct timespec times[2];
 } NfsSetAttr;
 
-static bool decode_set_bool(Nfs2XdrReader *r, bool *set)
+static bool decode_set_bool(OncRpcXdrReader *r, bool *set)
 {
     uint32_t value;
 
-    if (!nfs2_xdr_u32(r, &value) || value > 1) {
+    if (!onc_rpc_xdr_u32(r, &value) || value > 1) {
         return false;
     }
     *set = value;
     return true;
 }
 
-static bool decode_v3_time(Nfs2XdrReader *r, struct timespec *time,
+static bool decode_v3_time(OncRpcXdrReader *r, struct timespec *time,
                            bool *set)
 {
     uint32_t how, seconds, nanoseconds;
 
-    if (!nfs2_xdr_u32(r, &how) || how > 2) {
+    if (!onc_rpc_xdr_u32(r, &how) || how > 2) {
         return false;
     }
     if (how == 0) {
@@ -1179,8 +1181,8 @@ static bool decode_v3_time(Nfs2XdrReader *r, struct timespec *time,
         time->tv_nsec = UTIME_NOW;
         return true;
     }
-    if (!nfs2_xdr_u32(r, &seconds) ||
-        !nfs2_xdr_u32(r, &nanoseconds) || nanoseconds >= 1000000000) {
+    if (!onc_rpc_xdr_u32(r, &seconds) ||
+        !onc_rpc_xdr_u32(r, &nanoseconds) || nanoseconds >= 1000000000) {
         return false;
     }
     time->tv_sec = seconds;
@@ -1188,7 +1190,7 @@ static bool decode_v3_time(Nfs2XdrReader *r, struct timespec *time,
     return true;
 }
 
-static bool decode_v3_sattr(Nfs2XdrReader *r, NfsSetAttr *attr)
+static bool decode_v3_sattr(OncRpcXdrReader *r, NfsSetAttr *attr)
 {
     bool set;
     uint32_t value;
@@ -1196,7 +1198,7 @@ static bool decode_v3_sattr(Nfs2XdrReader *r, NfsSetAttr *attr)
     memset(attr, 0, sizeof(*attr));
     attr->times[0].tv_nsec = attr->times[1].tv_nsec = UTIME_OMIT;
     if (!decode_set_bool(r, &set) ||
-        (set && !nfs2_xdr_u32(r, &value))) {
+        (set && !onc_rpc_xdr_u32(r, &value))) {
         return false;
     }
     if (set) {
@@ -1206,7 +1208,7 @@ static bool decode_v3_sattr(Nfs2XdrReader *r, NfsSetAttr *attr)
     /* UID and GID are deliberately decoded and ignored. */
     for (unsigned int i = 0; i < 2; i++) {
         if (!decode_set_bool(r, &set) ||
-            (set && !nfs2_xdr_u32(r, &value))) {
+            (set && !onc_rpc_xdr_u32(r, &value))) {
             return false;
         }
     }
@@ -1219,19 +1221,19 @@ static bool decode_v3_sattr(Nfs2XdrReader *r, NfsSetAttr *attr)
            decode_v3_time(r, &attr->times[1], &attr->times_set);
 }
 
-static bool decode_v2_sattr(Nfs2XdrReader *r, NfsSetAttr *attr)
+static bool decode_v2_sattr(OncRpcXdrReader *r, NfsSetAttr *attr)
 {
     uint32_t mode, ignored, size, atime_sec, atime_usec;
     uint32_t mtime_sec, mtime_usec;
 
     memset(attr, 0, sizeof(*attr));
     attr->times[0].tv_nsec = attr->times[1].tv_nsec = UTIME_OMIT;
-    if (!nfs2_xdr_u32(r, &mode) || !nfs2_xdr_u32(r, &ignored) ||
-        !nfs2_xdr_u32(r, &ignored) || !nfs2_xdr_u32(r, &size) ||
-        !nfs2_xdr_u32(r, &atime_sec) ||
-        !nfs2_xdr_u32(r, &atime_usec) ||
-        !nfs2_xdr_u32(r, &mtime_sec) ||
-        !nfs2_xdr_u32(r, &mtime_usec)) {
+    if (!onc_rpc_xdr_u32(r, &mode) || !onc_rpc_xdr_u32(r, &ignored) ||
+        !onc_rpc_xdr_u32(r, &ignored) || !onc_rpc_xdr_u32(r, &size) ||
+        !onc_rpc_xdr_u32(r, &atime_sec) ||
+        !onc_rpc_xdr_u32(r, &atime_usec) ||
+        !onc_rpc_xdr_u32(r, &mtime_sec) ||
+        !onc_rpc_xdr_u32(r, &mtime_usec)) {
         return false;
     }
     if (atime_usec >= 1000000 && atime_usec != UINT32_MAX) {
@@ -1317,14 +1319,15 @@ static int coroutine_fn apply_sattr(Nfs2Server *server,
     return ret;
 }
 
-static bool decode_v3_handle(Nfs2XdrReader *r, Nfs2FileHandle *handle,
+static bool decode_v3_handle(OncRpcXdrReader *r, Nfs2FileHandle *handle,
                              bool require_empty)
 {
     const uint8_t *bytes;
     size_t length;
 
-    if (!nfs2_xdr_counted_opaque(r, &bytes, &length, NFS3_FHSIZE) ||
-        length != NFS3_FHSIZE || (require_empty && !nfs2_xdr_reader_empty(r))) {
+    if (!onc_rpc_xdr_counted_opaque(r, &bytes, &length, NFS3_FHSIZE) ||
+        length != NFS3_FHSIZE ||
+        (require_empty && !onc_rpc_xdr_reader_empty(r))) {
         return false;
     }
     memcpy(handle->bytes, bytes, sizeof(handle->bytes));
@@ -1459,9 +1462,9 @@ static int make_handle(Nfs2Server *server, const char *path,
            0 : -EIO;
 }
 
-static bool write_nfs_status(Nfs2XdrWriter *w, uint32_t status)
+static bool write_nfs_status(OncRpcXdrWriter *w, uint32_t status)
 {
-    return nfs2_xdr_put_u32(w, status);
+    return onc_rpc_xdr_put_u32(w, status);
 }
 
 static int service_program(Nfs2Service service)
@@ -1485,9 +1488,9 @@ static bool service_version(Nfs2Service service, uint32_t version)
     return version == NFS2_NFS_VERSION || version == NFS3_VERSION;
 }
 
-static bool body_empty(const Nfs2RpcCall *call)
+static bool body_empty(const OncRpcCall *call)
 {
-    return nfs2_xdr_reader_empty(&call->body);
+    return onc_rpc_xdr_reader_empty(&call->body);
 }
 
 static int port_for_mapping(const Nfs2PmapGetPortArgs *args)
@@ -1511,41 +1514,41 @@ static int port_for_mapping(const Nfs2PmapGetPortArgs *args)
     return 0;
 }
 
-static bool coroutine_fn dispatch_portmap(Nfs2RpcCall *call,
-                                          Nfs2XdrWriter *w)
+static bool coroutine_fn dispatch_portmap(OncRpcCall *call,
+                                          OncRpcXdrWriter *w)
 {
     Nfs2PmapGetPortArgs args;
 
     switch (call->procedure) {
     case NFS2_PMAP_NULL:
-        return body_empty(call) ? nfs2_rpc_reply_success(w, call->xid) :
-                                  nfs2_rpc_reply_garbage_args(w, call->xid);
+        return body_empty(call) ? onc_rpc_reply_success(w, call->xid) :
+                                  onc_rpc_reply_garbage_args(w, call->xid);
     case NFS2_PMAP_GETPORT:
         if (!nfs2_xdr_decode_pmap_getport(&call->body, &args)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
-        return nfs2_rpc_reply_success(w, call->xid) &&
-               nfs2_xdr_put_u32(w, port_for_mapping(&args));
+        return onc_rpc_reply_success(w, call->xid) &&
+               onc_rpc_xdr_put_u32(w, port_for_mapping(&args));
     default:
-        return nfs2_rpc_reply_proc_unavail(w, call->xid);
+        return onc_rpc_reply_proc_unavail(w, call->xid);
     }
 }
 
 static bool coroutine_fn dispatch_mount(Nfs2Server *server,
-                                        Nfs2RpcCall *call,
-                                        Nfs2XdrWriter *w)
+                                        OncRpcCall *call,
+                                        OncRpcXdrWriter *w)
 {
     Nfs2MountMntArgs args;
 
     switch (call->procedure) {
     case NFS2_MOUNT_NULL:
-        return body_empty(call) ? nfs2_rpc_reply_success(w, call->xid) :
-                                  nfs2_rpc_reply_garbage_args(w, call->xid);
+        return body_empty(call) ? onc_rpc_reply_success(w, call->xid) :
+                                  onc_rpc_reply_garbage_args(w, call->xid);
     case NFS2_MOUNT_MNT:
         if (!nfs2_xdr_decode_mount_mnt(&call->body, &args)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
-        if (!nfs2_rpc_reply_success(w, call->xid)) {
+        if (!onc_rpc_reply_success(w, call->xid)) {
             return false;
         }
         if (strcmp(args.path, "/")) {
@@ -1555,33 +1558,33 @@ static bool coroutine_fn dispatch_mount(Nfs2Server *server,
             return false;
         }
         if (call->version == NFS2_MOUNT_VERSION) {
-            return nfs2_xdr_put_opaque(w, server->root_handle.bytes,
+            return onc_rpc_xdr_put_opaque(w, server->root_handle.bytes,
                                        sizeof(server->root_handle.bytes));
         }
-        return nfs2_xdr_put_counted_opaque(w, server->root_handle.bytes,
+        return onc_rpc_xdr_put_counted_opaque(w, server->root_handle.bytes,
                                            sizeof(server->root_handle.bytes),
                                            NFS3_FHSIZE) &&
-               nfs2_xdr_put_u32(w, 1) &&
-               nfs2_xdr_put_u32(w, NFS2_AUTH_SYS);
+               onc_rpc_xdr_put_u32(w, 1) &&
+               onc_rpc_xdr_put_u32(w, ONC_RPC_AUTH_SYS);
     default:
-        return nfs2_rpc_reply_proc_unavail(w, call->xid);
+        return onc_rpc_reply_proc_unavail(w, call->xid);
     }
 }
 
-static bool decode_v2_handle(Nfs2RpcCall *call, Nfs2FileHandle *handle)
+static bool decode_v2_handle(OncRpcCall *call, Nfs2FileHandle *handle)
 {
     return nfs2_xdr_decode_fhandle(&call->body, handle);
 }
 
-static bool decode_v2_handle_partial(Nfs2XdrReader *r,
+static bool decode_v2_handle_partial(OncRpcXdrReader *r,
                                      Nfs2FileHandle *handle)
 {
-    return nfs2_xdr_opaque(r, handle->bytes, sizeof(handle->bytes));
+    return onc_rpc_xdr_opaque(r, handle->bytes, sizeof(handle->bytes));
 }
 
 static bool coroutine_fn reply_getattr(Nfs2Server *server,
-                                       Nfs2RpcCall *call,
-                                       Nfs2XdrWriter *w, bool v3)
+                                       OncRpcCall *call,
+                                       OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -1591,10 +1594,10 @@ static bool coroutine_fn reply_getattr(Nfs2Server *server,
 
     if (!(v3 ? decode_v3_handle(&call->body, &handle, true) :
                decode_v2_handle(call, &handle))) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && ret >= 0) {
         ok = v3 ? put_v3_attr(w, &st) : put_v2_attr(server, w, &st);
@@ -1604,7 +1607,7 @@ static bool coroutine_fn reply_getattr(Nfs2Server *server,
     return ok;
 }
 
-static bool decode_lookup(Nfs2RpcCall *call, bool v3, Nfs2FileHandle *dir,
+static bool decode_lookup(OncRpcCall *call, bool v3, Nfs2FileHandle *dir,
                           char name[NFS2_MAX_NAME + 1])
 {
     if (!v3) {
@@ -1619,14 +1622,14 @@ static bool decode_lookup(Nfs2RpcCall *call, bool v3, Nfs2FileHandle *dir,
                !strchr(name, '/');
     }
     return decode_v3_handle(&call->body, dir, false) &&
-           nfs2_xdr_string(&call->body, name, NFS2_MAX_NAME + 1,
+           onc_rpc_xdr_string(&call->body, name, NFS2_MAX_NAME + 1,
                            NFS2_MAX_NAME) && name[0] && strcmp(name, ".") &&
            strcmp(name, "..") && !strchr(name, '/') &&
-           nfs2_xdr_reader_empty(&call->body);
+           onc_rpc_xdr_reader_empty(&call->body);
 }
 
-static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w, bool v3)
+static bool coroutine_fn reply_lookup(Nfs2Server *server, OncRpcCall *call,
+                                      OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle dir_handle, result_handle;
     char name[NFS2_MAX_NAME + 1];
@@ -1640,7 +1643,7 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     bool child_revalidated = false;
 
     if (!decode_lookup(call, v3, &dir_handle, name)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &dir_handle, &absolute, &dir, &dir_st);
     dir_resolved = ret >= 0;
@@ -1704,17 +1707,17 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
         ret = make_handle(server, child_path, &st, &child_path_state,
                           &result_handle);
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && ret >= 0) {
         if (v3) {
-            ok = nfs2_xdr_put_counted_opaque(w, result_handle.bytes,
+            ok = onc_rpc_xdr_put_counted_opaque(w, result_handle.bytes,
                                               sizeof(result_handle.bytes),
                                               NFS3_FHSIZE) &&
                  put_post_attr(w, &st, true) &&
                  put_post_attr(w, &dir_st, true);
         } else {
-            ok = nfs2_xdr_put_opaque(w, result_handle.bytes,
+            ok = onc_rpc_xdr_put_opaque(w, result_handle.bytes,
                                      sizeof(result_handle.bytes)) &&
                  put_v2_attr(server, w, &st);
         }
@@ -1727,8 +1730,8 @@ static bool coroutine_fn reply_lookup(Nfs2Server *server, Nfs2RpcCall *call,
     return ok;
 }
 
-static bool coroutine_fn reply_access(Nfs2Server *server, Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w)
+static bool coroutine_fn reply_access(Nfs2Server *server, OncRpcCall *call,
+                                      OncRpcXdrWriter *w)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -1738,17 +1741,17 @@ static bool coroutine_fn reply_access(Nfs2Server *server, Nfs2RpcCall *call,
     bool ok;
 
     if (!decode_v3_handle(&call->body, &handle, false) ||
-        !nfs2_xdr_u32(&call->body, &requested) ||
-        !nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        !onc_rpc_xdr_u32(&call->body, &requested) ||
+        !onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
     requested &= ~(uint32_t)(0x0004 | 0x0008 | 0x0010);
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_post_attr(w, &st, ret >= 0);
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_u32(w, requested & 0x003f);
+        ok = onc_rpc_xdr_put_u32(w, requested & 0x003f);
     }
     path_clear(&absolute);
     path_clear(&path);
@@ -1756,8 +1759,8 @@ static bool coroutine_fn reply_access(Nfs2Server *server, Nfs2RpcCall *call,
 }
 
 static bool coroutine_fn reply_readlink(Nfs2Server *server,
-                                        Nfs2RpcCall *call,
-                                        Nfs2XdrWriter *w, bool v3)
+                                        OncRpcCall *call,
+                                        OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -1770,7 +1773,7 @@ static bool coroutine_fn reply_readlink(Nfs2Server *server,
 
     if (!(v3 ? decode_v3_handle(&call->body, &handle, true) :
                decode_v2_handle(call, &handle))) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0 && !S_ISLNK(st.st_mode)) {
@@ -1792,13 +1795,13 @@ static bool coroutine_fn reply_readlink(Nfs2Server *server,
             st = current_st;
         }
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_post_attr(w, &st, ret >= 0);
     }
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_counted_opaque(w, target, target_length,
+        ok = onc_rpc_xdr_put_counted_opaque(w, target, target_length,
                                           NFS2_MAX_PATH);
     }
     path_clear(&absolute);
@@ -1806,7 +1809,7 @@ static bool coroutine_fn reply_readlink(Nfs2Server *server,
     return ok;
 }
 
-static bool decode_read(Nfs2RpcCall *call, bool v3, Nfs2FileHandle *handle,
+static bool decode_read(OncRpcCall *call, bool v3, Nfs2FileHandle *handle,
                         uint64_t *offset, uint32_t *count)
 {
     if (!v3) {
@@ -1822,12 +1825,12 @@ static bool decode_read(Nfs2RpcCall *call, bool v3, Nfs2FileHandle *handle,
     }
     return decode_v3_handle(&call->body, handle, false) &&
            get_u64(&call->body, offset) &&
-           nfs2_xdr_u32(&call->body, count) && *count <= NFS2_MAX_DATA &&
-           nfs2_xdr_reader_empty(&call->body);
+           onc_rpc_xdr_u32(&call->body, count) && *count <= NFS2_MAX_DATA &&
+           onc_rpc_xdr_reader_empty(&call->body);
 }
 
-static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
-                                    Nfs2XdrWriter *w, bool v3)
+static bool coroutine_fn reply_read(Nfs2Server *server, OncRpcCall *call,
+                                    OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -1841,7 +1844,7 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
     bool ok;
 
     if (!decode_read(call, v3, &handle, &offset, &count)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0 && !S_ISREG(st.st_mode)) {
@@ -1885,17 +1888,17 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
             ret = close_ret;
         }
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && ret >= 0) {
         if (v3) {
             ok = put_post_attr(w, &st, true) &&
-                 nfs2_xdr_put_u32(w, ret) &&
-                 nfs2_xdr_put_u32(w, offset + ret >= (uint64_t)st.st_size) &&
-                 nfs2_xdr_put_counted_opaque(w, data, ret, NFS2_MAX_DATA);
+                 onc_rpc_xdr_put_u32(w, ret) &&
+                 onc_rpc_xdr_put_u32(w, offset + ret >= (uint64_t)st.st_size) &&
+                 onc_rpc_xdr_put_counted_opaque(w, data, ret, NFS2_MAX_DATA);
         } else {
             ok = put_v2_attr(server, w, &st) &&
-                 nfs2_xdr_put_counted_opaque(w, data, ret, NFS2_MAX_DATA);
+                 onc_rpc_xdr_put_counted_opaque(w, data, ret, NFS2_MAX_DATA);
         }
     } else if (ok && v3) {
         ok = put_post_attr(w, &st, false);
@@ -1905,7 +1908,7 @@ static bool coroutine_fn reply_read(Nfs2Server *server, Nfs2RpcCall *call,
     return ok;
 }
 
-static bool decode_readdir(Nfs2RpcCall *call, bool v3,
+static bool decode_readdir(OncRpcCall *call, bool v3,
                            Nfs2FileHandle *handle, uint64_t *cookie,
                            uint8_t verifier[NFS3_COOKIEVERFSIZE],
                            uint32_t *dircount, uint32_t *count, bool plus)
@@ -1913,25 +1916,25 @@ static bool decode_readdir(Nfs2RpcCall *call, bool v3,
     if (v3) {
         if (!decode_v3_handle(&call->body, handle, false) ||
             !get_u64(&call->body, cookie) ||
-            !nfs2_xdr_opaque(&call->body, verifier,
+            !onc_rpc_xdr_opaque(&call->body, verifier,
                              NFS3_COOKIEVERFSIZE)) {
             return false;
         }
-        if (plus && (!nfs2_xdr_u32(&call->body, dircount) ||
+        if (plus && (!onc_rpc_xdr_u32(&call->body, dircount) ||
                      *dircount > NFS2_MAX_DATA)) {
             return false;
         }
-        return nfs2_xdr_u32(&call->body, count) &&
+        return onc_rpc_xdr_u32(&call->body, count) &&
                *count <= NFS2_MAX_DATA &&
-               nfs2_xdr_reader_empty(&call->body);
+               onc_rpc_xdr_reader_empty(&call->body);
     }
     uint32_t cookie32;
 
-    if (!nfs2_xdr_opaque(&call->body, handle->bytes, NFS2_FHSIZE) ||
-        !nfs2_xdr_u32(&call->body, &cookie32) ||
-        !nfs2_xdr_u32(&call->body, count) || *count < 8 ||
+    if (!onc_rpc_xdr_opaque(&call->body, handle->bytes, NFS2_FHSIZE) ||
+        !onc_rpc_xdr_u32(&call->body, &cookie32) ||
+        !onc_rpc_xdr_u32(&call->body, count) || *count < 8 ||
         *count > NFS2_MAX_DATA ||
-        !nfs2_xdr_reader_empty(&call->body)) {
+        !onc_rpc_xdr_reader_empty(&call->body)) {
         return false;
     }
     *cookie = cookie32;
@@ -1954,8 +1957,8 @@ static void directory_verifier(Nfs2Server *server, const struct stat *st,
 }
 
 static bool coroutine_fn reply_readdir(Nfs2Server *server,
-                                       Nfs2RpcCall *call,
-                                       Nfs2XdrWriter *w, bool v3, bool plus)
+                                       OncRpcCall *call,
+                                       OncRpcXdrWriter *w, bool v3, bool plus)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -1975,7 +1978,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
 
     if (!decode_readdir(call, v3, &handle, &cookie, supplied_verifier,
                         &dircount, &count, plus)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &dir_st);
     directory_identity = ldq_be_p(handle.bytes + 8);
@@ -2050,14 +2053,14 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
 
         ret = run_backend(&work);
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_post_attr(w, &dir_st, dir_attr_valid && ret >= 0) &&
-             (ret < 0 || nfs2_xdr_put_opaque(w, current_verifier,
+             (ret < 0 || onc_rpc_xdr_put_opaque(w, current_verifier,
                                               sizeof(current_verifier)));
         if (ok && ret >= 0 &&
-            nfs2_xdr_writer_size(w) - 28 + 8 > count) {
+            onc_rpc_xdr_writer_size(w) - 28 + 8 > count) {
             ret = -EMSGSIZE;
         }
     }
@@ -2073,7 +2076,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         Nfs2HandlePathState child_path_state;
         uint32_t child_identity = 0;
         bool child_valid = false;
-        size_t before = nfs2_xdr_writer_size(w), directory_end;
+        size_t before = onc_rpc_xdr_writer_size(w), directory_end;
 
         ret = run_backend(&work);
         if (ret <= 0) {
@@ -2136,18 +2139,18 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
                 cookie = tell.cookie;
             }
         }
-        if (!nfs2_xdr_put_u32(w, 1) ||
+        if (!onc_rpc_xdr_put_u32(w, 1) ||
             !(v3 ? put_u64(w, work.dirent_ino) :
-                   nfs2_xdr_put_u32(w, child_identity)) ||
-            !nfs2_xdr_put_counted_opaque(w, work.dirent_name,
+                   onc_rpc_xdr_put_u32(w, child_identity)) ||
+            !onc_rpc_xdr_put_counted_opaque(w, work.dirent_name,
                                           strlen(work.dirent_name),
                                           NFS2_MAX_NAME) ||
             !(v3 ? put_u64(w, cookie) :
-                   nfs2_xdr_put_u32(w, clamp_u32(cookie))) ||
+                   onc_rpc_xdr_put_u32(w, clamp_u32(cookie))) ||
             (plus && (!put_post_attr(w, &child_st, child_valid) ||
-                      !nfs2_xdr_put_u32(w, child_valid) ||
+                      !onc_rpc_xdr_put_u32(w, child_valid) ||
                       (child_valid &&
-                       !nfs2_xdr_put_counted_opaque(w, child_handle.bytes,
+                       !onc_rpc_xdr_put_counted_opaque(w, child_handle.bytes,
                                                    sizeof(child_handle.bytes),
                                                    NFS3_FHSIZE))))) {
             w->cursor = w->start + before;
@@ -2162,7 +2165,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
             eof = false;
             break;
         }
-        if (nfs2_xdr_writer_size(w) - 28 + 8 > count) {
+        if (onc_rpc_xdr_writer_size(w) - 28 + 8 > count) {
             w->cursor = w->start + before;
             ret = (v3 && !emitted) ? -EMSGSIZE : 0;
             eof = false;
@@ -2192,8 +2195,8 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
     if (ret < 0) {
         size_t capacity = w->end - w->start;
 
-        nfs2_xdr_writer_init(w, w->start, capacity);
-        ok = nfs2_rpc_reply_success(w, call->xid) &&
+        onc_rpc_xdr_writer_init(w, w->start, capacity);
+        ok = onc_rpc_reply_success(w, call->xid) &&
              write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
         if (ok && v3) {
             ok = put_post_attr(w, &dir_st, dir_attr_valid);
@@ -2203,7 +2206,7 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
         return ok;
     }
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_u32(w, 0) && nfs2_xdr_put_u32(w, eof);
+        ok = onc_rpc_xdr_put_u32(w, 0) && onc_rpc_xdr_put_u32(w, eof);
     }
     path_clear(&absolute);
     path_clear(&path);
@@ -2211,8 +2214,8 @@ static bool coroutine_fn reply_readdir(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_statfs(Nfs2Server *server,
-                                      Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w, bool v3)
+                                      OncRpcCall *call,
+                                      OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -2227,7 +2230,7 @@ static bool coroutine_fn reply_statfs(Nfs2Server *server,
 
     if (!(v3 ? decode_v3_handle(&call->body, &handle, true) :
                decode_v2_handle(call, &handle))) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
     if (ret >= 0) {
@@ -2249,7 +2252,7 @@ static bool coroutine_fn reply_statfs(Nfs2Server *server,
             st = current_st;
         }
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_post_attr(w, &st, ret >= 0);
@@ -2263,13 +2266,13 @@ static bool coroutine_fn reply_statfs(Nfs2Server *server,
                  put_u64(w, MIN((uint64_t)fs.f_files, UINT64_MAX)) &&
                  put_u64(w, MIN((uint64_t)fs.f_ffree, UINT64_MAX)) &&
                  put_u64(w, MIN((uint64_t)fs.f_ffree, UINT64_MAX)) &&
-                 nfs2_xdr_put_u32(w, 0);
+                 onc_rpc_xdr_put_u32(w, 0);
         } else {
-            ok = nfs2_xdr_put_u32(w, NFS2_MAX_DATA) &&
-                 nfs2_xdr_put_u32(w, clamp_u32(fs.f_bsize)) &&
-                 nfs2_xdr_put_u32(w, clamp_u32(fs.f_blocks)) &&
-                 nfs2_xdr_put_u32(w, clamp_u32(fs.f_bfree)) &&
-                 nfs2_xdr_put_u32(w, clamp_u32(fs.f_bavail));
+            ok = onc_rpc_xdr_put_u32(w, NFS2_MAX_DATA) &&
+                 onc_rpc_xdr_put_u32(w, clamp_u32(fs.f_bsize)) &&
+                 onc_rpc_xdr_put_u32(w, clamp_u32(fs.f_blocks)) &&
+                 onc_rpc_xdr_put_u32(w, clamp_u32(fs.f_bfree)) &&
+                 onc_rpc_xdr_put_u32(w, clamp_u32(fs.f_bavail));
         }
     }
     path_clear(&absolute);
@@ -2278,7 +2281,7 @@ static bool coroutine_fn reply_statfs(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_fsinfo(Nfs2Server *server,
-                                      Nfs2RpcCall *call, Nfs2XdrWriter *w)
+                                      OncRpcCall *call, OncRpcXdrWriter *w)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -2287,23 +2290,23 @@ static bool coroutine_fn reply_fsinfo(Nfs2Server *server,
     bool ok;
 
     if (!decode_v3_handle(&call->body, &handle, true)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_post_attr(w, &st, ret >= 0);
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_u32(w, NFS2_MAX_DATA) &&
-             nfs2_xdr_put_u32(w, NFS2_MAX_DATA) &&
-             nfs2_xdr_put_u32(w, 4096) &&
-             nfs2_xdr_put_u32(w, NFS2_MAX_DATA) &&
-             nfs2_xdr_put_u32(w, NFS2_MAX_DATA) &&
-             nfs2_xdr_put_u32(w, 4096) &&
-             nfs2_xdr_put_u32(w, NFS2_MAX_DATA) &&
+        ok = onc_rpc_xdr_put_u32(w, NFS2_MAX_DATA) &&
+             onc_rpc_xdr_put_u32(w, NFS2_MAX_DATA) &&
+             onc_rpc_xdr_put_u32(w, 4096) &&
+             onc_rpc_xdr_put_u32(w, NFS2_MAX_DATA) &&
+             onc_rpc_xdr_put_u32(w, NFS2_MAX_DATA) &&
+             onc_rpc_xdr_put_u32(w, 4096) &&
+             onc_rpc_xdr_put_u32(w, NFS2_MAX_DATA) &&
              put_u64(w, INT64_MAX) &&
-             nfs2_xdr_put_u32(w, 0) && nfs2_xdr_put_u32(w, 1) &&
-             nfs2_xdr_put_u32(w, 0x0002 | 0x0008);
+             onc_rpc_xdr_put_u32(w, 0) && onc_rpc_xdr_put_u32(w, 1) &&
+             onc_rpc_xdr_put_u32(w, 0x0002 | 0x0008);
     }
     path_clear(&absolute);
     path_clear(&path);
@@ -2311,7 +2314,7 @@ static bool coroutine_fn reply_fsinfo(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_pathconf(Nfs2Server *server,
-                                        Nfs2RpcCall *call, Nfs2XdrWriter *w)
+                                        OncRpcCall *call, OncRpcXdrWriter *w)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -2320,17 +2323,17 @@ static bool coroutine_fn reply_pathconf(Nfs2Server *server,
     bool ok;
 
     if (!decode_v3_handle(&call->body, &handle, true)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &st);
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_post_attr(w, &st, ret >= 0);
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_u32(w, 32000) &&
-             nfs2_xdr_put_u32(w, NFS2_MAX_NAME) &&
-             nfs2_xdr_put_u32(w, 1) && nfs2_xdr_put_u32(w, 1) &&
-             nfs2_xdr_put_u32(w, 0) && nfs2_xdr_put_u32(w, 1);
+        ok = onc_rpc_xdr_put_u32(w, 32000) &&
+             onc_rpc_xdr_put_u32(w, NFS2_MAX_NAME) &&
+             onc_rpc_xdr_put_u32(w, 1) && onc_rpc_xdr_put_u32(w, 1) &&
+             onc_rpc_xdr_put_u32(w, 0) && onc_rpc_xdr_put_u32(w, 1);
     }
     path_clear(&absolute);
     path_clear(&path);
@@ -2338,8 +2341,8 @@ static bool coroutine_fn reply_pathconf(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_setattr(Nfs2Server *server,
-                                       Nfs2RpcCall *call,
-                                       Nfs2XdrWriter *w, bool v3)
+                                       OncRpcCall *call,
+                                       OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle handle;
     NfsSetAttr attr;
@@ -2354,16 +2357,16 @@ static bool coroutine_fn reply_setattr(Nfs2Server *server,
                decode_v2_handle_partial(&call->body, &handle)) ||
         !(v3 ? decode_v3_sattr(&call->body, &attr) :
                decode_v2_sattr(&call->body, &attr))) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     if (v3 && (!decode_set_bool(&call->body, &guard) ||
-               (guard && (!nfs2_xdr_u32(&call->body, &guard_sec) ||
-                          !nfs2_xdr_u32(&call->body, &guard_nsec) ||
+               (guard && (!onc_rpc_xdr_u32(&call->body, &guard_sec) ||
+                          !onc_rpc_xdr_u32(&call->body, &guard_nsec) ||
                           guard_nsec >= 1000000000)))) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
-    if (!nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+    if (!onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &handle, &absolute, &path, &before);
     before_valid = ret >= 0;
@@ -2384,7 +2387,7 @@ static bool coroutine_fn reply_setattr(Nfs2Server *server,
             ret = post_ret;
         }
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? (ret == -EAGAIN ? NFS3ERR_NOT_SYNC :
                                    v3_status(ret)) : v2_status(ret));
     if (ok && v3) {
@@ -2397,13 +2400,13 @@ static bool coroutine_fn reply_setattr(Nfs2Server *server,
     return ok;
 }
 
-static bool decode_name_args(Nfs2RpcCall *call, bool v3,
+static bool decode_name_args(OncRpcCall *call, bool v3,
                              Nfs2FileHandle *dir,
                              char name[NFS2_MAX_NAME + 1])
 {
     return (v3 ? decode_v3_handle(&call->body, dir, false) :
                  decode_v2_handle_partial(&call->body, dir)) &&
-           nfs2_xdr_string(&call->body, name, NFS2_MAX_NAME + 1,
+           onc_rpc_xdr_string(&call->body, name, NFS2_MAX_NAME + 1,
                            NFS2_MAX_NAME) && name[0] && strcmp(name, ".") &&
            strcmp(name, "..") && !strchr(name, '/');
 }
@@ -2545,8 +2548,8 @@ static int coroutine_fn exclusive_create(Nfs2Server *server, V9fsPath *dir,
 }
 
 static bool coroutine_fn reply_create(Nfs2Server *server,
-                                      Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w, bool v3,
+                                      OncRpcCall *call,
+                                      OncRpcXdrWriter *w, bool v3,
                                       uint32_t kind)
 {
     Nfs2FileHandle dir_handle, result_handle;
@@ -2565,70 +2568,70 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
     bool ok;
 
     if (!decode_name_args(call, v3, &dir_handle, name)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     if (!v3) {
         if (kind == NFS2_NFSPROC_SYMLINK) {
-            if (!nfs2_xdr_string(&call->body, target, sizeof(target),
+            if (!onc_rpc_xdr_string(&call->body, target, sizeof(target),
                                  NFS2_MAX_PATH) || !target[0]) {
-                return nfs2_rpc_reply_garbage_args(w, call->xid);
+                return onc_rpc_reply_garbage_args(w, call->xid);
             }
         }
         if (!decode_v2_sattr(&call->body, &attr)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         type = kind == NFS2_NFSPROC_MKDIR ? NFS2_NFDIR :
                kind == NFS2_NFSPROC_SYMLINK ? NFS2_NFLNK : NFS2_NFREG;
     } else if (kind == NFS3PROC_CREATE) {
-        if (!nfs2_xdr_u32(&call->body, &create_mode) || create_mode > 2) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+        if (!onc_rpc_xdr_u32(&call->body, &create_mode) || create_mode > 2) {
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         if (create_mode == 2) {
-            if (!nfs2_xdr_opaque(&call->body, verifier,
+            if (!onc_rpc_xdr_opaque(&call->body, verifier,
                                  sizeof(verifier))) {
-                return nfs2_rpc_reply_garbage_args(w, call->xid);
+                return onc_rpc_reply_garbage_args(w, call->xid);
             }
             attr.mode_set = true;
             attr.mode = 0600;
         } else if (!decode_v3_sattr(&call->body, &attr)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
     } else if (kind == NFS3PROC_SYMLINK) {
         if (!decode_v3_sattr(&call->body, &attr) ||
-            !nfs2_xdr_string(&call->body, target, sizeof(target),
+            !onc_rpc_xdr_string(&call->body, target, sizeof(target),
                              NFS2_MAX_PATH) || !target[0]) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         type = NFS2_NFLNK;
     } else if (kind == NFS3PROC_MKNOD) {
-        if (!nfs2_xdr_u32(&call->body, &type)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+        if (!onc_rpc_xdr_u32(&call->body, &type)) {
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         if (type < NFS2_NFBLK || type > 7 || type == NFS2_NFLNK) {
-            if (!nfs2_xdr_reader_empty(&call->body)) {
-                return nfs2_rpc_reply_garbage_args(w, call->xid);
+            if (!onc_rpc_xdr_reader_empty(&call->body)) {
+                return onc_rpc_reply_garbage_args(w, call->xid);
             }
-            return nfs2_rpc_reply_success(w, call->xid) &&
+            return onc_rpc_reply_success(w, call->xid) &&
                    write_nfs_status(w, NFS3ERR_BADTYPE) &&
-                   nfs2_xdr_put_u32(w, 0) && nfs2_xdr_put_u32(w, 0);
+                   onc_rpc_xdr_put_u32(w, 0) && onc_rpc_xdr_put_u32(w, 0);
         }
         if (!decode_v3_sattr(&call->body, &attr) ||
             ((type == NFS2_NFBLK || type == NFS2_NFCHR) &&
-             (!nfs2_xdr_u32(&call->body, &major_no) ||
-              !nfs2_xdr_u32(&call->body, &minor_no)))) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+             (!onc_rpc_xdr_u32(&call->body, &major_no) ||
+              !onc_rpc_xdr_u32(&call->body, &minor_no)))) {
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
     } else {
         if (!decode_v3_sattr(&call->body, &attr)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         type = NFS2_NFDIR;
     }
     if (type != NFS2_NFREG) {
         attr.size_set = false;
     }
-    if (!nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+    if (!onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_directory(server, &dir_handle, &absolute, &dir, &before);
     before_valid = ret >= 0;
@@ -2741,18 +2744,18 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
                                                       &dir_after) >= 0) {
             dir_after_valid = true;
         }
-        ok = nfs2_rpc_reply_success(w, call->xid) &&
+        ok = onc_rpc_reply_success(w, call->xid) &&
              write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
         if (ok && ret >= 0) {
             if (v3) {
-                ok = nfs2_xdr_put_u32(w, 1) &&
-                     nfs2_xdr_put_counted_opaque(w, result_handle.bytes, 32,
+                ok = onc_rpc_xdr_put_u32(w, 1) &&
+                     onc_rpc_xdr_put_counted_opaque(w, result_handle.bytes, 32,
                                                  32) &&
                      put_post_attr(w, &after, true) &&
                      put_wcc(w, &before, before_valid, &dir_after,
                              dir_after_valid);
             } else if (kind != NFS2_NFSPROC_SYMLINK) {
-                ok = nfs2_xdr_put_opaque(w, result_handle.bytes, 32) &&
+                ok = onc_rpc_xdr_put_opaque(w, result_handle.bytes, 32) &&
                      put_v2_attr(server, w, &after);
             }
         } else if (ok && v3) {
@@ -2767,8 +2770,8 @@ static bool coroutine_fn reply_create(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_write(Nfs2Server *server,
-                                     Nfs2RpcCall *call,
-                                     Nfs2XdrWriter *w, bool v3)
+                                     OncRpcCall *call,
+                                     OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -2785,27 +2788,27 @@ static bool coroutine_fn reply_write(Nfs2Server *server,
     if (v3) {
         if (!decode_v3_handle(&call->body, &handle, false) ||
             !get_u64(&call->body, &offset) ||
-            !nfs2_xdr_u32(&call->body, &count) ||
-            !nfs2_xdr_u32(&call->body, &stable) || stable > 2 ||
-            !nfs2_xdr_counted_opaque(&call->body, &data, &data_len,
+            !onc_rpc_xdr_u32(&call->body, &count) ||
+            !onc_rpc_xdr_u32(&call->body, &stable) || stable > 2 ||
+            !onc_rpc_xdr_counted_opaque(&call->body, &data, &data_len,
                                      NFS2_MAX_DATA) ||
-            data_len != count || !nfs2_xdr_reader_empty(&call->body)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            data_len != count || !onc_rpc_xdr_reader_empty(&call->body)) {
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
     } else {
         uint32_t begin_offset, write_offset, total_count;
 
         if (!decode_v2_handle_partial(&call->body, &handle) ||
-            !nfs2_xdr_u32(&call->body, &begin_offset) ||
-            !nfs2_xdr_u32(&call->body, &write_offset) ||
-            !nfs2_xdr_u32(&call->body, &total_count)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            !onc_rpc_xdr_u32(&call->body, &begin_offset) ||
+            !onc_rpc_xdr_u32(&call->body, &write_offset) ||
+            !onc_rpc_xdr_u32(&call->body, &total_count)) {
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         offset = write_offset;
-        if (!nfs2_xdr_counted_opaque(&call->body, &data, &data_len,
+        if (!onc_rpc_xdr_counted_opaque(&call->body, &data, &data_len,
                                      NFS2_MAX_DATA) ||
-            !nfs2_xdr_reader_empty(&call->body)) {
-            return nfs2_rpc_reply_garbage_args(w, call->xid);
+            !onc_rpc_xdr_reader_empty(&call->body)) {
+            return onc_rpc_reply_garbage_args(w, call->xid);
         }
         (void)begin_offset;
         count = data_len;
@@ -2851,14 +2854,14 @@ static bool coroutine_fn reply_write(Nfs2Server *server,
             ret = post_ret;
         }
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_wcc(w, &before, before_valid, &after, after_valid);
         if (ok && ret >= 0) {
-            ok = nfs2_xdr_put_u32(w, count) &&
-                 nfs2_xdr_put_u32(w, 2) &&
-                 nfs2_xdr_put_opaque(w, server->write_verifier,
+            ok = onc_rpc_xdr_put_u32(w, count) &&
+                 onc_rpc_xdr_put_u32(w, 2) &&
+                 onc_rpc_xdr_put_opaque(w, server->write_verifier,
                                      sizeof(server->write_verifier));
         }
     } else if (ok && ret >= 0) {
@@ -2870,8 +2873,8 @@ static bool coroutine_fn reply_write(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_remove(Nfs2Server *server,
-                                      Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w, bool v3,
+                                      OncRpcCall *call,
+                                      OncRpcXdrWriter *w, bool v3,
                                       bool directory)
 {
     Nfs2FileHandle dir_handle;
@@ -2884,8 +2887,8 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
     bool ok;
 
     if (!decode_name_args(call, v3, &dir_handle, name) ||
-        !nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        !onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_directory(server, &dir_handle, &absolute, &dir, &before);
     before_valid = ret >= 0;
@@ -2903,7 +2906,7 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
                                                   &after) >= 0) {
         after_valid = true;
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_wcc(w, &before, before_valid, &after, after_valid);
@@ -2914,8 +2917,8 @@ static bool coroutine_fn reply_remove(Nfs2Server *server,
 }
 
 static bool coroutine_fn reply_rename(Nfs2Server *server,
-                                      Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w, bool v3)
+                                      OncRpcCall *call,
+                                      OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle old_handle, new_handle;
     char old_name[NFS2_MAX_NAME + 1], new_name[NFS2_MAX_NAME + 1];
@@ -2936,8 +2939,8 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
 
     if (!decode_name_args(call, v3, &old_handle, old_name) ||
         !decode_name_args(call, v3, &new_handle, new_name) ||
-        !nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        !onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_directory(server, &old_handle, &old_abs, &old_dir,
                             &old_before);
@@ -2998,7 +3001,7 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
                                  &new_after) >= 0) {
         new_after_valid = true;
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_wcc(w, &old_before, old_before_valid,
@@ -3015,8 +3018,8 @@ static bool coroutine_fn reply_rename(Nfs2Server *server,
     return ok;
 }
 
-static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
-                                    Nfs2XdrWriter *w, bool v3)
+static bool coroutine_fn reply_link(Nfs2Server *server, OncRpcCall *call,
+                                    OncRpcXdrWriter *w, bool v3)
 {
     Nfs2FileHandle file_handle, dir_handle;
     char name[NFS2_MAX_NAME + 1];
@@ -3036,8 +3039,8 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
     if (!(v3 ? decode_v3_handle(&call->body, &file_handle, false) :
                decode_v2_handle_partial(&call->body, &file_handle)) ||
         !decode_name_args(call, v3, &dir_handle, name) ||
-        !nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        !onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     ret = resolve_handle(server, &file_handle, &file_abs, &file, &file_st);
     file_valid = ret >= 0;
@@ -3099,7 +3102,7 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
                                  &dir_after) >= 0) {
         dir_after_valid = true;
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3 ? v3_status(ret) : v2_status(ret));
     if (ok && v3) {
         ok = put_post_attr(w, &file_after, file_after_valid) &&
@@ -3115,7 +3118,7 @@ static bool coroutine_fn reply_link(Nfs2Server *server, Nfs2RpcCall *call,
 }
 
 static bool coroutine_fn reply_commit(Nfs2Server *server,
-                                      Nfs2RpcCall *call, Nfs2XdrWriter *w)
+                                      OncRpcCall *call, OncRpcXdrWriter *w)
 {
     Nfs2FileHandle handle;
     V9fsPath absolute = { 0 }, path = { 0 };
@@ -3129,9 +3132,9 @@ static bool coroutine_fn reply_commit(Nfs2Server *server,
 
     if (!decode_v3_handle(&call->body, &handle, false) ||
         !get_u64(&call->body, &offset) ||
-        !nfs2_xdr_u32(&call->body, &count) ||
-        !nfs2_xdr_reader_empty(&call->body)) {
-        return nfs2_rpc_reply_garbage_args(w, call->xid);
+        !onc_rpc_xdr_u32(&call->body, &count) ||
+        !onc_rpc_xdr_reader_empty(&call->body)) {
+        return onc_rpc_reply_garbage_args(w, call->xid);
     }
     (void)offset;
     (void)count;
@@ -3170,11 +3173,11 @@ static bool coroutine_fn reply_commit(Nfs2Server *server,
             ret = post_ret;
         }
     }
-    ok = nfs2_rpc_reply_success(w, call->xid) &&
+    ok = onc_rpc_reply_success(w, call->xid) &&
          write_nfs_status(w, v3_status(ret)) &&
          put_wcc(w, &before, before_valid, &after, after_valid);
     if (ok && ret >= 0) {
-        ok = nfs2_xdr_put_opaque(w, server->write_verifier,
+        ok = onc_rpc_xdr_put_opaque(w, server->write_verifier,
                                  sizeof(server->write_verifier));
     }
     path_clear(&absolute);
@@ -3195,7 +3198,7 @@ static bool is_v3_mutator(uint32_t proc)
            proc == NFS3PROC_COMMIT;
 }
 
-static bool reply_v3_rofs(Nfs2XdrWriter *w, uint32_t xid, uint32_t proc)
+static bool reply_v3_rofs(OncRpcXdrWriter *w, uint32_t xid, uint32_t proc)
 {
     unsigned int absent_attributes;
 
@@ -3210,12 +3213,12 @@ static bool reply_v3_rofs(Nfs2XdrWriter *w, uint32_t xid, uint32_t proc)
         absent_attributes = 2; /* One wcc_data value. */
         break;
     }
-    if (!nfs2_rpc_reply_success(w, xid) ||
+    if (!onc_rpc_reply_success(w, xid) ||
         !write_nfs_status(w, NFS3ERR_ROFS)) {
         return false;
     }
     for (unsigned int i = 0; i < absent_attributes; i++) {
-        if (!nfs2_xdr_put_u32(w, 0)) {
+        if (!onc_rpc_xdr_put_u32(w, 0)) {
             return false;
         }
     }
@@ -3223,8 +3226,8 @@ static bool reply_v3_rofs(Nfs2XdrWriter *w, uint32_t xid, uint32_t proc)
 }
 
 static bool coroutine_fn dispatch_nfs_mutation(Nfs2Server *server,
-                                               Nfs2RpcCall *call,
-                                               Nfs2XdrWriter *w, bool v3)
+                                               OncRpcCall *call,
+                                               OncRpcXdrWriter *w, bool v3)
 {
     bool ok;
 
@@ -3294,8 +3297,8 @@ static bool coroutine_fn dispatch_nfs_mutation(Nfs2Server *server,
     return ok;
 }
 
-static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
-                                      Nfs2XdrWriter *w)
+static bool coroutine_fn dispatch_nfs(Nfs2Server *server, OncRpcCall *call,
+                                      OncRpcXdrWriter *w)
 {
     bool v3 = call->version == NFS3_VERSION;
 
@@ -3305,14 +3308,14 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
             if (v3) {
                 return reply_v3_rofs(w, call->xid, call->procedure);
             }
-            return nfs2_rpc_reply_success(w, call->xid) &&
+            return onc_rpc_reply_success(w, call->xid) &&
                    write_nfs_status(w, NFS2_NFSERR_ROFS);
         }
         return dispatch_nfs_mutation(server, call, w, v3);
     }
     if (call->procedure == 0) {
-        return body_empty(call) ? nfs2_rpc_reply_success(w, call->xid) :
-                                  nfs2_rpc_reply_garbage_args(w, call->xid);
+        return body_empty(call) ? onc_rpc_reply_success(w, call->xid) :
+                                  onc_rpc_reply_garbage_args(w, call->xid);
     }
     if (!v3) {
         switch (call->procedure) {
@@ -3320,8 +3323,8 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
             return reply_getattr(server, call, w, false);
         case NFS2_NFSPROC_ROOT:
         case NFS2_NFSPROC_WRITECACHE:
-            return body_empty(call) ? nfs2_rpc_reply_success(w, call->xid) :
-                                      nfs2_rpc_reply_garbage_args(w, call->xid);
+            return body_empty(call) ? onc_rpc_reply_success(w, call->xid) :
+                                      onc_rpc_reply_garbage_args(w, call->xid);
         case NFS2_NFSPROC_LOOKUP:
             return reply_lookup(server, call, w, false);
         case NFS2_NFSPROC_READLINK:
@@ -3333,7 +3336,7 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
         case NFS2_NFSPROC_STATFS:
             return reply_statfs(server, call, w, false);
         default:
-            return nfs2_rpc_reply_proc_unavail(w, call->xid);
+            return onc_rpc_reply_proc_unavail(w, call->xid);
         }
     }
     switch (call->procedure) {
@@ -3358,37 +3361,37 @@ static bool coroutine_fn dispatch_nfs(Nfs2Server *server, Nfs2RpcCall *call,
     case NFS3PROC_PATHCONF:
         return reply_pathconf(server, call, w);
     default:
-        return nfs2_rpc_reply_proc_unavail(w, call->xid);
+        return onc_rpc_reply_proc_unavail(w, call->xid);
     }
 }
 
 static bool coroutine_fn dispatch_request(Nfs2Request *request,
-                                          Nfs2XdrWriter *w)
+                                          OncRpcXdrWriter *w)
 {
-    Nfs2RpcCall call;
-    Nfs2RpcDecodeResult decode;
+    OncRpcCall call;
+    OncRpcDecodeResult decode;
     int expected_program = service_program(request->service);
 
-    decode = nfs2_rpc_decode_call(request->data, request->length, &call);
-    if (decode != NFS2_RPC_DECODE_OK) {
+    decode = onc_rpc_decode_call(request->data, request->length, &call);
+    if (decode != ONC_RPC_DECODE_OK) {
         uint32_t xid = request->length >= 4 ? ldl_be_p(request->data) : 0;
 
-        if (decode == NFS2_RPC_DECODE_RPC_MISMATCH) {
-            return nfs2_rpc_reply_rpc_mismatch(w, xid, NFS2_RPC_VERSION,
-                                                NFS2_RPC_VERSION);
+        if (decode == ONC_RPC_DECODE_RPC_MISMATCH) {
+            return onc_rpc_reply_rpc_mismatch(w, xid, ONC_RPC_VERSION,
+                                                ONC_RPC_VERSION);
         }
-        if (decode == NFS2_RPC_DECODE_AUTH_ERROR) {
-            return nfs2_rpc_reply_auth_error(w, xid, NFS2_RPC_AUTH_BADCRED);
+        if (decode == ONC_RPC_DECODE_AUTH_ERROR) {
+            return onc_rpc_reply_auth_error(w, xid, ONC_RPC_AUTH_BADCRED);
         }
-        return nfs2_rpc_reply_garbage_args(w, xid);
+        return onc_rpc_reply_garbage_args(w, xid);
     }
     if (call.program != expected_program) {
-        return nfs2_rpc_reply_prog_unavail(w, call.xid);
+        return onc_rpc_reply_prog_unavail(w, call.xid);
     }
     if (!service_version(request->service, call.version)) {
         uint32_t low = request->service == NFS2_SERVICE_PORTMAP ? 2 : 1;
         uint32_t high = request->service == NFS2_SERVICE_PORTMAP ? 2 : 3;
-        return nfs2_rpc_reply_prog_mismatch(w, call.xid, low, high);
+        return onc_rpc_reply_prog_mismatch(w, call.xid, low, high);
     }
     switch (request->service) {
     case NFS2_SERVICE_PORTMAP:
@@ -3398,7 +3401,7 @@ static bool coroutine_fn dispatch_request(Nfs2Request *request,
     case NFS2_SERVICE_NFS:
         return dispatch_nfs(request->server, &call, w);
     default:
-        return nfs2_rpc_reply_prog_unavail(w, call.xid);
+        return onc_rpc_reply_prog_unavail(w, call.xid);
     }
 }
 
@@ -3408,13 +3411,13 @@ static void coroutine_fn request_entry(void *opaque)
     Nfs2Server *server = request->server;
     void (*request_unref)(void *opaque) = server->transport.request_unref;
     void *transport_opaque = server->transport_opaque;
-    uint8_t reply[NFS2_MAX_RPC_DATAGRAM];
-    Nfs2XdrWriter writer;
+    uint8_t reply[ONC_RPC_MAX_DATAGRAM];
+    OncRpcXdrWriter writer;
 
-    nfs2_xdr_writer_init(&writer, reply, sizeof(reply));
+    onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
     if (!dispatch_request(request, &writer)) {
-        nfs2_xdr_writer_init(&writer, reply, sizeof(reply));
-        nfs2_rpc_reply_system_err(&writer,
+        onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
+        onc_rpc_reply_system_err(&writer,
                                   request->length >= 4 ?
                                   ldl_be_p(request->data) : 0);
     }
@@ -3423,7 +3426,7 @@ static void coroutine_fn request_entry(void *opaque)
 
         g_byte_array_set_size(entry->reply, 0);
         g_byte_array_append(entry->reply, reply,
-                            nfs2_xdr_writer_size(&writer));
+                            onc_rpc_xdr_writer_size(&writer));
         entry->in_flight = false;
         entry->completed_at = server_now_ms(server);
         entry->last_used = ++server->duplicate_sequence;
@@ -3434,7 +3437,7 @@ static void coroutine_fn request_entry(void *opaque)
             request->duplicate->sending = true;
         }
         server->transport.send(request->service, &request->peer, reply,
-                               nfs2_xdr_writer_size(&writer),
+                               onc_rpc_xdr_writer_size(&writer),
                                server->transport_opaque);
         if (request->duplicate) {
             request->duplicate->sending = false;
@@ -3521,9 +3524,9 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
         error_setg(errp, "invalid NFS datagram");
         return -1;
     }
-    if (len > NFS2_MAX_RPC_DATAGRAM) {
+    if (len > ONC_RPC_MAX_DATAGRAM) {
         error_setg(errp, "NFS RPC datagram exceeds %u bytes",
-                   NFS2_MAX_RPC_DATAGRAM);
+                   ONC_RPC_MAX_DATAGRAM);
         return -1;
     }
     {
@@ -3582,12 +3585,12 @@ int nfs2_server_receive(Nfs2Server *server, Nfs2Service service,
                 }
                 if (oldest_index == SIZE_MAX) {
                     uint8_t reply[24];
-                    Nfs2XdrWriter writer;
+                    OncRpcXdrWriter writer;
 
-                    nfs2_xdr_writer_init(&writer, reply, sizeof(reply));
-                    nfs2_rpc_reply_system_err(&writer, xid);
+                    onc_rpc_xdr_writer_init(&writer, reply, sizeof(reply));
+                    onc_rpc_reply_system_err(&writer, xid);
                     server->transport.send(service, peer, reply,
-                                           nfs2_xdr_writer_size(&writer),
+                                           onc_rpc_xdr_writer_size(&writer),
                                            server->transport_opaque);
                     return 0;
                 }
