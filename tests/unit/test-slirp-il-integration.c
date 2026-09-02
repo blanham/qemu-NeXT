@@ -1031,7 +1031,7 @@ static void test_named_netdev_rpc_portmapper(void)
         .version_low = RPC_VERSION,
         .version_high = RPC_VERSION,
         .port = RPC_PORT,
-        .transports = ONC_RPC_TRANSPORT_UDP | ONC_RPC_TRANSPORT_TCP,
+        .transports = ONC_RPC_TRANSPORT_UDP,
         .dispatch = rpc_integration_dispatch,
         .opaque = &state,
     };
@@ -1154,7 +1154,7 @@ static void test_named_netdev_rpc_portmapper(void)
     g_assert_true(onc_rpc_xdr_u32(&reply, &port));
     g_assert_cmphex(port, ==, state.result);
 
-    /* TCP GETPORT uses the same portmapper registration. */
+    /* TCP GETPORT discovers the UDP-only service through portmapper. */
     service_next = establish_tcp_guest_connection(s, connection.source_port,
                                                    111);
     connection.guest_next_seq = 1001;
@@ -1162,7 +1162,7 @@ static void test_named_netdev_rpc_portmapper(void)
     onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
     g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_PROGRAM));
     g_assert_true(onc_rpc_xdr_put_u32(&writer, RPC_VERSION));
-    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_TCP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_UDP));
     g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
     body_len = onc_rpc_xdr_writer_size(&writer);
     call_len = build_rpc_call(call, sizeof(call), 3, 100000, 2, 3, body,

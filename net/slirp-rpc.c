@@ -866,6 +866,18 @@ static bool rpc_dispatch_portmap(OncRpcRequest *request,
     }
 }
 
+static bool rpc_request_is_portmap_endpoint(
+    const OncRpcRequest *request, const QemuSlirpRpcRegistry *registry)
+{
+    if (request->tcp) {
+        return request->tcp_connection && registry->tcp_portmap &&
+               request->tcp_connection->port == ONC_RPC_PORTMAP_PORT &&
+               request->tcp_connection->endpoint == registry->tcp_portmap;
+    }
+    return registry->udp_portmap && request->udp_listener &&
+           request->udp_listener == registry->udp_portmap->udp_listener;
+}
+
 static void rpc_dispatch_packet(QemuSlirpRpcRegistry *registry,
                                 const uint8_t *data, size_t length,
                                 const struct sockaddr_in *peer, bool tcp,
@@ -918,7 +930,8 @@ static void rpc_dispatch_packet(QemuSlirpRpcRegistry *registry,
         return;
     }
 
-    if (request->call.program == ONC_RPC_PORTMAP_PROGRAM) {
+    if (request->call.program == ONC_RPC_PORTMAP_PROGRAM &&
+        rpc_request_is_portmap_endpoint(request, registry)) {
         if (request->call.version != ONC_RPC_PORTMAP_VERSION) {
             rpc_reply_prog_mismatch_request(request, ONC_RPC_PORTMAP_VERSION,
                                             ONC_RPC_PORTMAP_VERSION);
@@ -1207,19 +1220,6 @@ QemuSlirpRpcRegistry *qemu_slirp_rpc_registry_new(
     return registry;
 }
 
-static bool rpc_has_transport(QemuSlirpRpcRegistry *registry,
-                              unsigned transport)
-{
-    QemuSlirpRpcRegistration *registration;
-
-    QTAILQ_FOREACH(registration, &registry->registrations, entry) {
-        if (registration->program.transports & transport) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static QemuSlirpRpcEndpoint *rpc_endpoint_find(
     QemuSlirpRpcRegistry *registry, uint16_t port, unsigned transport)
 {
@@ -1319,40 +1319,46 @@ static QemuSlirpRpcEndpoint *rpc_endpoint_acquire(
                             QEMU_SLIRP_UDP_LISTEN_DEFAULT, errp);
 }
 
-static int rpc_portmap_acquire(QemuSlirpRpcRegistry *registry,
-                               unsigned transport, Error **errp)
+static int rpc_portmap_acquire(QemuSlirpRpcRegistry *registry, Error **errp)
 {
-    QemuSlirpRpcEndpoint **portmap;
+    QemuSlirpRpcEndpoint *udp_endpoint;
+    QemuSlirpRpcEndpoint *tcp_endpoint;
 
-    portmap = transport == ONC_RPC_TRANSPORT_UDP ? &registry->udp_portmap
-                                                  : &registry->tcp_portmap;
-    if (*portmap) {
+    if (registry->udp_portmap || registry->tcp_portmap) {
+        g_assert(registry->udp_portmap && registry->tcp_portmap);
         return 0;
     }
-    *portmap = rpc_endpoint_new(
-        registry, ONC_RPC_PORTMAP_PORT, transport,
-        transport == ONC_RPC_TRANSPORT_UDP
-            ? QEMU_SLIRP_UDP_LISTEN_BROADCAST
-            : QEMU_SLIRP_UDP_LISTEN_DEFAULT,
-        errp);
-    if (!*portmap) {
+
+    udp_endpoint = rpc_endpoint_new(
+        registry, ONC_RPC_PORTMAP_PORT, ONC_RPC_TRANSPORT_UDP,
+        QEMU_SLIRP_UDP_LISTEN_BROADCAST, errp);
+    if (!udp_endpoint) {
         return -1;
     }
+
+    tcp_endpoint = rpc_endpoint_new(
+        registry, ONC_RPC_PORTMAP_PORT, ONC_RPC_TRANSPORT_TCP,
+        QEMU_SLIRP_UDP_LISTEN_DEFAULT, errp);
+    if (!tcp_endpoint) {
+        rpc_endpoint_release(udp_endpoint);
+        return -1;
+    }
+
+    registry->udp_portmap = udp_endpoint;
+    registry->tcp_portmap = tcp_endpoint;
     return 0;
 }
 
-static void rpc_release_unused_listeners(QemuSlirpRpcRegistry *registry)
+static void rpc_portmap_release(QemuSlirpRpcRegistry *registry)
 {
     QemuSlirpRpcEndpoint *endpoint;
 
-    if (registry->udp_portmap &&
-        !rpc_has_transport(registry, ONC_RPC_TRANSPORT_UDP)) {
+    if (registry->udp_portmap) {
         endpoint = registry->udp_portmap;
         registry->udp_portmap = NULL;
         rpc_endpoint_release(endpoint);
     }
-    if (registry->tcp_portmap &&
-        !rpc_has_transport(registry, ONC_RPC_TRANSPORT_TCP)) {
+    if (registry->tcp_portmap) {
         endpoint = registry->tcp_portmap;
         registry->tcp_portmap = NULL;
         rpc_endpoint_release(endpoint);
@@ -1399,18 +1405,20 @@ int qemu_slirp_rpc_registry_register(
     if (program->transports & ONC_RPC_TRANSPORT_UDP) {
         udp_endpoint = rpc_endpoint_acquire(
             registry, program->port, ONC_RPC_TRANSPORT_UDP, errp);
-        if (!udp_endpoint ||
-            rpc_portmap_acquire(registry, ONC_RPC_TRANSPORT_UDP, errp) < 0) {
+        if (!udp_endpoint) {
             goto fail;
         }
     }
     if (program->transports & ONC_RPC_TRANSPORT_TCP) {
         tcp_endpoint = rpc_endpoint_acquire(
             registry, program->port, ONC_RPC_TRANSPORT_TCP, errp);
-        if (!tcp_endpoint ||
-            rpc_portmap_acquire(registry, ONC_RPC_TRANSPORT_TCP, errp) < 0) {
+        if (!tcp_endpoint) {
             goto fail;
         }
+    }
+    if (QTAILQ_EMPTY(&registry->registrations) &&
+        rpc_portmap_acquire(registry, errp) < 0) {
+        goto fail;
     }
     entry = g_new0(QemuSlirpRpcRegistration, 1);
     entry->registry = registry;
@@ -1433,7 +1441,9 @@ fail:
     if (udp_endpoint) {
         rpc_endpoint_release(udp_endpoint);
     }
-    rpc_release_unused_listeners(registry);
+    if (QTAILQ_EMPTY(&registry->registrations)) {
+        rpc_portmap_release(registry);
+    }
     return -1;
 }
 
@@ -1465,7 +1475,9 @@ void qemu_slirp_rpc_registry_unregister(QemuSlirpRpcRegistration *entry)
         if (udp_endpoint) {
             rpc_endpoint_release(udp_endpoint);
         }
-        rpc_release_unused_listeners(registry);
+        if (QTAILQ_EMPTY(&registry->registrations)) {
+            rpc_portmap_release(registry);
+        }
         rpc_registration_unref(entry);
         rpc_registry_unref(registry);
     }
@@ -1475,7 +1487,6 @@ void qemu_slirp_rpc_registry_unregister(QemuSlirpRpcRegistration *entry)
 void qemu_slirp_rpc_registry_invalidate(QemuSlirpRpcRegistry *registry)
 {
     QemuSlirpRpcRegistration *entry;
-    QemuSlirpRpcEndpoint *endpoint;
     QemuSlirpRpcEndpoint *udp_endpoint;
     QemuSlirpRpcEndpoint *tcp_endpoint;
     OncRpcRequest *request, *next;
@@ -1520,16 +1531,7 @@ void qemu_slirp_rpc_registry_invalidate(QemuSlirpRpcRegistry *registry)
         rpc_registration_unref(entry);
         rpc_registration_unref(entry);
     }
-    if (registry->udp_portmap) {
-        endpoint = registry->udp_portmap;
-        registry->udp_portmap = NULL;
-        rpc_endpoint_release(endpoint);
-    }
-    if (registry->tcp_portmap) {
-        endpoint = registry->tcp_portmap;
-        registry->tcp_portmap = NULL;
-        rpc_endpoint_release(endpoint);
-    }
+    rpc_portmap_release(registry);
     rpc_registry_unref(registry);
 }
 

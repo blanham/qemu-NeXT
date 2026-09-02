@@ -624,6 +624,8 @@ struct RpcFakeTcp {
     struct sockaddr_in peer;
     bool close_on_remove;
     bool close_on_send;
+    bool fail_listen;
+    uint16_t fail_port;
     bool send_eagain_once;
     bool send_eio_once;
     bool enforce_send_space;
@@ -706,6 +708,9 @@ static int rpc_fake_tcp_listen(
     unsigned i;
 
     (void)address;
+    if (fake->fail_listen && fake->fail_port == port) {
+        return -1;
+    }
     for (i = 0; i < G_N_ELEMENTS(fake->endpoints); i++) {
         if (!fake->endpoints[i].active) {
             endpoint = &fake->endpoints[i];
@@ -1299,6 +1304,204 @@ static void test_rpc_registry_portmapper(void)
     qemu_slirp_rpc_registry_unregister(tcp_reg);
     g_assert_cmpuint(harness.udp.removes, ==, 2);
     g_assert_cmpuint(harness.tcp.removes, ==, 2);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_portmapper_udp_first_owns_both(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 31 };
+    OncRpcProgram program = rpc_program(200020, 1, 1, 4020,
+                                         ONC_RPC_TRANSPORT_UDP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    g_assert_nonnull(registration);
+    g_assert_cmpuint(harness.udp.listens, ==, 2);
+    g_assert_cmpuint(harness.tcp.listens, ==, 1);
+    g_assert_nonnull(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_nonnull(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+    g_assert_cmpuint(rpc_fake_udp_endpoint(&harness.udp, 111)->flags, ==,
+                     QEMU_SLIRP_UDP_LISTEN_BROADCAST);
+
+    qemu_slirp_rpc_registry_unregister(registration);
+    g_assert_null(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_null(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    g_assert_cmpuint(harness.tcp.removes, ==, 1);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_portmapper_tcp_first_udp_discovery(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 37 };
+    OncRpcProgram program = rpc_program(200021, 2, 2, 4021,
+                                         ONC_RPC_TRANSPORT_TCP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t body[32], call[96];
+    OncRpcXdrWriter writer;
+    OncRpcXdrReader reply;
+    uint32_t value, port;
+    size_t call_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    g_assert_nonnull(registration);
+    g_assert_cmpuint(harness.udp.listens, ==, 1);
+    g_assert_cmpuint(harness.tcp.listens, ==, 2);
+    g_assert_nonnull(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_nonnull(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.version_low));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_TCP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    call_len = rpc_build_call(call, sizeof(call), 11, 100000, 2, 3, body,
+                              onc_rpc_xdr_writer_size(&writer));
+    rpc_send_udp(&harness, call, call_len);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_SUCCESS);
+    g_assert_true(onc_rpc_xdr_u32(&reply, &port));
+    g_assert_cmpuint(port, ==, program.port);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_portmapper_retained_until_last(void)
+{
+    RpcHarness harness;
+    RpcProgramState udp_state = { .result = 41 };
+    RpcProgramState tcp_state = { .result = 43 };
+    OncRpcProgram udp = rpc_program(200022, 1, 1, 4022,
+                                    ONC_RPC_TRANSPORT_UDP, &udp_state);
+    OncRpcProgram tcp = rpc_program(200023, 1, 1, 4023,
+                                    ONC_RPC_TRANSPORT_TCP, &tcp_state);
+    QemuSlirpRpcRegistration *udp_registration = NULL;
+    QemuSlirpRpcRegistration *tcp_registration = NULL;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &udp, &udp_registration, &err), ==, 0);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &tcp, &tcp_registration, &err), ==, 0);
+    g_assert_nonnull(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_nonnull(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+
+    qemu_slirp_rpc_registry_unregister(udp_registration);
+    g_assert_nonnull(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_nonnull(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+    g_assert_cmpuint(harness.udp.removes, ==, 1);
+    g_assert_cmpuint(harness.tcp.removes, ==, 0);
+
+    qemu_slirp_rpc_registry_unregister(tcp_registration);
+    g_assert_null(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_null(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    g_assert_cmpuint(harness.tcp.removes, ==, 2);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_registry_portmapper_rollback(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 47 };
+    OncRpcProgram program = rpc_program(200024, 1, 1, 4024,
+                                         ONC_RPC_TRANSPORT_UDP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.fail_listen = true;
+    harness.tcp.fail_port = 111;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, -1);
+    g_assert_null(registration);
+    g_assert_nonnull(err);
+    g_assert_null(rpc_fake_udp_endpoint(&harness.udp, 111));
+    g_assert_null(rpc_fake_tcp_endpoint(&harness.tcp, 111));
+    g_assert_null(rpc_fake_udp_endpoint(&harness.udp, program.port));
+    g_assert_cmpuint(harness.udp.removes, ==, 2);
+    error_free(err);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_portmap_dispatch_only_on_111(void)
+{
+    RpcHarness harness;
+    RpcProgramState state = { .result = 53 };
+    OncRpcProgram program = rpc_program(200025, 1, 1, 4025,
+                                         ONC_RPC_TRANSPORT_UDP |
+                                         ONC_RPC_TRANSPORT_TCP, &state);
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t body[32], call[96], record[100];
+    OncRpcXdrWriter writer;
+    OncRpcXdrReader reply;
+    uint32_t value;
+    size_t body_len, call_len, record_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+
+    call_len = rpc_build_call(call, sizeof(call), 21, 100000, 2, 0, NULL, 0);
+    rpc_send_udp_port(&harness, program.port, call, call_len);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_PROG_UNAVAIL);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.version_low));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_UDP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = rpc_build_call(call, sizeof(call), 22, 100000, 2, 3, body,
+                              body_len);
+    rpc_send_udp_port(&harness, program.port, call, call_len);
+    value = rpc_reply_status(harness.udp.reply->data, harness.udp.reply->len,
+                             &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_PROG_UNAVAIL);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 23, 100000, 2, 0, NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    value = rpc_reply_status(harness.tcp.reply->data + 4,
+                             harness.tcp.reply->len - 4, &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_PROG_UNAVAIL);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+
+    onc_rpc_xdr_writer_init(&writer, body, sizeof(body));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.program));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, program.version_low));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, IPPROTO_TCP));
+    g_assert_true(onc_rpc_xdr_put_u32(&writer, 0));
+    body_len = onc_rpc_xdr_writer_size(&writer);
+    call_len = rpc_build_call(call, sizeof(call), 24, 100000, 2, 3, body,
+                              body_len);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    value = rpc_reply_status(harness.tcp.reply->data + 4,
+                             harness.tcp.reply->len - 4, &reply);
+    g_assert_cmpuint(value, ==, ONC_RPC_PROG_UNAVAIL);
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+    rpc_close_tcp(&harness);
+
+    qemu_slirp_rpc_registry_unregister(registration);
     rpc_harness_cleanup(&harness);
 }
 
@@ -2229,6 +2432,16 @@ int main(int argc, char **argv)
                     test_rpc_registry_registration);
     g_test_add_func("/onc-rpc/registry/portmapper",
                     test_rpc_registry_portmapper);
+    g_test_add_func("/onc-rpc/registry/portmapper-udp-first-owns-both",
+                    test_rpc_registry_portmapper_udp_first_owns_both);
+    g_test_add_func("/onc-rpc/registry/portmapper-tcp-first-udp-discovery",
+                    test_rpc_registry_portmapper_tcp_first_udp_discovery);
+    g_test_add_func("/onc-rpc/registry/portmapper-retained-until-last",
+                    test_rpc_registry_portmapper_retained_until_last);
+    g_test_add_func("/onc-rpc/registry/portmapper-rollback",
+                    test_rpc_registry_portmapper_rollback);
+    g_test_add_func("/onc-rpc/registry/portmap-dispatch-only-on-111",
+                    test_rpc_portmap_dispatch_only_on_111);
     g_test_add_func("/onc-rpc/registry/dump-uint32-max",
                     test_rpc_registry_dump_uint32_max);
     g_test_add_func("/onc-rpc/registry/dump-overflow",
