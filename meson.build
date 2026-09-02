@@ -1296,16 +1296,15 @@ slirp_tcp_service = false
 slirp_bootp_root = false
 if slirp.found()
   if slirp.type_name() == 'internal'
-    # The immutable fallback revision provides the IL, Plan 9 BOOTP, guest UDP,
-    # and BOOTP root APIs.  Normal QEMU targets compile and link against its
-    # exported public dependency, which validates that contract without
-    # crossing Meson's subproject sandbox.
-    # Keep the optional full-listen API disabled until the pinned wrap revision
-    # exports it as part of that contract.
+    # The immutable fallback revision provides the IL, Plan 9 BOOTP,
+    # UDP/full-listen, TCP guest service, and BOOTP root APIs.  Normal QEMU
+    # targets compile and link against its exported public dependency, which
+    # validates that contract without crossing Meson's subproject sandbox.
     slirp_il = true
     slirp_plan9_bootp = true
     slirp_udp_service = true
-    slirp_udp_listen_full = false
+    slirp_udp_listen_full = true
+    slirp_tcp_service = true
     slirp_bootp_root = true
   else
     slirp_il = cc.links('''
