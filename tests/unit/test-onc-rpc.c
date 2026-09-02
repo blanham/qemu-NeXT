@@ -623,8 +623,13 @@ struct RpcFakeTcp {
     RpcFakeTcpEndpoint *connection_endpoint;
     struct sockaddr_in peer;
     bool close_on_remove;
+    bool close_on_send;
     bool send_eagain_once;
     bool send_eio_once;
+    bool enforce_send_space;
+    size_t send_space;
+    GByteArray *wire;
+    unsigned closes;
     unsigned sends;
 };
 
@@ -738,9 +743,11 @@ static void rpc_fake_tcp_remove(void *opaque, void *backend_listener)
 
 static size_t rpc_fake_tcp_can_send(void *opaque, void *backend_connection)
 {
-    (void)opaque;
+    RpcFakeTcp *fake = opaque;
+
     (void)backend_connection;
-    return ONC_RPC_MAX_TCP_RECORD + 4;
+    return fake->enforce_send_space ? fake->send_space :
+                                      ONC_RPC_MAX_TCP_RECORD + 4;
 }
 
 static int rpc_fake_tcp_send(void *opaque, void *backend_connection,
@@ -759,6 +766,20 @@ static int rpc_fake_tcp_send(void *opaque, void *backend_connection,
         fake->send_eio_once = false;
         return -EIO;
     }
+    if (fake->close_on_send) {
+        fake->close_on_send = false;
+        fake->closes++;
+        fake->connection_endpoint->callbacks.closed(
+            fake->connection, fake->connection_endpoint->callbacks_opaque);
+        return 0;
+    }
+    if (fake->enforce_send_space && len > fake->send_space) {
+        return -EAGAIN;
+    }
+    if (fake->enforce_send_space) {
+        fake->send_space -= len;
+        g_byte_array_append(fake->wire, data, len);
+    }
     g_byte_array_set_size(fake->reply, 0);
     g_byte_array_append(fake->reply, data, len);
     return 0;
@@ -770,6 +791,7 @@ static void rpc_fake_tcp_close(void *opaque, void *backend_connection)
 
     g_assert_nonnull(fake->connection_endpoint);
     g_assert_true(backend_connection == fake->connection);
+    fake->closes++;
     fake->connection_endpoint->callbacks.closed(
         backend_connection, fake->connection_endpoint->callbacks_opaque);
 }
@@ -797,6 +819,7 @@ static void rpc_harness_init(RpcHarness *harness)
     harness->vhost.s_addr = htonl(0x0a000202);
     harness->udp.reply = g_byte_array_new();
     harness->tcp.reply = g_byte_array_new();
+    harness->tcp.wire = g_byte_array_new();
     harness->udp_registry = qemu_slirp_udp_registry_new(
         true, harness->vhost, &rpc_fake_udp_ops, &harness->udp);
     harness->stream_registry = qemu_slirp_stream_registry_new(
@@ -813,6 +836,7 @@ static void rpc_harness_cleanup(RpcHarness *harness)
     qemu_slirp_stream_registry_free(harness->stream_registry);
     g_byte_array_unref(harness->udp.reply);
     g_byte_array_unref(harness->tcp.reply);
+    g_byte_array_unref(harness->tcp.wire);
 }
 
 static size_t rpc_build_call(uint8_t *buffer, size_t capacity, uint32_t xid,
@@ -919,6 +943,15 @@ typedef struct RpcProgramState {
     OncRpcRequest *pending;
 } RpcProgramState;
 
+typedef struct RpcQueueProgramState {
+    unsigned calls;
+    size_t reply_length;
+    bool tag_xid;
+    bool async;
+    OncRpcRequest *pending[2];
+    unsigned pending_count;
+} RpcQueueProgramState;
+
 static OncRpcDispatchResult rpc_program_dispatch(
     OncRpcRequest *request, const OncRpcCall *call, void *opaque)
 {
@@ -965,6 +998,31 @@ static OncRpcDispatchResult rpc_program_dispatch(
     g_assert_true(onc_rpc_xdr_put_u32(&writer, state->result));
     g_assert_true(onc_rpc_request_reply(request, reply,
                                         onc_rpc_xdr_writer_size(&writer)));
+    return ONC_RPC_DISPATCH_REPLIED;
+}
+
+static OncRpcDispatchResult rpc_queue_program_dispatch(
+    OncRpcRequest *request, const OncRpcCall *call, void *opaque)
+{
+    RpcQueueProgramState *state = opaque;
+    uint8_t *reply;
+    size_t i;
+
+    state->calls++;
+    if (state->async) {
+        g_assert_cmpuint(state->pending_count, <, G_N_ELEMENTS(state->pending));
+        state->pending[state->pending_count++] = onc_rpc_request_ref(request);
+        return ONC_RPC_DISPATCH_ASYNC;
+    }
+    reply = g_malloc(state->reply_length);
+    for (i = 0; i < state->reply_length; i++) {
+        reply[i] = (uint8_t)(i * 37 + 11);
+    }
+    if (state->tag_xid && state->reply_length >= sizeof(call->xid)) {
+        stl_be_p(reply, call->xid);
+    }
+    g_assert_true(onc_rpc_request_reply(request, reply, state->reply_length));
+    g_free(reply);
     return ONC_RPC_DISPATCH_REPLIED;
 }
 
@@ -1081,6 +1139,12 @@ static void rpc_ready_tcp(RpcHarness *harness)
     harness->tcp.connection_endpoint->callbacks.can_send(
         harness->tcp.connection,
         harness->tcp.connection_endpoint->callbacks_opaque);
+}
+
+static void rpc_ready_tcp_with_space(RpcHarness *harness, size_t space)
+{
+    harness->tcp.send_space = space;
+    rpc_ready_tcp(harness);
 }
 
 static void test_rpc_registry_registration(void)
@@ -1628,6 +1692,365 @@ static void test_rpc_registry_callit_async_and_cancel(void)
     rpc_harness_cleanup(&harness);
 }
 
+static void test_rpc_tcp_reply_large_partial_progress(void)
+{
+    enum { PROGRAM = 200024, PORT = 4024 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .reply_length = 128 * 1024 + 4096,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    size_t call_len, record_len;
+    unsigned sends;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.enforce_send_space = true;
+    harness.tcp.send_space = 128 * 1024;
+    harness.tcp.send_eagain_once = true;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 20, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 0);
+
+    rpc_ready_tcp_with_space(&harness, 128 * 1024);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128 * 1024);
+    g_assert_cmpuint(harness.tcp.send_space, ==, 0);
+    sends = harness.tcp.sends;
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, sends + 1);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128 * 1024);
+    g_assert_cmpuint(harness.tcp.send_space, ==, 0);
+    sends = harness.tcp.sends;
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, sends + 1);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128 * 1024);
+    rpc_ready_tcp_with_space(&harness, 4096);
+    g_assert_cmpuint(harness.tcp.wire->len, ==,
+                    128 * 1024 + 4096);
+    rpc_ready_tcp_with_space(&harness, 4);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, state.reply_length + 4);
+    g_assert_cmphex(ldl_be_p(harness.tcp.wire->data) & 0x7fffffff, ==,
+                    state.reply_length);
+    for (size_t i = 0; i < state.reply_length; i++) {
+        g_assert_cmphex(harness.tcp.wire->data[i + 4], ==,
+                        (uint8_t)(i * 37 + 11));
+    }
+    rpc_close_tcp(&harness);
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_zero_length(void)
+{
+    enum { PROGRAM = 200030, PORT = 4030 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .async = true,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    size_t call_len, record_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 70, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.pending_count, ==, 1);
+
+    g_assert_true(onc_rpc_request_reply(state.pending[0], NULL, 0));
+    g_assert_cmpuint(harness.tcp.reply->len, ==, 4);
+    g_assert_cmphex((uint32_t)ldl_be_p(harness.tcp.reply->data), ==,
+                    UINT32_C(0x80000000));
+
+    onc_rpc_request_unref(state.pending[0]);
+    state.pending[0] = NULL;
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_queue_order(void)
+{
+    enum { PROGRAM = 200025, PORT = 4025 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .reply_length = 8192,
+        .tag_xid = true,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    size_t call_len, record_len;
+    size_t attempts = 0;
+    size_t offset;
+    uint32_t xids[2] = { 21, 22 };
+    unsigned sends;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.enforce_send_space = true;
+    harness.tcp.send_space = 128;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    for (size_t i = 0; i < G_N_ELEMENTS(xids); i++) {
+        harness.tcp.send_eagain_once = true;
+        call_len = rpc_build_call(call, sizeof(call), xids[i], program.program,
+                                  1, 1, NULL, 0);
+        record_len = rpc_build_record(record, sizeof(record), call, call_len);
+        rpc_send_tcp(&harness, record, record_len);
+    }
+    g_assert_cmpuint(state.calls, ==, G_N_ELEMENTS(xids));
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 0);
+
+    rpc_ready_tcp_with_space(&harness, 128);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128);
+    g_assert_cmpuint(harness.tcp.send_space, ==, 0);
+    sends = harness.tcp.sends;
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, sends + 1);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128);
+    g_assert_cmpuint(harness.tcp.send_space, ==, 0);
+    sends = harness.tcp.sends;
+    rpc_ready_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.sends, ==, sends + 1);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128);
+    while (harness.tcp.wire->len < 2 * (state.reply_length + 4) &&
+           attempts++ < 256) {
+        rpc_ready_tcp_with_space(&harness, 128);
+    }
+    g_assert_cmpuint(harness.tcp.wire->len, ==,
+                    2 * (state.reply_length + 4));
+    offset = 0;
+    for (size_t i = 0; i < G_N_ELEMENTS(xids); i++) {
+        size_t length;
+
+        g_assert_cmpuint(harness.tcp.wire->len - offset, >=, 4);
+        length = ldl_be_p(harness.tcp.wire->data + offset) & 0x7fffffff;
+        g_assert_cmpuint(length, ==, state.reply_length);
+        g_assert_cmphex(ldl_be_p(harness.tcp.wire->data + offset + 4), ==,
+                        xids[i]);
+        offset += length + 4;
+    }
+    g_assert_cmpuint(offset, ==, harness.tcp.wire->len);
+    rpc_close_tcp(&harness);
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_queue_cap_closes(void)
+{
+    enum { PROGRAM = 200026, PORT = 4026 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .reply_length = ONC_RPC_MAX_TCP_RECORD - 64,
+        .async = true,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    g_autofree uint8_t *reply = NULL;
+    size_t call_len, record_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.enforce_send_space = true;
+    harness.tcp.send_space = 0;
+    reply = g_malloc0(state.reply_length);
+    reply[0] = 1;
+    reply[1] = 2;
+    reply[2] = 3;
+    reply[3] = 4;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    for (uint32_t xid = 30; xid < 32; xid++) {
+        call_len = rpc_build_call(call, sizeof(call), xid, program.program, 1,
+                                  1, NULL, 0);
+        record_len = rpc_build_record(record, sizeof(record), call, call_len);
+        rpc_send_tcp(&harness, record, record_len);
+    }
+    g_assert_cmpuint(state.pending_count, ==, 2);
+    g_assert_true(onc_rpc_request_reply(
+        state.pending[0], reply, state.reply_length));
+    g_assert_false(onc_rpc_request_reply(
+        state.pending[1], reply, state.reply_length));
+    g_assert_cmpuint(harness.tcp.closes, ==, 1);
+    g_assert_false(onc_rpc_request_reply(
+        state.pending[0], reply, state.reply_length));
+    g_assert_false(onc_rpc_request_reply(
+        state.pending[1], reply, state.reply_length));
+    onc_rpc_request_unref(state.pending[0]);
+    onc_rpc_request_unref(state.pending[1]);
+    state.pending[0] = NULL;
+    state.pending[1] = NULL;
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_partial_close_cancels_once(void)
+{
+    enum { PROGRAM = 200027, PORT = 4027 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .reply_length = 128 * 1024 + 4096,
+        .async = true,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    g_autofree uint8_t *reply = NULL;
+    size_t call_len, record_len;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.enforce_send_space = true;
+    harness.tcp.send_space = 128 * 1024;
+    reply = g_malloc0(state.reply_length);
+    reply[0] = 1;
+    reply[1] = 2;
+    reply[2] = 3;
+    reply[3] = 4;
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 40, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.pending_count, ==, 1);
+    g_assert_true(onc_rpc_request_reply(
+        state.pending[0], reply, state.reply_length));
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128 * 1024);
+    rpc_close_tcp(&harness);
+    g_assert_cmpuint(harness.tcp.closes, ==, 1);
+    g_assert_false(onc_rpc_request_reply(
+        state.pending[0], reply, state.reply_length));
+    g_assert_false(onc_rpc_request_reply(
+        state.pending[0], reply, state.reply_length));
+    onc_rpc_request_unref(state.pending[0]);
+    state.pending[0] = NULL;
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
+static void test_rpc_tcp_reply_invalidate_discards_partial_once(void)
+{
+    enum { PROGRAM = 200029, PORT = 4029 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .reply_length = 128 * 1024 + 4096,
+        .async = true,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132];
+    g_autofree uint8_t *reply = NULL;
+    size_t call_len, record_len;
+    unsigned sends;
+    size_t wire_length;
+    Error *err = NULL;
+
+    rpc_harness_init(&harness);
+    harness.tcp.enforce_send_space = true;
+    harness.tcp.send_space = 128 * 1024;
+    reply = g_malloc0(state.reply_length);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 60, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(state.pending_count, ==, 1);
+    g_assert_true(onc_rpc_request_reply(state.pending[0], reply,
+                                        state.reply_length));
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 128 * 1024);
+    sends = harness.tcp.sends;
+    wire_length = harness.tcp.wire->len;
+
+    qemu_slirp_rpc_registry_invalidate(harness.rpc);
+    g_assert_cmpuint(harness.tcp.sends, ==, sends);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, wire_length);
+    g_assert_cmpuint(harness.tcp.removes, ==, 2);
+    g_assert_false(onc_rpc_request_reply(state.pending[0], reply,
+                                         state.reply_length));
+    g_assert_false(onc_rpc_request_reply(state.pending[0], reply,
+                                         state.reply_length));
+
+    qemu_slirp_rpc_registry_invalidate(harness.rpc);
+    g_assert_cmpuint(harness.tcp.sends, ==, sends);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, wire_length);
+    g_assert_false(onc_rpc_request_reply(state.pending[0], reply,
+                                         state.reply_length));
+    qemu_slirp_rpc_registry_unregister(registration);
+    onc_rpc_request_unref(state.pending[0]);
+    state.pending[0] = NULL;
+    rpc_harness_cleanup(&harness);
+}
+
 static void test_rpc_tcp_reply_eagain(void)
 {
     RpcHarness harness;
@@ -1729,6 +2152,53 @@ static void test_rpc_tcp_reply_fatal_closes_after_iteration(void)
     rpc_harness_cleanup(&harness);
 }
 
+static void test_rpc_tcp_reply_send_close_reentrant(void)
+{
+    enum { PROGRAM = 200028, PORT = 4028 };
+    RpcHarness harness;
+    RpcQueueProgramState state = {
+        .reply_length = 64,
+        .async = true,
+    };
+    OncRpcProgram program = {
+        .program = PROGRAM,
+        .version_low = 1,
+        .version_high = 1,
+        .port = PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_queue_program_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    uint8_t call[128], record[132], reply[64];
+    size_t call_len, record_len;
+    Error *err = NULL;
+
+    memset(reply, 0x5a, sizeof(reply));
+    rpc_harness_init(&harness);
+    g_assert_cmpint(qemu_slirp_rpc_registry_register(
+                        harness.rpc, &program, &registration, &err), ==, 0);
+    rpc_connect_tcp_port(&harness, program.port);
+    call_len = rpc_build_call(call, sizeof(call), 50, program.program, 1, 1,
+                              NULL, 0);
+    record_len = rpc_build_record(record, sizeof(record), call, call_len);
+    rpc_send_tcp(&harness, record, record_len);
+    g_assert_cmpuint(state.pending_count, ==, 1);
+
+    harness.tcp.close_on_send = true;
+    g_assert_false(onc_rpc_request_reply(state.pending[0], reply,
+                                         sizeof(reply)));
+    g_assert_cmpuint(harness.tcp.closes, ==, 1);
+    g_assert_cmpuint(harness.tcp.wire->len, ==, 0);
+    g_assert_false(onc_rpc_request_reply(state.pending[0], reply,
+                                         sizeof(reply)));
+
+    onc_rpc_request_unref(state.pending[0]);
+    state.pending[0] = NULL;
+    qemu_slirp_rpc_registry_unregister(registration);
+    rpc_harness_cleanup(&harness);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1777,5 +2247,19 @@ int main(int argc, char **argv)
                     test_rpc_tcp_reply_eagain);
     g_test_add_func("/onc-rpc/registry/tcp-reply-fatal-close",
                     test_rpc_tcp_reply_fatal_closes_after_iteration);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-send-close-reentrant",
+                    test_rpc_tcp_reply_send_close_reentrant);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-large-partial",
+                    test_rpc_tcp_reply_large_partial_progress);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-zero-length",
+                    test_rpc_tcp_reply_zero_length);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-queue-order",
+                    test_rpc_tcp_reply_queue_order);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-queue-cap",
+                    test_rpc_tcp_reply_queue_cap_closes);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-partial-close",
+                    test_rpc_tcp_reply_partial_close_cancels_once);
+    g_test_add_func("/onc-rpc/registry/tcp-reply-invalidate-partial",
+                    test_rpc_tcp_reply_invalidate_discards_partial_once);
     return g_test_run();
 }

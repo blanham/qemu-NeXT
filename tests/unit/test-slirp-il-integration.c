@@ -16,6 +16,10 @@ static NetClientState *test_netdev;
 static uint8_t sent_packet[SENT_PACKET_CAPACITY];
 static size_t sent_packet_len;
 static unsigned sent_packet_count;
+static GByteArray *tcp_rpc_capture;
+static uint16_t tcp_rpc_capture_source_port;
+static uint16_t tcp_rpc_capture_port;
+static uint32_t tcp_rpc_capture_next_seq;
 
 #define ETHERNET_HEADER_LEN 14
 #define IPV4_HEADER_LEN 20
@@ -57,10 +61,60 @@ static void tracked_slirp_cleanup(Slirp *slirp);
 
 ssize_t qemu_send_packet(NetClientState *nc, const uint8_t *buf, int size)
 {
+    const uint8_t *ip;
+    const uint8_t *tcp;
+    size_t ip_len;
+    size_t ip_total;
+    size_t tcp_len;
+    size_t payload_len;
+    size_t overlap;
+    const uint8_t *payload;
+    uint32_t sequence;
+
     g_assert_cmpuint(size, <=, sizeof(sent_packet));
     memcpy(sent_packet, buf, size);
     sent_packet_len = size;
     sent_packet_count++;
+    if (tcp_rpc_capture && size >= ETHERNET_HEADER_LEN + IPV4_HEADER_LEN +
+        TCP_HEADER_LEN) {
+        ip = buf + ETHERNET_HEADER_LEN;
+        ip_len = (size_t)(ip[0] & 0x0f) * 4;
+        if (ip_len < IPV4_HEADER_LEN ||
+            size < ETHERNET_HEADER_LEN + ip_len + TCP_HEADER_LEN ||
+            ip[9] != 6) {
+            return size;
+        }
+        tcp = ip + ip_len;
+        tcp_len = (size_t)(tcp[12] >> 4) * 4;
+        ip_total = ((size_t)ip[2] << 8) | ip[3];
+        if (tcp_len < TCP_HEADER_LEN ||
+            size < ETHERNET_HEADER_LEN + ip_len + tcp_len ||
+            ip_total < ip_len + tcp_len ||
+            size < ETHERNET_HEADER_LEN + ip_total ||
+            ((uint16_t)tcp[0] << 8 | tcp[1]) != tcp_rpc_capture_source_port ||
+            ((uint16_t)tcp[2] << 8 | tcp[3]) != tcp_rpc_capture_port) {
+            return size;
+        }
+        payload_len = ip_total - ip_len - tcp_len;
+        if (!payload_len) {
+            return size;
+        }
+        sequence = ((uint32_t)tcp[4] << 24) | ((uint32_t)tcp[5] << 16) |
+                   ((uint32_t)tcp[6] << 8) | tcp[7];
+        payload = tcp + tcp_len;
+        if (sequence < tcp_rpc_capture_next_seq) {
+            overlap = tcp_rpc_capture_next_seq - sequence;
+            if (overlap >= payload_len) {
+                return size;
+            }
+            payload_len -= overlap;
+            sequence += overlap;
+            payload += overlap;
+        }
+        g_assert_cmpuint(sequence, ==, tcp_rpc_capture_next_seq);
+        g_byte_array_append(tcp_rpc_capture, payload, payload_len);
+        tcp_rpc_capture_next_seq += payload_len;
+    }
     return size;
 }
 
@@ -834,6 +888,18 @@ typedef struct RpcIntegrationState {
     uint32_t result;
 } RpcIntegrationState;
 
+typedef struct RpcLargeIntegrationState {
+    unsigned calls;
+    size_t body_length;
+    uint8_t pattern_seed;
+} RpcLargeIntegrationState;
+
+static uint8_t rpc_large_pattern(const RpcLargeIntegrationState *state,
+                                 size_t index)
+{
+    return state->pattern_seed ^ (uint8_t)(index * 37 + 11);
+}
+
 static OncRpcDispatchResult rpc_integration_dispatch(
     OncRpcRequest *request, const OncRpcCall *call, void *opaque)
 {
@@ -847,6 +913,26 @@ static OncRpcDispatchResult rpc_integration_dispatch(
     g_assert_true(onc_rpc_xdr_put_u32(&writer, state->result));
     g_assert_true(onc_rpc_request_reply(request, reply,
                                         onc_rpc_xdr_writer_size(&writer)));
+    return ONC_RPC_DISPATCH_REPLIED;
+}
+
+static OncRpcDispatchResult rpc_large_integration_dispatch(
+    OncRpcRequest *request, const OncRpcCall *call, void *opaque)
+{
+    RpcLargeIntegrationState *state = opaque;
+    size_t reply_length = 24 + state->body_length;
+    g_autofree uint8_t *reply = g_malloc0(reply_length);
+    OncRpcXdrWriter writer;
+
+    state->calls++;
+    onc_rpc_xdr_writer_init(&writer, reply, reply_length);
+    g_assert_true(onc_rpc_reply_success(&writer, call->xid));
+    for (size_t i = 0; i < state->body_length; i++) {
+        writer.cursor[i] = rpc_large_pattern(state, i);
+    }
+    writer.cursor += state->body_length;
+    g_assert_cmpuint(onc_rpc_xdr_writer_size(&writer), ==, reply_length);
+    g_assert_true(onc_rpc_request_reply(request, reply, reply_length));
     return ONC_RPC_DISPATCH_REPLIED;
 }
 
@@ -1110,6 +1196,84 @@ static void test_named_netdev_rpc_portmapper(void)
     g_assert_cmpint(qemu_slirp_stream_listen("user0", 111, &stream_ops, NULL,
                                              &tcp111, &err), ==, 0);
     qemu_slirp_stream_listener_remove(tcp111);
+    destroy_user_netdev(s);
+    error_free(err);
+}
+
+static void test_named_netdev_rpc_large_tcp_reply(void)
+{
+    enum {
+        RPC_PROGRAM = 200031,
+        RPC_VERSION = 1,
+        RPC_PORT = 4031,
+        RPC_BODY_LENGTH = 128 * 1024 + 4096,
+    };
+    SlirpState *s = new_user_netdev();
+    RpcLargeIntegrationState state = {
+        .body_length = RPC_BODY_LENGTH,
+        .pattern_seed = 0xa5,
+    };
+    OncRpcProgram program = {
+        .program = RPC_PROGRAM,
+        .version_low = RPC_VERSION,
+        .version_high = RPC_VERSION,
+        .port = RPC_PORT,
+        .transports = ONC_RPC_TRANSPORT_TCP,
+        .dispatch = rpc_large_integration_dispatch,
+        .opaque = &state,
+    };
+    QemuSlirpRpcRegistration *registration = NULL;
+    StreamConnectionState connection = { .source_port = 40004 };
+    uint8_t call[128], record[132];
+    size_t call_len, record_len;
+    size_t reply_length = 24 + RPC_BODY_LENGTH;
+    size_t expected_length = reply_length + 4;
+    size_t attempts;
+    uint32_t service_start;
+    OncRpcXdrReader reply;
+    uint32_t status;
+    Error *err = NULL;
+
+    g_assert_cmpint(qemu_slirp_rpc_register("user0", &program,
+                                            &registration, &err), ==, 0);
+    g_assert_nonnull(registration);
+    service_start = establish_tcp_guest_connection(s, connection.source_port,
+                                                   RPC_PORT);
+    connection.guest_next_seq = 1001;
+    connection.service_next_seq = service_start;
+    tcp_rpc_capture = g_byte_array_new();
+    tcp_rpc_capture_source_port = RPC_PORT;
+    tcp_rpc_capture_port = connection.source_port;
+    tcp_rpc_capture_next_seq = service_start;
+    call_len = build_rpc_call(call, sizeof(call), 0x10203040, RPC_PROGRAM,
+                              RPC_VERSION, 1, NULL, 0);
+    record_len = build_rpc_record(record, sizeof(record), call, call_len);
+    send_tcp_guest_segment_to(s, &connection, RPC_PORT, 0x18, record,
+                              record_len);
+    for (attempts = 0; attempts < 256 &&
+                        tcp_rpc_capture->len < expected_length; attempts++) {
+        send_tcp_guest_ack_to(s, &connection, RPC_PORT,
+                              tcp_rpc_capture_next_seq);
+    }
+    g_assert_cmpuint(state.calls, ==, 1);
+    g_assert_cmpuint(tcp_rpc_capture->len, ==, expected_length);
+    g_assert_cmphex(tcp_load_be32(tcp_rpc_capture->data), ==,
+                    UINT32_C(0x80000000) | (uint32_t)reply_length);
+    g_assert_cmphex(tcp_load_be32(tcp_rpc_capture->data + 4), ==,
+                    UINT32_C(0x10203040));
+    status = rpc_integration_reply_status(tcp_rpc_capture->data + 4,
+                                          reply_length, &reply);
+    g_assert_cmpuint(status, ==, ONC_RPC_SUCCESS);
+    g_assert_cmpuint(onc_rpc_xdr_reader_remaining(&reply), ==,
+                     RPC_BODY_LENGTH);
+    for (size_t i = 0; i < RPC_BODY_LENGTH; i++) {
+        g_assert_cmphex(reply.cursor[i], ==, rpc_large_pattern(&state, i));
+    }
+    reply.cursor += RPC_BODY_LENGTH;
+    g_assert_true(onc_rpc_xdr_reader_empty(&reply));
+    g_byte_array_unref(tcp_rpc_capture);
+    tcp_rpc_capture = NULL;
+    qemu_slirp_rpc_unregister(registration);
     destroy_user_netdev(s);
     error_free(err);
 }
@@ -1428,6 +1592,8 @@ int main(int argc, char **argv)
 #if defined(CONFIG_SLIRP_UDP_SERVICE) && defined(CONFIG_SLIRP_TCP_SERVICE)
     g_test_add_func("/slirp-il-integration/named-netdev-rpc-portmapper",
                     test_named_netdev_rpc_portmapper);
+    g_test_add_func("/slirp-il-integration/named-netdev-rpc-large-tcp",
+                    test_named_netdev_rpc_large_tcp_reply);
 #endif
 #ifdef CONFIG_SLIRP_TCP_SERVICE
     g_test_add_func("/slirp-il-integration/named-netdev-stream-packets",

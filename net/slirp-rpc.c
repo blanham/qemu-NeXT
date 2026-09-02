@@ -12,6 +12,7 @@
 
 typedef struct QemuSlirpRpcEndpoint QemuSlirpRpcEndpoint;
 typedef struct QemuSlirpRpcTcpConnection QemuSlirpRpcTcpConnection;
+typedef struct QemuSlirpRpcTcpReply QemuSlirpRpcTcpReply;
 
 struct QemuSlirpRpcRegistry {
     QemuSlirpUdpRegistry *udp_registry;
@@ -62,8 +63,6 @@ struct OncRpcRequest {
     uint8_t *data;
     size_t data_length;
     GByteArray *synthetic_reply;
-    uint8_t *pending_reply;
-    size_t pending_reply_length;
     OncRpcRequest *callit_parent;
     uint16_t callit_port;
     unsigned refs;
@@ -72,7 +71,15 @@ struct OncRpcRequest {
     bool tcp;
     bool synthetic;
     bool terminal;
-    bool pending_ref;
+    bool reply_queued;
+};
+
+struct QemuSlirpRpcTcpReply {
+    QTAILQ_ENTRY(QemuSlirpRpcTcpReply) entry;
+    OncRpcRequest *request;
+    uint8_t *data;
+    size_t length;
+    size_t offset;
 };
 
 struct QemuSlirpRpcTcpConnection {
@@ -87,6 +94,9 @@ struct QemuSlirpRpcTcpConnection {
     bool linked;
     bool closed;
     bool callback_depth;
+    QTAILQ_HEAD(, QemuSlirpRpcTcpReply) replies;
+    size_t queued_bytes;
+    bool flushing;
 };
 
 static void rpc_endpoint_ref(QemuSlirpRpcEndpoint *endpoint)
@@ -202,7 +212,6 @@ static void rpc_request_unref_internal(OncRpcRequest *request)
         onc_rpc_request_unref(request->callit_parent);
         request->callit_parent = NULL;
     }
-    g_free(request->pending_reply);
     if (request->synthetic_reply) {
         g_byte_array_unref(request->synthetic_reply);
     }
@@ -216,36 +225,43 @@ static void rpc_request_terminal(OncRpcRequest *request)
     rpc_request_registry_detach(request);
 }
 
-static void rpc_request_pending_clear(OncRpcRequest *request)
+static void rpc_tcp_reply_free(QemuSlirpRpcTcpReply *reply)
 {
-    bool pending_ref;
+    OncRpcRequest *request = reply->request;
 
-    g_free(request->pending_reply);
-    request->pending_reply = NULL;
-    request->pending_reply_length = 0;
-    pending_ref = request->pending_ref;
-    request->pending_ref = false;
-    if (pending_ref) {
-        rpc_request_unref_internal(request);
+    request->reply_queued = false;
+    onc_rpc_request_unref(request);
+    g_free(reply->data);
+    g_free(reply);
+}
+
+static void rpc_tcp_reply_remove_request(OncRpcRequest *request)
+{
+    QemuSlirpRpcTcpConnection *connection = request->tcp_connection;
+    QemuSlirpRpcTcpReply *reply, *next;
+
+    if (!connection || !request->reply_queued) {
+        return;
     }
+    QTAILQ_FOREACH_SAFE(reply, &connection->replies, entry, next) {
+        if (reply->request != request) {
+            continue;
+        }
+        QTAILQ_REMOVE(&connection->replies, reply, entry);
+        connection->queued_bytes -= reply->length - reply->offset;
+        rpc_tcp_reply_free(reply);
+        return;
+    }
+    g_assert_not_reached();
 }
 
 static void rpc_request_cancel(OncRpcRequest *request)
 {
-    bool pending_ref;
-
     if (!request || request->terminal) {
         return;
     }
-    pending_ref = request->pending_ref;
-    if (pending_ref) {
-        rpc_request_ref_internal(request);
-    }
+    rpc_tcp_reply_remove_request(request);
     rpc_request_terminal(request);
-    if (pending_ref) {
-        rpc_request_pending_clear(request);
-        rpc_request_unref_internal(request);
-    }
 }
 
 static OncRpcRequest *rpc_request_new(QemuSlirpRpcRegistry *registry,
@@ -420,38 +436,104 @@ static bool rpc_request_reply_synthetic(OncRpcRequest *request,
     return result;
 }
 
-static bool rpc_request_flush_pending(OncRpcRequest *request)
+static void rpc_tcp_reply_discard(QemuSlirpRpcTcpConnection *connection)
 {
-    QemuSlirpStream *stream;
-    int ret;
+    QemuSlirpRpcTcpReply *reply;
 
-    if (!request || request->terminal || !request->pending_reply ||
-        !request->stream) {
-        return false;
+    if (!connection) {
+        return;
     }
-    stream = request->stream;
-    ret = qemu_slirp_stream_send(stream, request->pending_reply,
-                                  request->pending_reply_length);
-    if (ret == -EAGAIN) {
+    while ((reply = QTAILQ_FIRST(&connection->replies))) {
+        QTAILQ_REMOVE(&connection->replies, reply, entry);
+        connection->queued_bytes -= reply->length - reply->offset;
+        rpc_request_terminal(reply->request);
+        rpc_tcp_reply_free(reply);
+    }
+    g_assert(connection->queued_bytes == 0);
+}
+
+static bool rpc_tcp_flush(QemuSlirpRpcTcpConnection *connection)
+{
+    QemuSlirpRpcTcpReply *reply;
+    QemuSlirpRpcRegistry *registry;
+    bool result = true;
+    bool open;
+
+    if (!connection || connection->flushing) {
         return true;
     }
-    if (ret != 0) {
-        rpc_request_terminal(request);
-        rpc_request_pending_clear(request);
-        return false;
+    rpc_tcp_connection_ref(connection);
+    registry = connection->registry;
+    if (registry) {
+        rpc_registry_ref(registry);
     }
-    rpc_request_terminal(request);
-    rpc_request_pending_clear(request);
-    return true;
+    connection->flushing = true;
+    while (!connection->closed &&
+           (reply = QTAILQ_FIRST(&connection->replies))) {
+        QemuSlirpStream *stream = connection->stream;
+        size_t space;
+        size_t chunk;
+        int ret;
+
+        if (!stream) {
+            result = false;
+            break;
+        }
+        space = qemu_slirp_stream_can_send(stream);
+        if (!space) {
+            /*
+             * The stream adapter reports readiness only after a send has
+             * observed backpressure.  A full-capacity chunk can consume the
+             * entire current window without setting that state, so probe the
+             * head with one byte to arm the adapter for the next ACK.  A
+             * conforming backend must reject this probe without accepting
+             * any data when can_send() returned zero.
+             */
+            ret = qemu_slirp_stream_send(stream, reply->data + reply->offset,
+                                         1);
+            if (ret == -EAGAIN) {
+                break;
+            }
+            result = false;
+            break;
+        }
+        chunk = MIN(space, reply->length - reply->offset);
+        ret = qemu_slirp_stream_send(stream, reply->data + reply->offset,
+                                     chunk);
+        if (ret == -EAGAIN) {
+            break;
+        }
+        if (ret != 0 || connection->closed) {
+            result = false;
+            break;
+        }
+        reply->offset += chunk;
+        connection->queued_bytes -= chunk;
+        if (reply->offset == reply->length) {
+            QTAILQ_REMOVE(&connection->replies, reply, entry);
+            rpc_request_terminal(reply->request);
+            rpc_tcp_reply_free(reply);
+        }
+    }
+    connection->flushing = false;
+    open = !connection->closed;
+    if (registry) {
+        rpc_registry_unref(registry);
+    }
+    rpc_tcp_connection_unref(connection);
+    return result && open;
 }
 
 static bool rpc_request_send_bytes(OncRpcRequest *request,
                                    const uint8_t *data, size_t length)
 {
-    int ret;
+    QemuSlirpRpcTcpConnection *connection;
+    QemuSlirpRpcRegistry *registry;
+    QemuSlirpRpcTcpReply *reply;
     uint8_t *record;
     size_t record_length;
-    QemuSlirpRpcRegistry *registry;
+    bool result;
+    int ret;
 
     if (!request || request->terminal || !request->registry ||
         (length && !data)) {
@@ -464,7 +546,9 @@ static bool rpc_request_send_bytes(OncRpcRequest *request,
     registry = request->registry;
     rpc_registry_ref(registry);
     if (request->tcp) {
-        if (!request->stream || request->pending_reply) {
+        connection = request->tcp_connection;
+        if (!connection || connection->closed || !request->stream ||
+            request->reply_queued) {
             rpc_registry_unref(registry);
             return false;
         }
@@ -475,17 +559,42 @@ static bool rpc_request_send_bytes(OncRpcRequest *request,
         record_length = length + 4;
         record = g_malloc(record_length);
         stl_be_p(record, UINT32_C(0x80000000) | length);
-        memcpy(record + 4, data, length);
-        ret = qemu_slirp_stream_send(request->stream, record, record_length);
-        if (ret == -EAGAIN) {
-            request->pending_reply = record;
-            request->pending_reply_length = record_length;
-            request->pending_ref = true;
-            rpc_request_ref_internal(request);
-            rpc_registry_unref(registry);
-            return true;
+        if (length) {
+            memcpy(record + 4, data, length);
         }
-        g_free(record);
+        rpc_tcp_connection_ref(connection);
+        if (record_length > ONC_RPC_MAX_TCP_RECORD + 4 ||
+            connection->queued_bytes >
+                (ONC_RPC_MAX_TCP_RECORD + 4) - record_length) {
+            QemuSlirpStream *stream = request->stream;
+
+            g_free(record);
+            qemu_slirp_stream_close(stream);
+            if (!request->terminal) {
+                rpc_request_terminal(request);
+            }
+            rpc_tcp_connection_unref(connection);
+            rpc_registry_unref(registry);
+            return false;
+        }
+        reply = g_new0(QemuSlirpRpcTcpReply, 1);
+        reply->request = onc_rpc_request_ref(request);
+        reply->data = record;
+        reply->length = record_length;
+        request->reply_queued = true;
+        QTAILQ_INSERT_TAIL(&connection->replies, reply, entry);
+        connection->queued_bytes += record_length;
+        result = rpc_tcp_flush(connection);
+        if (!result && !connection->closed) {
+            QemuSlirpStream *stream = connection->stream;
+
+            if (stream) {
+                qemu_slirp_stream_close(stream);
+            }
+        }
+        rpc_tcp_connection_unref(connection);
+        rpc_registry_unref(registry);
+        return result;
     } else {
         if (!request->udp_listener) {
             rpc_registry_unref(registry);
@@ -640,7 +749,7 @@ static OncRpcDispatchResult rpc_dispatch_callit(
         onc_rpc_request_drop(target_request);
     }
     rpc_request_unref_internal(target_request);
-    if (!request->terminal && !request->pending_reply) {
+    if (!request->terminal && !request->reply_queued) {
         onc_rpc_request_drop(request);
     }
     return ONC_RPC_DISPATCH_REPLIED;
@@ -842,7 +951,7 @@ static void rpc_dispatch_packet(QemuSlirpRpcRegistry *registry,
     rpc_registration_unref(registration);
     if ((result == ONC_RPC_DISPATCH_REPLIED ||
          result == ONC_RPC_DISPATCH_DROP) && !request->terminal &&
-        !request->pending_reply) {
+        !request->reply_queued) {
         onc_rpc_request_drop(request);
     }
     rpc_request_unref_internal(request);
@@ -903,6 +1012,7 @@ static void rpc_tcp_connected(QemuSlirpStream *stream,
     connection->linked = true;
     onc_rpc_tcp_record_decoder_init(&connection->decoder,
                                    ONC_RPC_MAX_TCP_RECORD);
+    QTAILQ_INIT(&connection->replies);
     QTAILQ_INSERT_TAIL(&registry->tcp_connections, connection, entry);
     rpc_endpoint_unref(endpoint);
 }
@@ -927,8 +1037,7 @@ static void rpc_tcp_can_send(QemuSlirpStream *stream, void *opaque)
     QemuSlirpRpcEndpoint *endpoint = opaque;
     QemuSlirpRpcRegistry *registry = endpoint ? endpoint->registry : NULL;
     QemuSlirpRpcTcpConnection *connection;
-    OncRpcRequest *request, *next;
-    bool close_stream = false;
+    bool flush_ok;
 
     if (endpoint) {
         rpc_endpoint_ref(endpoint);
@@ -949,20 +1058,8 @@ static void rpc_tcp_can_send(QemuSlirpStream *stream, void *opaque)
     rpc_registry_ref(registry);
     rpc_tcp_connection_ref(connection);
     connection->callback_depth = true;
-    QTAILQ_FOREACH_SAFE(request, &registry->requests, entry, next) {
-        if (request->tcp_connection != connection ||
-            !request->pending_reply) {
-            continue;
-        }
-        rpc_request_ref_internal(request);
-        if (!rpc_request_flush_pending(request)) {
-            close_stream = true;
-            rpc_request_unref_internal(request);
-            break;
-        }
-        rpc_request_unref_internal(request);
-    }
-    if (close_stream) {
+    flush_ok = rpc_tcp_flush(connection);
+    if (!flush_ok && !connection->closed) {
         qemu_slirp_stream_close(stream);
     }
     connection->callback_depth = false;
@@ -1066,6 +1163,7 @@ static void rpc_tcp_closed(QemuSlirpStream *stream, void *opaque)
     rpc_registry_ref(registry);
     rpc_tcp_connection_ref(connection);
     connection->closed = true;
+    rpc_tcp_reply_discard(connection);
     QTAILQ_FOREACH_SAFE(request, &registry->requests, entry, next) {
         if (request->tcp_connection == connection) {
             rpc_request_cancel(request);
@@ -1381,6 +1479,7 @@ void qemu_slirp_rpc_registry_invalidate(QemuSlirpRpcRegistry *registry)
     QemuSlirpRpcEndpoint *udp_endpoint;
     QemuSlirpRpcEndpoint *tcp_endpoint;
     OncRpcRequest *request, *next;
+    QemuSlirpRpcTcpConnection *connection, *connection_next;
 
     if (!registry) {
         return;
@@ -1391,6 +1490,12 @@ void qemu_slirp_rpc_registry_invalidate(QemuSlirpRpcRegistry *registry)
         return;
     }
     registry->valid = false;
+    QTAILQ_FOREACH_SAFE(connection, &registry->tcp_connections, entry,
+                        connection_next) {
+        rpc_tcp_connection_ref(connection);
+        rpc_tcp_reply_discard(connection);
+        rpc_tcp_connection_unref(connection);
+    }
     QTAILQ_FOREACH_SAFE(request, &registry->requests, entry, next) {
         rpc_request_cancel(request);
     }
@@ -1483,7 +1588,7 @@ bool onc_rpc_request_reply(OncRpcRequest *request, const uint8_t *data,
 {
     bool result;
 
-    if (!request || request->terminal || request->pending_reply ||
+    if (!request || request->terminal || request->reply_queued ||
         (length && !data)) {
         return false;
     }
@@ -1492,7 +1597,7 @@ bool onc_rpc_request_reply(OncRpcRequest *request, const uint8_t *data,
         result = rpc_request_reply_synthetic(request, data, length);
     } else {
         result = rpc_request_send_bytes(request, data, length);
-        if (!result && !request->terminal && !request->pending_reply) {
+        if (!result && !request->terminal && !request->reply_queued) {
             rpc_request_terminal(request);
         }
     }
