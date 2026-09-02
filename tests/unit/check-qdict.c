@@ -228,6 +228,141 @@ static void qdict_iterapi_test(void)
     qobject_unref(tests_dict);
 }
 
+static void qdict_ordered_iterapi_test(void)
+{
+    static const char *const expected[] = { "zeta", "alpha", "middle" };
+    QDict *qdict = qdict_new();
+    const QDictEntry *entry;
+    size_t i;
+
+    g_assert_null(qdict_ordered_first(qdict));
+
+    qdict_put_int(qdict, expected[0], 1);
+    entry = qdict_ordered_first(qdict);
+    g_assert_nonnull(entry);
+    g_assert_cmpstr(qdict_entry_key(entry), ==, expected[0]);
+    g_assert_null(qdict_ordered_next(entry));
+
+    qdict_put_int(qdict, expected[1], 2);
+    qdict_put_int(qdict, expected[2], 3);
+    for (entry = qdict_ordered_first(qdict), i = 0;
+         entry;
+         entry = qdict_ordered_next(entry), i++) {
+        g_assert_cmpuint(i, <, G_N_ELEMENTS(expected));
+        g_assert_cmpstr(qdict_entry_key(entry), ==, expected[i]);
+    }
+    g_assert_cmpuint(i, ==, G_N_ELEMENTS(expected));
+
+    qobject_unref(qdict);
+}
+
+static void qdict_ordered_replacement_test(void)
+{
+    static const char *const expected[] = { "first", "second" };
+    QDict *qdict = qdict_new();
+    const QDictEntry *entry;
+    size_t i;
+
+    qdict_put_int(qdict, "first", 1);
+    qdict_put_int(qdict, "second", 2);
+    qdict_put_int(qdict, "first", 3);
+
+    for (entry = qdict_ordered_first(qdict), i = 0;
+         entry;
+         entry = qdict_ordered_next(entry), i++) {
+        g_assert_cmpuint(i, <, G_N_ELEMENTS(expected));
+        g_assert_cmpstr(qdict_entry_key(entry), ==, expected[i]);
+    }
+    g_assert_cmpuint(i, ==, G_N_ELEMENTS(expected));
+    g_assert_cmpint(qdict_get_int(qdict, "first"), ==, 3);
+
+    qobject_unref(qdict);
+}
+
+static void qdict_ordered_delete_reinsert_test(void)
+{
+    static const char *const expected[] = { "second", "first" };
+    QDict *qdict = qdict_new();
+    const QDictEntry *entry;
+    size_t i;
+
+    qdict_put_int(qdict, "first", 1);
+    qdict_put_int(qdict, "second", 2);
+    qdict_del(qdict, "first");
+    qdict_put_int(qdict, "first", 3);
+
+    for (entry = qdict_ordered_first(qdict), i = 0;
+         entry;
+         entry = qdict_ordered_next(entry), i++) {
+        g_assert_cmpuint(i, <, G_N_ELEMENTS(expected));
+        g_assert_cmpstr(qdict_entry_key(entry), ==, expected[i]);
+    }
+    g_assert_cmpuint(i, ==, G_N_ELEMENTS(expected));
+
+    qobject_unref(qdict);
+}
+
+static void qdict_ordered_clone_test(void)
+{
+    static const char *const expected[] = { "zeta", "alpha", "middle" };
+    QDict *src = qdict_new();
+    g_autoptr(QDict) clone = NULL;
+    const QDictEntry *entry;
+    const QDictEntry *clone_entry;
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(expected); i++) {
+        qdict_put_int(src, expected[i], i);
+    }
+    clone = qdict_clone_shallow(src);
+
+    for (entry = qdict_ordered_first(src), clone_entry =
+             qdict_ordered_first(clone), i = 0;
+         entry && clone_entry;
+         entry = qdict_ordered_next(entry),
+             clone_entry = qdict_ordered_next(clone_entry), i++) {
+        g_assert_cmpuint(i, <, G_N_ELEMENTS(expected));
+        g_assert_cmpstr(qdict_entry_key(entry), ==, expected[i]);
+        g_assert_cmpstr(qdict_entry_key(clone_entry), ==, expected[i]);
+    }
+    g_assert_cmpuint(i, ==, G_N_ELEMENTS(expected));
+    g_assert_null(entry);
+    g_assert_null(clone_entry);
+
+    entry = qdict_first(src);
+    clone_entry = qdict_first(clone);
+    while (entry && clone_entry) {
+        g_assert_cmpstr(qdict_entry_key(entry), ==,
+                        qdict_entry_key(clone_entry));
+        entry = qdict_next(src, entry);
+        clone_entry = qdict_next(clone, clone_entry);
+    }
+    g_assert_null(entry);
+    g_assert_null(clone_entry);
+
+    qobject_unref(src);
+}
+
+static void qdict_ordered_mutation_test(void)
+{
+    QDict *qdict = qdict_new();
+    const QDictEntry *entry;
+    const QDictEntry *next;
+
+    qdict_put_int(qdict, "one", 1);
+    qdict_put_int(qdict, "two", 2);
+    qdict_put_int(qdict, "three", 3);
+
+    for (entry = qdict_ordered_first(qdict); entry; entry = next) {
+        next = qdict_ordered_next(entry);
+        qdict_del(qdict, qdict_entry_key(entry));
+    }
+    g_assert_cmpuint(qdict_size(qdict), ==, 0);
+    g_assert_null(qdict_ordered_first(qdict));
+
+    qobject_unref(qdict);
+}
+
 /*
  * Errors test-cases
  */
@@ -366,6 +501,13 @@ int main(int argc, char **argv)
     g_test_add_func("/public/del", qdict_del_test);
     g_test_add_func("/public/to_qdict", qobject_to_qdict_test);
     g_test_add_func("/public/iterapi", qdict_iterapi_test);
+    g_test_add_func("/public/ordered_iterapi", qdict_ordered_iterapi_test);
+    g_test_add_func("/public/ordered_replacement",
+                    qdict_ordered_replacement_test);
+    g_test_add_func("/public/ordered_delete_reinsert",
+                    qdict_ordered_delete_reinsert_test);
+    g_test_add_func("/public/ordered_clone", qdict_ordered_clone_test);
+    g_test_add_func("/public/ordered_mutation", qdict_ordered_mutation_test);
 
     g_test_add_func("/errors/put_exists", qdict_put_exists_test);
     g_test_add_func("/errors/get_not_exists", qdict_get_not_exists_test);

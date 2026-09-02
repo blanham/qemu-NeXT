@@ -3636,6 +3636,7 @@ F: include/qobject/
 F: scripts/coccinelle/qobject.cocci
 F: tests/unit/check-qdict.c
 F: tests/unit/check-qjson.c
+F: tests/unit/test-qjson5.c
 F: tests/unit/check-qlist.c
 F: tests/unit/check-qlit.c
 F: tests/unit/check-qnull.c

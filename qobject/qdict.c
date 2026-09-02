@@ -29,6 +29,7 @@ QDict *qdict_new(void)
 
     qdict = g_malloc0(sizeof(*qdict));
     qobject_init(QOBJECT(qdict), QTYPE_QDICT);
+    QTAILQ_INIT(&qdict->order);
 
     return qdict;
 }
@@ -127,6 +128,7 @@ void qdict_put_obj(QDict *qdict, const char *key, QObject *value)
         /* allocate a new entry */
         entry = alloc_entry(key, value);
         QLIST_INSERT_HEAD(&qdict->table[bucket], entry, next);
+        QTAILQ_INSERT_TAIL(&qdict->order, entry, order);
         qdict->size++;
     }
 }
@@ -352,6 +354,27 @@ const QDictEntry *qdict_next(const QDict *qdict, const QDictEntry *entry)
 }
 
 /**
+ * qdict_ordered_first(): Return the first entry in insertion order.
+ *
+ * Return a weak reference.  See qdict_ordered_next() for mutation rules.
+ */
+const QDictEntry *qdict_ordered_first(const QDict *qdict)
+{
+    return QTAILQ_FIRST(&qdict->order);
+}
+
+/**
+ * qdict_ordered_next(): Return the next entry in insertion order.
+ *
+ * Return a weak reference.  The entry must still belong to its QDict; callers
+ * deleting entries during iteration must save this result before deletion.
+ */
+const QDictEntry *qdict_ordered_next(const QDictEntry *entry)
+{
+    return QTAILQ_NEXT(entry, order);
+}
+
+/**
  * qdict_clone_shallow(): Clones a given QDict. Its entries are not copied, but
  * another reference is added.
  */
@@ -367,6 +390,24 @@ QDict *qdict_clone_shallow(const QDict *src)
         QLIST_FOREACH(entry, &src->table[i], next) {
             qdict_put_obj(dest, entry->key, qobject_ref(entry->value));
         }
+    }
+
+    /*
+     * The bucket walk above deliberately retains the historical legacy
+     * traversal order.  Restore source insertion order independently.
+     */
+    while (!QTAILQ_EMPTY(&dest->order)) {
+        QDictEntry *first = QTAILQ_FIRST(&dest->order);
+
+        QTAILQ_REMOVE(&dest->order, first, order);
+    }
+    QTAILQ_FOREACH(entry, &src->order, order) {
+        QDictEntry *dest_entry = qdict_find(dest, entry->key,
+                                            tdb_hash(entry->key) %
+                                            QDICT_BUCKET_MAX);
+
+        assert(dest_entry != NULL);
+        QTAILQ_INSERT_TAIL(&dest->order, dest_entry, order);
     }
 
     return dest;
@@ -398,6 +439,7 @@ void qdict_del(QDict *qdict, const char *key)
     entry = qdict_find(qdict, key, tdb_hash(key) % QDICT_BUCKET_MAX);
     if (entry) {
         QLIST_REMOVE(entry, next);
+        QTAILQ_REMOVE(&qdict->order, entry, order);
         qentry_destroy(entry);
         qdict->size--;
     }
@@ -448,6 +490,7 @@ void qdict_destroy_obj(QObject *obj)
         while (entry) {
             QDictEntry *tmp = QLIST_NEXT(entry, next);
             QLIST_REMOVE(entry, next);
+            QTAILQ_REMOVE(&qdict->order, entry, order);
             qentry_destroy(entry);
             entry = tmp;
         }

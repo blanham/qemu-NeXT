@@ -13,6 +13,7 @@ tests = {
   'check-qnull': [],
   'check-qobject': [],
   'check-qjson': [],
+  'test-qjson5': [],
   'check-json-parser': [],
   'check-qlit': [],
   'test-error-report': [],

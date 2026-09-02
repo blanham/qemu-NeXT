@@ -22,12 +22,14 @@ typedef struct QDictEntry {
     char *key;
     QObject *value;
     QLIST_ENTRY(QDictEntry) next;
+    QTAILQ_ENTRY(QDictEntry) order;
 } QDictEntry;
 
 struct QDict {
     struct QObjectBase_ base;
     size_t size;
     QLIST_HEAD(,QDictEntry) table[QDICT_BUCKET_MAX];
+    QTAILQ_HEAD(, QDictEntry) order;
 };
 
 void qdict_unref(QDict *q);
@@ -45,6 +47,18 @@ int qdict_haskey(const QDict *qdict, const char *key);
 QObject *qdict_get(const QDict *qdict, const char *key);
 const QDictEntry *qdict_first(const QDict *qdict);
 const QDictEntry *qdict_next(const QDict *qdict, const QDictEntry *entry);
+
+/*
+ * Iterate entries in insertion order.  New keys append to the order;
+ * replacing a value retains its position, while deleting and reinserting a
+ * key appends it again.  The returned entries are borrowed references and
+ * become invalid when their key is deleted or the dictionary is destroyed.
+ * The legacy qdict_first()/qdict_next() APIs retain their hash-bucket order.
+ * To mutate a dictionary while iterating, save the result of
+ * qdict_ordered_next() before deleting the current entry.
+ */
+const QDictEntry *qdict_ordered_first(const QDict *qdict);
+const QDictEntry *qdict_ordered_next(const QDictEntry *entry);
 
 /* Helper to qdict_put_obj(), accepts any object */
 #define qdict_put(qdict, key, obj) \
