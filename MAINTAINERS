@@ -1414,6 +1414,7 @@ F: hw/m68k/trace-events
 F: hw/m68k/trace.h
 F: hw/misc/next-*.c
 F: hw/net/next-mb8795.c
+F: hw/netinfo/*
 F: hw/nvram/next-nvram.c
 F: hw/rtc/next-rtc.c
 F: include/hw/audio/next-sound.h
@@ -1428,6 +1429,7 @@ F: include/hw/net/next-mb8795.h
 F: include/hw/nvram/next-nvram.h
 F: include/hw/rtc/next-rtc.h
 F: tests/functional/m68k/test_nextcube.py
+F: tests/unit/test-netinfo-xdr.c
 F: tests/qtest/next-*.c
 F: tests/unit/test-bt463.c
 
