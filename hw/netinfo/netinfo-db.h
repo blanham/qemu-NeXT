@@ -20,6 +20,7 @@ typedef struct NetInfoDbNodeSpec {
 NetInfoDb *netinfo_db_new(void);
 NetInfoDb *netinfo_db_new_with_tag(const char *tag);
 NetInfoDb *netinfo_db_new_default(void);
+NetInfoDb *netinfo_db_new_default_with_tag(const char *tag);
 NetInfoDb *netinfo_db_default(void);
 
 /*

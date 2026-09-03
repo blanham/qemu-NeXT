@@ -562,6 +562,61 @@ static void test_default_network_domain(void)
     ni_property_list_clear(&properties);
 }
 
+static void test_default_domain_custom_tag_is_consistent(void)
+{
+    g_autoptr(NetInfoDb) db = netinfo_db_new_default_with_tag("custom");
+    NiId id = { 0 };
+    NiIdList children;
+    NiPropertyList properties;
+
+    ni_id_list_init(&children);
+    ni_property_list_init(&properties);
+    g_assert_nonnull(db);
+    g_assert_cmpstr(netinfo_db_tag(db), ==, "custom");
+
+    g_assert_cmpint(netinfo_db_root(db, &id), ==, NI_OK);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpstr(properties.properties[1].name, ==, "master");
+    g_assert_cmpstr(properties.properties[1].values.values[0], ==,
+                    "localhost/custom");
+    ni_property_list_clear(&properties);
+
+    g_assert_cmpint(netinfo_db_lookup(db, &id, "name", "machines",
+                                      &children), ==, NI_OK);
+    g_assert_cmpuint(children.count, ==, 1);
+    id = (NiId) { .nii_object = children.values[0] };
+    ni_id_list_clear(&children);
+    g_assert_cmpint(netinfo_db_lookup(db, &id, "name", "localhost",
+                                      &children), ==, NI_OK);
+    g_assert_cmpuint(children.count, ==, 1);
+    id = (NiId) { .nii_object = children.values[0] };
+    ni_id_list_clear(&children);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpstr(properties.properties[2].name, ==, "serves");
+    g_assert_cmpstr(properties.properties[2].values.values[0], ==,
+                    "./custom");
+    ni_id_list_clear(&children);
+    ni_property_list_clear(&properties);
+}
+
+static void test_default_domain_custom_tag_rejects_derived_overflow(void)
+{
+    const size_t prefix_length = strlen("localhost/");
+    g_autofree char *boundary_tag = NULL;
+    g_autofree char *too_long_tag = NULL;
+    g_autoptr(NetInfoDb) db = NULL;
+
+    boundary_tag = g_strnfill(NI_SERVICE_MAX_NAME - prefix_length, 'x');
+    db = netinfo_db_new_default_with_tag(boundary_tag);
+    g_assert_nonnull(db);
+    g_assert_cmpuint(strlen(boundary_tag) + prefix_length, ==,
+                     NI_SERVICE_MAX_NAME);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    too_long_tag = g_strnfill(NI_SERVICE_MAX_NAME - prefix_length + 1, 'x');
+    g_assert_null(netinfo_db_new_default_with_tag(too_long_tag));
+}
+
 static void test_input_ownership_and_service_limits(void)
 {
     char property_name[] = "name";
@@ -1506,6 +1561,10 @@ int main(int argc, char **argv)
                     test_construction_is_strict_and_transactional);
     g_test_add_func("/netinfo-db/default/network-domain",
                     test_default_network_domain);
+    g_test_add_func("/netinfo-db/default/custom-tag-is-consistent",
+                    test_default_domain_custom_tag_is_consistent);
+    g_test_add_func("/netinfo-db/default/custom-tag-derived-overflow",
+                    test_default_domain_custom_tag_rejects_derived_overflow);
     g_test_add_func("/netinfo-db/construction/ownership-limits",
                     test_input_ownership_and_service_limits);
     g_test_add_func("/netinfo-db/construction/parent-validation",

@@ -1301,6 +1301,49 @@
   'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } }
 
 ##
+# @NetInfoServerProperties:
+#
+# @netdev: ID of the user-mode network stack that owns the guest-only
+#     endpoints.
+#
+# @config: Optional versioned JSON5 domain seed.  When omitted, the
+#     deterministic read-only network domain is used.
+#
+# @domain-tag: Optional domain tag.  With a JSON5 seed it must match
+#     the tag in the seed; without a seed it changes the built-in tag.
+#
+# @binder-udp-port: Guest UDP port for the NetInfo binder
+#     (default: 659).
+#
+# @binder-tcp-port: Guest TCP port for the NetInfo binder
+#     (default: 661).
+#
+# @database-udp-port: Guest UDP port for the NetInfo database
+#     (default: 660).
+#
+# @database-tcp-port: Guest TCP port for the NetInfo database
+#     (default: 662).
+#
+# @writable: Reserved for the complete server; writable mode is not
+#     currently supported (default: false).
+#
+# @state: Reserved for the complete server's persistent state
+#     location.
+#
+# Since: 11.1
+##
+{ 'struct': 'NetInfoServerProperties',
+  'data': { 'netdev': 'str', '*config': 'str', '*domain-tag': 'str',
+            '*binder-udp-port': 'uint16',
+            '*binder-tcp-port': 'uint16',
+            '*database-udp-port': 'uint16',
+            '*database-tcp-port': 'uint16',
+            '*writable': 'bool', '*state': 'str' },
+  'if': { 'all': [ 'CONFIG_SLIRP', 'CONFIG_SLIRP_UDP_SERVICE',
+                    'CONFIG_SLIRP_UDP_LISTEN_FULL',
+                    'CONFIG_SLIRP_TCP_SERVICE' ] } }
+
+##
 # @NfsServerProperties:
 #
 # @fsdev: ID of the filesystem export to serve.
@@ -1378,6 +1421,10 @@
       'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP',
                         'CONFIG_SLIRP_UDP_SERVICE',
                         'CONFIG_SLIRP_BOOTP_ROOT' ] } },
+    { 'name': 'netinfo-server',
+      'if': { 'all': [ 'CONFIG_SLIRP', 'CONFIG_SLIRP_UDP_SERVICE',
+                        'CONFIG_SLIRP_UDP_LISTEN_FULL',
+                        'CONFIG_SLIRP_TCP_SERVICE' ] } },
     { 'name': 'plan9-9p1-server',
       'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } },
     'pef-guest',
@@ -1465,6 +1512,11 @@
           'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP',
                             'CONFIG_SLIRP_UDP_SERVICE',
                             'CONFIG_SLIRP_BOOTP_ROOT' ] } },
+      'netinfo-server':             {
+          'type': 'NetInfoServerProperties',
+          'if': { 'all': [ 'CONFIG_SLIRP', 'CONFIG_SLIRP_UDP_SERVICE',
+                            'CONFIG_SLIRP_UDP_LISTEN_FULL',
+                            'CONFIG_SLIRP_TCP_SERVICE' ] } },
       'plan9-9p1-server':           {
           'type': 'Plan9P1ServerProperties',
           'if': { 'all': [ 'CONFIG_VIRTFS', 'CONFIG_SLIRP' ] } },

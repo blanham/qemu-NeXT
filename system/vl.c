@@ -1989,6 +1989,11 @@ static bool object_create_early(const char *type)
         return false;
     }
 
+    /* Reason: property "netdev". */
+    if (g_str_equal(type, "netinfo-server")) {
+        return false;
+    }
+
 #if defined(CONFIG_VHOST_USER) && defined(CONFIG_LINUX)
     /* Reason: cryptodev-vhost-user property "chardev" */
     if (g_str_equal(type, "cryptodev-vhost-user")) {

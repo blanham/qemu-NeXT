@@ -10,6 +10,13 @@
 
 typedef struct NetInfoServer NetInfoServer;
 
+typedef struct NetInfoServerPortConfig {
+    uint16_t binder_udp_port;
+    uint16_t binder_tcp_port;
+    uint16_t database_udp_port;
+    uint16_t database_tcp_port;
+} NetInfoServerPortConfig;
+
 /*
  * Construct the read-only binder and database services for one user-mode
  * network.  Ownership of @db is transferred to the server on success and on
@@ -22,6 +29,9 @@ NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
                                                   const char *netdev_id,
                                                   uint32_t local_addr,
                                                   Error **errp);
+NetInfoServer *netinfo_server_new_with_ports(
+    NetInfoDb *db, const char *netdev_id, uint32_t local_addr,
+    const NetInfoServerPortConfig *ports, Error **errp);
 void netinfo_server_free(NetInfoServer *server);
 
 #endif /* HW_NETINFO_NETINFO_SERVER_H */

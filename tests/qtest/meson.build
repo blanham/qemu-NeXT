@@ -167,6 +167,13 @@ qtests_m68k = ['boot-serial-test'] + \
   (config_all_devices.has_key('CONFIG_FSDEV_9P') and
    slirp_udp_service and slirp_bootp_root ?
    ['nfs-server-object-test'] : []) + \
+  (slirp.found() and slirp_udp_service and slirp_udp_listen_full and
+   slirp_tcp_service ?
+   ['netinfo-server-object-test'] : []) + \
+  (have_virtfs and config_all_devices.has_key('CONFIG_FSDEV_9P') and
+   slirp.found() and slirp_udp_service and slirp_bootp_root and
+   slirp_udp_listen_full and slirp_tcp_service ?
+   ['netinfo-server-nfs-object-test'] : []) + \
   (config_all_devices.has_key('CONFIG_NEXTCUBE') ?
    ['next-machine-test',
     'next-color-video-test',

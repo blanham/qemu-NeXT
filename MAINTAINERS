@@ -1433,6 +1433,8 @@ F: tests/unit/test-netinfo-xdr.c
 F: tests/unit/test-netinfo-db.c
 F: tests/unit/test-netinfo-server.c
 F: tests/data/netinfo/*
+F: tests/qtest/netinfo-server-object-test.c
+F: tests/qtest/netinfo-server-nfs-object-test.c
 F: tests/qtest/next-*.c
 F: tests/unit/test-bt463.c
 

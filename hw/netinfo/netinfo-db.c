@@ -206,14 +206,45 @@ void netinfo_db_free(NetInfoDb *db)
     g_free(db);
 }
 
-NetInfoDb *netinfo_db_new_default(void)
+static char *netinfo_default_tagged_value(const char *prefix,
+                                          const char *tag)
+{
+    size_t prefix_length = strlen(prefix);
+    size_t tag_length;
+    size_t value_length;
+    char *value;
+
+    /* The derived references are service names too, so bound the full value. */
+    if (!valid_name(tag, false)) {
+        return NULL;
+    }
+    tag_length = strlen(tag);
+    if (prefix_length > SIZE_MAX - tag_length) {
+        return NULL;
+    }
+    value_length = prefix_length + tag_length;
+    if (value_length > NI_SERVICE_MAX_NAME || value_length == SIZE_MAX) {
+        return NULL;
+    }
+    value = g_try_malloc(value_length + 1);
+    if (!value) {
+        return NULL;
+    }
+    memcpy(value, prefix, prefix_length);
+    memcpy(value + prefix_length, tag, tag_length + 1);
+    return value;
+}
+
+NetInfoDb *netinfo_db_new_default_with_tag(const char *tag)
 {
     static NiName root_name[] = { (char *)"/" };
-    static NiName root_master[] = { (char *)"localhost/network" };
     static NiName machines_name[] = { (char *)"machines" };
     static NiName host_name[] = { (char *)"localhost" };
     static NiName host_ip[] = { (char *)"10.0.2.2" };
-    static NiName host_serves[] = { (char *)"./network" };
+    g_autofree char *root_master_value = NULL;
+    g_autofree char *host_serves_value = NULL;
+    NiName root_master[1];
+    NiName host_serves[1];
     NiProperty root_properties[] = {
         { .name = (char *)"name",
           .values = { .count = 1, .values = root_name } },
@@ -242,7 +273,16 @@ NetInfoDb *netinfo_db_new_default(void)
     NiPropertyList host_list = {
         .count = G_N_ELEMENTS(host_properties), .properties = host_properties,
     };
-    NetInfoDb *db = netinfo_db_new();
+    NetInfoDb *db;
+
+    root_master_value = netinfo_default_tagged_value("localhost/", tag);
+    host_serves_value = netinfo_default_tagged_value("./", tag);
+    if (!root_master_value || !host_serves_value) {
+        return NULL;
+    }
+    root_master[0] = root_master_value;
+    host_serves[0] = host_serves_value;
+    db = netinfo_db_new_with_tag(tag);
 
     if (!db ||
         netinfo_db_add_node(db, &(NiId) { 0, 0x24 }, false, 0, &root_list) !=
@@ -256,6 +296,11 @@ NetInfoDb *netinfo_db_new_default(void)
         return NULL;
     }
     return db;
+}
+
+NetInfoDb *netinfo_db_new_default(void)
+{
+    return netinfo_db_new_default_with_tag("network");
 }
 
 NetInfoDb *netinfo_db_default(void)

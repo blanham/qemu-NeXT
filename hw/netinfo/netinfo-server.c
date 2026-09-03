@@ -19,6 +19,7 @@ typedef enum NetInfoReplyKind {
 struct NetInfoServer {
     NetInfoDb *db;
     uint32_t local_addr;
+    NetInfoServerPortConfig ports;
     QemuSlirpRpcRegistration *binder_udp;
     QemuSlirpRpcRegistration *binder_tcp;
     QemuSlirpRpcRegistration *database_udp;
@@ -236,8 +237,8 @@ static OncRpcDispatchResult netinfo_binder_dispatch(OncRpcRequest *request,
         result.status = g_strcmp0(tag, netinfo_db_tag(server->db)) == 0 ?
                         NI_OK : NI_NOTAG;
         if (result.status == NI_OK) {
-            result.addrs.udp_port = NI_UDP_PORT;
-            result.addrs.tcp_port = NI_TCP_PORT;
+            result.addrs.udp_port = server->ports.database_udp_port;
+            result.addrs.tcp_port = server->ports.database_tcp_port;
         }
         ni_name_clear(&tag);
         {
@@ -263,8 +264,10 @@ static OncRpcDispatchResult netinfo_binder_dispatch(OncRpcRequest *request,
         result.registrations = g_new0(NiBindRegistration, 1);
         ni_bind_registration_init(&result.registrations[0]);
         result.registrations[0].tag = g_strdup(netinfo_db_tag(server->db));
-        result.registrations[0].addrs.udp_port = NI_UDP_PORT;
-        result.registrations[0].addrs.tcp_port = NI_TCP_PORT;
+        result.registrations[0].addrs.udp_port =
+            server->ports.database_udp_port;
+        result.registrations[0].addrs.tcp_port =
+            server->ports.database_tcp_port;
         {
             OncRpcDispatchResult dispatch = netinfo_reply(
                 request, call, NETINFO_REPLY_SUCCESS,
@@ -1033,17 +1036,16 @@ void netinfo_server_free(NetInfoServer *server)
     g_free(server);
 }
 
-NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
-                                                  const char *netdev_id,
-                                                  uint32_t local_addr,
-                                                  Error **errp)
+NetInfoServer *netinfo_server_new_with_ports(
+    NetInfoDb *db, const char *netdev_id, uint32_t local_addr,
+    const NetInfoServerPortConfig *ports, Error **errp)
 {
     NetInfoServer *server;
     OncRpcProgram binder_udp = {
         .program = NIBIND_PROG,
         .version_low = NIBIND_VERS,
         .version_high = NIBIND_VERS,
-        .port = NIBIND_UDP_PORT,
+        .port = ports ? ports->binder_udp_port : 0,
         .transports = ONC_RPC_TRANSPORT_UDP,
         .dispatch = netinfo_binder_dispatch,
     };
@@ -1051,7 +1053,7 @@ NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
         .program = NIBIND_PROG,
         .version_low = NIBIND_VERS,
         .version_high = NIBIND_VERS,
-        .port = NIBIND_TCP_PORT,
+        .port = ports ? ports->binder_tcp_port : 0,
         .transports = ONC_RPC_TRANSPORT_TCP,
         .dispatch = netinfo_binder_dispatch,
     };
@@ -1059,7 +1061,7 @@ NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
         .program = NI_PROG,
         .version_low = NI_VERS,
         .version_high = NI_VERS,
-        .port = NI_UDP_PORT,
+        .port = ports ? ports->database_udp_port : 0,
         .transports = ONC_RPC_TRANSPORT_UDP,
         .dispatch = netinfo_database_dispatch,
     };
@@ -1067,13 +1069,15 @@ NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
         .program = NI_PROG,
         .version_low = NI_VERS,
         .version_high = NI_VERS,
-        .port = NI_TCP_PORT,
+        .port = ports ? ports->database_tcp_port : 0,
         .transports = ONC_RPC_TRANSPORT_TCP,
         .dispatch = netinfo_database_dispatch,
     };
 
     if (!db || !netdev_id || !netdev_id[0] || !netinfo_db_tag(db) ||
-        !netinfo_db_tag(db)[0]) {
+        !netinfo_db_tag(db)[0] || !ports || !ports->binder_udp_port ||
+        !ports->binder_tcp_port || !ports->database_udp_port ||
+        !ports->database_tcp_port) {
         error_setg(errp, "NetInfo server configuration is incomplete");
         netinfo_db_free(db);
         return NULL;
@@ -1081,6 +1085,7 @@ NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
     server = g_new0(NetInfoServer, 1);
     server->db = db;
     server->local_addr = local_addr;
+    server->ports = *ports;
     /* The registry copies each descriptor, so bind its opaque owner first. */
     binder_udp.opaque = server;
     binder_tcp.opaque = server;
@@ -1098,6 +1103,22 @@ NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
         return NULL;
     }
     return server;
+}
+
+NetInfoServer *netinfo_server_new_with_local_addr(NetInfoDb *db,
+                                                  const char *netdev_id,
+                                                  uint32_t local_addr,
+                                                  Error **errp)
+{
+    const NetInfoServerPortConfig ports = {
+        .binder_udp_port = NIBIND_UDP_PORT,
+        .binder_tcp_port = NIBIND_TCP_PORT,
+        .database_udp_port = NI_UDP_PORT,
+        .database_tcp_port = NI_TCP_PORT,
+    };
+
+    return netinfo_server_new_with_ports(db, netdev_id, local_addr, &ports,
+                                         errp);
 }
 
 NetInfoServer *netinfo_server_new(NetInfoDb *db, const char *netdev_id,
