@@ -95,6 +95,7 @@ Emulated Devices
    devices/ivshmem.rst
    devices/keyboard.rst
    devices/net.rst
+   devices/netinfo.rst
    devices/nfs-root.rst
    devices/nvme.rst
    devices/scsi/index.rst
