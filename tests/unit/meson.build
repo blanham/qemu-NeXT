@@ -81,6 +81,12 @@ tests = {
     meson.project_source_root() / 'net/onc-rpc-xdr.c',
     netinfo_db_testing,
   ],
+  'test-netinfo-server': [
+    meson.project_source_root() / 'hw/netinfo/netinfo-server.c',
+    meson.project_source_root() / 'hw/netinfo/netinfo-db.c',
+    meson.project_source_root() / 'hw/netinfo/netinfo-xdr.c',
+    meson.project_source_root() / 'net/onc-rpc-xdr.c',
+  ],
   'test-nfs2-handle': [
     meson.project_source_root() / 'hw/nfs/nfs2-handle.c',
     crypto,
