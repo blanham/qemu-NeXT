@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+{
+  version: 1,
+  domain: 'network',
+  nodes: [{ id: 0, instance: 1, parent: null, properties: { name: ['/'] } }],
+}

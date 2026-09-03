@@ -3,6 +3,9 @@ testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 nfs2_handle_testing = declare_dependency(
   compile_args: ['-DNFS2_HANDLE_TESTING'],
 )
+netinfo_db_testing = declare_dependency(
+  compile_args: ['-DNETINFO_DB_TESTING'],
+)
 
 tests = {
   'check-block-qdict': [],
@@ -76,6 +79,7 @@ tests = {
     meson.project_source_root() / 'hw/netinfo/netinfo-db.c',
     meson.project_source_root() / 'hw/netinfo/netinfo-xdr.c',
     meson.project_source_root() / 'net/onc-rpc-xdr.c',
+    netinfo_db_testing,
   ],
   'test-nfs2-handle': [
     meson.project_source_root() / 'hw/nfs/nfs2-handle.c',

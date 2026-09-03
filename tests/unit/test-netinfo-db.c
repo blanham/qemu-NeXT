@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "qemu/osdep.h"
 
+#include "qapi/error.h"
 #include "hw/netinfo/netinfo-db.h"
 #include "hw/netinfo/netinfo-xdr.h"
+#include "qobject/qjson5.h"
 
 static NiPropertyList props(NiProperty *properties, size_t count)
 {
@@ -822,6 +824,669 @@ static void test_strict_clear_reuses_sealed_database(void)
     g_assert_cmpuint(id.nii_instance, ==, 2);
 }
 
+static char *netinfo_fixture_path(const char *name)
+{
+    return g_test_build_filename(G_TEST_DIST, "..", "data", "netinfo", name,
+                                 NULL);
+}
+
+static void assert_json5_load_failure(const char *fixture,
+                                      const char *message_fragment)
+{
+    g_autofree char *path = netinfo_fixture_path(fixture);
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    if (message_fragment) {
+        g_assert_nonnull(strstr(error_get_pretty(err), message_fragment));
+    }
+    error_free(err);
+}
+
+static char *write_json5_temp(const char *text)
+{
+    g_autoptr(GError) file_error = NULL;
+    char *path = NULL;
+    int fd;
+
+    fd = g_file_open_tmp("netinfo-domain-XXXXXX", &path, &file_error);
+    g_assert_no_error(file_error);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(close(fd), ==, 0);
+    g_assert_true(g_file_set_contents(path, text, -1, &file_error));
+    g_assert_no_error(file_error);
+    return path;
+}
+
+static void assert_json5_text_load_failure(char *text,
+                                           const char *message_fragment)
+{
+    g_autofree char *owned_text = text;
+    g_autofree char *path = write_json5_temp(owned_text);
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    g_test_message("JSON5 loader error: %s", error_get_pretty(err));
+    g_assert_nonnull(strstr(error_get_pretty(err), message_fragment));
+    error_free(err);
+    g_assert_cmpint(unlink(path), ==, 0);
+}
+
+static NetInfoDb *load_json5_text_success(char *text)
+{
+    g_autofree char *owned_text = text;
+    g_autofree char *path = write_json5_temp(owned_text);
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(err);
+    g_assert_nonnull(db);
+    g_assert_cmpint(unlink(path), ==, 0);
+    return g_steal_pointer(&db);
+}
+
+static GString *json5_domain_prefix(void)
+{
+    return g_string_new("{version: 1, domain: {tag: 'network', name: '/'}, "
+                        "nodes: [");
+}
+
+static char *json5_nodes_with_count(size_t count)
+{
+    GString *text = json5_domain_prefix();
+
+    g_assert_cmpuint(count, >=, 1);
+    g_string_append(text,
+                    "{id: 0, instance: 1, parent: null, "
+                    "properties: {name: ['/']}}");
+    for (size_t i = 1; i < count; i++) {
+        g_string_append_printf(
+            text,
+            ", {id: %zu, instance: 1, parent: 0, properties: {}}", i);
+    }
+    g_string_append(text, "]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_properties_with_count(size_t count)
+{
+    GString *text = json5_domain_prefix();
+
+    g_assert_cmpuint(count, >=, 1);
+    g_string_append(text,
+                    "{id: 0, instance: 1, parent: null, properties: "
+                    "{name: ['/']");
+    for (size_t i = 1; i < count; i++) {
+        g_string_append_printf(text, ", p%zu: []", i - 1);
+    }
+    g_string_append(text, "}}");
+    g_string_append(text, "]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_values_with_count(size_t count)
+{
+    GString *text = json5_domain_prefix();
+
+    g_assert_cmpuint(count, >=, 1);
+    g_string_append(text,
+                    "{id: 0, instance: 1, parent: null, properties: "
+                    "{name: ['/'], values: [");
+    for (size_t i = 0; i < count; i++) {
+        if (i) {
+            g_string_append_c(text, ',');
+        }
+        g_string_append(text, "'v'");
+    }
+    g_string_append(text, "]}}");
+    g_string_append(text, "]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_property_name_with_length(size_t length)
+{
+    GString *text = json5_domain_prefix();
+    GString *name = g_string_sized_new(length);
+
+    for (size_t i = 0; i < length; i++) {
+        g_string_append_c(name, 'x');
+    }
+    g_string_append_printf(text,
+                           "{id: 0, instance: 1, parent: null, "
+                           "properties: {name: ['/'], '%s': ['boundary']}}]}",
+                           name->str);
+    g_string_free(name, true);
+    return g_string_free(text, false);
+}
+
+static char *json5_property_value_with_length(size_t length)
+{
+    GString *text = json5_domain_prefix();
+    GString *value = g_string_sized_new(length);
+
+    for (size_t i = 0; i < length; i++) {
+        g_string_append_c(value, 'x');
+    }
+    g_string_append_printf(text,
+                           "{id: 0, instance: 1, parent: null, "
+                           "properties: {name: ['/'], boundary: ['%s']}}]}",
+                           value->str);
+    g_string_free(value, true);
+    return g_string_free(text, false);
+}
+
+static char *json5_unknown_root_key_with_length(size_t length)
+{
+    static const char prefix[] = "attacker-";
+    GString *text = g_string_new("{version: 1, '");
+
+    g_assert_cmpuint(length, >=, sizeof(prefix) - 1);
+    g_string_append(text, prefix);
+    for (size_t i = sizeof(prefix) - 1; i < length; i++) {
+        g_string_append_c(text, 'x');
+    }
+    g_string_append(text,
+                    "': true, domain: {tag: 'network', name: '/'}, "
+                    "nodes: [{id: 0, instance: 1, parent: null, "
+                    "properties: {name: ['/']}}]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_domain_tag_with_length(size_t length)
+{
+    GString *text = g_string_new("{version: 1, domain: {tag: '");
+
+    for (size_t i = 0; i < length; i++) {
+        g_string_append_c(text, 'x');
+    }
+    g_string_append(text,
+                    "', name: '/'}, nodes: [{id: 0, instance: 1, "
+                    "parent: null, properties: {name: ['/']}}]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_input_at_limit(bool over_limit);
+
+static void test_json5_load_accepts_exact_service_limits(void)
+{
+    g_autoptr(NetInfoDb) db = NULL;
+    NiId id = { .nii_object = 0, .nii_instance = 0 };
+    NiIdList children;
+    NiPropertyList properties;
+    g_autofree char *last_property = NULL;
+
+    db = load_json5_text_success(json5_nodes_with_count(
+        NI_SERVICE_MAX_NODES));
+    g_assert_cmpuint(netinfo_db_node_count(db), ==, NI_SERVICE_MAX_NODES);
+    ni_id_list_init(&children);
+    g_assert_cmpint(netinfo_db_children(db, &id, &children), ==, NI_OK);
+    g_assert_cmpuint(children.count, ==, NI_SERVICE_MAX_NODES - 1);
+    g_assert_cmpuint(children.values[0], ==, 1);
+    g_assert_cmpuint(children.values[children.count - 1], ==,
+                    NI_SERVICE_MAX_NODES - 1);
+    ni_id_list_clear(&children);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    db = load_json5_text_success(json5_properties_with_count(
+        NI_SERVICE_MAX_PROPERTIES));
+    ni_property_list_init(&properties);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpuint(properties.count, ==, NI_SERVICE_MAX_PROPERTIES);
+    g_assert_cmpstr(properties.properties[0].name, ==, "name");
+    last_property = g_strdup_printf("p%u", NI_SERVICE_MAX_PROPERTIES - 2);
+    g_assert_cmpstr(properties.properties[properties.count - 1].name, ==,
+                    last_property);
+    ni_property_list_clear(&properties);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    db = load_json5_text_success(json5_values_with_count(
+        NI_SERVICE_MAX_VALUES));
+    ni_property_list_init(&properties);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpuint(properties.count, ==, 2);
+    g_assert_cmpstr(properties.properties[1].name, ==, "values");
+    g_assert_cmpuint(properties.properties[1].values.count, ==,
+                     NI_SERVICE_MAX_VALUES);
+    g_assert_cmpstr(properties.properties[1].values.values[0], ==, "v");
+    g_assert_cmpstr(properties.properties[1].values.values[
+                        NI_SERVICE_MAX_VALUES - 1], ==, "v");
+    ni_property_list_clear(&properties);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    db = load_json5_text_success(json5_property_name_with_length(
+        NI_SERVICE_MAX_NAME));
+    ni_property_list_init(&properties);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpuint(properties.count, ==, 2);
+    g_assert_cmpuint(strlen(properties.properties[1].name), ==,
+                     NI_SERVICE_MAX_NAME);
+    g_assert_cmpint(properties.properties[1].name[0], ==, 'x');
+    g_assert_cmpint(properties.properties[1].name[
+                        NI_SERVICE_MAX_NAME - 1], ==, 'x');
+    g_assert_cmpstr(properties.properties[1].values.values[0], ==,
+                    "boundary");
+    ni_property_list_clear(&properties);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    db = load_json5_text_success(json5_property_value_with_length(
+        NI_SERVICE_MAX_NAME));
+    ni_property_list_init(&properties);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpuint(properties.count, ==, 2);
+    g_assert_cmpstr(properties.properties[1].name, ==, "boundary");
+    g_assert_cmpuint(strlen(properties.properties[1].values.values[0]), ==,
+                     NI_SERVICE_MAX_NAME);
+    g_assert_cmpint(properties.properties[1].values.values[0][0], ==, 'x');
+    g_assert_cmpint(properties.properties[1].values.values[0][
+                        NI_SERVICE_MAX_NAME - 1], ==, 'x');
+    ni_property_list_clear(&properties);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    db = load_json5_text_success(json5_domain_tag_with_length(
+        NI_SERVICE_MAX_NAME));
+    g_assert_cmpuint(strlen(netinfo_db_tag(db)), ==, NI_SERVICE_MAX_NAME);
+    g_assert_cmpint(netinfo_db_tag(db)[0], ==, 'x');
+    g_assert_cmpint(netinfo_db_tag(db)[NI_SERVICE_MAX_NAME - 1], ==, 'x');
+}
+
+static void test_json5_load_rejects_service_limit_plus_one(void)
+{
+    assert_json5_text_load_failure(json5_nodes_with_count(
+                                       NI_SERVICE_MAX_NODES + 1),
+                                   "nodes has more than");
+    assert_json5_text_load_failure(json5_properties_with_count(
+                                       NI_SERVICE_MAX_PROPERTIES + 1),
+                                   "properties has more than");
+    assert_json5_text_load_failure(json5_values_with_count(
+                                       NI_SERVICE_MAX_VALUES + 1),
+                                   "values has more than");
+    assert_json5_text_load_failure(json5_property_name_with_length(
+                                       NI_SERVICE_MAX_NAME + 1),
+                                   "property name exceeds");
+    assert_json5_text_load_failure(json5_property_value_with_length(
+                                       NI_SERVICE_MAX_NAME + 1),
+                                   "boundary[0] exceeds");
+    assert_json5_text_load_failure(json5_domain_tag_with_length(
+                                       NI_SERVICE_MAX_NAME + 1),
+                                   "domain.tag exceeds");
+}
+
+static void test_json5_load_rejects_combined_invalid_domain_fields(void)
+{
+    g_autofree char *path = netinfo_fixture_path(
+        "invalid-domain-both-invalid.json5");
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    g_assert_cmpstr(error_get_pretty(err), ==, "domain.tag must be a string");
+    error_free(err);
+}
+
+static void test_json5_load_reports_missing_grandparent(void)
+{
+    g_autofree char *path = netinfo_fixture_path(
+        "invalid-dangling-grandparent.json5");
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    g_assert_cmpstr(error_get_pretty(err), ==,
+                    "node 1 has dangling parent 99");
+    error_free(err);
+}
+
+static void test_json5_load_bounds_unknown_key_diagnostic(void)
+{
+    const size_t key_length = QJSON5_MAX_TOKEN_SIZE - 2;
+    g_autofree char *text = json5_unknown_root_key_with_length(key_length);
+    g_autofree char *path = write_json5_temp(text);
+    g_autoptr(NetInfoDb) db = NULL;
+    g_autofree char *length_suffix = NULL;
+    const char *message;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    message = error_get_pretty(err);
+    length_suffix = g_strdup_printf("(%zu bytes)", key_length);
+    g_assert_nonnull(strstr(message, "domain file has unknown key"));
+    g_assert_nonnull(strstr(message, "attacker-"));
+    g_assert_nonnull(strstr(message, "..."));
+    g_assert_nonnull(strstr(message, length_suffix));
+    g_assert_cmpuint(strlen(message), <, 512);
+    error_free(err);
+    g_assert_cmpint(unlink(path), ==, 0);
+}
+
+static void test_json5_property_name_diagnostic_is_compact(void)
+{
+    g_autofree char *text = json5_property_name_with_length(
+        NI_SERVICE_MAX_NAME + 1);
+    g_autofree char *path = write_json5_temp(text);
+    g_autoptr(NetInfoDb) db = NULL;
+    const char *message;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    message = error_get_pretty(err);
+    g_assert_nonnull(strstr(message, "property name exceeds"));
+    g_assert_cmpuint(strlen(message), <, 128);
+    error_free(err);
+    g_assert_cmpint(unlink(path), ==, 0);
+}
+
+static void test_json5_load_rejects_non_regular_file(void)
+{
+    g_autoptr(GError) file_error = NULL;
+    g_autofree char *directory = g_dir_make_tmp(
+        "netinfo-domain-directory-XXXXXX", &file_error);
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    g_assert_no_error(file_error);
+    g_assert_nonnull(directory);
+    db = netinfo_db_load_json5(directory, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err), "not a regular file"));
+    error_free(err);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
+static int json5_growth_fd = -1;
+static bool json5_growth_done;
+
+static ssize_t json5_read_after_growth(int fd, void *buf, size_t count)
+{
+    static const char growth[] = " ";
+    ssize_t written;
+
+    if (!json5_growth_done) {
+        written = write(json5_growth_fd, growth, sizeof(growth) - 1);
+        g_assert_cmpint(written, ==, sizeof(growth) - 1);
+        json5_growth_done = true;
+    }
+    return read(fd, buf, count);
+}
+
+static void test_json5_load_rejects_growth_after_stat(void)
+{
+    g_autofree char *text = json5_input_at_limit(false);
+    g_autofree char *path = write_json5_temp(text);
+    Error *open_error = NULL;
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    json5_growth_fd = qemu_open(path, O_WRONLY | O_APPEND | O_BINARY,
+                                &open_error);
+    g_assert_cmpint(json5_growth_fd, >=, 0);
+    g_assert_null(open_error);
+    json5_growth_done = false;
+    netinfo_db_test_set_json5_read_hook(json5_read_after_growth);
+    db = netinfo_db_load_json5(path, false, &err);
+    netinfo_db_test_set_json5_read_hook(NULL);
+    g_assert_cmpint(qemu_close(json5_growth_fd), ==, 0);
+    json5_growth_fd = -1;
+
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err), "exceeds"));
+    error_free(err);
+    g_assert_cmpint(unlink(path), ==, 0);
+}
+
+static char *json5_depth_over_limit(void)
+{
+    GString *text = json5_domain_prefix();
+
+    g_string_append(text,
+                    "{id: 0, instance: 1, parent: null, "
+                    "properties: {name: ['/']}}");
+    for (size_t i = 1; i <= NI_SERVICE_MAX_DEPTH + 1; i++) {
+        g_string_append_printf(
+            text,
+            ", {id: %zu, instance: 1, parent: %zu, properties: {}}",
+            i, i - 1);
+    }
+    g_string_append(text, "]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_name_over_limit(void)
+{
+    GString *text = json5_domain_prefix();
+    GString *value = g_string_sized_new(NI_SERVICE_MAX_NAME + 1);
+
+    for (size_t i = 0; i < NI_SERVICE_MAX_NAME + 1; i++) {
+        g_string_append_c(value, 'x');
+    }
+    g_string_append_printf(text,
+                           "{id: 0, instance: 1, parent: null, "
+                           "properties: {name: ['%s']}}]}", value->str);
+    g_string_free(value, true);
+    return g_string_free(text, false);
+}
+
+static char *json5_tag_over_limit(void)
+{
+    GString *text = g_string_new("{version: 1, domain: {tag: '");
+
+    for (size_t i = 0; i < NI_SERVICE_MAX_NAME + 1; i++) {
+        g_string_append_c(text, 'x');
+    }
+    g_string_append(text,
+                    "', name: '/'}, nodes: [{id: 0, instance: 1, "
+                    "parent: null, properties: {name: ['/']}}]}");
+    return g_string_free(text, false);
+}
+
+static char *json5_input_at_limit(bool over_limit)
+{
+    static const char suffix[] =
+        "{version: 1, domain: {tag: 'network', name: '/'}, "
+        "nodes: [{id: 0, instance: 1, parent: null, "
+        "properties: {name: ['/']}}]}";
+    size_t length = QJSON5_MAX_INPUT_SIZE + (over_limit ? 1 : 0);
+    GString *text = g_string_sized_new(length);
+
+    g_string_set_size(text, length);
+    memset(text->str, ' ', length);
+    memcpy(text->str + length - sizeof(suffix) + 1, suffix,
+           sizeof(suffix) - 1);
+    return g_string_free(text, false);
+}
+
+static void test_json5_load_enforces_input_limit(void)
+{
+    g_autofree char *exact = json5_input_at_limit(false);
+    g_autofree char *over = json5_input_at_limit(true);
+    g_autofree char *exact_path = write_json5_temp(exact);
+    g_autofree char *over_path = write_json5_temp(over);
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(exact_path, false, &err);
+    g_assert_null(err);
+    g_assert_nonnull(db);
+    g_clear_pointer(&db, netinfo_db_free);
+
+    db = netinfo_db_load_json5(over_path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err), "exceeds"));
+    error_free(err);
+    g_assert_cmpint(unlink(exact_path), ==, 0);
+    g_assert_cmpint(unlink(over_path), ==, 0);
+}
+
+static void test_json5_load_rejects_explicit_limits(void)
+{
+    assert_json5_text_load_failure(json5_depth_over_limit(), "depth");
+    assert_json5_text_load_failure(json5_name_over_limit(), "exceeds");
+    assert_json5_text_load_failure(json5_tag_over_limit(), "exceeds");
+}
+
+static void test_json5_load_minimal_domain(void)
+{
+    g_autofree char *path = netinfo_fixture_path("minimal-domain.json5");
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+    NiId id = { .nii_object = 99, .nii_instance = 99 };
+    NiPropertyList properties;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(err);
+    g_assert_nonnull(db);
+    g_assert_cmpstr(netinfo_db_tag(db), ==, "network");
+    g_assert_cmpuint(netinfo_db_node_count(db), ==, 1);
+
+    ni_property_list_init(&properties);
+    g_assert_cmpint(netinfo_db_root(db, &id), ==, NI_OK);
+    g_assert_cmpuint(id.nii_object, ==, 0);
+    g_assert_cmpuint(id.nii_instance, ==, 1);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpuint(properties.count, ==, 1);
+    g_assert_cmpstr(properties.properties[0].name, ==, "name");
+    g_assert_cmpuint(properties.properties[0].values.count, ==, 1);
+    g_assert_cmpstr(properties.properties[0].values.values[0], ==, "/");
+    ni_property_list_clear(&properties);
+}
+
+static void test_json5_load_propagates_file_errors(void)
+{
+    g_autofree char *path = netinfo_fixture_path(
+        "missing-netinfo-domain.json5");
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(db);
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_json5_load_preserves_hex_and_source_order(void)
+{
+    g_autofree char *path = netinfo_fixture_path("ordered-domain.json5");
+    g_autoptr(NetInfoDb) db = NULL;
+    Error *err = NULL;
+    NiId id = { .nii_object = 0, .nii_instance = 0 };
+    NiPropertyList properties;
+
+    db = netinfo_db_load_json5(path, false, &err);
+    g_assert_null(err);
+    g_assert_nonnull(db);
+    g_assert_cmpstr(netinfo_db_tag(db), ==, "custom");
+    g_assert_cmpuint(netinfo_db_node_count(db), ==, 2);
+
+    ni_property_list_init(&properties);
+    g_assert_cmpint(netinfo_db_read(db, &id, &properties), ==, NI_OK);
+    g_assert_cmpuint(properties.count, ==, 3);
+    g_assert_cmpstr(properties.properties[0].name, ==, "zeta");
+    g_assert_cmpstr(properties.properties[1].name, ==, "name");
+    g_assert_cmpstr(properties.properties[2].name, ==, "alpha");
+    g_assert_cmpuint(properties.properties[0].values.count, ==, 2);
+    g_assert_cmpstr(properties.properties[0].values.values[0], ==, "last");
+    g_assert_cmpstr(properties.properties[0].values.values[1], ==, "last");
+    ni_property_list_clear(&properties);
+}
+
+static void test_json5_load_defaults_are_explicit_and_non_merging(void)
+{
+    g_autofree char *path = netinfo_fixture_path("minimal-domain.json5");
+    g_autoptr(NetInfoDb) defaults = NULL;
+    g_autoptr(NetInfoDb) loaded = NULL;
+    Error *err = NULL;
+
+    loaded = netinfo_db_load_json5(NULL, true, &err);
+    g_assert_null(err);
+    g_assert_nonnull(loaded);
+    g_assert_cmpstr(netinfo_db_tag(loaded), ==, "network");
+    g_assert_cmpuint(netinfo_db_node_count(loaded), ==, 3);
+
+    defaults = netinfo_db_load_json5(NULL, false, &err);
+    g_assert_null(defaults);
+    g_assert_nonnull(err);
+    g_assert_nonnull(strstr(error_get_pretty(err), "path"));
+    error_free(err);
+    err = NULL;
+
+    g_clear_pointer(&loaded, netinfo_db_free);
+    loaded = netinfo_db_load_json5(path, true, &err);
+    g_assert_null(err);
+    g_assert_nonnull(loaded);
+    g_assert_cmpuint(netinfo_db_node_count(loaded), ==, 1);
+}
+
+static void test_json5_load_rejects_schema_and_graph_errors(void)
+{
+    static const struct {
+        const char *fixture;
+        const char *message;
+    } cases[] = {
+        { "invalid-unknown-root-key.json5", "unknown key" },
+        { "invalid-top-level-type.json5", "object" },
+        { "invalid-missing-domain-key.json5", "missing" },
+        { "invalid-unknown-domain-key.json5", "unknown key" },
+        { "invalid-domain-missing-name.json5", "missing" },
+        { "invalid-unknown-node-key.json5", "unknown key" },
+        { "invalid-unknown-property-value.json5", "array" },
+        { "invalid-version.json5", "version" },
+        { "invalid-missing-version.json5", "missing" },
+        { "invalid-domain-type.json5", "object" },
+        { "invalid-domain-tag-type.json5", "string" },
+        { "invalid-domain-name-type.json5", "string" },
+        { "invalid-nodes-type.json5", "array" },
+        { "invalid-node-properties-type.json5", "object" },
+        { "invalid-node-missing-field.json5", "missing" },
+        { "invalid-dangling-parent.json5", "parent" },
+        { "invalid-duplicate-ids.json5", "duplicate" },
+        { "invalid-cycle.json5", "cycle" },
+        { "invalid-multiple-roots.json5", "root" },
+        { "invalid-nonzero-root.json5", "root" },
+        { "invalid-domain-name.json5", "domain" },
+        { "invalid-domain-tag.json5", "tag" },
+        { "invalid-duplicate-property-key.json5", "duplicate object key" },
+        { "invalid-id-type.json5", "id" },
+        { "invalid-instance-type.json5", "instance" },
+        { "invalid-parent-type.json5", "parent" },
+        { "invalid-property-values-type.json5", "array" },
+        { "invalid-id-negative.json5", "u32" },
+        { "invalid-id-float.json5", "u32" },
+        { "invalid-id-too-large.json5", "u32" },
+        { "invalid-id-nonfinite.json5", "u32" },
+        { "invalid-instance-negative.json5", "u32" },
+        { "invalid-instance-too-large.json5", "u32" },
+        { "invalid-instance-nonfinite.json5", "u32" },
+        { "invalid-parent-negative.json5", "u32" },
+        { "invalid-parent-too-large.json5", "u32" },
+        { "invalid-parent-nonfinite.json5", "u32" },
+        { "invalid-empty-nodes.json5", "at least one" },
+        { "invalid-root-name-missing.json5", "root name" },
+        { "invalid-root-name-mismatch.json5", "root name" },
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        g_test_message("invalid NetInfo JSON5 fixture: %s", cases[i].fixture);
+        assert_json5_load_failure(cases[i].fixture, cases[i].message);
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -863,5 +1528,35 @@ int main(int argc, char **argv)
                     test_strict_seal_retry_after_adding_missing_parent);
     g_test_add_func("/netinfo-db/construction/strict-clear-reuse",
                     test_strict_clear_reuses_sealed_database);
+    g_test_add_func("/netinfo-db/json5/minimal-domain",
+                    test_json5_load_minimal_domain);
+    g_test_add_func("/netinfo-db/json5/file-errors",
+                    test_json5_load_propagates_file_errors);
+    g_test_add_func("/netinfo-db/json5/hex-and-source-order",
+                    test_json5_load_preserves_hex_and_source_order);
+    g_test_add_func("/netinfo-db/json5/defaults",
+                    test_json5_load_defaults_are_explicit_and_non_merging);
+    g_test_add_func("/netinfo-db/json5/schema-and-graph-errors",
+                    test_json5_load_rejects_schema_and_graph_errors);
+    g_test_add_func("/netinfo-db/json5/limits",
+                    test_json5_load_rejects_explicit_limits);
+    g_test_add_func("/netinfo-db/json5/input-limit",
+                    test_json5_load_enforces_input_limit);
+    g_test_add_func("/netinfo-db/json5/exact-service-limits",
+                    test_json5_load_accepts_exact_service_limits);
+    g_test_add_func("/netinfo-db/json5/service-limit-plus-one",
+                    test_json5_load_rejects_service_limit_plus_one);
+    g_test_add_func("/netinfo-db/json5/combined-invalid-domain-fields",
+                    test_json5_load_rejects_combined_invalid_domain_fields);
+    g_test_add_func("/netinfo-db/json5/dangling-grandparent",
+                    test_json5_load_reports_missing_grandparent);
+    g_test_add_func("/netinfo-db/json5/unknown-key-diagnostic",
+                    test_json5_load_bounds_unknown_key_diagnostic);
+    g_test_add_func("/netinfo-db/json5/property-name-diagnostic",
+                    test_json5_property_name_diagnostic_is_compact);
+    g_test_add_func("/netinfo-db/json5/non-regular-file",
+                    test_json5_load_rejects_non_regular_file);
+    g_test_add_func("/netinfo-db/json5/growth-after-stat",
+                    test_json5_load_rejects_growth_after_stat);
     return g_test_run();
 }

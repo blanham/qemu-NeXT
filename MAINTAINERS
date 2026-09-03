@@ -1431,6 +1431,7 @@ F: include/hw/rtc/next-rtc.h
 F: tests/functional/m68k/test_nextcube.py
 F: tests/unit/test-netinfo-xdr.c
 F: tests/unit/test-netinfo-db.c
+F: tests/data/netinfo/*
 F: tests/qtest/next-*.c
 F: tests/unit/test-bt463.c
 

@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+{
+  version: 1,
+  domain: { tag: 'custom', name: '/' },
+  nodes: [
+    {
+      id: 0x0,
+      instance: 0x7,
+      parent: null,
+      properties: {
+        zeta: ['last', 'last'],
+        name: ['/'],
+        alpha: ['a', 'b'],
+      },
+    },
+    {
+      id: 0x2,
+      instance: 0x8,
+      parent: 0x0,
+      properties: { name: ['child'], alias: ['v', 'v'] },
+    },
+  ],
+}

@@ -4,6 +4,7 @@
 
 #include <glib.h>
 
+#include "qapi/error.h"
 #include "hw/netinfo/netinfo-protocol.h"
 
 typedef struct NetInfoDb NetInfoDb;
@@ -20,6 +21,23 @@ NetInfoDb *netinfo_db_new(void);
 NetInfoDb *netinfo_db_new_with_tag(const char *tag);
 NetInfoDb *netinfo_db_new_default(void);
 NetInfoDb *netinfo_db_default(void);
+
+/*
+ * Load one complete, versioned JSON5 domain.  A non-NULL path always
+ * replaces the safe seed; it is never merged with @defaults.  When @path is
+ * NULL, @defaults requests the built-in read-only network domain and false
+ * reports an error.  The returned database is sealed and owns all parsed
+ * data; on failure it is NULL and @errp receives a useful Error.
+ */
+NetInfoDb *netinfo_db_load_json5(const char *path, bool defaults,
+                                 Error **errp);
+
+#ifdef NETINFO_DB_TESTING
+/* Test-only seam for deterministically exercising bounded file growth. */
+typedef gssize (*NetInfoDbJson5ReadHook)(int fd, void *buf, size_t count);
+void netinfo_db_test_set_json5_read_hook(NetInfoDbJson5ReadHook hook);
+#endif
+
 void netinfo_db_clear(NetInfoDb *db);
 void netinfo_db_free(NetInfoDb *db);
 
