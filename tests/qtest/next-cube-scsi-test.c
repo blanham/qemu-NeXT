@@ -360,6 +360,26 @@ static uint8_t submit_nodata_cdb(QTestState *qts, uint8_t target,
     return status;
 }
 
+static void wait_for_scsi_command_completion(QTestState *qts)
+{
+    const gint64 deadline =
+        g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
+    uint8_t status = 0;
+
+    while (g_get_monotonic_time() < deadline) {
+        status = qtest_readb(qts, NEXT_ESP_STAT);
+        if (status & ESP_STAT_INT) {
+            return;
+        }
+        qtest_clock_step(qts, 1);
+    }
+
+    g_error("timed out waiting for SCSI command completion: ESP status "
+            "0x%02x, DMA NEXT 0x%08" PRIx32 ", DMA CSR 0x%08" PRIx32,
+            status, qtest_readl(qts, NEXT_DMA_NEXT),
+            qtest_readl(qts, NEXT_DMA_CSR));
+}
+
 static QTestState *start_scsi_write_dma(TestDisk *disk,
                                         const uint8_t source[NEXT_SECTOR_SIZE])
 {
@@ -840,6 +860,7 @@ static void test_scsi_read_dma_chain(void)
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
+    wait_for_scsi_command_completion(qts);
     qtest_memread(qts, NEXT_DMA_BUFFER, first, sizeof(first));
     qtest_memread(qts, NEXT_DMA_BUFFER2, second, sizeof(second));
     for (i = 0; i < SEGMENT_LENGTH; i++) {
@@ -930,6 +951,7 @@ static void test_scsi_chained_tail_overflow(void)
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
+    wait_for_scsi_command_completion(qts);
     qtest_memread(qts, NEXT_DMA_BUFFER, first, sizeof(first));
     qtest_memread(qts, NEXT_DMA_BUFFER2, second, sizeof(second));
     qtest_memread(qts, NEXT_DMA_BUFFER3, tail, sizeof(tail));
@@ -1044,6 +1066,7 @@ static void read_scsi_dma(QTestState *qts, uint8_t target,
     qtest_writeb(qts, NEXT_ESP_TCMID, (transfer_len >> 8) & 0xff);
     qtest_writeb(qts, NEXT_ESP_TCHI, (transfer_len >> 16) & 0xff);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+    wait_for_scsi_command_completion(qts);
     finish_scsi_command(qts);
 
     if (transfer_len % DMA_BEAT_LENGTH) {
@@ -1196,6 +1219,7 @@ static void read_cd_sector_1_dma_chain(QTestState *qts)
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
+    wait_for_scsi_command_completion(qts);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
                     NEXT_DMA_BUFFER2 + SEGMENT_LENGTH);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_LIMIT), ==,
