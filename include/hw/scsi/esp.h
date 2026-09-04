@@ -169,6 +169,7 @@ struct SysBusESPState {
 #define TCHI_AM53C974 0x12
 
 void esp_dma_enable(ESPState *s, int irq, int level);
+bool esp_has_unmigratable_dma_state(const ESPState *s);
 void esp_request_cancelled(SCSIRequest *req);
 void esp_command_complete(SCSIRequest *req, size_t resid);
 void esp_transfer_data(SCSIRequest *req, uint32_t len);

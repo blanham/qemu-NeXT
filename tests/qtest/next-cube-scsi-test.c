@@ -1250,7 +1250,7 @@ static void run_netbsd_data_in(QTestState *qts, uint8_t target,
                     NEXT_DMA_BUFFER + dma_window_len);
 }
 
-static void issue_new_netbsd_inquiry_ti(QTestState *qts, uint8_t target)
+static void prepare_new_netbsd_inquiry_data(QTestState *qts, uint8_t target)
 {
     size_t i;
 
@@ -1271,6 +1271,12 @@ static void issue_new_netbsd_inquiry_ti(QTestState *qts, uint8_t target)
     qtest_readb(qts, NEXT_ESP_INTR);
     g_assert_cmphex(qtest_readb(qts, NEXT_ESP_STAT) & ESP_STAT_PHASE,
                     ==, ESP_STAT_DI);
+    g_assert_cmphex(qtest_readb(qts, NEXT_ESP_CMD), ==, ESP_CMD_SELATN);
+}
+
+static void issue_new_netbsd_inquiry_ti(QTestState *qts, uint8_t target)
+{
+    prepare_new_netbsd_inquiry_data(qts, target);
 
     qtest_writeb(qts, NEXT_ESP_TCLO,
                  sizeof(netbsd_disk_inquiry_prefix));
@@ -1294,6 +1300,48 @@ static void assert_new_netbsd_inquiry_complete(QTestState *qts)
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
                     (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
                     ==, DMA_COMPLETE);
+}
+
+static void wait_scsi_migration_failed(QTestState *qts)
+{
+    enum {
+        MIGRATION_POLL_LIMIT = 10000,
+    };
+    unsigned int i;
+
+    for (i = 0; i < MIGRATION_POLL_LIMIT; i++) {
+        QDict *response = qtest_qmp_assert_success_ref(
+            qts, "{ 'execute': 'query-migrate' }");
+        const char *status = qdict_get_str(response, "status");
+
+        if (!strcmp(status, "failed")) {
+            const char *error_desc =
+                qdict_get_try_str(response, "error-desc");
+
+            g_assert_nonnull(error_desc);
+            g_assert_nonnull(strstr(error_desc, "NeXT SCSI"));
+            g_assert_nonnull(strstr(error_desc, "deferred DMA"));
+            g_test_message("outgoing migration failure: %s", error_desc);
+            qobject_unref(response);
+            return;
+        }
+        if (!strcmp(status, "completed") || !strcmp(status, "cancelled")) {
+            g_error("outgoing migration entered unexpected terminal state "
+                    "'%s'", status);
+        }
+        qobject_unref(response);
+        g_usleep(1000);
+    }
+
+    g_error("timed out waiting for failed outgoing migration");
+}
+
+static void assert_vm_running(QTestState *qts, bool expected)
+{
+    g_autoptr(QDict) response = qtest_qmp_assert_success_ref(
+        qts, "{ 'execute': 'query-status' }");
+
+    g_assert_cmpint(qdict_get_bool(response, "running"), ==, expected);
 }
 
 static void test_scsi_netbsd_order_disk_inquiry(void)
@@ -1344,17 +1392,146 @@ static void test_scsi_netbsd_order_cd_read_capacity(void)
     cleanup_test_media(media);
 }
 
-static void test_scsi_netbsd_order_retains_response_until_dctl_cpudma(void)
+static void test_scsi_migration_rejects_pending_cpudma_low_ti(void)
 {
-    TestMedia *media = &test_media;
-    QTestState *qts = next_cube_scsi_media_start(media);
+    enum {
+        NETBSD_DCTL_DATA_IN_LOW = 0xe8,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    TestMedia *source_media = &test_media;
+    TestMedia *destination_media = &test_media_destination;
+    QTestState *source;
+    QTestState *destination;
 
-    run_netbsd_data_in(qts, 0, netbsd_inquiry_32,
-                       sizeof(netbsd_inquiry_32),
-                       netbsd_disk_inquiry_prefix,
-                       sizeof(netbsd_disk_inquiry_prefix), false);
-    qtest_quit(qts);
-    cleanup_test_media(media);
+    tmpdir = g_dir_make_tmp("next-scsi-reject-pending-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scsi_media_start_with_args(destination_media,
+                                                        incoming_args);
+    source = next_cube_scsi_media_start(source_media);
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+    qtest_set_expected_status(destination, 1);
+
+    consume_power_on_unit_attention(source, 0);
+    qtest_writeb(source, NEXT_SCSI_CSR, NETBSD_DCTL_DATA_IN_LOW);
+    issue_new_netbsd_inquiry_ti(source, 0);
+    assert_netbsd_ti_pending(source,
+                             sizeof(netbsd_disk_inquiry_prefix), true);
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    wait_scsi_migration_failed(source);
+    assert_vm_running(source, true);
+    qtest_wait_qemu(destination);
+    assert_netbsd_ti_pending(source,
+                             sizeof(netbsd_disk_inquiry_prefix), true);
+
+    qtest_writeb(source, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    assert_new_netbsd_inquiry_complete(source);
+
+    qtest_quit(destination);
+    cleanup_test_media(destination_media);
+    g_unlink(socket_path);
+
+    g_clear_pointer(&socket_path, g_free);
+    g_clear_pointer(&uri, g_free);
+    g_clear_pointer(&quoted_uri, g_free);
+    g_clear_pointer(&incoming_args, g_free);
+    socket_path = g_build_filename(tmpdir, "retry.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+    destination = next_cube_scsi_media_start_with_args(destination_media,
+                                                        incoming_args);
+    unrealize_next_kbd(destination);
+    migrate_wait(source, destination, uri);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    cleanup_test_media(source_media);
+    cleanup_test_media(destination_media);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_scsi_migration_rejects_pre_ti_async_window(void)
+{
+    enum {
+        NETBSD_DCTL_DATA_IN_LOW = 0xe8,
+    };
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    TestMedia *source_media = &test_media;
+    TestMedia *destination_media = &test_media_destination;
+    QTestState *source;
+    QTestState *destination;
+
+    tmpdir = g_dir_make_tmp("next-scsi-reject-async-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scsi_media_start_with_args(destination_media,
+                                                        incoming_args);
+    source = next_cube_scsi_media_start(source_media);
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+    qtest_set_expected_status(destination, 1);
+
+    consume_power_on_unit_attention(source, 0);
+    qtest_writeb(source, NEXT_SCSI_CSR, NETBSD_DCTL_DATA_IN_LOW);
+    prepare_new_netbsd_inquiry_data(source, 0);
+    g_assert_cmphex(qtest_readb(source, NEXT_ESP_TCLO), ==, 0);
+    g_assert_cmphex(qtest_readb(source, NEXT_ESP_TCMID), ==, 0);
+    assert_poisoned_scsi_buffer(source, NEXT_DMA_BUFFER,
+                                sizeof(netbsd_disk_inquiry_prefix), 0xa5);
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    wait_scsi_migration_failed(source);
+    assert_vm_running(source, true);
+    qtest_wait_qemu(destination);
+    g_assert_cmphex(qtest_readb(source, NEXT_ESP_CMD), ==, ESP_CMD_SELATN);
+    g_assert_cmphex(qtest_readb(source, NEXT_ESP_STAT) & ESP_STAT_PHASE,
+                    ==, ESP_STAT_DI);
+
+    qtest_writeb(source, NEXT_ESP_TCLO,
+                 sizeof(netbsd_disk_inquiry_prefix));
+    qtest_writeb(source, NEXT_ESP_TCMID, 0);
+    qtest_writeb(source, NEXT_ESP_TCHI, 0);
+    qtest_writeb(source, NEXT_ESP_CMD, ESP_CMD_NOP_DMA);
+    qtest_writeb(source, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+    assert_netbsd_ti_pending(source,
+                             sizeof(netbsd_disk_inquiry_prefix), true);
+    qtest_writeb(source, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    assert_new_netbsd_inquiry_complete(source);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    cleanup_test_media(source_media);
+    cleanup_test_media(destination_media);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
 }
 
 static void test_scsi_cpudma_low_retains_response(void)
@@ -2185,8 +2362,11 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/scsi/netbsd-order-cd-read-capacity",
                    test_scsi_netbsd_order_cd_read_capacity);
     qtest_add_func(
-        "/next-cube/scsi/netbsd-order-retains-response-until-dctl-cpudma",
-        test_scsi_netbsd_order_retains_response_until_dctl_cpudma);
+        "/next-cube/scsi/migration-rejects-pending-cpudma-low-ti",
+        test_scsi_migration_rejects_pending_cpudma_low_ti);
+    qtest_add_func(
+        "/next-cube/scsi/migration-rejects-pre-ti-async-window",
+        test_scsi_migration_rejects_pre_ti_async_window);
     qtest_add_func("/next-cube/scsi/cpudma-low-retains-response",
                    test_scsi_cpudma_low_retains_response);
     qtest_add_func("/next-cube/scsi/reset-forces-cpudma-low-for-new-ti",

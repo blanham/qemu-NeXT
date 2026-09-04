@@ -149,6 +149,11 @@ void esp_dma_enable(ESPState *s, int irq, int level)
     }
 }
 
+bool esp_has_unmigratable_dma_state(const ESPState *s)
+{
+    return s->dma_cb != NULL || s->async_len != 0;
+}
+
 void esp_request_cancelled(SCSIRequest *req)
 {
     ESPState *s = req->hba_private;

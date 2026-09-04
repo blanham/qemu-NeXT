@@ -827,10 +827,24 @@ static int next_scsi_post_load(void *opaque, int version_id)
     return 0;
 }
 
+static bool next_scsi_pre_save(void *opaque, Error **errp)
+{
+    NeXTSCSI *s = opaque;
+
+    if (esp_has_unmigratable_dma_state(&s->sysbus_esp.esp)) {
+        error_setg(errp,
+                   "NeXT SCSI cannot migrate with deferred DMA state");
+        return false;
+    }
+
+    return true;
+}
+
 static const VMStateDescription next_scsi_vmstate = {
     .name = "next-scsi",
     .version_id = 0,
     .minimum_version_id = 0,
+    .pre_save_errp = next_scsi_pre_save,
     .post_load = next_scsi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(scsi_csr_1, NeXTSCSI),
