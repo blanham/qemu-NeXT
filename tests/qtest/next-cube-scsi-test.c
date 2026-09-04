@@ -47,6 +47,7 @@
 #define ESP_CMD_BUSRESET   0x03
 #define ESP_CMD_SEL        0x41
 #define ESP_CMD_SELATN     0x42
+#define ESP_CMD_SELATN_DMA (ESP_CMD_SELATN | 0x80)
 #define ESP_CMD_NOP_DMA    0x80
 #define ESP_CMD_TI_DMA     0x90
 #define ESP_CMD_ICCS       0x11
@@ -1534,6 +1535,124 @@ static void test_scsi_migration_rejects_pre_ti_async_window(void)
     g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
 }
 
+static void test_scsi_migration_rejects_deferred_dma_selection(void)
+{
+    enum {
+        NETBSD_DCTL_DATA_IN_LOW = 0xe8,
+    };
+    uint8_t command_data[1 + sizeof(netbsd_inquiry_32)] = { 0xc0 };
+    uint8_t received[sizeof(command_data)];
+    g_autoptr(GError) error = NULL;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *socket_path = NULL;
+    g_autofree char *uri = NULL;
+    g_autofree char *quoted_uri = NULL;
+    g_autofree char *incoming_args = NULL;
+    TestMedia *source_media = &test_media;
+    TestMedia *destination_media = &test_media_destination;
+    QTestState *source;
+    QTestState *destination;
+
+    memcpy(&command_data[1], netbsd_inquiry_32, sizeof(netbsd_inquiry_32));
+    tmpdir = g_dir_make_tmp("next-scsi-reject-selection-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    socket_path = g_build_filename(tmpdir, "migration.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+
+    destination = next_cube_scsi_media_start_with_args(destination_media,
+                                                        incoming_args);
+    source = next_cube_scsi_media_start(source_media);
+    unrealize_next_kbd(source);
+    unrealize_next_kbd(destination);
+    qtest_set_expected_status(destination, 1);
+
+    consume_power_on_unit_attention(source, 0);
+    qtest_writeb(source, NEXT_SCSI_CSR, NETBSD_DCTL_DATA_IN_LOW);
+    qtest_memwrite(source, NEXT_DMA_BUFFER, command_data,
+                   sizeof(command_data));
+    qtest_writel(source, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(source, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(source, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + sizeof(command_data));
+    qtest_writel(source, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+
+    qtest_writeb(source, NEXT_ESP_BUSID, 0);
+    qtest_writeb(source, NEXT_ESP_TCLO, sizeof(command_data));
+    qtest_writeb(source, NEXT_ESP_TCMID, 0);
+    qtest_writeb(source, NEXT_ESP_TCHI, 0);
+    qtest_writeb(source, NEXT_ESP_CMD, ESP_CMD_SELATN_DMA);
+
+    /*
+     * DMA selection is deferred before esp_select(), so no SCSI request has
+     * delivered data and async_len remains zero; dma_cb is the sole live
+     * transient state here.
+     */
+    g_assert_cmphex(qtest_readb(source, NEXT_ESP_CMD), ==,
+                    ESP_CMD_SELATN_DMA);
+    g_assert_cmphex(qtest_readl(source, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER);
+    qtest_memread(source, NEXT_DMA_BUFFER, received, sizeof(received));
+    g_assert_cmpmem(received, sizeof(received), command_data,
+                    sizeof(command_data));
+
+    qtest_qmp_assert_success(
+        source,
+        "{ 'execute': 'migrate', 'arguments': { 'uri': %s } }", uri);
+    wait_scsi_migration_failed(source);
+    assert_vm_running(source, true);
+    qtest_wait_qemu(destination);
+    g_assert_cmphex(qtest_readb(source, NEXT_ESP_CMD), ==,
+                    ESP_CMD_SELATN_DMA);
+    g_assert_cmphex(qtest_readl(source, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER);
+    qtest_memread(source, NEXT_DMA_BUFFER, received, sizeof(received));
+    g_assert_cmpmem(received, sizeof(received), command_data,
+                    sizeof(command_data));
+
+    /*
+     * Enabling CPUDMA runs the deferred selection callback and supplies the
+     * CDB from the programmed DMA window.
+     */
+    qtest_writeb(source, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    qtest_writel(source, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(source, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(source, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + sizeof(netbsd_disk_inquiry_prefix));
+    qtest_writel(source, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    qtest_writeb(source, NEXT_ESP_TCLO,
+                 sizeof(netbsd_disk_inquiry_prefix));
+    qtest_writeb(source, NEXT_ESP_TCMID, 0);
+    qtest_writeb(source, NEXT_ESP_TCHI, 0);
+    qtest_writeb(source, NEXT_ESP_CMD, ESP_CMD_NOP_DMA);
+    qtest_writeb(source, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+    assert_new_netbsd_inquiry_complete(source);
+
+    qtest_quit(destination);
+    cleanup_test_media(destination_media);
+    g_unlink(socket_path);
+
+    g_clear_pointer(&socket_path, g_free);
+    g_clear_pointer(&uri, g_free);
+    g_clear_pointer(&quoted_uri, g_free);
+    g_clear_pointer(&incoming_args, g_free);
+    socket_path = g_build_filename(tmpdir, "retry.sock", NULL);
+    uri = g_strdup_printf("unix:%s", socket_path);
+    quoted_uri = g_shell_quote(uri);
+    incoming_args = g_strdup_printf("-incoming %s", quoted_uri);
+    destination = next_cube_scsi_media_start_with_args(destination_media,
+                                                        incoming_args);
+    unrealize_next_kbd(destination);
+    migrate_wait(source, destination, uri);
+
+    qtest_quit(source);
+    qtest_quit(destination);
+    cleanup_test_media(source_media);
+    cleanup_test_media(destination_media);
+    g_unlink(socket_path);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
 static void test_scsi_cpudma_low_retains_response(void)
 {
     TestMedia *media = &test_media;
@@ -2367,6 +2486,9 @@ int main(int argc, char **argv)
     qtest_add_func(
         "/next-cube/scsi/migration-rejects-pre-ti-async-window",
         test_scsi_migration_rejects_pre_ti_async_window);
+    qtest_add_func(
+        "/next-cube/scsi/migration-rejects-deferred-dma-selection",
+        test_scsi_migration_rejects_deferred_dma_selection);
     qtest_add_func("/next-cube/scsi/cpudma-low-retains-response",
                    test_scsi_cpudma_low_retains_response);
     qtest_add_func("/next-cube/scsi/reset-forces-cpudma-low-for-new-ti",
