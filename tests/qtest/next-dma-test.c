@@ -66,6 +66,7 @@
 #define SCSI_CSR_INTMASK    0x20
 #define SCSI_CSR_FIFOFL     0x04
 #define SCSI_CSR_DMADIR     0x08
+#define SCSI_CSR_DATA_IN    (SCSI_CSR_CPUDMA | SCSI_CSR_DMADIR)
 
 #define DMA_SETENABLE       0x00010000
 #define DMA_SETSUPDATE      0x00020000
@@ -254,6 +255,8 @@ static void issue_inquiry_dma(QTestState *qts, uint8_t length)
     qtest_writeb(qts, NEXT_ESP_TCLO, length);
     qtest_writeb(qts, NEXT_ESP_TCMID, 0);
     qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CSR), ==, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 }
 
