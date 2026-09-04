@@ -154,7 +154,6 @@ static void m68k_rte_complete_access(CPUM68KState *env,
         env->mmu030.fault_data_input_address = 0;
         env->mmu030.fault_resume_pc = 0;
     }
-    env->mmu030.fault_frame_active = false;
 }
 
 static void cf_rte(CPUM68KState *env)
@@ -193,6 +192,10 @@ throwaway:
         sp += 2;
         switch (fmt >> 12) {
         case 0:
+            if (m68k_feature(env, M68K_FEATURE_M68030)) {
+                m68k_mmu030_pop_collapsed_fault_frame(&env->mmu030,
+                                                       frame_start, true);
+            }
             break;
         case 1:
             env->aregs[7] = sp;
@@ -215,13 +218,31 @@ throwaway:
                     M68K_MMU030_ACCESS_FRAME_SIZE_SHORT;
                 uint16_t restored_sr;
                 uint32_t restored_pc;
-                uint32_t fault_pc = env->mmu030.fault_pc;
-                uint32_t resume_pc = env->mmu030.fault_resume_pc;
+                uint32_t fault_pc = 0;
+                uint32_t resume_pc = 0;
+                bool frame_owned =
+                    m68k_mmu030_restore_fault_frame_context(
+                        &env->mmu030, frame_start, frame_size);
+                bool legacy_owned =
+                    !frame_owned &&
+                    m68k_mmu030_legacy_fault_frame_active(&env->mmu030);
+
+                if (frame_owned || legacy_owned) {
+                    /* Save the original continuation before reading the
+                     * handler-editable frame image.  An owned frame's
+                     * architectural PC may have been deliberately changed
+                     * by the handler. */
+                    fault_pc = env->mmu030.fault_pc;
+                    resume_pc = env->mmu030.fault_resume_pc;
+                }
 
                 for (uint32_t offset = 0; offset < frame_size; offset += 2) {
                     stw_be_p(frame + offset,
                              cpu_lduw_be_mmuidx_ra(env, frame_start + offset,
                                                    MMU_KERNEL_IDX, 0));
+                }
+                if (!frame_owned && !legacy_owned) {
+                    fault_pc = ldl_be_p(frame + 0x02);
                 }
                 if (!m68k_mmu030_restore_access_frame(
                         &env->mmu030, frame, frame_size,
@@ -232,6 +253,13 @@ throwaway:
                 env->pc = restored_pc;
                 m68k_rte_complete_access(env, fault_pc, resume_pc,
                                          restored_pc);
+                if (frame_owned) {
+                    m68k_mmu030_pop_fault_frame(&env->mmu030,
+                                                frame_start, frame_size,
+                                                false);
+                } else if (legacy_owned) {
+                    m68k_mmu030_clear_legacy_fault_frame(&env->mmu030);
+                }
                 sp = frame_start + frame_size;
             }
             break;
@@ -242,13 +270,29 @@ throwaway:
                     M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
                 uint16_t restored_sr;
                 uint32_t restored_pc;
-                uint32_t fault_pc = env->mmu030.fault_pc;
-                uint32_t resume_pc = env->mmu030.fault_resume_pc;
+                uint32_t fault_pc = 0;
+                uint32_t resume_pc = 0;
+                bool frame_owned =
+                    m68k_mmu030_restore_fault_frame_context(
+                        &env->mmu030, frame_start, frame_size);
+                bool legacy_owned =
+                    !frame_owned &&
+                    m68k_mmu030_legacy_fault_frame_active(&env->mmu030);
+
+                if (frame_owned || legacy_owned) {
+                    /* Preserve the original scalar continuation before the
+                     * handler can edit the frame's saved PC. */
+                    fault_pc = env->mmu030.fault_pc;
+                    resume_pc = env->mmu030.fault_resume_pc;
+                }
 
                 for (uint32_t offset = 0; offset < frame_size; offset += 2) {
                     stw_be_p(frame + offset,
                              cpu_lduw_be_mmuidx_ra(env, frame_start + offset,
                                                    MMU_KERNEL_IDX, 0));
+                }
+                if (!frame_owned && !legacy_owned) {
+                    fault_pc = ldl_be_p(frame + 0x02);
                 }
                 if (!m68k_mmu030_restore_access_frame(
                         &env->mmu030, frame, frame_size,
@@ -259,6 +303,13 @@ throwaway:
                 env->pc = restored_pc;
                 m68k_rte_complete_access(env, fault_pc, resume_pc,
                                          restored_pc);
+                if (frame_owned) {
+                    m68k_mmu030_pop_fault_frame(&env->mmu030,
+                                                frame_start, frame_size,
+                                                false);
+                } else if (legacy_owned) {
+                    m68k_mmu030_clear_legacy_fault_frame(&env->mmu030);
+                }
                 sp = frame_start + frame_size;
             }
             break;
@@ -268,7 +319,9 @@ throwaway:
                 uint32_t frame_size = M68K_MMU030_COPROCESSOR_FRAME_SIZE;
                 uint16_t restored_sr;
                 uint32_t restored_pc;
-
+                bool frame_owned =
+                    m68k_mmu030_restore_fault_frame_context(
+                        &env->mmu030, frame_start, frame_size);
                 for (uint32_t offset = 0; offset < frame_size; offset += 2) {
                     stw_be_p(frame + offset,
                              cpu_lduw_be_mmuidx_ra(env, frame_start + offset,
@@ -281,6 +334,11 @@ throwaway:
                 }
                 sr = restored_sr;
                 env->pc = restored_pc;
+                if (frame_owned) {
+                    m68k_mmu030_pop_fault_frame(&env->mmu030,
+                                                frame_start, frame_size,
+                                                false);
+                }
                 sp = frame_start + frame_size;
             }
             break;
@@ -513,10 +571,14 @@ static void m68k_mmu030_access_error_frame(CPUM68KState *env, uint32_t *sp,
 {
     uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
     uint32_t frame_size;
+    M68KMMU030FaultFramePushResult push_result;
 
-    if (env->mmu030.fault_frame_active) {
+    if (env->mmu030.fault_exception_processing ||
+        m68k_mmu030_legacy_fault_frame_active(&env->mmu030)) {
         m68k_mmu030_double_fault(env_cpu(env));
     }
+
+    env->mmu030.fault_exception_processing = true;
 
     /*
      * The 68030 has two ordinary bus-cycle fault frames.  The latched fault
@@ -541,6 +603,18 @@ static void m68k_mmu030_access_error_frame(CPUM68KState *env, uint32_t *sp,
         cpu_stw_be_mmuidx_ra(env, *sp + offset, lduw_be_p(frame + offset),
                              MMU_KERNEL_IDX, 0);
     }
+    push_result = m68k_mmu030_push_fault_frame(&env->mmu030, *sp,
+                                               frame_size);
+    if (push_result == M68K_MMU030_FAULT_FRAME_PUSH_CAPACITY) {
+        /* The architectural frame is already complete.  A full bounded
+         * sidecar only loses hidden restart fidelity; it is not another CPU
+         * bus fault and must not halt the processor. */
+        m68k_mmu030_reset_fault_scratch(&env->mmu030);
+    } else if (push_result == M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT) {
+        /* Reusing an exact or collapsed identity would let this frame steal
+         * an older frame's hidden restart image on RTE. */
+        m68k_mmu030_double_fault(env_cpu(env));
+    }
 }
 
 static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
@@ -550,6 +624,14 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     uint32_t vector;
     uint16_t sr, oldsr;
     uint64_t last_pc = env->pc;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030) &&
+        (env->mmu030.fault_exception_processing ||
+         m68k_mmu030_legacy_fault_frame_active(&env->mmu030)) &&
+        (cs->exception_index == EXCP_ACCESS ||
+         cs->exception_index == EXCP_ADDRESS)) {
+        m68k_mmu030_double_fault(cs);
+    }
 
     if (!is_hw) {
         switch (cs->exception_index) {
@@ -694,6 +776,24 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     env->aregs[7] = sp;
     /* Jump to vector.  */
     env->pc = cpu_ldl_be_mmuidx_ra(env, env->vbr + vector, MMU_KERNEL_IDX, 0);
+    if (m68k_feature(env, M68K_FEATURE_M68030) &&
+        env->mmu030.fault_exception_processing) {
+        env->mmu030.fault_exception_prefetch_words = 0;
+        m68k_mmu030_reset_fault_scratch(&env->mmu030);
+        /*
+         * Exception processing ends only after the processor has fetched
+         * the first three words at the handler PC.  Do this synchronously:
+         * a previously translated handler TB would otherwise bypass the
+         * translator-time fetch bookkeeping and leave the double-fault
+         * guard asserted indefinitely.
+         */
+        for (unsigned int i = 0; i < 3; i++) {
+            cpu_lduw_be_mmuidx_ra(env, env->pc + i * 2,
+                                  MMU_KERNEL_IDX, 0);
+            env->mmu030.fault_exception_prefetch_words++;
+        }
+        env->mmu030.fault_exception_processing = false;
+    }
 
     do_plugin_vcpu_interrupt_cb(cs, last_pc);
 }
@@ -725,7 +825,8 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
     CPUM68KState *env = cpu_env(cs);
 
     if (m68k_feature(env, M68K_FEATURE_M68030) &&
-        env->mmu030.fault_frame_active) {
+        (env->mmu030.fault_exception_processing ||
+         m68k_mmu030_legacy_fault_frame_active(&env->mmu030))) {
         m68k_mmu030_double_fault(cs);
     }
 

@@ -212,6 +212,7 @@ typedef struct NeXTBoardProfile {
     bool has_nextbus;
     bool has_optical_formatter;
     bool mb8795_wide_station_access;
+    bool mb8795_power_on_ready;
     bool serial_clock_wide_access;
     NextRTCChip default_rtc_chip;
 } NeXTBoardProfile;
@@ -326,6 +327,7 @@ static const NeXTBoardProfile next_computer_profile = {
     .has_nextbus = true,
     .has_optical_formatter = true,
     .mb8795_wide_station_access = true,
+    .mb8795_power_on_ready = true,
     .serial_clock_wide_access = true,
     .default_rtc_chip = NEXT_RTC_CHIP_MC68HC68T1,
 };
@@ -1551,6 +1553,8 @@ static void next_machine_init(MachineState *machine)
                              OBJECT(m->dma), &error_abort);
     qdev_prop_set_bit(mbdev, "wide-station-access",
                       profile->mb8795_wide_station_access);
+    qdev_prop_set_bit(mbdev, "power-on-ready",
+                      profile->mb8795_power_on_ready);
     qemu_configure_nic_device(mbdev, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mbdev), &error_fatal);
     sysbus_mmio_map(

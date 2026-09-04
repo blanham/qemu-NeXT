@@ -90,6 +90,7 @@ struct NextMB8795State {
     uint8_t rx_mode;
     uint8_t station[6];
     bool wide_station_access;
+    bool power_on_ready;
     bool reset;
     bool rx_turnaround;
 };
@@ -464,11 +465,15 @@ static void next_mb8795_reset_hold(Object *obj, ResetType type)
 {
     NextMB8795State *s = NEXT_MB8795(obj);
 
-    /*
-     * Retained NeXT and NetBSD drivers begin controller initialization in
-     * RESET_MODE.  Keep that safe latch on QOM reset while preserving the
-     * configured/programmed station address.
-     */
+    if (s->power_on_ready) {
+        next_mb8795_enter_reset(s);
+        next_mb8795_leave_reset(s);
+        return;
+    }
+
+    /* Later NeXT and NetBSD drivers begin controller initialization in
+     * RESET_MODE.  The original 68030 NeXT kernel instead expects power-on
+     * TXSTAT READY and never writes the RESET register. */
     next_mb8795_enter_reset(s);
 }
 
@@ -565,6 +570,8 @@ static const Property next_mb8795_properties[] = {
                      TYPE_NEXT_DMA, NextDMAState *),
     DEFINE_PROP_BOOL("wide-station-access", NextMB8795State,
                      wide_station_access, false),
+    DEFINE_PROP_BOOL("power-on-ready", NextMB8795State,
+                     power_on_ready, false),
     DEFINE_NIC_PROPERTIES(NextMB8795State, conf),
 };
 

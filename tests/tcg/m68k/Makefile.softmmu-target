@@ -31,6 +31,15 @@ run-pmmu-fault-restart:
 
 EXTRA_RUNS += run-pmmu-fault-restart
 
+.PHONY: run-pmmu-access-frame-rte
+run-pmmu-access-frame-rte:
+	$(call run-test, $@, \
+		env QEMU_M68K_SYSTEM='$(QEMU)' \
+		M68K_AS='$(AS)' M68K_LD='$(LD)' \
+		$(M68K_SYSTEM_TESTS_DIR)/run-pmmu-access-frame-rte.sh)
+
+EXTRA_RUNS += run-pmmu-access-frame-rte
+
 .PHONY: run-fpu-030-state
 run-fpu-030-state:
 	$(call run-test, $@, \

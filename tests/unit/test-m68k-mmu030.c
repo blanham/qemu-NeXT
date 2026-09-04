@@ -116,6 +116,26 @@ static M68KMMU030MemoryOps mmu030_test_ops(M68KMMU030TestMemory *memory)
     (M68K_MMU030_WIRE_V5_EXTRA + 2 * sizeof(uint8_t) + sizeof(bool) + \
      sizeof(uint32_t) + M68K_MMU030_SPECIAL_MAX_CYCLES * sizeof(uint32_t))
 
+/* One complete non-PMMU restart context appended by version 7. */
+#define M68K_MMU030_FAULT_CONTEXT_WIRE_SIZE \
+    (2 * sizeof(uint32_t) + sizeof(bool) + 2 * sizeof(uint32_t) + \
+     sizeof(uint16_t) + sizeof(uint32_t) + 4 * sizeof(uint8_t) + \
+     2 * sizeof(uint16_t) + sizeof(uint32_t) + 6 * sizeof(uint32_t) + \
+     3 * sizeof(bool) + sizeof(uint8_t) + 5 * sizeof(bool) + \
+     sizeof(uint8_t) + 2 * sizeof(uint32_t) + sizeof(bool) + \
+     2 * sizeof(uint8_t) + sizeof(bool) + sizeof(uint32_t) + \
+     M68K_MMU030_SPECIAL_MAX_CYCLES * sizeof(uint32_t))
+
+/* The frame context stack and exception-entry guard were appended by v7. */
+#define M68K_MMU030_WIRE_V7_EXTRA \
+    (M68K_MMU030_WIRE_V6_EXTRA + sizeof(bool) + sizeof(uint8_t) + \
+     M68K_MMU030_MAX_FAULT_FRAMES * M68K_MMU030_FAULT_CONTEXT_WIRE_SIZE + \
+     sizeof(uint8_t))
+
+/* The transient scalar-frame migration marker was appended by v8. */
+#define M68K_MMU030_WIRE_V8_EXTRA \
+    (M68K_MMU030_WIRE_V7_EXTRA + sizeof(bool))
+
 static void test_mmu030_pmove_extension_decode(void)
 {
     static const struct {
@@ -347,6 +367,14 @@ static void test_mmu030_reset(void)
     g_assert_cmpuint(state.fault_ssw, ==, 0);
     g_assert_cmpuint(state.fault_status, ==, 0);
     g_assert_false(state.fault_frame_active);
+    g_assert_false(state.fault_exception_processing);
+    g_assert_cmpuint(state.fault_exception_prefetch_words, ==, 0);
+    g_assert_cmpuint(state.fault_frame_depth, ==, 0);
+    for (unsigned i = 0; i < M68K_MMU030_MAX_FAULT_FRAMES; i++) {
+        g_assert_cmpuint(state.fault_frames[i].frame_start, ==, 0);
+        g_assert_cmpuint(state.fault_frames[i].frame_end, ==, 0);
+        g_assert_false(state.fault_frames[i].fault_pending);
+    }
     g_assert_cmpuint(state.fault_resume_pc, ==, 0);
     g_assert_cmpuint(state.fault_data_input_address, ==, 0);
     g_assert_false(state.fault_data_complete);
@@ -429,10 +457,14 @@ static void test_mmu030_vmstate(void)
     QIOChannelBuffer *save_channel = qio_channel_buffer_new(0);
     QIOChannelBuffer *load_channel;
     QIOChannelBuffer *current_channel;
+    QIOChannelBuffer *removed_save_channel;
+    QIOChannelBuffer *removed_load_channel;
     QEMUFile *file;
     Error *local_err = NULL;
     g_autofree uint8_t *wire = NULL;
+    g_autofree uint8_t *removed_wire = NULL;
     size_t wire_size;
+    size_t removed_wire_size;
 
     memset(&source, 0, sizeof(source));
     source.crp = UINT64_C(0x123456789abcdef0);
@@ -460,7 +492,6 @@ static void test_mmu030_vmstate(void)
     source.fault_instruction_address = UINT32_C(0x00123456);
     source.fault_resume_pc = UINT32_C(0x0012345c);
     source.fault_data_input_address = UINT32_C(0x00123450);
-    source.fault_frame_active = true;
     source.fault_data_complete = true;
     source.fault_data_input_valid = true;
     source.fault_data_write = true;
@@ -480,6 +511,20 @@ static void test_mmu030_vmstate(void)
     for (unsigned i = 0; i < M68K_MMU030_SPECIAL_MAX_CYCLES; i++) {
         source.fault_special_data[i] = UINT32_C(0x90000000) + i;
     }
+    g_assert_true(m68k_mmu030_push_fault_frame(
+        &source, UINT32_C(0x0000f000), M68K_MMU030_ACCESS_FRAME_SIZE_LONG));
+    /* Keep the scalar source state unchanged for the legacy stream checks,
+     * while making the second live context observably distinct. */
+    source.fault_address = UINT32_C(0xbaadf00d);
+    source.fault_pc = UINT32_C(0x00baad00);
+    source.fault_resume_pc = UINT32_C(0x00baad04);
+    g_assert_true(m68k_mmu030_push_fault_frame(
+        &source, UINT32_C(0x0000e000), M68K_MMU030_ACCESS_FRAME_SIZE_LONG));
+    source.fault_address = UINT32_C(0xfeedcafe);
+    source.fault_pc = UINT32_C(0x00123456);
+    source.fault_resume_pc = UINT32_C(0x0012345c);
+    source.fault_exception_processing = true;
+    source.fault_exception_prefetch_words = 2;
     for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
         source.atc[i].logical = UINT32_C(0x10000000) + i;
         source.atc[i].physical = UINT32_C(0x20000000) + i * 0x1000;
@@ -544,6 +589,13 @@ static void test_mmu030_vmstate(void)
     g_assert_cmpuint(destination.fault_resume_pc, ==, 0);
     g_assert_cmpuint(destination.fault_data_input_address, ==, 0);
     g_assert_false(destination.fault_frame_active);
+    g_assert_false(destination.fault_exception_processing);
+    g_assert_cmpuint(destination.fault_exception_prefetch_words, ==, 0);
+    g_assert_cmpuint(destination.fault_frame_depth, ==, 0);
+    for (unsigned i = 0; i < M68K_MMU030_MAX_FAULT_FRAMES; i++) {
+        g_assert_cmpuint(destination.fault_frames[i].frame_start, ==, 0);
+        g_assert_cmpuint(destination.fault_frames[i].frame_end, ==, 0);
+    }
     g_assert_false(destination.fault_data_complete);
     g_assert_false(destination.fault_data_input_valid);
     g_assert_false(destination.fault_data_write);
@@ -601,6 +653,98 @@ static void test_mmu030_vmstate(void)
                     source.fault_special_data,
                     sizeof(source.fault_special_data));
     qemu_fclose(file);
+    object_unref(OBJECT(current_channel));
+
+    /* The current-version load must retain the live context stack and
+     * exception-entry guard. */
+    M68KMMU030State current_v7 = { 0 };
+    current_channel = qio_channel_buffer_new(wire_size);
+    memcpy(current_channel->data, wire, wire_size);
+    current_channel->usage = wire_size;
+    current_channel->offset = 0;
+    file = qemu_file_new_input(QIO_CHANNEL(current_channel));
+    g_assert_cmpint(vmstate_load_state(file, &vmstate_mmu030_state,
+                                       &current_v7, 7, &local_err), ==, 0);
+    g_assert_null(local_err);
+    qemu_fclose(file);
+    g_assert_true(current_v7.fault_exception_processing);
+    g_assert_cmpuint(current_v7.fault_exception_prefetch_words, ==, 2);
+    g_assert_cmpuint(current_v7.fault_frame_depth, ==, 2);
+    g_assert_true(current_v7.fault_frame_active);
+    g_assert_cmpuint(current_v7.fault_frames[0].frame_start, ==,
+                     UINT32_C(0x0000f000));
+    g_assert_cmpuint(current_v7.fault_frames[0].frame_end, ==,
+                     UINT32_C(0x0000f05c));
+    g_assert_cmpuint(current_v7.fault_frames[0].fault_resume_pc, ==,
+                     source.fault_resume_pc);
+    g_assert_cmpuint(current_v7.fault_frames[0].fault_rmw_data1, ==,
+                     source.fault_rmw_data1);
+    g_assert_cmpmem(current_v7.fault_frames[0].fault_special_data,
+                    sizeof(current_v7.fault_frames[0].fault_special_data),
+                    source.fault_special_data,
+                    sizeof(source.fault_special_data));
+    g_assert_cmpuint(current_v7.fault_frames[1].frame_start, ==,
+                     UINT32_C(0x0000e000));
+    g_assert_cmpuint(current_v7.fault_frames[1].frame_end, ==,
+                     UINT32_C(0x0000e05c));
+    g_assert_cmpuint(current_v7.fault_frames[1].fault_address, ==,
+                     UINT32_C(0xbaadf00d));
+    g_assert_cmpuint(current_v7.fault_frames[1].fault_pc, ==,
+                     UINT32_C(0x00baad00));
+    g_assert_cmpuint(current_v7.fault_frames[1].fault_resume_pc, ==,
+                     UINT32_C(0x00baad04));
+
+    /* Removing the older entry first must compact the live array; migration
+     * of the remaining B entry must then preserve its exact identity. */
+    g_assert_true(m68k_mmu030_restore_fault_frame_context(
+        &current_v7, UINT32_C(0x0000f000),
+        M68K_MMU030_ACCESS_FRAME_SIZE_LONG));
+    g_assert_true(m68k_mmu030_pop_fault_frame(
+        &current_v7, UINT32_C(0x0000f000),
+        M68K_MMU030_ACCESS_FRAME_SIZE_LONG, false));
+    g_assert_cmpuint(current_v7.fault_frame_depth, ==, 1);
+    g_assert_true(current_v7.fault_frame_active);
+    g_assert_cmpuint(current_v7.fault_frames[0].frame_start, ==,
+                     UINT32_C(0x0000e000));
+    g_assert_cmpuint(current_v7.fault_frames[0].frame_end, ==,
+                     UINT32_C(0x0000e05c));
+    g_assert_true(m68k_mmu030_fault_frame_matches(
+        &current_v7, UINT32_C(0x0000e000),
+        M68K_MMU030_ACCESS_FRAME_SIZE_LONG));
+
+    removed_save_channel = qio_channel_buffer_new(0);
+    file = qemu_file_new_output(QIO_CHANNEL(removed_save_channel));
+    g_assert_cmpint(vmstate_save_state(file, &vmstate_mmu030_state,
+                                       &current_v7, NULL, &local_err), ==, 0);
+    g_assert_null(local_err);
+    g_assert_cmpint(qemu_fflush(file), ==, 0);
+    removed_wire_size = removed_save_channel->usage;
+    removed_wire = g_memdup2(removed_save_channel->data, removed_wire_size);
+    qemu_fclose(file);
+
+    M68KMMU030State removed_roundtrip = { 0 };
+    removed_load_channel = qio_channel_buffer_new(removed_wire_size);
+    memcpy(removed_load_channel->data, removed_wire, removed_wire_size);
+    removed_load_channel->usage = removed_wire_size;
+    removed_load_channel->offset = 0;
+    file = qemu_file_new_input(QIO_CHANNEL(removed_load_channel));
+    g_assert_cmpint(vmstate_load_state(file, &vmstate_mmu030_state,
+                                       &removed_roundtrip, 7,
+                                       &local_err), ==, 0);
+    g_assert_null(local_err);
+    qemu_fclose(file);
+    g_assert_cmpuint(removed_roundtrip.fault_frame_depth, ==, 1);
+    g_assert_true(removed_roundtrip.fault_frame_active);
+    g_assert_cmpuint(removed_roundtrip.fault_frames[0].frame_start, ==,
+                     UINT32_C(0x0000e000));
+    g_assert_cmpuint(removed_roundtrip.fault_frames[0].frame_end, ==,
+                     UINT32_C(0x0000e05c));
+    g_assert_cmpuint(removed_roundtrip.fault_frames[0].fault_address, ==,
+                     UINT32_C(0xbaadf00d));
+    g_assert_cmpuint(removed_roundtrip.fault_frames[0].fault_resume_pc, ==,
+                     UINT32_C(0x00baad04));
+    object_unref(OBJECT(removed_save_channel));
+    object_unref(OBJECT(removed_load_channel));
     object_unref(OBJECT(current_channel));
     for (unsigned i = 0; i < M68K_MMU030_ATC_ENTRIES; i++) {
         g_assert_cmpuint(destination.atc[i].logical, ==,
@@ -1460,6 +1604,7 @@ static void test_mmu030_nested_fault_preserves_frame(void)
     M68KMMU030State state = {
         .fault_pending = true,
         .fault_frame_active = true,
+        .fault_exception_processing = true,
         .fault_format = M68K_MMU030_FAULT_FORMAT_B,
         .fault_address = UINT32_C(0x00123456),
         .fault_pc = UINT32_C(0x00001000),
@@ -1475,18 +1620,289 @@ static void test_mmu030_nested_fault_preserves_frame(void)
         .mmusr = M68K_MMU030_MMUSR_B,
         .descriptor_address = UINT32_C(0x00002000),
     };
-    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
 
-    memset(frame, 0xa5, sizeof(frame));
+    /* The ingress guard rejects a fault while exception entry is active and
+     * leaves the suspended construction state untouched. */
     m68k_mmu030_capture_fault(&state, UINT32_C(0x00abcdef),
                               UINT32_C(0x00002000), 1, false, false, 5,
                               &nested);
     g_assert_cmpmem(&state, sizeof(state), &before, sizeof(before));
-    g_assert_false(m68k_mmu030_build_access_frame(
+}
+
+static void test_mmu030_late_nested_access_frame(void)
+{
+    const uint32_t frame_size = M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
+    const uint32_t a_start = UINT32_C(0x00001000);
+    const uint32_t b_start = UINT32_C(0x00000fa4);
+    const uint32_t a_collapse = UINT32_C(0x00001054);
+    const uint32_t b_collapse = UINT32_C(0x00000ff8);
+    M68KMMU030State state = {
+        .fault_address = UINT32_C(0x00123456),
+        .fault_pc = UINT32_C(0x00001000),
+        .fault_instruction_address = UINT32_C(0x00001000),
+        .fault_resume_pc = UINT32_C(0x00001004),
+        .fault_ssw = M68K_MMU030_SSW_DF | M68K_MMU030_SSW_RW |
+                     M68K_MMU030_SSW_SIZE_LONG | 5,
+        .fault_rmw = true,
+        .fault_rmw_phase = 2,
+        .fault_rmw_data1 = UINT32_C(0x11112222),
+        .fault_rmw_data2 = UINT32_C(0x33334444),
+        .fault_rmw_data_valid = true,
+        .fault_special_kind = M68K_MMU030_SPECIAL_MOVEP,
+        .fault_special_phase = 1,
+        .fault_special_valid = true,
+        .fault_special_pc = UINT32_C(0x00001000),
+    };
+    M68KMMU030TranslateResult nested = {
+        .fault = true,
+        .bus_error = true,
+        .mmusr = M68K_MMU030_MMUSR_B,
+    };
+    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
+    M68KMMU030FaultContext b_context;
+
+    g_assert_true(m68k_mmu030_push_fault_frame(&state, a_start, frame_size));
+
+    /* Once vector dispatch completed, a handler fault may own a second
+     * pending frame while the outer frame's complete restart context remains
+     * stacked. */
+    m68k_mmu030_capture_fault(&state, UINT32_C(0x00abcdef),
+                              UINT32_C(0x00002000), 4, false, false, 5,
+                              &nested);
+    g_assert_true(state.fault_pending);
+    g_assert_true(state.fault_frame_active);
+    g_assert_false(state.fault_exception_processing);
+    g_assert_true(m68k_mmu030_build_access_frame(
         &state, UINT16_C(0x2700), 8, frame, sizeof(frame)));
-    for (size_t i = 0; i < sizeof(frame); i++) {
-        g_assert_cmpuint(frame[i], ==, 0xa5);
+    g_assert_cmpuint(ldl_be_p(frame + 0x10), ==, UINT32_C(0x00abcdef));
+
+    g_assert_true(m68k_mmu030_push_fault_frame(&state, b_start, frame_size));
+    g_assert_cmpuint(state.fault_frame_depth, ==, 2);
+    g_assert_true(state.fault_frame_active);
+    g_assert_true(m68k_mmu030_fault_frame_matches(&state, b_start,
+                                                   frame_size));
+    /* A live outer frame remains addressable after the newer handler frame
+     * has been stacked.  Top-only lookup is the regression being fixed. */
+    g_assert_true(m68k_mmu030_fault_frame_matches(&state, a_start,
+                                                   frame_size));
+    g_assert_false(m68k_mmu030_fault_frame_matches(&state, a_start + 2,
+                                                    frame_size));
+    g_assert_false(m68k_mmu030_fault_frame_matches(&state, a_start,
+                                                    frame_size - 2));
+    g_assert_false(m68k_mmu030_pop_fault_frame(&state, a_start,
+                                                frame_size - 2, false));
+    g_assert_cmpuint(state.fault_frame_depth, ==, 2);
+    b_context = state.fault_frames[1];
+
+    /* A duplicate exact range and a second range with the same collapse key
+     * cannot be admitted while both identities would be live. */
+    g_assert_cmpint(m68k_mmu030_push_fault_frame(&state, a_start, frame_size),
+                    ==, M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT);
+    g_assert_cmpint(m68k_mmu030_push_fault_frame(
+                        &state, a_start - 4, frame_size + 4),
+                    ==, M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT);
+    g_assert_cmpuint(state.fault_frame_depth, ==, 2);
+
+    /* A normal RTE for the older frame restores that exact snapshot and
+     * leaves the newer frame intact after compacting its array slot. */
+    g_assert_true(m68k_mmu030_restore_fault_frame_context(
+        &state, a_start, frame_size));
+    g_assert_cmpuint(state.fault_address, ==, UINT32_C(0x00123456));
+    g_assert_cmpuint(state.fault_resume_pc, ==, UINT32_C(0x00001004));
+    g_assert_cmpuint(state.fault_rmw_phase, ==, 2);
+    g_assert_cmpuint(state.fault_rmw_data1, ==, UINT32_C(0x11112222));
+    g_assert_true(m68k_mmu030_pop_fault_frame(&state, a_start, frame_size,
+                                               false));
+    g_assert_cmpuint(state.fault_frame_depth, ==, 1);
+    g_assert_true(state.fault_frame_active);
+    g_assert_cmpmem(&state.fault_frames[0], sizeof(state.fault_frames[0]),
+                    &b_context, sizeof(b_context));
+    g_assert_false(m68k_mmu030_fault_frame_matches(&state, a_start,
+                                                    frame_size));
+    g_assert_true(m68k_mmu030_fault_frame_matches(&state, b_start,
+                                                   frame_size));
+    /* Normal completion leaves the matched instruction's scratch live. */
+    g_assert_cmpuint(state.fault_address, ==, UINT32_C(0x00123456));
+
+    g_assert_true(m68k_mmu030_restore_fault_frame_context(
+        &state, b_start, frame_size));
+    g_assert_cmpuint(state.fault_address, ==, UINT32_C(0x00abcdef));
+    g_assert_true(m68k_mmu030_pop_fault_frame(&state, b_start, frame_size,
+                                               false));
+    g_assert_cmpuint(state.fault_frame_depth, ==, 0);
+    g_assert_false(state.fault_frame_active);
+
+    /* Format-0 collapse uses the exact trailing eight-byte identity and can
+     * remove an older frame while preserving the newer frame's snapshot. */
+    M68KMMU030State collapsed = {
+        .fault_address = UINT32_C(0x00123456),
+        .fault_resume_pc = UINT32_C(0x00001004),
+        .fault_rmw = true,
+        .fault_rmw_phase = 2,
+        .fault_rmw_data1 = UINT32_C(0x11112222),
+        .fault_rmw_data_valid = true,
+    };
+    M68KMMU030FaultContext collapsed_b;
+
+    g_assert_true(m68k_mmu030_push_fault_frame(&collapsed, a_start,
+                                                frame_size));
+    collapsed.fault_address = UINT32_C(0x00abcdef);
+    collapsed.fault_resume_pc = UINT32_C(0x00002004);
+    collapsed.fault_rmw = false;
+    collapsed.fault_rmw_phase = 0;
+    collapsed.fault_rmw_data1 = 0;
+    collapsed.fault_rmw_data_valid = false;
+    g_assert_true(m68k_mmu030_push_fault_frame(&collapsed, b_start,
+                                                frame_size));
+    collapsed_b = collapsed.fault_frames[1];
+
+    g_assert_true(m68k_mmu030_fault_frame_collapsed_matches(&collapsed,
+                                                             a_collapse));
+    g_assert_true(m68k_mmu030_fault_frame_collapsed_matches(&collapsed,
+                                                             b_collapse));
+    g_assert_false(m68k_mmu030_fault_frame_collapsed_matches(
+        &collapsed, a_start));
+    g_assert_false(m68k_mmu030_fault_frame_collapsed_matches(
+        &collapsed, a_collapse - 2));
+    g_assert_true(m68k_mmu030_pop_collapsed_fault_frame(&collapsed,
+                                                         a_collapse, true));
+    g_assert_cmpuint(collapsed.fault_frame_depth, ==, 1);
+    g_assert_true(collapsed.fault_frame_active);
+    g_assert_cmpmem(&collapsed.fault_frames[0],
+                    sizeof(collapsed.fault_frames[0]), &collapsed_b,
+                    sizeof(collapsed_b));
+    g_assert_false(collapsed.fault_pending);
+    g_assert_cmpuint(collapsed.fault_address, ==, 0);
+    g_assert_false(collapsed.fault_rmw);
+    g_assert_true(m68k_mmu030_fault_frame_matches(&collapsed, b_start,
+                                                   frame_size));
+    g_assert_false(m68k_mmu030_fault_frame_matches(&collapsed, a_start,
+                                                    frame_size));
+
+    g_assert_true(m68k_mmu030_restore_fault_frame_context(
+        &collapsed, b_start, frame_size));
+    g_assert_cmpuint(collapsed.fault_address, ==, UINT32_C(0x00abcdef));
+    g_assert_true(m68k_mmu030_pop_fault_frame(&collapsed, b_start, frame_size,
+                                               false));
+    g_assert_cmpuint(collapsed.fault_frame_depth, ==, 0);
+    g_assert_false(collapsed.fault_frame_active);
+}
+
+static void test_mmu030_fault_frame_push_collision(void)
+{
+    M68KMMU030State state = { 0 };
+    M68KMMU030State malformed = { 0 };
+    const uint32_t frame_size = M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
+    const uint32_t frame_start = UINT32_C(0x00001000);
+    const uint32_t collapse_collision_start = frame_start - 4;
+    int result;
+
+    result = m68k_mmu030_push_fault_frame(&state, frame_start, frame_size);
+    g_assert_cmpint(result, ==, M68K_MMU030_FAULT_FRAME_PUSHED);
+
+    /* An exact duplicate must be reported as a collision, not as an
+     * unowned frame that a later RTE could bind to the old snapshot. */
+    result = m68k_mmu030_push_fault_frame(&state, frame_start, frame_size);
+    g_assert_cmpint(result, ==, M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT);
+    g_assert_true(m68k_mmu030_fault_frame_matches(&state, frame_start,
+                                                   frame_size));
+
+    /* Distinct ranges with the same format-0 trailing identity are equally
+     * unsafe: a collapsed RTE cannot choose between them. */
+    result = m68k_mmu030_push_fault_frame(
+        &state, collapse_collision_start, frame_size + 4);
+    g_assert_cmpint(result, ==, M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT);
+    g_assert_true(m68k_mmu030_fault_frame_collapsed_matches(
+        &state, frame_start + frame_size - 8));
+
+    /* A unique identity at capacity is a recoverable sidecar loss. */
+    for (unsigned i = 1; i < M68K_MMU030_MAX_FAULT_FRAMES; i++) {
+        result = m68k_mmu030_push_fault_frame(
+            &state, frame_start + i * 0x1000, frame_size);
+        g_assert_cmpint(result, ==, M68K_MMU030_FAULT_FRAME_PUSHED);
     }
+    result = m68k_mmu030_push_fault_frame(&state, UINT32_C(0x00008000),
+                                          frame_size);
+    g_assert_cmpint(result, ==, M68K_MMU030_FAULT_FRAME_PUSH_CAPACITY);
+
+    /* A malformed migrated depth must be rejected before indexing beyond
+     * the fixed registry. */
+    malformed.fault_frame_depth = M68K_MMU030_MAX_FAULT_FRAMES + 1;
+    result = m68k_mmu030_push_fault_frame(&malformed, frame_start,
+                                          frame_size);
+    g_assert_cmpint(result, ==, M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT);
+}
+
+static void test_mmu030_fault_frame_capacity_unowned(void)
+{
+    M68KMMU030State state = { 0 };
+    uint8_t frame[M68K_MMU030_ACCESS_FRAME_SIZE_LONG];
+    const uint32_t frame_size = M68K_MMU030_ACCESS_FRAME_SIZE_LONG;
+    const uint32_t candidate_start = UINT32_C(0x00005000);
+    uint16_t restored_sr;
+    uint32_t restored_pc;
+
+    /* Fill the bounded sidecar with legitimate live handler frames. */
+    for (unsigned i = 0; i < M68K_MMU030_MAX_FAULT_FRAMES; i++) {
+        state.fault_pending = true;
+        state.fault_format = M68K_MMU030_FAULT_FORMAT_B;
+        state.fault_frame_version = M68K_MMU030_FRAME_VERSION;
+        state.fault_pc = UINT32_C(0x00100000) + i * 4;
+        state.fault_address = UINT32_C(0x00200000) + i * 0x1000;
+        state.fault_resume_pc = state.fault_pc + 4;
+        state.fault_ssw = M68K_MMU030_SSW_DF | M68K_MMU030_SSW_RW | 5;
+        g_assert_true(m68k_mmu030_build_access_frame(
+            &state, UINT16_C(0x2700), 8, frame, sizeof(frame)));
+        g_assert_true(m68k_mmu030_push_fault_frame(
+            &state, UINT32_C(0x00001000) + i * 0x1000, frame_size));
+    }
+    g_assert_cmpuint(state.fault_frame_depth, ==,
+                     M68K_MMU030_MAX_FAULT_FRAMES);
+
+    /* A fifth architectural frame is still complete even though no hidden
+     * restart snapshot can be cached.  Model access_error_frame's fallback:
+     * discard only the new scalar scratch after the failed sidecar insert. */
+    state.fault_pending = true;
+    state.fault_format = M68K_MMU030_FAULT_FORMAT_B;
+    state.fault_frame_version = M68K_MMU030_FRAME_VERSION;
+    state.fault_pc = UINT32_C(0x00500000);
+    state.fault_address = UINT32_C(0x00600000);
+    state.fault_resume_pc = UINT32_C(0x00500004);
+    state.fault_ssw = M68K_MMU030_SSW_DF | M68K_MMU030_SSW_RW | 5;
+    state.fault_exception_processing = true;
+    state.fault_exception_prefetch_words = 2;
+    g_assert_true(m68k_mmu030_build_access_frame(
+        &state, UINT16_C(0x2700), 8, frame, sizeof(frame)));
+    g_assert_cmpint(m68k_mmu030_push_fault_frame(
+                        &state, candidate_start, frame_size),
+                    ==, M68K_MMU030_FAULT_FRAME_PUSH_CAPACITY);
+    m68k_mmu030_reset_fault_scratch(&state);
+    g_assert_false(state.fault_pending);
+    g_assert_cmpuint(state.fault_pc, ==, 0);
+    g_assert_cmpuint(state.fault_address, ==, 0);
+    g_assert_cmpuint(state.fault_resume_pc, ==, 0);
+    g_assert_true(state.fault_exception_processing);
+    g_assert_cmpuint(state.fault_exception_prefetch_words, ==, 2);
+    g_assert_cmpuint(state.fault_frame_depth, ==,
+                     M68K_MMU030_MAX_FAULT_FRAMES);
+    g_assert_true(state.fault_frame_active);
+    g_assert_true(m68k_mmu030_fault_frame_matches(
+        &state, UINT32_C(0x00001000), frame_size));
+    g_assert_true(m68k_mmu030_fault_frame_matches(
+        &state, UINT32_C(0x00004000), frame_size));
+    g_assert_false(m68k_mmu030_fault_frame_matches(
+        &state, candidate_start, frame_size));
+
+    /* With no sidecar owner, RTE can still consume the frame-visible image
+     * and leave every pre-existing context discoverable. */
+    g_assert_true(m68k_mmu030_restore_access_frame(
+        &state, frame, sizeof(frame), &restored_sr, &restored_pc));
+    g_assert_cmpuint(restored_sr, ==, UINT16_C(0x2700));
+    g_assert_cmpuint(restored_pc, ==, UINT32_C(0x00500000));
+    g_assert_true(m68k_mmu030_fault_frame_matches(
+        &state, UINT32_C(0x00001000), frame_size));
+    g_assert_true(m68k_mmu030_fault_frame_matches(
+        &state, UINT32_C(0x00004000), frame_size));
 }
 
 static uint32_t mmu030_tt(uint8_t address_base, uint8_t address_mask,
@@ -1712,6 +2128,130 @@ static M68KMMU030State migration_pattern(void)
     return state;
 }
 
+static void test_mmu030_legacy_live_migration(void)
+{
+    M68KMMU030State source = { 0 };
+    M68KMMU030State legacy = { 0 };
+    M68KMMU030State current = { 0 };
+    M68KMMU030State chained = { 0 };
+    M68KMMU030TranslateResult result = { 0 };
+    QIOChannelBuffer *save_channel;
+    QIOChannelBuffer *load_channel;
+    QIOChannelBuffer *chain_save_channel;
+    QIOChannelBuffer *chain_load_channel;
+    QEMUFile *file;
+    Error *local_err = NULL;
+    g_autofree uint8_t *wire = NULL;
+    g_autofree uint8_t *chain_wire = NULL;
+    size_t wire_size;
+    size_t chain_wire_size;
+    uint32_t saved_pc;
+    uint32_t saved_resume_pc;
+
+    /* Versions 3 through 6 carried only this scalar live marker.  There is
+     * no frame identity in those streams, so a loaded handler frame must
+     * remain authoritative until its next successful RTE. */
+    source.fault_frame_active = true;
+    source.fault_pc = UINT32_C(0x00123456);
+    source.fault_resume_pc = UINT32_C(0x0012345a);
+    source.fault_ssw = M68K_MMU030_SSW_DF;
+    source.fault_pending = false;
+
+    save_channel = qio_channel_buffer_new(0);
+    file = qemu_file_new_output(QIO_CHANNEL(save_channel));
+    g_assert_cmpint(vmstate_save_state(file, &vmstate_mmu030_state,
+                                       &source, NULL, &local_err), ==, 0);
+    g_assert_null(local_err);
+    g_assert_cmpint(qemu_fflush(file), ==, 0);
+    wire_size = save_channel->usage;
+    wire = g_memdup2(save_channel->data, wire_size);
+    qemu_fclose(file);
+
+    load_channel = qio_channel_buffer_new(wire_size);
+    memcpy(load_channel->data, wire, wire_size);
+    load_channel->usage = wire_size;
+    load_channel->offset = 0;
+    file = qemu_file_new_input(QIO_CHANNEL(load_channel));
+    g_assert_cmpint(vmstate_load_state(file, &vmstate_mmu030_state,
+                                       &legacy, 6, &local_err), ==, 0);
+    g_assert_null(local_err);
+    qemu_fclose(file);
+    g_assert_true(legacy.fault_frame_active);
+    g_assert_cmpuint(legacy.fault_frame_depth, ==, 0);
+    saved_pc = legacy.fault_pc;
+    saved_resume_pc = legacy.fault_resume_pc;
+
+    /* A handler access before RTE must not overwrite the scalar continuation
+     * that came from the pre-v7 stream. */
+    m68k_mmu030_capture_fault(&legacy, UINT32_C(0x00abcdef),
+                              UINT32_C(0x00bad000), 4, true, false, 5,
+                              &result);
+    g_assert_cmpuint(legacy.fault_pc, ==, saved_pc);
+    g_assert_cmpuint(legacy.fault_resume_pc, ==, saved_resume_pc);
+    g_assert_false(legacy.fault_pending);
+
+    /* The same zero-depth shape in a current-v7 stream is not a legacy
+     * scalar frame and remains available for a new fault. */
+    load_channel = qio_channel_buffer_new(wire_size);
+    memcpy(load_channel->data, wire, wire_size);
+    load_channel->usage = wire_size;
+    load_channel->offset = 0;
+    file = qemu_file_new_input(QIO_CHANNEL(load_channel));
+    g_assert_cmpint(vmstate_load_state(file, &vmstate_mmu030_state,
+                                       &current, 7, &local_err), ==, 0);
+    g_assert_null(local_err);
+    qemu_fclose(file);
+    m68k_mmu030_capture_fault(&current, UINT32_C(0x00abcdef),
+                              UINT32_C(0x00bad000), 4, true, false, 5,
+                              &result);
+    g_assert_true(current.fault_pending);
+    g_assert_cmpuint(current.fault_pc, ==, UINT32_C(0x00bad000));
+
+    /* A state loaded from v6 may itself be migrated before its scalar frame
+     * is consumed.  The current stream must carry that legacy ownership
+     * through a save/load hop instead of silently permitting a replacement
+     * fault. */
+    chain_save_channel = qio_channel_buffer_new(0);
+    file = qemu_file_new_output(QIO_CHANNEL(chain_save_channel));
+    g_assert_cmpint(vmstate_save_state(file, &vmstate_mmu030_state,
+                                       &legacy, NULL, &local_err), ==, 0);
+    g_assert_null(local_err);
+    g_assert_cmpint(qemu_fflush(file), ==, 0);
+    chain_wire_size = chain_save_channel->usage;
+    chain_wire = g_memdup2(chain_save_channel->data, chain_wire_size);
+    qemu_fclose(file);
+
+    chain_load_channel = qio_channel_buffer_new(chain_wire_size);
+    memcpy(chain_load_channel->data, chain_wire, chain_wire_size);
+    chain_load_channel->usage = chain_wire_size;
+    chain_load_channel->offset = 0;
+    file = qemu_file_new_input(QIO_CHANNEL(chain_load_channel));
+    g_assert_cmpint(vmstate_load_state(file, &vmstate_mmu030_state,
+                                       &chained, 8, &local_err), ==, 0);
+    g_assert_null(local_err);
+    qemu_fclose(file);
+    g_assert_true(m68k_mmu030_legacy_fault_frame_active(&chained));
+    saved_pc = chained.fault_pc;
+    saved_resume_pc = chained.fault_resume_pc;
+    m68k_mmu030_capture_fault(&chained, UINT32_C(0x00abcdef),
+                              UINT32_C(0x00bad000), 4, true, false, 5,
+                              &result);
+    g_assert_cmpuint(chained.fault_pc, ==, saved_pc);
+    g_assert_cmpuint(chained.fault_resume_pc, ==, saved_resume_pc);
+    g_assert_false(chained.fault_pending);
+    /* Format-0 RTE has no exact pre-v7 identity.  Its helper path consumes
+     * the scalar-only ownership while discarding the collapsed scratch. */
+    g_assert_true(m68k_mmu030_pop_collapsed_fault_frame(
+        &chained, UINT32_C(0x00100000), true));
+    g_assert_false(m68k_mmu030_legacy_fault_frame_active(&chained));
+    g_assert_false(chained.fault_frame_active);
+
+    object_unref(OBJECT(save_channel));
+    object_unref(OBJECT(load_channel));
+    object_unref(OBJECT(chain_save_channel));
+    object_unref(OBJECT(chain_load_channel));
+}
+
 static void test_cpu_vmstate_gating(void)
 {
     static const struct {
@@ -1839,12 +2379,12 @@ static void test_cpu_migration_old_mmu030_layout(void)
      * that an older source produced by removing all appended restart fields;
      * VMSTATE_STRUCT does not put a nested version marker on the wire. */
     current_end = payload_offset + M68K_MMU030_WIRE_SIZE +
-                  M68K_MMU030_WIRE_V6_EXTRA;
+                  M68K_MMU030_WIRE_V8_EXTRA;
     old_end = payload_offset + M68K_MMU030_WIRE_SIZE;
     g_assert_cmpuint(current_end, <=, wire_size);
     memmove((uint8_t *)wire + old_end, (uint8_t *)wire + current_end,
             wire_size - current_end);
-    wire_size -= M68K_MMU030_WIRE_V6_EXTRA;
+    wire_size -= M68K_MMU030_WIRE_V8_EXTRA;
     stl_be_p((uint8_t *)wire + payload_offset - sizeof(uint32_t), 1);
     g_assert_true(g_file_set_contents(path, wire, wire_size, NULL));
 
@@ -1857,14 +2397,14 @@ static void test_cpu_migration_old_mmu030_layout(void)
     g_assert_cmpuint(migration_find_subsection(
                          (const uint8_t *)roundtrip_wire, roundtrip_size,
                          "cpu/68030_mmu", &roundtrip_offset), ==, 1);
-    g_assert_cmpuint(roundtrip_offset + M68K_MMU030_WIRE_V6_EXTRA +
+    g_assert_cmpuint(roundtrip_offset + M68K_MMU030_WIRE_V8_EXTRA +
                          M68K_MMU030_WIRE_SIZE,
                      <=, roundtrip_size);
     /*
      * Fields introduced in versions 2, 3, and 4 default on an old load; in
      * particular the continuation and live-frame marker must not inherit
      * bytes left after the shortened version-1 payload. */
-    for (size_t i = 0; i < M68K_MMU030_WIRE_V6_EXTRA; i++) {
+    for (size_t i = 0; i < M68K_MMU030_WIRE_V8_EXTRA; i++) {
         g_assert_cmpuint((uint8_t)roundtrip_wire[
                              roundtrip_offset + M68K_MMU030_WIRE_SIZE + i],
                          ==, 0);
@@ -2519,6 +3059,8 @@ int main(int argc, char **argv)
     g_test_add_func("/m68k/mmu030/split-cycle-state",
                     test_mmu030_split_cycle_state);
     g_test_add_func("/m68k/mmu030/vmstate", test_mmu030_vmstate);
+    g_test_add_func("/m68k/mmu030/legacy-live-migration",
+                    test_mmu030_legacy_live_migration);
     g_test_add_func("/m68k/mmu030/tc-validation",
                     test_mmu030_tc_validation);
     g_test_add_func("/m68k/mmu030/tt-matching",
@@ -2549,6 +3091,12 @@ int main(int argc, char **argv)
                     test_mmu030_capture_fault_state);
     g_test_add_func("/m68k/mmu030/nested-fault-preserves-frame",
                     test_mmu030_nested_fault_preserves_frame);
+    g_test_add_func("/m68k/mmu030/late-nested-access-frame",
+                    test_mmu030_late_nested_access_frame);
+    g_test_add_func("/m68k/mmu030/fault-frame-push-collision",
+                    test_mmu030_fault_frame_push_collision);
+    g_test_add_func("/m68k/mmu030/fault-frame-capacity-unowned",
+                    test_mmu030_fault_frame_capacity_unowned);
     g_test_add_func("/m68k/mmu030/atc-entries-matching",
                     test_mmu030_atc_entries_and_matching);
     g_test_add_func("/m68k/mmu030/atc-permissions-replacement",

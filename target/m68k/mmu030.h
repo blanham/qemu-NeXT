@@ -89,6 +89,13 @@ enum {
     M68K_MMU030_SPECIAL_FMOVEM,
 };
 #define M68K_MMU030_SPECIAL_MAX_CYCLES 4
+#define M68K_MMU030_MAX_FAULT_FRAMES   4
+
+typedef enum M68KMMU030FaultFramePushResult {
+    M68K_MMU030_FAULT_FRAME_PUSHED = 1,
+    M68K_MMU030_FAULT_FRAME_PUSH_CAPACITY,
+    M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT,
+} M68KMMU030FaultFramePushResult;
 
 /* Compatibility spelling used by the Task3 short-frame API. */
 #define M68K_MMU030_SSW_OF M68K_MMU030_SSW_DF
@@ -159,6 +166,54 @@ typedef struct M68KMMU030TTResult {
     bool cache_inhibit;
 } M68KMMU030TTResult;
 
+/*
+ * A live access-error frame owns the complete restart image which was
+ * current when the frame was stacked.  Handler accesses use the scalar
+ * fields in M68KMMU030State as scratch; this explicit snapshot keeps nested
+ * handler faults from replacing the suspended instruction's state.
+ */
+typedef struct M68KMMU030FaultContext {
+    uint32_t frame_start;
+    uint32_t frame_end;
+
+    bool fault_pending;
+    uint32_t fault_address;
+    uint32_t fault_pc;
+    uint16_t fault_ssw;
+    uint32_t fault_status;
+    uint8_t fault_format;
+    uint8_t fault_size;
+    uint8_t fault_function_code;
+    uint8_t fault_table_level;
+    uint16_t fault_stage_c;
+    uint16_t fault_stage_b;
+    uint32_t fault_stage_b_address;
+    uint32_t fault_data_output;
+    uint32_t fault_data_input;
+    uint32_t fault_data_input_address;
+    uint32_t fault_descriptor_address;
+    uint32_t fault_instruction_address;
+    uint32_t fault_resume_pc;
+    bool fault_data_complete;
+    bool fault_data_input_valid;
+    bool fault_data_write;
+    uint8_t fault_frame_version;
+    bool restart_pending;
+    bool fault_rmw;
+    bool fault_fetch_active;
+    bool fault_code_fetch;
+    bool fault_pipe_accept;
+    uint8_t fault_rmw_phase;
+    uint32_t fault_rmw_data1;
+    uint32_t fault_rmw_data2;
+    bool fault_rmw_data_valid;
+    uint8_t fault_special_kind;
+    uint8_t fault_special_phase;
+    bool fault_special_valid;
+    uint32_t fault_special_pc;
+    uint32_t fault_special_data[M68K_MMU030_SPECIAL_MAX_CYCLES];
+} M68KMMU030FaultContext;
+
 typedef struct M68KMMU030State {
     uint64_t crp;
     uint64_t srp;
@@ -197,6 +252,10 @@ typedef struct M68KMMU030State {
     uint32_t fault_resume_pc;
     /* An access frame is live while its handler is running. */
     bool fault_frame_active;
+    /* Access-error exception entry is still stacking/vectoring. */
+    bool fault_exception_processing;
+    /* Number of handler instruction words successfully prefetched at entry. */
+    uint8_t fault_exception_prefetch_words;
     /* A cleared DF lets the translated instruction consume the stacked data
      * buffer without issuing the completed bus cycle again. */
     bool fault_data_complete;
@@ -228,6 +287,14 @@ typedef struct M68KMMU030State {
     bool fault_special_valid;
     uint32_t fault_special_pc;
     uint32_t fault_special_data[M68K_MMU030_SPECIAL_MAX_CYCLES];
+
+    M68KMMU030FaultContext fault_frames[M68K_MMU030_MAX_FAULT_FRAMES];
+    uint8_t fault_frame_depth;
+    /* A pre-v7 migration can report one live scalar frame without an
+     * architectural frame identity.  This transient marker is set only by
+     * the pre-v7 post-load path; current compact v7 state derives ownership
+     * solely from fault_frame_depth. */
+    bool fault_legacy_frame_active;
 } M68KMMU030State;
 
 typedef struct M68KMMU030ControlState {
@@ -413,6 +480,29 @@ void m68k_mmu030_record_instruction_fetch(M68KMMU030State *state,
                                           uint32_t fetch_address,
                                           uint16_t word);
 void m68k_mmu030_end_instruction_fetch(M68KMMU030State *state);
+void m68k_mmu030_reset_fault_scratch(M68KMMU030State *state);
+bool m68k_mmu030_legacy_fault_frame_active(
+    const M68KMMU030State *state);
+void m68k_mmu030_clear_legacy_fault_frame(M68KMMU030State *state);
+
+M68KMMU030FaultFramePushResult m68k_mmu030_push_fault_frame(
+    M68KMMU030State *state, uint32_t frame_start, uint32_t frame_size);
+bool m68k_mmu030_fault_frame_matches(const M68KMMU030State *state,
+                                     uint32_t frame_start,
+                                     uint32_t frame_size);
+bool m68k_mmu030_fault_frame_collapsed_matches(
+    const M68KMMU030State *state, uint32_t frame_start);
+bool m68k_mmu030_pop_fault_frame(M68KMMU030State *state,
+                                 uint32_t frame_start,
+                                 uint32_t frame_size,
+                                 bool discard);
+bool m68k_mmu030_pop_collapsed_fault_frame(M68KMMU030State *state,
+                                           uint32_t frame_start,
+                                           bool discard);
+bool m68k_mmu030_restore_fault_frame_context(M68KMMU030State *state,
+                                             uint32_t frame_start,
+                                             uint32_t frame_size);
+void m68k_mmu030_discard_fault_frames(M68KMMU030State *state);
 
 /* Latch one failed CPU access for exception entry. */
 void m68k_mmu030_capture_fault(

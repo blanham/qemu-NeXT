@@ -783,6 +783,360 @@ void m68k_mmu030_reset(M68KMMU030State *state)
     memset(state, 0, sizeof(*state));
 }
 
+static void m68k_mmu030_save_fault_context(
+    M68KMMU030FaultContext *context, const M68KMMU030State *state,
+    uint32_t frame_start, uint32_t frame_size)
+{
+    context->frame_start = frame_start;
+    context->frame_end = frame_start + frame_size;
+    context->fault_pending = state->fault_pending;
+    context->fault_address = state->fault_address;
+    context->fault_pc = state->fault_pc;
+    context->fault_ssw = state->fault_ssw;
+    context->fault_status = state->fault_status;
+    context->fault_format = state->fault_format;
+    context->fault_size = state->fault_size;
+    context->fault_function_code = state->fault_function_code;
+    context->fault_table_level = state->fault_table_level;
+    context->fault_stage_c = state->fault_stage_c;
+    context->fault_stage_b = state->fault_stage_b;
+    context->fault_stage_b_address = state->fault_stage_b_address;
+    context->fault_data_output = state->fault_data_output;
+    context->fault_data_input = state->fault_data_input;
+    context->fault_data_input_address = state->fault_data_input_address;
+    context->fault_descriptor_address = state->fault_descriptor_address;
+    context->fault_instruction_address = state->fault_instruction_address;
+    context->fault_resume_pc = state->fault_resume_pc;
+    context->fault_data_complete = state->fault_data_complete;
+    context->fault_data_input_valid = state->fault_data_input_valid;
+    context->fault_data_write = state->fault_data_write;
+    context->fault_frame_version = state->fault_frame_version;
+    context->restart_pending = state->restart_pending;
+    context->fault_rmw = state->fault_rmw;
+    context->fault_fetch_active = state->fault_fetch_active;
+    context->fault_code_fetch = state->fault_code_fetch;
+    context->fault_pipe_accept = state->fault_pipe_accept;
+    context->fault_rmw_phase = state->fault_rmw_phase;
+    context->fault_rmw_data1 = state->fault_rmw_data1;
+    context->fault_rmw_data2 = state->fault_rmw_data2;
+    context->fault_rmw_data_valid = state->fault_rmw_data_valid;
+    context->fault_special_kind = state->fault_special_kind;
+    context->fault_special_phase = state->fault_special_phase;
+    context->fault_special_valid = state->fault_special_valid;
+    context->fault_special_pc = state->fault_special_pc;
+    memcpy(context->fault_special_data, state->fault_special_data,
+           sizeof(context->fault_special_data));
+}
+
+static void m68k_mmu030_restore_fault_context(
+    M68KMMU030State *state, const M68KMMU030FaultContext *context)
+{
+    state->fault_pending = context->fault_pending;
+    state->fault_address = context->fault_address;
+    state->fault_pc = context->fault_pc;
+    state->fault_ssw = context->fault_ssw;
+    state->fault_status = context->fault_status;
+    state->fault_format = context->fault_format;
+    state->fault_size = context->fault_size;
+    state->fault_function_code = context->fault_function_code;
+    state->fault_table_level = context->fault_table_level;
+    state->fault_stage_c = context->fault_stage_c;
+    state->fault_stage_b = context->fault_stage_b;
+    state->fault_stage_b_address = context->fault_stage_b_address;
+    state->fault_data_output = context->fault_data_output;
+    state->fault_data_input = context->fault_data_input;
+    state->fault_data_input_address = context->fault_data_input_address;
+    state->fault_descriptor_address = context->fault_descriptor_address;
+    state->fault_instruction_address = context->fault_instruction_address;
+    state->fault_resume_pc = context->fault_resume_pc;
+    state->fault_data_complete = context->fault_data_complete;
+    state->fault_data_input_valid = context->fault_data_input_valid;
+    state->fault_data_write = context->fault_data_write;
+    state->fault_frame_version = context->fault_frame_version;
+    state->restart_pending = context->restart_pending;
+    state->fault_rmw = context->fault_rmw;
+    state->fault_fetch_active = context->fault_fetch_active;
+    state->fault_code_fetch = context->fault_code_fetch;
+    state->fault_pipe_accept = context->fault_pipe_accept;
+    state->fault_rmw_phase = context->fault_rmw_phase;
+    state->fault_rmw_data1 = context->fault_rmw_data1;
+    state->fault_rmw_data2 = context->fault_rmw_data2;
+    state->fault_rmw_data_valid = context->fault_rmw_data_valid;
+    state->fault_special_kind = context->fault_special_kind;
+    state->fault_special_phase = context->fault_special_phase;
+    state->fault_special_valid = context->fault_special_valid;
+    state->fault_special_pc = context->fault_special_pc;
+    memcpy(state->fault_special_data, context->fault_special_data,
+           sizeof(state->fault_special_data));
+}
+
+static void m68k_mmu030_clear_fault_scratch(M68KMMU030State *state)
+{
+    memset((uint8_t *)state + offsetof(M68KMMU030State, fault_pending), 0,
+           offsetof(M68KMMU030State, fault_frames) -
+           offsetof(M68KMMU030State, fault_pending));
+}
+
+static bool m68k_mmu030_fault_frames_active(
+    const M68KMMU030State *state)
+{
+    return state && (state->fault_frame_depth != 0 ||
+                     state->fault_legacy_frame_active);
+}
+
+bool m68k_mmu030_legacy_fault_frame_active(
+    const M68KMMU030State *state)
+{
+    return state && state->fault_legacy_frame_active;
+}
+
+void m68k_mmu030_clear_legacy_fault_frame(M68KMMU030State *state)
+{
+    if (!state) {
+        return;
+    }
+    state->fault_legacy_frame_active = false;
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
+}
+
+void m68k_mmu030_reset_fault_scratch(M68KMMU030State *state)
+{
+    bool exception_processing;
+    uint8_t prefetch_words;
+
+    if (!state) {
+        return;
+    }
+    exception_processing = state->fault_exception_processing;
+    prefetch_words = state->fault_exception_prefetch_words;
+    m68k_mmu030_clear_fault_scratch(state);
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
+    state->fault_exception_processing = exception_processing;
+    state->fault_exception_prefetch_words = prefetch_words;
+}
+
+M68KMMU030FaultFramePushResult m68k_mmu030_push_fault_frame(
+    M68KMMU030State *state, uint32_t frame_start, uint32_t frame_size)
+{
+    uint32_t frame_end;
+
+    if (!state || !frame_size || state->fault_legacy_frame_active ||
+        state->fault_frame_depth > M68K_MMU030_MAX_FAULT_FRAMES ||
+        frame_start + frame_size < frame_start) {
+        return M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT;
+    }
+
+    frame_end = frame_start + frame_size;
+    for (unsigned i = 0; i < state->fault_frame_depth; i++) {
+        const M68KMMU030FaultContext *context = &state->fault_frames[i];
+
+        /* Exact ranges must identify one live frame. */
+        if (context->frame_start == frame_start &&
+            context->frame_end == frame_end) {
+            return M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT;
+        }
+        /* A format-0 RTE names a frame by its trailing eight-byte base
+         * frame.  Do not admit two live contexts with the same collapse
+         * address, even when their full ranges differ. */
+        if (frame_size >= 8 && context->frame_end >= context->frame_start &&
+            context->frame_end - context->frame_start >= 8 &&
+            context->frame_end == frame_end) {
+            return M68K_MMU030_FAULT_FRAME_PUSH_CONFLICT;
+        }
+    }
+
+    if (state->fault_frame_depth >= M68K_MMU030_MAX_FAULT_FRAMES) {
+        return M68K_MMU030_FAULT_FRAME_PUSH_CAPACITY;
+    }
+
+    m68k_mmu030_save_fault_context(
+        &state->fault_frames[state->fault_frame_depth], state,
+        frame_start, frame_size);
+    state->fault_frame_depth++;
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
+    return M68K_MMU030_FAULT_FRAME_PUSHED;
+}
+
+static bool m68k_mmu030_find_fault_frame(
+    const M68KMMU030State *state, uint32_t frame_start, uint32_t frame_size,
+    unsigned *index)
+{
+    uint32_t frame_end;
+    unsigned found = 0;
+
+    if (!state || !state->fault_frame_active || !frame_size ||
+        state->fault_frame_depth > M68K_MMU030_MAX_FAULT_FRAMES ||
+        frame_start + frame_size < frame_start) {
+        return false;
+    }
+
+    frame_end = frame_start + frame_size;
+    for (unsigned i = 0; i < state->fault_frame_depth; i++) {
+        const M68KMMU030FaultContext *context = &state->fault_frames[i];
+
+        if (context->frame_start == frame_start &&
+            context->frame_end == frame_end) {
+            if (found++) {
+                /* A malformed/migrated duplicate is ambiguous. */
+                return false;
+            }
+            if (index) {
+                *index = i;
+            }
+        }
+    }
+    return found == 1;
+}
+
+bool m68k_mmu030_fault_frame_matches(const M68KMMU030State *state,
+                                     uint32_t frame_start,
+                                     uint32_t frame_size)
+{
+    return m68k_mmu030_find_fault_frame(state, frame_start, frame_size,
+                                        NULL);
+}
+
+bool m68k_mmu030_fault_frame_collapsed_matches(
+    const M68KMMU030State *state, uint32_t frame_start)
+{
+    unsigned found = 0;
+
+    if (!state || !state->fault_frame_active ||
+        (state->fault_frame_depth == 0 &&
+         !state->fault_legacy_frame_active) ||
+        state->fault_frame_depth > M68K_MMU030_MAX_FAULT_FRAMES) {
+        return false;
+    }
+
+    for (unsigned i = 0; i < state->fault_frame_depth; i++) {
+        const M68KMMU030FaultContext *context = &state->fault_frames[i];
+
+        /* Mach's format-0 collapse points RTE at the final eight-byte base
+         * frame, not at the original access-frame start. */
+        if (context->frame_end >= context->frame_start &&
+            context->frame_end - context->frame_start >= 8 &&
+            frame_start == context->frame_end - 8) {
+            found++;
+        }
+    }
+    return found == 1;
+}
+
+bool m68k_mmu030_restore_fault_frame_context(M68KMMU030State *state,
+                                             uint32_t frame_start,
+                                             uint32_t frame_size)
+{
+    unsigned index;
+
+    if (!m68k_mmu030_find_fault_frame(state, frame_start, frame_size,
+                                      &index)) {
+        return false;
+    }
+
+    m68k_mmu030_restore_fault_context(
+        state, &state->fault_frames[index]);
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
+    return true;
+}
+
+void m68k_mmu030_discard_fault_frames(M68KMMU030State *state)
+{
+    if (!state) {
+        return;
+    }
+
+    m68k_mmu030_clear_fault_scratch(state);
+    memset(state->fault_frames, 0, sizeof(state->fault_frames));
+    state->fault_frame_depth = 0;
+    state->fault_legacy_frame_active = false;
+    state->fault_frame_active = false;
+}
+
+static bool m68k_mmu030_pop_fault_frame_internal(M68KMMU030State *state,
+                                                  unsigned index, bool discard)
+{
+    unsigned last = state->fault_frame_depth - 1;
+
+    if (index < last) {
+        memmove(&state->fault_frames[index], &state->fault_frames[index + 1],
+                (last - index) * sizeof(state->fault_frames[0]));
+    }
+    memset(&state->fault_frames[last], 0, sizeof(state->fault_frames[0]));
+    state->fault_frame_depth--;
+    state->fault_exception_processing = false;
+    state->fault_exception_prefetch_words = 0;
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
+
+    if (!state->fault_frame_depth) {
+        if (discard) {
+            m68k_mmu030_discard_fault_frames(state);
+        }
+    } else if (discard) {
+        /* The repaired inner instruction remains the current scratch
+         * context; the outer snapshot is restored when its own RTE reads
+         * the matching frame. */
+        m68k_mmu030_reset_fault_scratch(state);
+        state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
+    }
+    return true;
+}
+
+bool m68k_mmu030_pop_fault_frame(M68KMMU030State *state,
+                                 uint32_t frame_start,
+                                 uint32_t frame_size,
+                                 bool discard)
+{
+    unsigned index;
+
+    if (!m68k_mmu030_find_fault_frame(state, frame_start, frame_size,
+                                      &index)) {
+        return false;
+    }
+    return m68k_mmu030_pop_fault_frame_internal(state, index, discard);
+}
+
+bool m68k_mmu030_pop_collapsed_fault_frame(M68KMMU030State *state,
+                                           uint32_t frame_start,
+                                           bool discard)
+{
+    unsigned index = 0;
+    unsigned found = 0;
+
+    if (!state || !state->fault_frame_active ||
+        (state->fault_frame_depth == 0 &&
+         !state->fault_legacy_frame_active) ||
+        state->fault_frame_depth > M68K_MMU030_MAX_FAULT_FRAMES) {
+        return false;
+    }
+
+    for (unsigned i = 0; i < state->fault_frame_depth; i++) {
+        const M68KMMU030FaultContext *context = &state->fault_frames[i];
+
+        if (context->frame_end >= context->frame_start &&
+            context->frame_end - context->frame_start >= 8 &&
+            frame_start == context->frame_end - 8) {
+            index = i;
+            found++;
+        }
+    }
+    if (found == 1) {
+        return m68k_mmu030_pop_fault_frame_internal(state, index, discard);
+    }
+
+    /* Pre-v7 streams have no frame identity.  A format-0 RTE is the only
+     * architectural completion available for that scalar continuation, so
+     * consume it when no compact identity can be matched. */
+    if (!found && state->fault_legacy_frame_active &&
+        !state->fault_frame_depth) {
+        m68k_mmu030_clear_legacy_fault_frame(state);
+        if (discard) {
+            m68k_mmu030_reset_fault_scratch(state);
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool m68k_mmu030_special_matches(const M68KMMU030State *state,
                                         unsigned kind, uint32_t pc)
 {
@@ -811,13 +1165,6 @@ bool m68k_mmu030_special_cycle(M68KMMU030State *state, unsigned kind,
         return false;
     }
 
-    /* A handler access belongs to the live frame and must never overwrite
-     * the suspended instruction's continuation.  If it faults, the normal
-     * frame-active guard turns that access into a double bus fault. */
-    if (state->fault_frame_active) {
-        return false;
-    }
-
     if (!m68k_mmu030_special_matches(state, kind, pc)) {
         m68k_mmu030_special_clear(state);
         state->fault_special_kind = kind;
@@ -840,8 +1187,7 @@ void m68k_mmu030_special_record(M68KMMU030State *state, unsigned kind,
                                 unsigned cycle, uint32_t pc, uint32_t data,
                                 bool is_load)
 {
-    if (!state || state->fault_frame_active ||
-        cycle >= M68K_MMU030_SPECIAL_MAX_CYCLES ||
+    if (!state || cycle >= M68K_MMU030_SPECIAL_MAX_CYCLES ||
         !m68k_mmu030_special_matches(state, kind, pc)) {
         return;
     }
@@ -893,7 +1239,7 @@ void m68k_mmu030_special_complete(M68KMMU030State *state, unsigned kind,
 static bool m68k_mmu030_fmovem_prepare(M68KMMU030State *state,
                                        uint32_t pc)
 {
-    if (!state || state->fault_frame_active) {
+    if (!state) {
         return false;
     }
 
@@ -980,7 +1326,7 @@ void m68k_mmu030_begin_instruction_fetch(M68KMMU030State *state,
 {
     bool accepted;
 
-    if (!state || state->fault_frame_active) {
+    if (!state) {
         return;
     }
 
@@ -1017,6 +1363,13 @@ void m68k_mmu030_record_instruction_fetch(M68KMMU030State *state,
         state->fault_stage_b = word;
         state->fault_stage_b_address = fetch_address;
     }
+    if (state->fault_exception_processing &&
+        state->fault_exception_prefetch_words < 3) {
+        state->fault_exception_prefetch_words++;
+        if (state->fault_exception_prefetch_words == 3) {
+            state->fault_exception_processing = false;
+        }
+    }
 }
 
 void m68k_mmu030_end_instruction_fetch(M68KMMU030State *state)
@@ -1026,7 +1379,7 @@ void m68k_mmu030_end_instruction_fetch(M68KMMU030State *state)
     }
 
     state->fault_fetch_active = false;
-    if (!state->fault_pending && !state->fault_frame_active) {
+    if (!state->fault_pending) {
         state->fault_instruction_address = 0;
         state->fault_stage_c = 0;
         state->fault_stage_b = 0;
@@ -1096,11 +1449,12 @@ void m68k_mmu030_capture_fault(
     bool pipeline_valid;
     bool rmw;
 
-    /* The first access error owns the CPU until its frame is consumed.  A
-     * fault while constructing, reading, or vectoring that frame is a
-     * double bus fault; never replace the original restart image.  The CPU
-     * fault ingress paths turn this condition into a halted CPU. */
-    if (!state || state->fault_frame_active) {
+    /* A fault while constructing, reading, or vectoring an access frame is a
+     * double bus fault.  Once exception entry has completed, a handler may
+     * take another access fault; its frame is stacked below the live outer
+     * frame and the outer frame remains authoritative for its restart state. */
+    if (!state || state->fault_exception_processing ||
+        state->fault_legacy_frame_active) {
         return;
     }
 
@@ -1159,7 +1513,7 @@ void m68k_mmu030_capture_fault(
     state->fault_rmw = false;
     state->fault_instruction_address = fault_pc;
     state->fault_resume_pc = resume_pc;
-    state->fault_frame_active = false;
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
     state->fault_fetch_active = false;
     state->fault_code_fetch = is_code;
     state->fault_pipe_accept = false;
@@ -1289,8 +1643,7 @@ bool m68k_mmu030_build_access_frame(
     uint32_t frame_length;
     uint16_t version;
 
-    if (!state || !state->fault_pending || state->fault_frame_active ||
-        !frame) {
+    if (!state || !state->fault_pending || !frame) {
         return false;
     }
 
@@ -1330,7 +1683,7 @@ bool m68k_mmu030_build_access_frame(
     /* The frame has consumed the pending MMU fault context. */
     state->fault_pending = false;
     state->fault_format = format;
-    state->fault_frame_active = true;
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
     return true;
 }
 
@@ -1503,7 +1856,7 @@ bool m68k_mmu030_restore_coprocessor_frame(
     state->fault_instruction_address = ldl_be_p(frame + 0x08);
     state->restart_pending = false;
     state->fault_resume_pc = 0;
-    state->fault_frame_active = false;
+    state->fault_frame_active = m68k_mmu030_fault_frames_active(state);
     state->fault_data_complete = false;
     state->fault_data_input_valid = false;
     state->fault_data_write = false;

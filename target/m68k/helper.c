@@ -1075,7 +1075,8 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
             return false;
         }
 
-        if (env->mmu030.fault_frame_active) {
+        if (env->mmu030.fault_exception_processing ||
+            m68k_mmu030_legacy_fault_frame_active(&env->mmu030)) {
             m68k_mmu030_double_fault(cs);
         }
 

@@ -536,6 +536,25 @@ static void test_register_reset(void)
     qtest_quit(qts);
 }
 
+static void test_computer_power_on_ready(void)
+{
+    QTestState *qts = next_mb8795_start_machine_with_args("next-computer",
+                                                          NULL);
+
+    /*
+     * The original 68030 driver does not toggle the MB8795 RESET register.
+     * It waits for TXSTAT READY before programming the original DMA engine,
+     * so the controller must be operational at machine reset on this board.
+     */
+    g_assert_cmphex(qtest_readb(qts, NEXT_COMPUTER_MB8795_BASE + EN_RESET),
+                    ==, 0);
+    g_assert_cmphex(qtest_readb(qts,
+                               NEXT_COMPUTER_MB8795_BASE + EN_TXSTAT),
+                    ==, EN_TXSTAT_READY);
+
+    qtest_quit(qts);
+}
+
 static void test_station_address(void)
 {
     static const uint8_t configured[6] = {
@@ -1815,6 +1834,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/next-cube/mb8795/register-reset",
                    test_register_reset);
+    qtest_add_func("/next-computer/mb8795/power-on-ready",
+                   test_computer_power_on_ready);
     qtest_add_func("/next-cube/mb8795/station-address",
                    test_station_address);
     qtest_add_func("/next-computer/mb8795/station-address-wide",

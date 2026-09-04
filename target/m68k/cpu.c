@@ -687,12 +687,22 @@ static bool cpu_68030_mmu_v5_field(void *opaque, int version_id)
 
 static bool cpu_68030_mmu_v6_field(void *opaque, int version_id)
 {
-    return version_id >= 6;
+    return version_id == 6;
+}
+
+static bool cpu_68030_mmu_v7_field(void *opaque, int version_id)
+{
+    return version_id == 7;
+}
+
+static bool cpu_68030_mmu_v8_field(void *opaque, int version_id)
+{
+    return version_id >= 8;
 }
 
 const VMStateDescription vmstate_68030_mmu = {
     .name = "cpu/68030_mmu",
-    .version_id = 6,
+    .version_id = 8,
     .minimum_version_id = 1,
     .needed = cpu_68030_mmu_needed,
     .post_load = cpu_68030_mmu_post_load,
@@ -718,6 +728,12 @@ const VMStateDescription vmstate_68030_mmu = {
         VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
                              cpu_68030_mmu_v6_field, 0,
                              vmstate_mmu030_state, M68KMMU030State, 6),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v7_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 7),
+        VMSTATE_VSTRUCT_TEST(env.mmu030, M68kCPU,
+                             cpu_68030_mmu_v8_field, 0,
+                             vmstate_mmu030_state, M68KMMU030State, 8),
         VMSTATE_END_OF_LIST()
     }
 };

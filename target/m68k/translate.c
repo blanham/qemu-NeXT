@@ -297,14 +297,9 @@ static inline void gen_addr_fault(DisasContext *s)
 static inline void gen_mmu030_fault_latch(DisasContext *s, TCGv data_output)
 {
     if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
-        TCGv active = tcg_temp_new_i32();
         TCGv complete = tcg_temp_new_i32();
         TCGLabel *done = gen_new_label();
 
-        tcg_gen_ld8u_i32(active, tcg_env,
-                         offsetof(CPUM68KState,
-                                  mmu030.fault_frame_active));
-        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
         tcg_gen_ld8u_i32(complete, tcg_env,
                          offsetof(CPUM68KState,
                                   mmu030.fault_data_complete));
@@ -340,15 +335,10 @@ static inline void gen_mmu030_fault_latch_rmw(DisasContext *s,
                                                TCGv data_output)
 {
     if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
-        TCGv active = tcg_temp_new_i32();
         TCGv complete = tcg_temp_new_i32();
         TCGLabel *done = gen_new_label();
 
         gen_mmu030_fault_latch(s, data_output);
-        tcg_gen_ld8u_i32(active, tcg_env,
-                         offsetof(CPUM68KState,
-                                  mmu030.fault_frame_active));
-        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
         tcg_gen_ld8u_i32(complete, tcg_env,
                          offsetof(CPUM68KState,
                                   mmu030.fault_data_complete));
@@ -366,15 +356,10 @@ static inline void gen_mmu030_fault_record_input(DisasContext *s, TCGv value,
                                                  TCGv address, int opsize)
 {
     if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
-        TCGv active = tcg_temp_new_i32();
         TCGv complete = tcg_temp_new_i32();
         TCGv input = tcg_temp_new_i32();
         TCGLabel *done = gen_new_label();
 
-        tcg_gen_ld8u_i32(active, tcg_env,
-                         offsetof(CPUM68KState,
-                                  mmu030.fault_frame_active));
-        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
         tcg_gen_ld8u_i32(complete, tcg_env,
                          offsetof(CPUM68KState,
                                   mmu030.fault_data_complete));
@@ -410,7 +395,6 @@ static inline void gen_mmu030_fault_record_input(DisasContext *s, TCGv value,
 static inline void gen_mmu030_fault_finish(DisasContext *s)
 {
     if (m68k_feature(s->env, M68K_FEATURE_M68030)) {
-        TCGv active = tcg_temp_new_i32();
         TCGv complete = tcg_temp_new_i32();
         TCGv rmw = tcg_temp_new_i32();
         TCGv rmw_valid = tcg_temp_new_i32();
@@ -421,10 +405,6 @@ static inline void gen_mmu030_fault_finish(DisasContext *s)
         TCGLabel *keep_cycle = gen_new_label();
         TCGLabel *keep_rmw = gen_new_label();
 
-        tcg_gen_ld8u_i32(active, tcg_env,
-                         offsetof(CPUM68KState,
-                                  mmu030.fault_frame_active));
-        tcg_gen_brcondi_i32(TCG_COND_NE, active, 0, done);
         /*
          * A DF-cleared RM frame is restored before the translator re-enters
          * the TB that contains the faulting CAS2.  That TB may contain setup

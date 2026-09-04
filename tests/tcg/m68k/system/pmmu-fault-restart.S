@@ -259,6 +259,10 @@ code_return:
         cmpi.l  #1,0x00105000
         bne.w   fail
 
+edited_rte_return:
+        cmpi.l  #0xdeadbeef,0x00105000
+        bne.w   fail
+
         /* 10: a distinct-address read completes before the write faults.
          * The handler invalidates the source after observing the DIB, so a
          * replay that issues the read again must enter the handler twice. */
@@ -517,6 +521,16 @@ boundary_done:
         cmpi.l  #0xbbbbbbb2,0x00134000
         bne.w   fail
 
+        /* 32: keep five late-handler faults live at once.  The fifth
+         * architectural frame must still be stacked when the bounded
+         * restart sidecar is full; it simply has no hidden continuation. */
+        move.l  #32,test_id
+        move.l  0x00150000,%d4
+        cmpi.l  #0x12345678,%d4
+        bne.w   fail
+        cmpi.l  #37,fault_count
+        bne.w   fail
+
         /* RTE must turn malformed long and unknown frames into vector 14
          * while leaving each attempted frame available to the handler. */
         lea     format_handler,%a0
@@ -619,6 +633,8 @@ access_handler:
         beq.w   repair_fmovem_first_write
         cmpi.l  #31,%d4
         beq.w   repair_cas2_two_reads
+        cmpi.l  #32,%d4
+        beq.w   repair_capacity
         bra.w   fail
 
 repair_write_long:
@@ -767,8 +783,14 @@ repair_write_rmw:
         move.l  %d3,(%a1)
         movea.l %a2,%a0
         andi.w  #0xfeff,10(%a0)
+        move.l  #edited_rte_pc,2(%a0)
         movem.l (%sp)+,%d0-%d7/%a0-%a6
         rte
+
+edited_rte_pc:
+        move.l  #0xdeadbeef,0x00105000
+        movea.l #edited_rte_return,%a0
+        jmp     (%a0)
 
 repair_write_distinct:
         cmpi.l  #10,fault_count
@@ -1260,6 +1282,62 @@ repair_cas2_second_read:
         andi.w  #0xfeff,10(%a0)          /* clear DF, preserve RM */
         movem.l (%sp)+,%d0-%d7/%a0-%a6
         rte
+
+repair_capacity:
+        cmpi.w  #0xb008,%d0
+        bne.w   fail
+        cmpi.w  #0x0145,%d1             /* DF, long read, FC=5 */
+        bne.w   fail
+        cmpi.l  #33,fault_count
+        beq.w   capacity_1
+        cmpi.l  #34,fault_count
+        beq.w   capacity_2
+        cmpi.l  #35,fault_count
+        beq.w   capacity_3
+        cmpi.l  #36,fault_count
+        beq.w   capacity_4
+        cmpi.l  #37,fault_count
+        beq.w   capacity_5
+        bra.w   fail
+
+capacity_1:
+        cmpi.l  #0x00150000,%d2
+        bne.w   fail
+        move.l  0x00151000,%d7
+        move.l  #0x00020001,page_table+0x540
+        movea.l #0x00150000,%a1
+        bra.w   flush_and_return
+
+capacity_2:
+        cmpi.l  #0x00151000,%d2
+        bne.w   fail
+        move.l  0x00152000,%d7
+        move.l  #0x00020001,page_table+0x544
+        movea.l #0x00151000,%a1
+        bra.w   flush_and_return
+
+capacity_3:
+        cmpi.l  #0x00152000,%d2
+        bne.w   fail
+        move.l  0x00153000,%d7
+        move.l  #0x00020001,page_table+0x548
+        movea.l #0x00152000,%a1
+        bra.w   flush_and_return
+
+capacity_4:
+        cmpi.l  #0x00153000,%d2
+        bne.w   fail
+        move.l  0x00154000,%d7
+        move.l  #0x00020001,page_table+0x54c
+        movea.l #0x00153000,%a1
+        bra.w   flush_and_return
+
+capacity_5:
+        cmpi.l  #0x00154000,%d2
+        bne.w   fail
+        move.l  #0x00020001,page_table+0x550
+        movea.l #0x00154000,%a1
+        bra.w   flush_and_return
 
 flush_and_return:
         /* PFLUSH page, supervisor data FC (#5), then RTE-owned retry. */
