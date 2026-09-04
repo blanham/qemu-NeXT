@@ -11,6 +11,10 @@
 #define NEXT_FB_RANGE         \
     "000000000b000000-000000000b1cb0ff"
 #define TEST_TIMEOUT          (5 * G_USEC_PER_SEC)
+#define NEXT_030_ROM_SHA256   \
+    "bdccecc045c1af09d0962e02e30e737e8571a81ec6a4458be63d57189d79eb92"
+#define NEXT_030_PASS_SHA256  \
+    "9e3c391867f05f3e7a14263ec569c997cd5924cd1ab156f13c813b9e851db3b9"
 
 typedef struct TestROM {
     int fd;
@@ -321,6 +325,68 @@ static void test_missing_firmware(void)
     g_test_trap_assert_passed();
 }
 
+static void test_next_computer_v41_rom(void)
+{
+#ifdef _WIN32
+    g_test_skip("v41 firmware smoke test requires a POSIX shell");
+#else
+    const char *rom_path = g_getenv("QTEST_NEXT_030_ROM");
+    const char *qemu_binary = g_getenv("QTEST_QEMU_BINARY");
+    g_autofree char *rom_data = NULL;
+    g_autofree char *rom_hash = NULL;
+    g_autofree char *screen_data = NULL;
+    g_autofree char *screen_hash = NULL;
+    g_autofree char *screen_path = NULL;
+    g_autofree char *quoted_qemu = NULL;
+    g_autofree char *quoted_rom = NULL;
+    g_autofree char *quoted_screen = NULL;
+    g_autofree char *command = NULL;
+    g_autofree char *stderr_data = NULL;
+    gsize rom_size;
+    gsize screen_size;
+    int wait_status = 0;
+    const char *argv[] = { "/bin/sh", "-c", NULL, NULL };
+
+    if (!rom_path || !rom_path[0]) {
+        g_test_skip("set QTEST_NEXT_030_ROM to run the Rev 1.0 v41 smoke test");
+        return;
+    }
+
+    g_assert_true(g_file_get_contents(rom_path, &rom_data, &rom_size, NULL));
+    rom_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+                                            (const guchar *)rom_data,
+                                            rom_size);
+    g_assert_cmpstr(rom_hash, ==, NEXT_030_ROM_SHA256);
+    g_assert_nonnull(qemu_binary);
+
+    screen_path = g_strdup_printf("%s/next-v41-%u.ppm",
+                                  g_get_tmp_dir(), g_random_int());
+    quoted_qemu = g_shell_quote(qemu_binary);
+    quoted_rom = g_shell_quote(rom_path);
+    quoted_screen = g_shell_quote(screen_path);
+    command = g_strdup_printf(
+        "{ sleep 12; printf 'screendump %%s\\nquit\\n' %s; } | "
+        "%s -M next-computer -cpu m68030 -m 64M -bios %s "
+        "-display none -audio none -no-reboot -monitor stdio "
+        "-icount shift=8,align=on,sleep=on",
+        quoted_screen, quoted_qemu, quoted_rom);
+    argv[2] = command;
+
+    g_assert_true(g_spawn_sync(NULL, (char **)argv, NULL,
+                               G_SPAWN_STDOUT_TO_DEV_NULL,
+                               NULL, NULL, NULL, &stderr_data,
+                               &wait_status, NULL));
+    g_assert_cmpint(wait_status, ==, 0);
+    g_assert_true(g_file_get_contents(screen_path, &screen_data,
+                                      &screen_size, NULL));
+    screen_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+                                               (const guchar *)screen_data,
+                                               screen_size);
+    g_assert_cmpstr(screen_hash, ==, NEXT_030_PASS_SHA256);
+    g_unlink(screen_path);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     static ExpectedSCR1 scr1_tests[] = {
@@ -434,6 +500,8 @@ int main(int argc, char **argv)
                    test_computer_invalid_cpu);
     qtest_add_func("/next-machine/next-cube/missing-firmware",
                    test_missing_firmware);
+    qtest_add_func("/next-machine/next-computer/v41-rom",
+                   test_next_computer_v41_rom);
 
     return g_test_run();
 }

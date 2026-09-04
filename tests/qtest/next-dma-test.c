@@ -505,6 +505,30 @@ static void test_access_contract(void)
     qtest_quit(qts);
 }
 
+static void test_scc_csr_byte_access(void)
+{
+    QTestState *qts = next_dma_start();
+    uint64_t address = channel_address(&channels[5], 0);
+
+    qtest_writel(qts, address,
+                 DMA_SETENABLE | DMA_SETSUPDATE | DMA_READ_CMD | DMA_RESET);
+    g_assert_cmphex(qtest_readl(qts, address) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_READ),
+                    ==, DMA_ENABLE | DMA_SUPDATE | DMA_READ);
+    g_assert_cmphex(qtest_readb(qts, address), ==, 0x07);
+
+    /* The NeXT ROM writes RESET | INITBUF through the SCC CSR byte lane. */
+    qtest_writeb(qts, address, 0x30);
+    g_assert_cmphex(qtest_readl(qts, address) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_READ |
+                     DMA_COMPLETE | DMA_BUSEXC), ==, 0);
+    g_assert_cmphex(qtest_readb(qts, address), ==, 0);
+    qtest_writeb(qts, address, 0);
+    g_assert_cmphex(qtest_readl(qts, address), ==, 0);
+
+    qtest_quit(qts);
+}
+
 static void test_inert_channels(void)
 {
     QTestState *qts = next_dma_start();
@@ -1697,6 +1721,8 @@ int main(int argc, char **argv)
                    test_size_holes);
     qtest_add_func("/next-cube/dma/exactly-32-bit-big-endian",
                    test_access_contract);
+    qtest_add_func("/next-cube/dma/scc-csr-byte-access",
+                   test_scc_csr_byte_access);
     qtest_add_func("/next-cube/dma/inert-never-completes",
                    test_inert_channels);
     qtest_add_func("/next-cube/dma/video-retrace-interrupt",

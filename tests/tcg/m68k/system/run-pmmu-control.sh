@@ -20,6 +20,11 @@ trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
 "${linker}" -T "$srcdir/kernel.ld" -o "$tmpdir/pmmu-control-privilege.elf" \
     "$tmpdir/pmmu-control-privilege.o"
 
+"${assembler}" -m68030 -o "$tmpdir/movec-caar.o" \
+    "$srcdir/movec-caar.S"
+"${linker}" -T "$srcdir/kernel.ld" -o "$tmpdir/movec-caar.elf" \
+    "$tmpdir/movec-caar.o"
+
 timeout 10s "$qemu" \
     -M virt -cpu m68030 -display none -serial none -monitor none \
     -kernel "$tmpdir/pmmu-control.elf"
@@ -27,3 +32,7 @@ timeout 10s "$qemu" \
 timeout 10s "$qemu" \
     -M virt -cpu m68030 -display none -serial none -monitor none \
     -kernel "$tmpdir/pmmu-control-privilege.elf"
+
+timeout 10s "$qemu" \
+    -M virt -cpu m68030 -display none -serial none -monitor none \
+    -kernel "$tmpdir/movec-caar.elf"

@@ -176,6 +176,8 @@ static void m68k_cpu_reset_hold(Object *obj, ResetType type)
     }
     cpu_m68k_set_fpcr(env, 0);
     env->fpsr = 0;
+    /* Hardware reset leaves an external 68882 in its NULL state. */
+    env->fp_state_null = true;
 
     /* TODO: We should set PC from the interrupt vector.  */
     env->pc = 0;
@@ -686,6 +688,25 @@ const VMStateDescription vmstate_68030_mmu = {
     }
 };
 
+static bool cpu_68020_caar_needed(void *opaque)
+{
+    M68kCPU *cpu = opaque;
+
+    return m68k_feature(&cpu->env, M68K_FEATURE_M68020) ||
+           m68k_feature(&cpu->env, M68K_FEATURE_M68030);
+}
+
+const VMStateDescription vmstate_68020_caar = {
+    .name = "cpu/68020_caar",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cpu_68020_caar_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(env.caar, M68kCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool cpu_68040_spregs_needed(void *opaque)
 {
     M68kCPU *s = opaque;
@@ -732,6 +753,7 @@ static const VMStateDescription vmstate_m68k_cpu = {
         &vmmstate_fpu,
         &vmstate_cf_spregs,
         &vmstate_68030_mmu,
+        &vmstate_68020_caar,
         &vmstate_68040_mmu,
         &vmstate_68040_spregs,
         NULL

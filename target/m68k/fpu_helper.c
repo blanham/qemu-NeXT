@@ -370,12 +370,69 @@ static bool valid_fp_state_frame(uint8_t version, unsigned size)
     }
 }
 
+/*
+ * The 68030 uses an external MC68882 for floating-point instructions.  Its
+ * state frame format is not the 68040 format handled above: the initial
+ * production 68882 emits a 60-byte idle frame with a 0x3f38 format word.
+ * Keep this validation separate so a 68040 frame is never accepted on the
+ * external-FPU path (or vice versa).
+ */
+#define M68K_68882_IDLE_FORMAT 0x3f380000
+#define M68K_68882_IDLE_SIZE   60
+
+static unsigned m68882_state_frame_size(uint32_t format)
+{
+    if ((format & 0xffff0000) == 0) {
+        return 4; /* null state; the low reserved word is ignored */
+    }
+    if ((format & 0xffff0000) == M68K_68882_IDLE_FORMAT) {
+        return M68K_68882_IDLE_SIZE;
+    }
+    return 0;
+}
+
+static void fsave_68882(CPUM68KState *env, uint32_t addr, uintptr_t ra,
+                        unsigned *size)
+{
+    unsigned i;
+
+    if (env->fp_state_null) {
+        *size = 4;
+        cpu_stl_be_data_ra(env, addr, 0, ra);
+        return;
+    }
+
+    *size = M68K_68882_IDLE_SIZE;
+    cpu_stl_be_data_ra(env, addr, M68K_68882_IDLE_FORMAT, ra);
+    /*
+     * The remaining idle-frame fields are internal 68882 state.  They are
+     * not visible to the m68k programming model, and a canonical zero image
+     * is sufficient for the current emulated idle state.  Write every word
+     * so the architectural 60-byte transfer and its fault boundaries are
+     * preserved.
+     */
+    for (i = sizeof(uint32_t); i < M68K_68882_IDLE_SIZE; i += sizeof(uint32_t)) {
+        cpu_stl_be_data_ra(env, addr + i, 0, ra);
+    }
+}
+
 uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
 {
     uintptr_t ra = GETPC();
-    unsigned size = env->fp_state_null ? 4 :
-                    env->fp_state_size ? env->fp_state_size : 4;
+    unsigned size;
     unsigned i;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        size = env->fp_state_null ? 4 : M68K_68882_IDLE_SIZE;
+        if (mode == 4) {
+            addr -= size;
+        }
+        fsave_68882(env, addr, ra, &size);
+        goto done;
+    }
+
+    size = env->fp_state_null ? 4 :
+           env->fp_state_size ? env->fp_state_size : 4;
 
     if (mode == 4) {
         addr -= size;
@@ -391,6 +448,7 @@ uint32_t HELPER(fsave)(CPUM68KState *env, uint32_t addr, uint32_t mode)
         cpu_stl_be_data_ra(env, addr, 0x41000000, ra);
     }
 
+done:
     /* FSAVE leaves the floating-point unit in the idle state. */
     env->fp_state_null = false;
     env->fp_state_size = 0;
@@ -404,10 +462,48 @@ uint32_t HELPER(frestore)(CPUM68KState *env, uint32_t addr)
 {
     uintptr_t ra = GETPC();
     CPUState *cs = env_cpu(env);
-    uint8_t version = cpu_ldub_data_ra(env, addr, ra);
-    unsigned size = version == 0 ? 4 :
-                    cpu_ldub_data_ra(env, addr + 1, ra) + 4;
+    uint8_t version;
+    unsigned size;
     unsigned i;
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        uint32_t format = cpu_ldl_be_data_ra(env, addr, ra);
+
+        size = m68882_state_frame_size(format);
+        if (!size) {
+            cs->exception_index = EXCP_FORMAT;
+            cpu_loop_exit_restore(cs, ra);
+        }
+
+        if (size == 4) {
+            floatx80 nan = floatx80_default_nan(&env->fp_status);
+
+            for (i = 0; i < ARRAY_SIZE(env->fregs); i++) {
+                env->fregs[i].d = nan;
+            }
+            cpu_m68k_set_fpcr(env, 0);
+            env->fpsr = 0;
+            env->fpiar = 0;
+            env->fp_pending_vector = 0;
+            env->fp_pending_pc = 0;
+            set_float_exception_flags(0, &env->fp_status);
+            memset(env->fp_state, 0, sizeof(env->fp_state));
+            env->fp_state_size = 0;
+            env->fp_state_null = true;
+        } else {
+            stl_be_p(env->fp_state, format);
+            for (i = sizeof(uint32_t); i < size; i++) {
+                env->fp_state[i] = cpu_ldub_data_ra(env, addr + i, ra);
+            }
+            env->fp_state_size = size;
+            env->fp_state_null = false;
+        }
+        return size;
+    }
+
+    version = cpu_ldub_data_ra(env, addr, ra);
+    size = version == 0 ? 4 :
+           cpu_ldub_data_ra(env, addr + 1, ra) + 4;
 
     if (!valid_fp_state_frame(version, size)) {
         cs->exception_index = EXCP_FORMAT;

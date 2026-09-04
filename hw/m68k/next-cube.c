@@ -211,6 +211,9 @@ typedef struct NeXTBoardProfile {
     NeXTDiskMuxKind disk_mux_kind;
     bool has_nextbus;
     bool has_optical_formatter;
+    bool mb8795_wide_station_access;
+    bool serial_clock_wide_access;
+    NextRTCChip default_rtc_chip;
 } NeXTBoardProfile;
 
 typedef struct NeXTMachineClass {
@@ -234,6 +237,7 @@ struct NeXTState {
     NextMB8795State *mb8795;
     char *nvram_file;
     NextRTCChip rtc_chip;
+    bool rtc_chip_user_set;
     bool rtc_chip_locked;
 };
 
@@ -263,6 +267,8 @@ static const NeXTBoardProfile next_cube_profile = {
     .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
     .has_nextbus = true,
     .has_optical_formatter = true,
+    .mb8795_wide_station_access = false,
+    .default_rtc_chip = NEXT_RTC_CHIP_MCS1850,
 };
 
 static const NeXTBoardProfile next_station_profile = {
@@ -280,6 +286,8 @@ static const NeXTBoardProfile next_station_profile = {
     .video_kind = NEXT_VIDEO_MONO,
     .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
     .has_nextbus = false,
+    .mb8795_wide_station_access = false,
+    .default_rtc_chip = NEXT_RTC_CHIP_MCS1850,
 };
 
 static const NeXTBoardProfile next_station_color_profile = {
@@ -297,6 +305,8 @@ static const NeXTBoardProfile next_station_color_profile = {
     .video_kind = NEXT_VIDEO_COLOR,
     .disk_mux_kind = NEXT_DISK_MUX_FLPCTL,
     .has_nextbus = false,
+    .mb8795_wide_station_access = false,
+    .default_rtc_chip = NEXT_RTC_CHIP_MCS1850,
 };
 
 static const NeXTBoardProfile next_computer_profile = {
@@ -315,6 +325,9 @@ static const NeXTBoardProfile next_computer_profile = {
     .disk_mux_kind = NEXT_DISK_MUX_CUBE_OD,
     .has_nextbus = true,
     .has_optical_formatter = true,
+    .mb8795_wide_station_access = true,
+    .serial_clock_wide_access = true,
+    .default_rtc_chip = NEXT_RTC_CHIP_MC68HC68T1,
 };
 
 static uint32_t next_profile_scr1(const NeXTBoardProfile *profile)
@@ -1411,6 +1424,10 @@ static void next_machine_init(MachineState *machine)
     DeviceState *sound_dev;
     int channel;
 
+    if (!m->rtc_chip_user_set) {
+        m->rtc_chip = profile->default_rtc_chip;
+    }
+
     if (machine->ram_size > profile->maximum_ram_size) {
         error_report("%s supports at most %" PRIu64 " MiB of RAM",
                      profile->product_name,
@@ -1503,6 +1520,8 @@ static void next_machine_init(MachineState *machine)
                              &error_abort);
     qdev_prop_set_chr(serial_dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(serial_dev, "chrB", serial_hd(1));
+    qdev_prop_set_bit(serial_dev, "wide-clock-access",
+                      profile->serial_clock_wide_access);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(serial_dev), &error_fatal);
     sysbus_mmio_map(
         SYS_BUS_DEVICE(serial_dev), 0,
@@ -1530,6 +1549,8 @@ static void next_machine_init(MachineState *machine)
     object_property_add_child(OBJECT(machine), "mb8795", OBJECT(mbdev));
     object_property_set_link(OBJECT(mbdev), "dma",
                              OBJECT(m->dma), &error_abort);
+    qdev_prop_set_bit(mbdev, "wide-station-access",
+                      profile->mb8795_wide_station_access);
     qemu_configure_nic_device(mbdev, true, NULL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(mbdev), &error_fatal);
     sysbus_mmio_map(
@@ -1710,6 +1731,7 @@ static void next_machine_set_rtc_chip(Object *obj, int value, Error **errp)
         return;
     }
     s->rtc_chip = value;
+    s->rtc_chip_user_set = true;
 }
 
 static void next_machine_finalize(Object *obj)
@@ -1721,18 +1743,15 @@ static void next_machine_finalize(Object *obj)
 
 static void next_machine_class_init(ObjectClass *oc, const void *data)
 {
-    ObjectProperty *prop;
-
     object_class_property_add_str(oc, "nvram-file",
                                   next_machine_get_nvram_file,
                                   next_machine_set_nvram_file);
     object_class_property_set_description(
         oc, "nvram-file", "Path to the persistent 32-byte NeXT NVRAM image");
-    prop = object_class_property_add_enum(oc, "rtc-chip", "NextRTCChip",
-                                          &next_machine_rtc_chip_lookup,
-                                          next_machine_get_rtc_chip,
-                                          next_machine_set_rtc_chip);
-    object_property_set_default_str(prop, "mcs1850");
+    object_class_property_add_enum(oc, "rtc-chip", "NextRTCChip",
+                                   &next_machine_rtc_chip_lookup,
+                                   next_machine_get_rtc_chip,
+                                   next_machine_set_rtc_chip);
     object_class_property_set_description(
         oc, "rtc-chip", "NeXT RTC chip model (mcs1850 or mc68hc68t1)");
 }

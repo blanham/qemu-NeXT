@@ -42,7 +42,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 
-#define NEXT_SERIAL_MMIO_SIZE 5
+#define NEXT_SERIAL_MMIO_SIZE 8
 #define NEXT_SERIAL_PCLK_HZ   3684000
 #define NEXT_SERIAL_RTXC_HZ   4000000
 
@@ -59,8 +59,10 @@ struct NextSerialState {
     NextDMAState *dma;
     MemoryRegion mmio;
     MemoryRegion clock_mem;
+    MemoryRegion clock_wide_mem;
     qemu_irq irq;
     bool irq_level[2];
+    bool wide_clock_access;
     uint8_t clock_select;
 };
 
@@ -168,6 +170,29 @@ static const MemoryRegionOps next_serial_clock_ops = {
     },
 };
 
+static bool next_serial_clock_wide_access_valid(void *opaque, hwaddr addr,
+                                                unsigned int size,
+                                                bool is_write,
+                                                MemTxAttrs attrs)
+{
+    return size == 1 || size == 4;
+}
+
+static const MemoryRegionOps next_serial_clock_wide_ops = {
+    .read = next_serial_clock_read,
+    .write = next_serial_clock_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+        .accepts = next_serial_clock_wide_access_valid,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static void next_serial_reset(DeviceState *dev)
 {
     NextSerialState *s = NEXT_SERIAL(dev);
@@ -224,6 +249,10 @@ static void next_serial_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    memory_region_add_subregion(&s->mmio, 4,
+                                s->wide_clock_access ?
+                                &s->clock_wide_mem : &s->clock_mem);
+
     next_dma_set_scc_ops(s->dma, &next_serial_dma_ops, s);
     for (channel = 0; channel < 2; channel++) {
         qdev_connect_gpio_out_named(
@@ -270,7 +299,9 @@ static void next_serial_init(Object *obj)
                        NEXT_SERIAL_MMIO_SIZE);
     memory_region_init_io(&s->clock_mem, obj, &next_serial_clock_ops, s,
                           "next.serial-clock", 1);
-    memory_region_add_subregion(&s->mmio, 4, &s->clock_mem);
+    memory_region_init_io(&s->clock_wide_mem, obj,
+                          &next_serial_clock_wide_ops, s,
+                          "next.serial-clock-wide", 4);
     sysbus_init_mmio(sbd, &s->mmio);
 
     qdev_init_gpio_in(DEVICE(obj), next_serial_set_irq, 2);
@@ -282,6 +313,8 @@ static void next_serial_init(Object *obj)
 static const Property next_serial_properties[] = {
     DEFINE_PROP_LINK("dma", NextSerialState, dma,
                      TYPE_NEXT_DMA, NextDMAState *),
+    DEFINE_PROP_BOOL("wide-clock-access", NextSerialState,
+                     wide_clock_access, false),
 };
 
 static void next_serial_class_init(ObjectClass *klass, const void *data)

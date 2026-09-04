@@ -34,6 +34,7 @@
 #include "libqtest.h"
 
 #define NEXT_MB8795_BASE 0x02106000
+#define NEXT_COMPUTER_MB8795_BASE 0x02006000
 #define NEXT_DMA_BASE    0x02000000
 #define NEXT_ENTX_CSR    (NEXT_DMA_BASE + 0x0110)
 #define NEXT_ENTX_SAVED_NEXT  (NEXT_ENTX_CSR + 0x3ff0)
@@ -94,6 +95,7 @@ enum {
 #define EN_TXSTAT_UNDERFLOW 0x08
 #define EN_TXMASK_TXRXIE    0x20
 #define EN_TXMODE_NO_LBC    0x02
+#define EN_RXMODE_RESETENABLE 0x04
 #define EN_RXSTAT_OK        0x80
 #define EN_RXSTAT_OVERFLOW  0x01
 #define EN_RESET_MODE       0x80
@@ -174,7 +176,8 @@ static void cleanup_test_rom(void *opaque)
     g_free(rom);
 }
 
-static QTestState *next_mb8795_start_with_args(const char *extra_args)
+static QTestState *next_mb8795_start_machine_with_args(const char *machine,
+                                                       const char *extra_args)
 {
     TestROM *rom = g_new0(TestROM, 1);
     g_autofree char *quoted_rom_path = NULL;
@@ -191,8 +194,14 @@ static QTestState *next_mb8795_start_with_args(const char *extra_args)
     rom->fd = -1;
 
     quoted_rom_path = g_shell_quote(rom->path);
-    return qtest_initf("-machine next-cube -bios %s %s",
+    return qtest_initf("-machine %s -bios %s %s",
+                       machine,
                        quoted_rom_path, extra_args ?: "");
+}
+
+static QTestState *next_mb8795_start_with_args(const char *extra_args)
+{
+    return next_mb8795_start_machine_with_args("next-cube", extra_args);
 }
 
 static QTestState *next_mb8795_start(void)
@@ -304,10 +313,16 @@ static void rx_program(QTestState *qts, uint32_t first_start,
                  DMA_SETENABLE | (chain ? DMA_SETSUPDATE : 0));
 }
 
+static void rx_prepare_controller_at(QTestState *qts, uint32_t base,
+                                     uint8_t mode)
+{
+    qtest_writeb(qts, base + EN_RESET, 0);
+    qtest_writeb(qts, base + EN_RXMODE, mode);
+}
+
 static void rx_prepare_controller(QTestState *qts, uint8_t mode)
 {
-    qtest_writeb(qts, NEXT_MB8795_BASE + EN_RESET, 0);
-    qtest_writeb(qts, NEXT_MB8795_BASE + EN_RXMODE, mode);
+    rx_prepare_controller_at(qts, NEXT_MB8795_BASE, mode);
 }
 
 static RxPointers rx_read_pointers(QTestState *qts)
@@ -376,12 +391,17 @@ static void tx_assert_pointers_equal(const TxPointers *actual,
     g_assert_cmphex(actual->next_init, ==, expected->next_init);
 }
 
+static void tx_prepare_controller_at(QTestState *qts, uint32_t base)
+{
+    qtest_writeb(qts, base + EN_RESET, 0);
+    qtest_writeb(qts, base + EN_TXMODE, EN_TXMODE_NO_LBC);
+    qtest_writeb(qts, base + EN_TXSTAT, EN_TXSTAT_READY);
+    g_assert_cmphex(qtest_readb(qts, base + EN_TXSTAT), ==, 0);
+}
+
 static void tx_prepare_controller(QTestState *qts)
 {
-    qtest_writeb(qts, NEXT_MB8795_BASE + EN_RESET, 0);
-    qtest_writeb(qts, NEXT_MB8795_BASE + EN_TXMODE, EN_TXMODE_NO_LBC);
-    qtest_writeb(qts, NEXT_MB8795_BASE + EN_TXSTAT, EN_TXSTAT_READY);
-    g_assert_cmphex(qtest_readb(qts, NEXT_MB8795_BASE + EN_TXSTAT), ==, 0);
+    tx_prepare_controller_at(qts, NEXT_MB8795_BASE);
 }
 #endif
 
@@ -547,9 +567,34 @@ static void test_station_address(void)
     qtest_quit(qts);
 }
 
+static void test_computer_station_address_wide(void)
+{
+    static const uint8_t programmed[6] = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+    };
+    QTestState *qts = next_mb8795_start_machine_with_args(
+        "next-computer", NULL);
+    size_t i;
+
+    qtest_writel(qts, NEXT_COMPUTER_MB8795_BASE + EN_ADDR,
+                 0x00112233);
+    qtest_writew(qts, NEXT_COMPUTER_MB8795_BASE + EN_ADDR + 4,
+                 0x4455);
+    for (i = 0; i < ARRAY_SIZE(programmed); i++) {
+        g_assert_cmphex(qtest_readb(qts,
+                                    NEXT_COMPUTER_MB8795_BASE + EN_ADDR + i),
+                        ==, programmed[i]);
+    }
+
+    qtest_quit(qts);
+}
+
 static void test_access_widths(void)
 {
     static const uint64_t holes[] = { 0x07, 0x0e, 0x0f };
+    static const uint8_t station[6] = {
+        0x52, 0x54, 0x00, 0x12, 0x34, 0x56,
+    };
     QTestState *qts = next_mb8795_start();
     size_t i;
 
@@ -573,6 +618,15 @@ static void test_access_widths(void)
     for (i = 0; i < ARRAY_SIZE(holes); i++) {
         en_writeb(qts, holes[i], 0xff);
         g_assert_cmphex(en_readb(qts, holes[i]), ==, 0);
+    }
+
+    for (i = 0; i < ARRAY_SIZE(station); i++) {
+        en_writeb(qts, EN_ADDR + i, station[i]);
+    }
+    qtest_writel(qts, NEXT_MB8795_BASE + EN_ADDR, 0xaabbccdd);
+    qtest_writew(qts, NEXT_MB8795_BASE + EN_ADDR + 4, 0xeeff);
+    for (i = 0; i < ARRAY_SIZE(station); i++) {
+        g_assert_cmphex(en_readb(qts, EN_ADDR + i), ==, station[i]);
     }
 
     qtest_quit(qts);
@@ -740,7 +794,7 @@ static void test_tx_single_buffer(void)
     tx_harness_stop(&harness);
 }
 
-static void test_tx_internal_loopback(void)
+static void tx_internal_loopback(uint8_t rx_mode)
 {
     TxHarness harness = tx_harness_start();
     QTestState *qts = harness.qts;
@@ -757,7 +811,7 @@ static void test_tx_internal_loopback(void)
     for (i = 0; i < 6; i++) {
         en_writeb(qts, EN_ADDR + i, rx_frame[i]);
     }
-    rx_prepare_controller(qts, 1);
+    rx_prepare_controller(qts, rx_mode);
     rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0,
                false);
     tx_prepare_controller(qts);
@@ -797,6 +851,60 @@ static void test_tx_internal_loopback(void)
     g_assert_cmphex(controller_irqs(qts), ==, 0);
 
     tx_harness_stop(&harness);
+}
+
+static void test_tx_internal_loopback(void)
+{
+    tx_internal_loopback(1);
+}
+
+static void test_computer_tx_internal_loopback_reset_enable(void)
+{
+    enum { FRAME_LENGTH = 1500 };
+    const uint32_t mb_base = NEXT_COMPUTER_MB8795_BASE;
+    QTestState *qts = next_mb8795_start_machine_with_args(
+        "next-computer", NULL);
+    g_autofree uint8_t *frame = g_malloc0(FRAME_LENGTH);
+    g_autofree uint8_t *received = g_malloc0(FRAME_LENGTH + sizeof(rx_fcs));
+    size_t i;
+
+    /* This is the 1500-byte broadcast loopback packet used by v41. */
+    memset(frame, 0xff, 6);
+    memcpy(frame + 6, "RST-030", 7);
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    for (i = 14; i < FRAME_LENGTH; i++) {
+        frame[i] = i;
+    }
+    memset(received, 0xa5, FRAME_LENGTH + sizeof(rx_fcs));
+    qtest_memwrite(qts, NEXT_TX_BUFFER, frame, FRAME_LENGTH);
+    qtest_memwrite(qts, NEXT_RX_BUFFER, received,
+                   FRAME_LENGTH + sizeof(rx_fcs));
+    qtest_writel(qts, NEXT_ENTX_NEXT, NEXT_TX_BUFFER);
+    qtest_writel(qts, NEXT_ENTX_LIMIT,
+                 ENTX_EOP | (NEXT_TX_BUFFER + FRAME_LENGTH + ENTX_END_BIAS));
+
+    rx_prepare_controller_at(qts, mb_base, EN_RXMODE_RESETENABLE | 2);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0, false);
+    tx_prepare_controller_at(qts, mb_base);
+    qtest_writeb(qts, mb_base + EN_TXMASK, EN_TXMASK_TXRXIE);
+    qtest_writeb(qts, mb_base + EN_TXMODE, 0);
+
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
+    qtest_clock_step(qts, 1);
+    qtest_memread(qts, NEXT_RX_BUFFER, received,
+                  FRAME_LENGTH + sizeof(rx_fcs));
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+    g_assert_cmpmem(received, FRAME_LENGTH, frame, FRAME_LENGTH);
+    g_assert_cmphex(qtest_readb(qts, mb_base + EN_RXSTAT), ==,
+                    EN_RXSTAT_OK);
+    g_assert_cmphex(qtest_readb(qts, mb_base + EN_TXSTAT), ==,
+                    EN_TXSTAT_READY | EN_TXSTAT_TXRECV);
+
+    qtest_quit(qts);
 }
 
 static void tx_internal_loopback_failure(uint8_t rx_mode,
@@ -1280,7 +1388,7 @@ static void test_rx_filter_modes(void)
     rx_filter_case(2, other_unicast, station, false);
     rx_filter_case(3, other_unicast, station, true);
     rx_filter_case(0x83, station_unicast, station, false);
-    rx_filter_case(0x07, station_unicast, station, false);
+    rx_filter_case(0x07, station_unicast, station, true);
 }
 
 static void test_rx_addrsize(void)
@@ -1709,6 +1817,8 @@ int main(int argc, char **argv)
                    test_register_reset);
     qtest_add_func("/next-cube/mb8795/station-address",
                    test_station_address);
+    qtest_add_func("/next-computer/mb8795/station-address-wide",
+                   test_computer_station_address_wide);
     qtest_add_func("/next-cube/mb8795/access-widths",
                    test_access_widths);
     qtest_add_func("/next-cube/mb8795/status-w1c",
@@ -1724,6 +1834,8 @@ int main(int argc, char **argv)
                    test_tx_single_buffer);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback",
                    test_tx_internal_loopback);
+    qtest_add_func("/next-computer/mb8795/tx-internal-loopback-reset-enable",
+                   test_computer_tx_internal_loopback_reset_enable);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback-filtered",
                    test_tx_internal_loopback_filtered);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback-rx-failure",
@@ -1758,6 +1870,8 @@ int main(int argc, char **argv)
     qtest_add_func("/next-cube/mb8795/tx-single-buffer",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback",
+                   test_tx_transport_unavailable);
+    qtest_add_func("/next-computer/mb8795/tx-internal-loopback-reset-enable",
                    test_tx_transport_unavailable);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback-filtered",
                    test_tx_transport_unavailable);

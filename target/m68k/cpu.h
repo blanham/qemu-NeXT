@@ -153,6 +153,7 @@ typedef struct CPUArchState {
     uint32_t mbar;
     uint32_t rambar0;
     uint32_t cacr;
+    uint32_t caar;
     uint32_t sfc;
     uint32_t dfc;
 
