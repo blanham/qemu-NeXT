@@ -122,6 +122,11 @@ static const uint8_t read_10_cd_sector_1[10] = {
 static void issue_inquiry_dma(QTestState *qts, uint8_t target,
                               uint8_t length);
 
+static uint8_t next_cube_cd_byte(size_t sector, size_t offset)
+{
+    return ((offset ^ 0xa5) + sector) & 0xff;
+}
+
 static void cleanup_test_rom(void *opaque)
 {
     TestROM *rom = opaque;
@@ -302,8 +307,11 @@ static QTestState *next_cube_scsi_media_start(TestMedia *media)
     media->disk_fd = -1;
 
     for (i = 0; i < sizeof(cd); i++) {
-        cd[i] = (i ^ 0xa5) & 0xff;
+        cd[i] = next_cube_cd_byte(i / NEXT_CD_SECTOR_SIZE,
+                                  i % NEXT_CD_SECTOR_SIZE);
     }
+    g_assert_cmpint(memcmp(&cd[0], &cd[NEXT_CD_SECTOR_SIZE],
+                           NEXT_CD_SECTOR_SIZE), !=, 0);
     media->cd_fd = g_file_open_tmp("next-cube-scsi-cd-XXXXXX",
                                    &media->cd_path, NULL);
     g_assert_cmpint(media->cd_fd, >=, 0);
@@ -1153,8 +1161,7 @@ static void test_scsi_cd_read_10(void)
     read_cd_sector_1_dma(qts);
     qtest_memread(qts, NEXT_DMA_BUFFER, sector, sizeof(sector));
     for (i = 0; i < sizeof(sector); i++) {
-        g_assert_cmphex(sector[i], ==,
-                        ((NEXT_CD_SECTOR_SIZE + i) ^ 0xa5) & 0xff);
+        g_assert_cmphex(sector[i], ==, next_cube_cd_byte(1, i));
     }
 
     qtest_quit(qts);
@@ -1223,11 +1230,9 @@ static void test_scsi_cd_read_10_chain(void)
     qtest_memread(qts, NEXT_DMA_BUFFER, first, sizeof(first));
     qtest_memread(qts, NEXT_DMA_BUFFER2, second, sizeof(second));
     for (i = 0; i < SEGMENT_LENGTH; i++) {
-        g_assert_cmphex(first[i], ==,
-                        ((NEXT_CD_SECTOR_SIZE + i) ^ 0xa5) & 0xff);
+        g_assert_cmphex(first[i], ==, next_cube_cd_byte(1, i));
         g_assert_cmphex(second[i], ==,
-                        ((NEXT_CD_SECTOR_SIZE + SEGMENT_LENGTH + i) ^
-                         0xa5) & 0xff);
+                        next_cube_cd_byte(1, SEGMENT_LENGTH + i));
     }
 
     qtest_quit(qts);
@@ -1299,8 +1304,7 @@ static void test_scsi_cd_reset_after_staged_inquiry(void)
     reset_after_staged_cd_inquiry_then_read(qts);
     qtest_memread(qts, NEXT_DMA_BUFFER2, sector, sizeof(sector));
     for (i = 0; i < sizeof(sector); i++) {
-        g_assert_cmphex(sector[i], ==,
-                        ((NEXT_CD_SECTOR_SIZE + i) ^ 0xa5) & 0xff);
+        g_assert_cmphex(sector[i], ==, next_cube_cd_byte(1, i));
     }
 
     qtest_quit(qts);
