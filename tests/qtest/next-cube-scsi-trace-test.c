@@ -28,6 +28,9 @@
 #define ESP_CMD_ICCS 0x11
 #define ESP_CMD_MSGACC 0x12
 
+#define SCSI_CSR_DATA_OUT 0xf0
+#define SCSI_CSR_DATA_IN  0xf8
+
 #define DMA_SETENABLE 0x00010000
 #define DMA_DEV2M     0x00040000
 #define DMA_RESET     0x00100000
@@ -151,7 +154,8 @@ static uint8_t submit_cdb(QTestState *qts, const uint8_t cdb[6])
 }
 
 static void issue_dma_cdb(QTestState *qts, const uint8_t *cdb,
-                          size_t cdb_len, uint32_t transfer_len)
+                          size_t cdb_len, uint32_t transfer_len,
+                          uint8_t scsi_csr)
 {
     size_t i;
 
@@ -165,6 +169,8 @@ static void issue_dma_cdb(QTestState *qts, const uint8_t *cdb,
     qtest_writeb(qts, NEXT_ESP_TCLO, transfer_len);
     qtest_writeb(qts, NEXT_ESP_TCMID, transfer_len >> 8);
     qtest_writeb(qts, NEXT_ESP_TCHI, transfer_len >> 16);
+    qtest_writeb(qts, NEXT_SCSI_CSR1, scsi_csr);
+    g_assert_cmphex(qtest_readb(qts, NEXT_SCSI_CSR1), ==, scsi_csr);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 }
 
@@ -225,7 +231,7 @@ static void run_completion_commands(const char *rom_path,
     qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
     qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 64);
     qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
-    issue_dma_cdb(qts, inquiry, sizeof(inquiry), 64);
+    issue_dma_cdb(qts, inquiry, sizeof(inquiry), 64, SCSI_CSR_DATA_IN);
     finish_dma_cdb(qts);
 
     qtest_memset(qts, NEXT_DMA_BUFFER, 0, 512);
@@ -233,7 +239,7 @@ static void run_completion_commands(const char *rom_path,
     qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
     qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 512);
     qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE);
-    issue_dma_cdb(qts, write_10, sizeof(write_10), 512);
+    issue_dma_cdb(qts, write_10, sizeof(write_10), 512, SCSI_CSR_DATA_OUT);
     finish_dma_cdb(qts);
 
     qtest_quit(qts);
