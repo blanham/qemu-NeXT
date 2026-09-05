@@ -315,7 +315,6 @@ if have_system
       meson.project_source_root() / 'system/ioport.c',
       meson.project_source_root() / 'system/runstate.c',
       meson.project_source_root() / 'system/bootdevice.c',
-      meson.project_build_root() / 'trace/trace-hw_scsi.c',
       qom,
       hwcore,
       migration,
