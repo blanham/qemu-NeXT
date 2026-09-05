@@ -334,7 +334,7 @@ static int esp_select(ESPState *s)
 static void esp_do_dma(ESPState *s);
 static void esp_do_nodma(ESPState *s);
 
-static void do_command_phase(ESPState *s)
+static void do_command_phase(ESPState *s, bool legacy_lun)
 {
     uint32_t cmdlen;
     int32_t datalen;
@@ -347,6 +347,10 @@ static void do_command_phase(ESPState *s)
         return;
     }
     fifo8_pop_buf(&s->cmdfifo, buf, cmdlen);
+
+    if (legacy_lun && cmdlen > 1 && !(buf[0] & 0xe0)) {
+        s->lun = (buf[1] >> 5) & 7;
+    }
 
     current_lun = scsi_device_find(&s->bus, 0, s->current_dev->id, s->lun);
     if (!current_lun) {
@@ -400,9 +404,11 @@ static void do_message_phase(ESPState *s)
 
 static void do_cmd(ESPState *s)
 {
+    bool legacy_lun = s->cmdfifo_cdb_offset == 0;
+
     do_message_phase(s);
     assert(s->cmdfifo_cdb_offset == 0);
-    do_command_phase(s);
+    do_command_phase(s, legacy_lun);
 }
 
 static void handle_satn(ESPState *s)

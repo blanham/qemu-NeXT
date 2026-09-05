@@ -4,6 +4,7 @@
 #include "exec/hwaddr.h"
 #include "libqtest.h"
 #include "qemu/bswap.h"
+#include "scsi/constants.h"
 
 #define NEXT_DSP_BASE      0x02108000
 #define NEXT_DSP_SIZE      8
@@ -1859,6 +1860,25 @@ static void test_scsi_disk_and_cd_inquiry(void)
     cleanup_test_media(media);
 }
 
+static void test_scsi_legacy_cdb_lun_inquiry(void)
+{
+    static const uint8_t legacy_lun_inquiry[6] = {
+        0x12, 4 << 5, 0, 0, 36, 0,
+    };
+    uint8_t inquiry[36];
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xcc, sizeof(inquiry));
+    read_scsi_dma(qts, 3, legacy_lun_inquiry, sizeof(legacy_lun_inquiry),
+                  NEXT_DMA_BUFFER, sizeof(inquiry));
+    qtest_memread(qts, NEXT_DMA_BUFFER, inquiry, sizeof(inquiry));
+    g_assert_cmphex(inquiry[0], ==, TYPE_NO_LUN);
+
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
 static void read_cd_capacity_dma(QTestState *qts)
 {
     read_scsi_dma(qts, 3, read_capacity_10, sizeof(read_capacity_10),
@@ -2528,6 +2548,8 @@ int main(int argc, char **argv)
                    test_scsi_cdrom_command_line);
     qtest_add_func("/next-cube/scsi/disk-and-cd-inquiry",
                    test_scsi_disk_and_cd_inquiry);
+    qtest_add_func("/next-cube/scsi/legacy-cdb-lun-inquiry",
+                   test_scsi_legacy_cdb_lun_inquiry);
     qtest_add_func("/next-cube/scsi/cd-read-capacity",
                    test_scsi_cd_read_capacity);
     qtest_add_func("/next-cube/scsi/cd-read-10",
