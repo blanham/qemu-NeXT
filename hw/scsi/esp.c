@@ -1308,9 +1308,26 @@ uint64_t esp_reg_read(ESPState *s, uint32_t saddr)
 
     switch (saddr) {
     case ESP_FIFO:
+    {
+        bool dma_ti = s->rregs[ESP_CMD] == (CMD_TI | CMD_DMA);
+        uint32_t async_len = s->async_len;
+
+        if (esp_get_phase(s) == STAT_DI && fifo8_is_empty(&s->fifo)) {
+            if (s->ti_size) {
+                esp_do_nodma(s);
+            } else {
+                esp_set_phase(s, STAT_ST);
+            }
+
+            /* PIO consumed one byte from a mixed TI|DMA transfer. */
+            if (dma_ti && async_len != s->async_len && esp_get_tc(s)) {
+                esp_set_tc(s, esp_get_tc(s) - 1);
+            }
+        }
         s->rregs[ESP_FIFO] = esp_fifo_pop(s);
         val = s->rregs[ESP_FIFO];
         break;
+    }
     case ESP_RINTR:
         /*
          * Clear sequence step, interrupt register and all status bits
