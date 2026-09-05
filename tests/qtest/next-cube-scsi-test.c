@@ -1885,6 +1885,50 @@ static void read_cd_capacity_dma(QTestState *qts)
                   NEXT_DMA_BUFFER, 8);
 }
 
+static void test_scsi_no_atn_lun_resets_before_group1(void)
+{
+    static const uint8_t legacy_lun_inquiry[6] = {
+        0x12, 4 << 5, 0, 0, 36, 0,
+    };
+    uint8_t inquiry[36];
+    uint8_t capacity[8];
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    consume_power_on_unit_attention(qts, 3);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xcc, sizeof(inquiry));
+    read_scsi_dma(qts, 3, legacy_lun_inquiry, sizeof(legacy_lun_inquiry),
+                  NEXT_DMA_BUFFER, sizeof(inquiry));
+    qtest_memread(qts, NEXT_DMA_BUFFER, inquiry, sizeof(inquiry));
+    g_assert_cmphex(inquiry[0], ==, TYPE_NO_LUN);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, sizeof(capacity));
+    read_cd_capacity_dma(qts);
+    qtest_memread(qts, NEXT_DMA_BUFFER, capacity, sizeof(capacity));
+    g_assert_cmpmem(capacity, sizeof(capacity), netbsd_cd_capacity,
+                    sizeof(netbsd_cd_capacity));
+
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
+static void test_scsi_identify_lun_overrides_legacy_cdb_lun(void)
+{
+    static const uint8_t conflicting_inquiry[6] = {
+        0x12, 4 << 5, 0, 0, 32, 0,
+    };
+    TestMedia *media = &test_media;
+    QTestState *qts = next_cube_scsi_media_start(media);
+
+    run_netbsd_data_in(qts, 3, conflicting_inquiry,
+                       sizeof(conflicting_inquiry), netbsd_cd_inquiry_prefix,
+                       sizeof(netbsd_cd_inquiry_prefix), false);
+
+    qtest_quit(qts);
+    cleanup_test_media(media);
+}
+
 static void test_scsi_cd_read_capacity(void)
 {
     static const uint8_t test_unit_ready[6] = { 0 };
@@ -2550,6 +2594,10 @@ int main(int argc, char **argv)
                    test_scsi_disk_and_cd_inquiry);
     qtest_add_func("/next-cube/scsi/legacy-cdb-lun-inquiry",
                    test_scsi_legacy_cdb_lun_inquiry);
+    qtest_add_func("/next-cube/scsi/no-atn-lun-resets-before-group1",
+                   test_scsi_no_atn_lun_resets_before_group1);
+    qtest_add_func("/next-cube/scsi/identify-lun-overrides-legacy-cdb-lun",
+                   test_scsi_identify_lun_overrides_legacy_cdb_lun);
     qtest_add_func("/next-cube/scsi/cd-read-capacity",
                    test_scsi_cd_read_capacity);
     qtest_add_func("/next-cube/scsi/cd-read-10",

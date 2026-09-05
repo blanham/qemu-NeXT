@@ -341,7 +341,6 @@ static void do_command_phase(ESPState *s, bool legacy_lun)
     SCSIDevice *current_lun;
     uint8_t buf[ESP_CMDFIFO_SZ];
 
-    trace_esp_do_command_phase(s->lun);
     cmdlen = fifo8_num_used(&s->cmdfifo);
     if (!cmdlen || !s->current_dev) {
         return;
@@ -351,6 +350,7 @@ static void do_command_phase(ESPState *s, bool legacy_lun)
     if (legacy_lun && cmdlen > 1 && !(buf[0] & 0xe0)) {
         s->lun = (buf[1] >> 5) & 7;
     }
+    trace_esp_do_command_phase(s->lun);
 
     current_lun = scsi_device_find(&s->bus, 0, s->current_dev->id, s->lun);
     if (!current_lun) {
@@ -442,6 +442,7 @@ static void handle_s_without_atn(ESPState *s)
         return;
     }
 
+    s->lun = 0;
     esp_set_phase(s, STAT_CD);
     s->cmdfifo_cdb_offset = 0;
 
