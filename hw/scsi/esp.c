@@ -333,6 +333,7 @@ static int esp_select(ESPState *s)
 
 static void esp_do_dma(ESPState *s);
 static void esp_do_nodma(ESPState *s);
+static void handle_ti(ESPState *s);
 
 static void do_command_phase(ESPState *s, bool legacy_lun)
 {
@@ -817,6 +818,38 @@ static void esp_nodma_ti_dataout(ESPState *s)
     esp_raise_irq(s);
 }
 
+static bool esp_nodma_data_in(ESPState *s, bool defer_continue)
+{
+    bool consumed = false;
+
+    if (!s->current_req || s->async_len == 0) {
+        return false;
+    }
+    if (fifo8_is_empty(&s->fifo)) {
+        esp_fifo_push(s, s->async_buf[0]);
+        s->async_buf++;
+        s->async_len--;
+        s->ti_size--;
+        consumed = true;
+    }
+
+    if (s->async_len == 0) {
+        if (!defer_continue) {
+            scsi_req_continue(s->current_req);
+        }
+        return consumed;
+    }
+
+    /* If preloading the FIFO, defer until TI command is issued */
+    if (s->rregs[ESP_CMD] != CMD_TI) {
+        return consumed;
+    }
+
+    s->rregs[ESP_RINTR] |= INTR_BS;
+    esp_raise_irq(s);
+    return consumed;
+}
+
 static void esp_do_nodma(ESPState *s)
 {
     uint8_t buf[ESP_FIFO_SZ];
@@ -946,25 +979,7 @@ static void esp_do_nodma(ESPState *s)
             /* Defer until data is available.  */
             return;
         }
-        if (fifo8_is_empty(&s->fifo)) {
-            esp_fifo_push(s, s->async_buf[0]);
-            s->async_buf++;
-            s->async_len--;
-            s->ti_size--;
-        }
-
-        if (s->async_len == 0) {
-            scsi_req_continue(s->current_req);
-            return;
-        }
-
-        /* If preloading the FIFO, defer until TI command issued */
-        if (s->rregs[ESP_CMD] != CMD_TI) {
-            return;
-        }
-
-        s->rregs[ESP_RINTR] |= INTR_BS;
-        esp_raise_irq(s);
+        esp_nodma_data_in(s, false);
         break;
 
     case STAT_ST:
@@ -1115,8 +1130,11 @@ void esp_transfer_data(SCSIRequest *req, uint32_t len)
     if (s->rregs[ESP_CMD] == (CMD_TI | CMD_DMA)) {
         /* When the SCSI layer returns more data, raise deferred INTR_BS */
         esp_dma_ti_check(s);
-
-        esp_do_dma(s);
+        if (s->dma && !s->dma_enabled) {
+            s->dma_cb = handle_ti;
+        } else {
+            esp_do_dma(s);
+        }
     } else if (s->rregs[ESP_CMD] == CMD_TI) {
         esp_do_nodma(s);
     }
@@ -1310,22 +1328,31 @@ uint64_t esp_reg_read(ESPState *s, uint32_t saddr)
     case ESP_FIFO:
     {
         bool dma_ti = s->rregs[ESP_CMD] == (CMD_TI | CMD_DMA);
-        uint32_t async_len = s->async_len;
+        bool consumed = false;
 
         if (esp_get_phase(s) == STAT_DI && fifo8_is_empty(&s->fifo)) {
             if (s->ti_size) {
-                esp_do_nodma(s);
+                if (dma_ti) {
+                    consumed = esp_nodma_data_in(s, true);
+                } else {
+                    esp_do_nodma(s);
+                }
             } else {
                 esp_set_phase(s, STAT_ST);
-            }
-
-            /* PIO consumed one byte from a mixed TI|DMA transfer. */
-            if (dma_ti && async_len != s->async_len && esp_get_tc(s)) {
-                esp_set_tc(s, esp_get_tc(s) - 1);
             }
         }
         s->rregs[ESP_FIFO] = esp_fifo_pop(s);
         val = s->rregs[ESP_FIFO];
+
+        if (dma_ti && consumed) {
+            /* Account for the mixed TI|DMA byte after popping it. */
+            if (esp_get_tc(s)) {
+                esp_set_tc(s, esp_get_tc(s) - 1);
+            }
+            if (s->async_len == 0 && s->current_req) {
+                scsi_req_continue(s->current_req);
+            }
+        }
         break;
     }
     case ESP_RINTR:

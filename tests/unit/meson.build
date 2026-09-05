@@ -305,6 +305,25 @@ if have_system
       io,
       meson.project_source_root() / 'hw/display/bt463.c',
     ],
+    'test-esp': [
+      meson.project_source_root() / 'hw/scsi/esp.c',
+      meson.project_source_root() / 'hw/scsi/scsi-bus.c',
+      meson.project_source_root() / 'hw/core/sysbus.c',
+      meson.project_source_root() / 'hw/core/qdev-fw.c',
+      meson.project_source_root() / 'hw/core/vm-change-state-handler.c',
+      meson.project_source_root() / 'system/memory.c',
+      meson.project_source_root() / 'system/ioport.c',
+      meson.project_source_root() / 'system/runstate.c',
+      meson.project_source_root() / 'system/bootdevice.c',
+      meson.project_build_root() / 'trace/trace-hw_scsi.c',
+      qom,
+      hwcore,
+      migration,
+      block,
+      blockdev,
+      io,
+      pixman,
+    ],
     'test-yank': ['socket-helpers.c', qom, io, chardev],
     'test-ram-discard-manager': [
       'test-ram-discard-manager.c',
@@ -372,6 +391,12 @@ foreach test_name, extra: tests
   if test_name == 'test-slirp-il-integration'
     exe = executable(test_name, src, genh, dependencies: deps,
                      c_args: ['-ffunction-sections'],
+                     link_args: ['-Wl,--gc-sections'])
+  elif test_name == 'test-esp'
+    exe = executable(test_name, src, genh, dependencies: deps,
+                     c_args: ['-DCONFIG_SOFTMMU',
+                              '-DCOMPILING_SYSTEM_VS_USER',
+                              '-ffunction-sections', '-fdata-sections'],
                      link_args: ['-Wl,--gc-sections'])
   else
     exe = executable(test_name, src, genh, dependencies: deps)
