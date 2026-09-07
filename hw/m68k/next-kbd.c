@@ -115,6 +115,7 @@ struct NextKBDState {
     uint8_t command;
     uint32_t monitor_data;
     uint16_t shift;
+    bool right_alt_neutral_pending;
     bool key_down[NEXTKBD_KEY_COUNT];
     bool overrun;
     int64_t mouse_dx;
@@ -378,14 +379,20 @@ static uint16_t nextkbd_modifier_for_key(unsigned key)
         return KD_RSHIFT;
     case KEY_LEFTALT:
         return KD_LALT;
-    case KEY_RIGHTALT:
-        return KD_RALT;
     case KEY_LEFTMETA:
         return KD_LCOMM;
     case KEY_RIGHTMETA:
         return KD_RCOMM;
     default:
         return 0;
+    }
+}
+
+static void nextkbd_flush_right_alt(NextKBDState *s)
+{
+    if (s->right_alt_neutral_pending &&
+        nextkbd_put_packet(s, 0x10000000 | s->shift, true)) {
+        s->right_alt_neutral_pending = false;
     }
 }
 
@@ -398,16 +405,22 @@ static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
     /* The NeXT right Alt key is the Plan 9 compose key. */
     if (evt->key.key == KEY_RIGHTALT) {
         if (evt->key.down) {
-            nextkbd_put_packet(s, 0x10000000 | KD_RALT | s->shift, true);
+            nextkbd_flush_right_alt(s);
+            if (nextkbd_put_packet(s, 0x10000000 | KD_RALT | s->shift,
+                                   true)) {
+                s->right_alt_neutral_pending = true;
+            }
         }
         return;
     }
 
     modifier = nextkbd_modifier_for_key(evt->key.key);
     if (modifier) {
+        /* Duplicate modifier events emit no packet and need no flush. */
         if (!!(s->shift & modifier) == evt->key.down) {
             return;
         }
+        nextkbd_flush_right_alt(s);
         if (evt->key.down) {
             s->shift |= modifier;
         } else {
@@ -436,6 +449,7 @@ static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
         keycode |= 0x80;
     }
 
+    nextkbd_flush_right_alt(s);
     nextkbd_put_packet(s, 0x10000000 | KD_VALID | s->shift | keycode, true);
 }
 
@@ -794,6 +808,7 @@ static void nextkbd_reset(DeviceState *dev)
 
     memset(&nks->queue, 0, sizeof(KBDQueue));
     nks->shift = 0;
+    nks->right_alt_neutral_pending = false;
     memset(nks->key_down, 0, sizeof(nks->key_down));
     nks->overrun = false;
     nks->command = 0;
@@ -902,6 +917,10 @@ static int nextkbd_post_load(void *opaque, int version_id)
 {
     NextKBDState *s = opaque;
 
+    if (version_id < 4) {
+        s->right_alt_neutral_pending = false;
+    }
+
     /* RALT is a one-shot Plan 9 compose packet, not retained state. */
     if (s->queue.rptr < 0 || s->queue.rptr >= KBD_QUEUE_SIZE ||
         s->queue.wptr < 0 || s->queue.wptr >= KBD_QUEUE_SIZE ||
@@ -963,7 +982,7 @@ static int nextkbd_post_load(void *opaque, int version_id)
 
 static const VMStateDescription nextkbd_vmstate = {
     .name = TYPE_NEXTKBD,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .pre_save = nextkbd_pre_save,
     .post_load = nextkbd_post_load,
@@ -976,6 +995,7 @@ static const VMStateDescription nextkbd_vmstate = {
         VMSTATE_UINT8(command, NextKBDState),
         VMSTATE_UINT32(monitor_data, NextKBDState),
         VMSTATE_UINT16(shift, NextKBDState),
+        VMSTATE_BOOL_V(right_alt_neutral_pending, NextKBDState, 4),
         VMSTATE_BOOL_ARRAY_V(key_down, NextKBDState, NEXTKBD_KEY_COUNT, 2),
         VMSTATE_BOOL(overrun, NextKBDState),
         VMSTATE_INT64(mouse_dx, NextKBDState),

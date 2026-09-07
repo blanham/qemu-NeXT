@@ -808,6 +808,8 @@ static void test_alt_modifiers(void)
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_RALT);
     send_key(qts, "a", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
     send_key(qts, "a", false);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
@@ -816,6 +818,28 @@ static void test_alt_modifiers(void)
     send_key(qts, "alt_r", false);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
                     (NEXT_KBD_INT | NEXT_KBD_DAV), ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_netbsd_right_alt_sequence(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_key(qts, "alt_r", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_RALT);
+    send_key(qts, "alt_r", false);
+    send_key(qts, "a", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    send_key(qts, "a", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    assert_mouse_queue_empty(qts);
 
     qtest_quit(qts);
 }
@@ -1464,6 +1488,34 @@ static void test_migrate_held_modifier(void)
     g_assert_cmpint(g_unlink(migration_path), ==, 0);
 }
 
+static void test_migrate_pending_right_alt(void)
+{
+    g_autofree char *migration_path = NULL;
+    QTestState *source = next_cube_kbd_start();
+    QTestState *destination;
+
+    send_key(source, "alt_r", true);
+    send_key(source, "alt_r", false);
+    save_next_kbd_migration(source, &migration_path);
+    destination = load_next_kbd_migration(migration_path, true);
+
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_RALT);
+    send_key(destination, "a", true);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    send_key(destination, "a", false);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    assert_mouse_queue_empty(destination);
+
+    qtest_quit(destination);
+    g_assert_cmpint(g_unlink(migration_path), ==, 0);
+}
+
 static void test_migrate_absolute_pending_timer(void)
 {
     g_autofree char *migration_path = NULL;
@@ -1584,6 +1636,8 @@ int main(int argc, char **argv)
         "/next-cube/kbd/netbsd-modifier-packets-preserve-key-sequence",
         test_netbsd_modifier_packets_preserve_key_sequence);
     qtest_add_func("/next-cube/kbd/alt-modifiers", test_alt_modifiers);
+    qtest_add_func("/next-cube/kbd/netbsd-right-alt-sequence",
+                   test_netbsd_right_alt_sequence);
     qtest_add_func("/next-cube/kbd/control-modifier", test_control_modifier);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
                    test_idle_csr_ctx_clear);
@@ -1637,6 +1691,8 @@ int main(int argc, char **argv)
                    test_migrate_queued_input);
     qtest_add_func("/next-cube/kbd/migrate-held-modifier",
                    test_migrate_held_modifier);
+    qtest_add_func("/next-cube/kbd/migrate-pending-right-alt",
+                   test_migrate_pending_right_alt);
     qtest_add_func("/next-cube/kbd/migrate-absolute-pending-timer",
                    test_migrate_absolute_pending_timer);
     qtest_add_func("/next-cube/kbd/migrate-absolute-deferred-button",
