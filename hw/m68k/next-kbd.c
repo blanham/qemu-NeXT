@@ -66,6 +66,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(NextKBDState, NEXTKBD)
 #define KD_RALT       0x4000
 #define KD_VALID      0x8000 /* only set for scancode keys ? */
 #define KD_MODS       0x4f00
+#define KD_RETAINED_MODS \
+    (KD_CNTL | KD_LSHIFT | KD_RSHIFT | KD_LCOMM | KD_RCOMM | KD_LALT)
 
 #define KBD_QUEUE_SIZE 256
 #define NEXTKBD_KEY_COUNT 128
@@ -392,6 +394,14 @@ static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
 {
     uint16_t modifier;
     int keycode;
+
+    /* The NeXT right Alt key is the Plan 9 compose key. */
+    if (evt->key.key == KEY_RIGHTALT) {
+        if (evt->key.down) {
+            nextkbd_put_packet(s, 0x10000000 | KD_RALT | s->shift, true);
+        }
+        return;
+    }
 
     modifier = nextkbd_modifier_for_key(evt->key.key);
     if (modifier) {
@@ -892,12 +902,13 @@ static int nextkbd_post_load(void *opaque, int version_id)
 {
     NextKBDState *s = opaque;
 
+    /* RALT is a one-shot Plan 9 compose packet, not retained state. */
     if (s->queue.rptr < 0 || s->queue.rptr >= KBD_QUEUE_SIZE ||
         s->queue.wptr < 0 || s->queue.wptr >= KBD_QUEUE_SIZE ||
         s->queue.count < 0 || s->queue.count > KBD_QUEUE_SIZE ||
         (s->queue.rptr + s->queue.count) % KBD_QUEUE_SIZE !=
             s->queue.wptr ||
-        (s->shift & ~(KD_LSHIFT | KD_RSHIFT))) {
+        (s->shift & ~KD_RETAINED_MODS)) {
         return -EINVAL;
     }
 

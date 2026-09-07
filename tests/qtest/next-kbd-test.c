@@ -54,6 +54,7 @@
 #define NEXT_KBD_VALID    0x00008000
 #define NEXT_KBD_CTRL     0x00000100
 #define NEXT_KBD_LSHIFT   0x00000200
+#define NEXT_KBD_LCOMM    0x00000800
 #define NEXT_KBD_LALT     0x00002000
 #define NEXT_KBD_RALT     0x00004000
 #define NEXT_KBD_DEVICE_1 0x10000000
@@ -805,9 +806,14 @@ static void test_alt_modifiers(void)
     send_key(qts, "alt_r", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_RALT);
-    send_key(qts, "alt_r", false);
+    send_key(qts, "a", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
-                    NEXT_KBD_DEVICE_1);
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_A);
+    send_key(qts, "a", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_A);
+    send_key(qts, "alt_r", false);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
                     (NEXT_KBD_INT | NEXT_KBD_DAV), ==, 0);
 
@@ -1414,6 +1420,50 @@ static void test_migrate_queued_input(void)
     g_assert_cmpint(g_unlink(migration_path), ==, 0);
 }
 
+static void test_migrate_held_modifier(void)
+{
+    g_autofree char *migration_path = NULL;
+    QTestState *source = next_cube_kbd_start();
+    QTestState *destination;
+
+    send_key(source, "ctrl", true);
+    send_key(source, "alt", true);
+    send_key(source, "meta_l", true);
+    save_next_kbd_migration(source, &migration_path);
+    destination = load_next_kbd_migration(migration_path, true);
+
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_CTRL);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_CTRL | NEXT_KBD_LALT);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_CTRL | NEXT_KBD_LALT |
+                    NEXT_KBD_LCOMM);
+    send_key(destination, "c", true);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_CTRL | NEXT_KBD_LALT | NEXT_KBD_LCOMM |
+                    NEXT_KEY_C);
+    send_key(destination, "c", false);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_CTRL | NEXT_KBD_LALT | NEXT_KBD_LCOMM |
+                    NEXT_KEY_UP | NEXT_KEY_C);
+    send_key(destination, "meta_l", false);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_CTRL | NEXT_KBD_LALT);
+    send_key(destination, "alt", false);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_CTRL);
+    send_key(destination, "ctrl", false);
+    g_assert_cmphex(qtest_readl(destination, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
+    assert_mouse_queue_empty(destination);
+
+    qtest_quit(destination);
+    g_assert_cmpint(g_unlink(migration_path), ==, 0);
+}
+
 static void test_migrate_absolute_pending_timer(void)
 {
     g_autofree char *migration_path = NULL;
@@ -1585,6 +1635,8 @@ int main(int argc, char **argv)
                    test_absolute_queue_full_retries_motion);
     qtest_add_func("/next-cube/kbd/migrate-queued-input",
                    test_migrate_queued_input);
+    qtest_add_func("/next-cube/kbd/migrate-held-modifier",
+                   test_migrate_held_modifier);
     qtest_add_func("/next-cube/kbd/migrate-absolute-pending-timer",
                    test_migrate_absolute_pending_timer);
     qtest_add_func("/next-cube/kbd/migrate-absolute-deferred-button",
