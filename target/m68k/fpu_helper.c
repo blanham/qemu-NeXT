@@ -964,10 +964,14 @@ void HELPER(fconst)(CPUM68KState *env, FPReg *val, uint32_t offset)
 typedef int (*float_access)(CPUM68KState *env, uint32_t addr, FPReg *fp,
                             uintptr_t ra);
 
+/*
+ * Keep the TCG return address supplied by the public helper.  Taking GETPC()
+ * here would identify this C worker instead of the translated FMOVEM
+ * instruction, so a faulting memory access could not restore guest state.
+ */
 static uint32_t fmovem_predec(CPUM68KState *env, uint32_t addr, uint32_t mask,
-                              float_access access_fn)
+                              float_access access_fn, uintptr_t ra)
 {
-    uintptr_t ra = GETPC();
     int i, size;
 
     for (i = 7; i >= 0; i--, mask <<= 1) {
@@ -983,9 +987,8 @@ static uint32_t fmovem_predec(CPUM68KState *env, uint32_t addr, uint32_t mask,
 }
 
 static uint32_t fmovem_postinc(CPUM68KState *env, uint32_t addr, uint32_t mask,
-                               float_access access_fn)
+                               float_access access_fn, uintptr_t ra)
 {
-    uintptr_t ra = GETPC();
     int i, size;
 
     for (i = 0; i < 8; i++, mask <<= 1) {
@@ -1047,37 +1050,37 @@ static int cpu_st_float64_ra(CPUM68KState *env, uint32_t addr, FPReg *fp,
 uint32_t HELPER(fmovemx_st_predec)(CPUM68KState *env, uint32_t addr,
                                    uint32_t mask)
 {
-    return fmovem_predec(env, addr, mask, cpu_st_floatx80_ra);
+    return fmovem_predec(env, addr, mask, cpu_st_floatx80_ra, GETPC());
 }
 
 uint32_t HELPER(fmovemx_st_postinc)(CPUM68KState *env, uint32_t addr,
                                     uint32_t mask)
 {
-    return fmovem_postinc(env, addr, mask, cpu_st_floatx80_ra);
+    return fmovem_postinc(env, addr, mask, cpu_st_floatx80_ra, GETPC());
 }
 
 uint32_t HELPER(fmovemx_ld_postinc)(CPUM68KState *env, uint32_t addr,
                                     uint32_t mask)
 {
-    return fmovem_postinc(env, addr, mask, cpu_ld_floatx80_ra);
+    return fmovem_postinc(env, addr, mask, cpu_ld_floatx80_ra, GETPC());
 }
 
 uint32_t HELPER(fmovemd_st_predec)(CPUM68KState *env, uint32_t addr,
                                    uint32_t mask)
 {
-    return fmovem_predec(env, addr, mask, cpu_st_float64_ra);
+    return fmovem_predec(env, addr, mask, cpu_st_float64_ra, GETPC());
 }
 
 uint32_t HELPER(fmovemd_st_postinc)(CPUM68KState *env, uint32_t addr,
                                     uint32_t mask)
 {
-    return fmovem_postinc(env, addr, mask, cpu_st_float64_ra);
+    return fmovem_postinc(env, addr, mask, cpu_st_float64_ra, GETPC());
 }
 
 uint32_t HELPER(fmovemd_ld_postinc)(CPUM68KState *env, uint32_t addr,
                                     uint32_t mask)
 {
-    return fmovem_postinc(env, addr, mask, cpu_ld_float64_ra);
+    return fmovem_postinc(env, addr, mask, cpu_ld_float64_ra, GETPC());
 }
 
 static void make_quotient(CPUM68KState *env, int sign, uint32_t quotient)
