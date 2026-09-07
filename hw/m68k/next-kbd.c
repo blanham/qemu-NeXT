@@ -191,11 +191,8 @@ static uint32_t kbd_read_long(void *opaque, hwaddr addr)
         if (q->count > 0) {
             KBDQueueEntry *entry = &q->entries[q->rptr];
 
+            /* Keyboard packets carry the modifier snapshot from enqueue. */
             data = entry->data;
-            if (entry->keyboard) {
-                data &= ~(KD_LSHIFT | KD_RSHIFT);
-                data |= s->shift;
-            }
             if (++q->rptr == KBD_QUEUE_SIZE) {
                 q->rptr = 0;
             }
@@ -367,55 +364,51 @@ static bool nextkbd_put_packet(NextKBDState *s, uint32_t packet,
     return true;
 }
 
+static uint16_t nextkbd_modifier_for_key(unsigned key)
+{
+    switch (key) {
+    case KEY_LEFTCTRL:
+    case KEY_RIGHTCTRL:
+        return KD_CNTL;
+    case KEY_LEFTSHIFT:
+        return KD_LSHIFT;
+    case KEY_RIGHTSHIFT:
+        return KD_RSHIFT;
+    case KEY_LEFTALT:
+        return KD_LALT;
+    case KEY_RIGHTALT:
+        return KD_RALT;
+    case KEY_LEFTMETA:
+        return KD_LCOMM;
+    case KEY_RIGHTMETA:
+        return KD_RCOMM;
+    default:
+        return 0;
+    }
+}
+
+/* NetBSD consumes a modifier transition before decoding any key bits. */
 static void nextkbd_key_event(NextKBDState *s, QemuInputEvent *evt)
 {
+    uint16_t modifier;
     int keycode;
 
-    if (evt->key.key == KEY_LEFTCTRL || evt->key.key == KEY_RIGHTCTRL) {
+    modifier = nextkbd_modifier_for_key(evt->key.key);
+    if (modifier) {
+        if (!!(s->shift & modifier) == evt->key.down) {
+            return;
+        }
         if (evt->key.down) {
-            s->shift |= KD_CNTL;
+            s->shift |= modifier;
         } else {
-            s->shift &= ~KD_CNTL;
+            s->shift &= ~modifier;
         }
-        return;
-    }
-
-    if (evt->key.key == KEY_LEFTALT) {
-        if (evt->key.down) {
-            s->shift |= KD_LALT;
-        } else {
-            s->shift &= ~KD_LALT;
-        }
-        return;
-    }
-
-    /* The NeXT right Alt key is the Plan 9 compose key. */
-    if (evt->key.key == KEY_RIGHTALT) {
-        if (evt->key.down) {
-            nextkbd_put_packet(s, 0x10000000 | KD_RALT | s->shift, true);
-        }
+        nextkbd_put_packet(s, 0x10000000 | s->shift, true);
         return;
     }
 
     if (evt->key.key >= ARRAY_SIZE(linux_to_nextkbd_keycode)) {
         return;
-    }
-
-    /* Shift key currently has no keycode, so handle separately */
-    if (evt->key.key == KEY_LEFTSHIFT) {
-        if (evt->key.down) {
-            s->shift |= KD_LSHIFT;
-        } else {
-            s->shift &= ~KD_LSHIFT;
-        }
-    }
-
-    if (evt->key.key == KEY_RIGHTSHIFT) {
-        if (evt->key.down) {
-            s->shift |= KD_RSHIFT;
-        } else {
-            s->shift &= ~KD_RSHIFT;
-        }
     }
 
     keycode = linux_to_nextkbd_keycode[evt->key.key];

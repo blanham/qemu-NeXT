@@ -62,6 +62,8 @@
 #define NEXT_MOUSE_LEFT_RELEASED  0x00000001
 #define NEXT_KEY_A        0x39
 #define NEXT_KEY_C        0x33
+#define NEXT_KEY_MINUS    0x1d
+#define NEXT_KEY_N        0x37
 #define NEXT_KEY_UP       0x80
 #define NEXT_KEY_LEFT_ARROW  0x09
 #define NEXT_KEY_DOWN_ARROW  0x0f
@@ -727,14 +729,54 @@ static void test_key_dequeue_modifiers(void)
     send_key(qts, "shift", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
-                    NEXT_KBD_LSHIFT | NEXT_KEY_A);
+                    NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_LSHIFT);
 
     send_key(qts, "a", false);
     send_key(qts, "shift", false);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
-                    NEXT_KEY_UP | NEXT_KEY_A);
+                    NEXT_KBD_LSHIFT | NEXT_KEY_UP | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void test_netbsd_modifier_packets_preserve_key_sequence(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    /*
+     * NetBSD consumes a modifier transition before looking at the key bits.
+     * Queue the complete sequence before reading anything so each packet must
+     * retain the modifier state present when it was generated.
+     */
+    send_key(qts, "shift", true);
+    send_key(qts, "minus", true);
+    send_key(qts, "minus", false);
+    send_key(qts, "shift", false);
+    send_key(qts, "n", true);
+    send_key(qts, "n", false);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_LSHIFT);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_LSHIFT | NEXT_KEY_MINUS);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KBD_LSHIFT | NEXT_KEY_UP | NEXT_KEY_MINUS);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_N);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_N);
+    assert_mouse_queue_empty(qts);
 
     qtest_quit(qts);
 }
@@ -743,8 +785,10 @@ static void test_alt_modifiers(void)
 {
     QTestState *qts = next_cube_kbd_start();
 
-    /* Left Alt is a modifier bit on the following key packet. */
+    /* Left Alt has its own modifier transition packet. */
     send_key(qts, "alt", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_LALT);
     send_key(qts, "a", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
@@ -754,12 +798,16 @@ static void test_alt_modifiers(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
                     NEXT_KBD_LALT | NEXT_KEY_UP | NEXT_KEY_A);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
 
     /* NeXT's right Alt is the Plan 9 compose key. */
     send_key(qts, "alt_r", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_RALT);
     send_key(qts, "alt_r", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
                     (NEXT_KBD_INT | NEXT_KBD_DAV), ==, 0);
 
@@ -771,6 +819,8 @@ static void test_control_modifier(void)
     QTestState *qts = next_cube_kbd_start();
 
     send_key(qts, "ctrl", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_CTRL);
     send_key(qts, "c", true);
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
@@ -780,6 +830,8 @@ static void test_control_modifier(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
                     NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
                     NEXT_KBD_CTRL | NEXT_KEY_UP | NEXT_KEY_C);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1);
 
     qtest_quit(qts);
 }
@@ -822,6 +874,8 @@ static void test_mouse_dequeue_modifier_isolation(void)
     send_key(qts, "shift", true);
 
     g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==, 0x11000501);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_LSHIFT);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_INTR_KBD, ==, 0);
 
     qtest_quit(qts);
@@ -1476,6 +1530,9 @@ int main(int argc, char **argv)
                    test_barrier_repeat_is_key_down);
     qtest_add_func("/next-cube/kbd/key-dequeue-modifiers",
                    test_key_dequeue_modifiers);
+    qtest_add_func(
+        "/next-cube/kbd/netbsd-modifier-packets-preserve-key-sequence",
+        test_netbsd_modifier_packets_preserve_key_sequence);
     qtest_add_func("/next-cube/kbd/alt-modifiers", test_alt_modifiers);
     qtest_add_func("/next-cube/kbd/control-modifier", test_control_modifier);
     qtest_add_func("/next-cube/kbd/idle-csr-ctx-clear",
