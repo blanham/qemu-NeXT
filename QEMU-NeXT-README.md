@@ -143,6 +143,64 @@ device. The archived root deliberately has `rc_configured=NO`, so press Return
 at its shell-path and terminal-type prompts to reach `/bin/sh`. The complete
 NFS object contract is in `docs/system/devices/nfs-root.rst`.
 
+## NetBSD 10.1 native SCSI install and local boot
+
+The official RAMDISK from NetBSD 10.1/next68k reaches the rescue root on
+`md0a`. From there the verified CD-only manual install uses the disk at SCSI
+target 0 and CD at target 3. Two subsequent network-independent runs boot
+`bsd() netbsd` from the installed disk and mount the local root on `sd0a`.
+Both boots read the same `/NETBSD_SCSI_INSTALLED` file written during
+installation; the second boot is the persisted install-marker check, not a
+check for a distinct `/NETBSD_SCSI_PERSISTED` file. This is not a sysinst
+claim: the ISO is not firmware-bootable.
+There is no official next68k install floppy. Earlier r2 and r3 runs are
+diagnostic failures, not acceptance evidence.
+
+![NetBSD 10.1 installing and booting locally from NeXT SCSI](docs/boot/netbsd-scsi.gif)
+
+Authenticated result:
+`/home/blanham/projects/NeXT/lab/.worktrees/netbsd-scsi-current-lab/results/netbsd-scsi-current/netbsd-scsi-101-current-9817ee-frame-quantum-normalized.json`<br>
+QEMU commit: `9817eefa75d8dc4e1eb59c0b21dedb135287f958`<br>
+Installed disk SHA-256: `3206adb32525c7eb62653273197e873a44fccad868b85c2d24b1031e33295ff5`<br>
+GIF SHA-256: `9fe9cd975455c6b12fd3cfabf4c3ef33b2218fd1b39782c12c60c72f11c8d361`<br>
+Master lossless FFV1 SHA-256: `ffcd9502510eec06f7e1a7ab271e6782d3c2b5ac623a12afa33ea30951fe2dab`<br>
+Published highlight FFV1 SHA-256: `d2e4cc5c32a2f7a66a083e3bf41ad8b64010ac9f63bde4914c5daa8cb48e7c7a`
+
+The GIF is a bounded, lossless-source highlight of the accepted three-phase
+capture. The untouched master is
+`/mnt/build/netbsd-scsi-20260908-current-9817ee-frame-quantum-normalized-3phase-ffv1.mkv`;
+the published highlight and its milestone-bearing timeline are
+`/mnt/build/netbsd-scsi-20260908-current-9817ee-frame-quantum-normalized-highlight-ffv1.mkv`
+and
+`/mnt/build/netbsd-scsi-20260908-current-9817ee-frame-quantum-normalized-highlight-ffv1.mkv.timeline.json`.
+The timeline records the accepted QMP UTC timestamps and nominal 15-fps
+master-frame selection windows used for device discovery and `md0a`, install
+completion, both ROM-disk loads, both `sd0a` transitions, both local shells,
+and the install-marker check on both boots. Its `master_start_utc` is a derived
+process-start
+anchor: `FFMPEG_START=14222709` mapped through `/proc/stat` `btime` with
+`CLK_TCK=100`, yielding `2026-09-08T12:27:03.090Z` at 10-ms precision. The
+master file's observed filesystem birth was `2026-09-08T12:27:03.927Z`, so the
+frame coordinates are nominal selection windows, not exact event-frame claims.
+The master capture remains the evidence source; the highlight exists only to
+stay within the repository GIF decoder's bounded decoded-frame policy.
+
+Authenticated inputs are ROM
+`1b753890b67095b73e104c939ddf62eca9e7d0aedde5108e3893b0ed9d8000a4`,
+boot `408927b96731f3ecdb4d58c4d042320a24a0c9b84d9e6089c547f517c6babd53`,
+RAMDISK `f04fc2329d2e9282b8e4c434d18b90d69be83322da948964c7cae9be97808aee`,
+symbols `884dd06236a4cf0519b914399547a9084e56dc045f9016b8f36849e8119335e5`,
+and ISO `a0a74335c87dff3d4e2255ea70f9ddf14f02d07cad9f325a06fc080879578089`.
+
+The accepted build metadata is
+`/home/blanham/projects/NeXT/lab/.worktrees/netbsd-scsi-current-lab/results/netbsd-scsi-current/netbsd-scsi-current-build-9817eefa75.json`.
+The lab campaign runner and its read-only verifier are documented in the lab
+README; both use the exact QEMU worktree at commit
+`9817eefa75d8dc4e1eb59c0b21dedb135287f958` and the authenticated input hashes
+above. Their commands are `netbsd_scsi_campaign_cli run` for a fresh
+authenticated campaign and `netbsd_scsi_campaign_cli verify` for read-only
+revalidation of the accepted aggregate.
+
 ## Plan 9
 
 Native Plan 9 First and Second Edition support now boots each release's
