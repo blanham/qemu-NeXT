@@ -1481,6 +1481,102 @@ static void test_scsi_read_dma_late_enable_resumes_pending_ti(void)
     cleanup_test_disk(disk);
 }
 
+static void test_scsi_read_dma_rearm_after_complete_clear(void)
+{
+    static const uint8_t test_unit_ready[6] = { 0 };
+    static const uint8_t read_10[10] = {
+        0x28, 0, 0, 0, 0, 0, 0, 0, 16, 0,
+    };
+    enum {
+        FIRST_SEGMENT_LENGTH = 4096,
+        SHORT_SEGMENT_LENGTH = 8,
+        SECOND_SEGMENT_LENGTH = 4096,
+        TRANSFER_LENGTH = FIRST_SEGMENT_LENGTH + SECOND_SEGMENT_LENGTH,
+    };
+    uint8_t expected[TRANSFER_LENGTH];
+    uint8_t first[FIRST_SEGMENT_LENGTH];
+    uint8_t short_segment[SHORT_SEGMENT_LENGTH];
+    uint8_t second[SECOND_SEGMENT_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    ssize_t bytes;
+    int fd;
+    int i;
+
+    for (i = 0; i < sizeof(expected); i++) {
+        expected[i] = 0x72 ^ (i * 0x2f) ^ (i >> 4);
+    }
+    fd = qemu_open(disk->disk_path, O_WRONLY, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    bytes = pwrite(fd, expected, sizeof(expected), 0);
+    close(fd);
+    g_assert_cmpint(bytes, ==, sizeof(expected));
+
+    g_assert_cmphex(submit_nodata_cdb(qts, 0, test_unit_ready), ==, 0x02);
+    g_assert_cmphex(submit_nodata_cdb(qts, 0, test_unit_ready), ==, 0x00);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, sizeof(first));
+    qtest_memset(qts, NEXT_DMA_BUFFER2, 0xa5, sizeof(short_segment));
+    qtest_memset(qts, NEXT_DMA_BUFFER3, 0xa5, sizeof(second));
+    qtest_writel(qts, NEXT_INTR_MASK, NEXT_SCSI_DMA_IRQ | NEXT_SCSI_IRQ);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + FIRST_SEGMENT_LENGTH);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_DMA_BUFFER2);
+    qtest_writel(qts, NEXT_DMA_STOP,
+                 NEXT_DMA_BUFFER2 + SHORT_SEGMENT_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE | DMA_DEV2M);
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, 0);
+    for (i = 0; i < sizeof(read_10); i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, read_10[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SEL);
+    qtest_readb(qts, NEXT_ESP_INTR);
+    qtest_writeb(qts, NEXT_ESP_TCLO, TRANSFER_LENGTH & 0xff);
+    qtest_writeb(qts, NEXT_ESP_TCMID, TRANSFER_LENGTH >> 8);
+    qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+
+    /* A short promoted window leaves the channel ENABLE|COMPLETE. */
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==,
+                     SECOND_SEGMENT_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
+                    ==, DMA_ENABLE | DMA_COMPLETE);
+    qtest_memread(qts, NEXT_DMA_BUFFER, first, sizeof(first));
+    g_assert_cmpmem(first, sizeof(first), expected, sizeof(first));
+    assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER2,
+                                sizeof(short_segment), 0xa5);
+    assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER3, sizeof(second), 0xa5);
+
+    /* SETENABLE cannot kick while COMPLETE is still asserted. */
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER3);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER3 + SECOND_SEGMENT_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE),
+                    ==, DMA_ENABLE | DMA_COMPLETE);
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==,
+                     SECOND_SEGMENT_LENGTH);
+    assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER3, sizeof(second), 0xa5);
+
+    /* Clearing COMPLETE makes the channel ready without another DCTL write. */
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_CLRCOMPLETE | DMA_DEV2M);
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==, 0);
+    wait_for_scsi_command_completion(qts);
+    qtest_memread(qts, NEXT_DMA_BUFFER3, second, sizeof(second));
+    g_assert_cmpmem(second, sizeof(second), expected + FIRST_SEGMENT_LENGTH,
+                    sizeof(second));
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
 static void issue_inquiry_dma(QTestState *qts, uint8_t target,
                               uint8_t length)
 {
@@ -3069,6 +3165,8 @@ int main(int argc, char **argv)
                    test_scsi_read_dma_16_sector_two_refills);
     qtest_add_func("/next-cube/scsi/read-dma-late-enable-resumes-pending-ti",
                    test_scsi_read_dma_late_enable_resumes_pending_ti);
+    qtest_add_func("/next-cube/scsi/read-dma-rearm-after-complete-clear",
+                   test_scsi_read_dma_rearm_after_complete_clear);
     qtest_add_func("/next-cube/scsi/dma-reset-clears-next-init-valid",
                    test_scsi_dma_reset_clears_next_init_valid);
     qtest_add_func("/next-cube/scsi/dma-initbuf-preserves-next-init",

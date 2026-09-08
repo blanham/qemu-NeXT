@@ -686,14 +686,19 @@ void next_dma_scsi_fifo_reset(NextDMAState *s)
     next_dma_clear_staging(&s->channel[NEXT_DMA_SCSI]);
 }
 
+static bool next_dma_scsi_ready(const NextDMAState *s)
+{
+    const NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+
+    return (c->csr & NEXT_DMA_CSR_ENABLE) &&
+           !(c->csr & NEXT_DMA_CSR_COMPLETE);
+}
+
 static void next_dma_notify_scsi_ready(NextDMAState *s)
 {
-    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
-
     if (!s->scsi_notify || !s->scsi_notify->ready ||
         !(s->scsi_control & NEXT_DMA_SCSI_DMAMODE) ||
-        !(c->csr & NEXT_DMA_CSR_ENABLE) ||
-        (c->csr & NEXT_DMA_CSR_COMPLETE) ||
+        !next_dma_scsi_ready(s) ||
         s->scsi_notify_in_progress) {
         return;
     }
@@ -708,7 +713,8 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
                                uint32_t value)
 {
     NextDMAChannelState *c = &s->channel[channel];
-    bool was_enabled = c->csr & NEXT_DMA_CSR_ENABLE;
+    bool was_scsi_ready = channel == NEXT_DMA_SCSI &&
+                          next_dma_scsi_ready(s);
 
     if (value & NEXT_DMA_CMD_RESET) {
         if (channel == NEXT_DMA_SCC) {
@@ -738,9 +744,8 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_update_irq(s, channel);
-    if (channel == NEXT_DMA_SCSI &&
-        (value & NEXT_DMA_CMD_SETENABLE) &&
-        (!was_enabled || (value & NEXT_DMA_CMD_RESET))) {
+    if (channel == NEXT_DMA_SCSI && !was_scsi_ready &&
+        next_dma_scsi_ready(s)) {
         next_dma_notify_scsi_ready(s);
     }
     if (channel == NEXT_DMA_SCC) {
