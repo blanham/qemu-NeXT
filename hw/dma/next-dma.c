@@ -1151,6 +1151,13 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
             c->saved_limit);
         return 0;
     }
+    if (c->csr & NEXT_DMA_CSR_COMPLETE) {
+        trace_next_scsi_dma_transfer(
+            "complete", next_dma_trace_int(len), 0, c->next, c->csr,
+            c->next, c->next_initbuf, c->limit, c->saved_next,
+            c->saved_limit);
+        return 0;
+    }
 
     base = next_dma_begin_scsi_transfer(c);
     trace_next_scsi_dma_transfer(
@@ -1228,6 +1235,13 @@ int next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len)
     if (!(c->csr & NEXT_DMA_CSR_ENABLE)) {
         trace_next_scsi_dma_read(
             "disabled", next_dma_trace_int(len), 0, c->next, c->csr,
+            c->next, c->next_initbuf, c->limit, c->saved_next,
+            c->saved_limit);
+        return 0;
+    }
+    if (c->csr & NEXT_DMA_CSR_COMPLETE) {
+        trace_next_scsi_dma_read(
+            "complete", next_dma_trace_int(len), 0, c->next, c->csr,
             c->next, c->next_initbuf, c->limit, c->saved_next,
             c->saved_limit);
         return 0;
