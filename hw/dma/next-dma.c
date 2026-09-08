@@ -181,6 +181,9 @@ struct NextDMAState {
     void *optical_opaque;
     const NextDMASoundOutNotify *sound_out_notify;
     void *sound_out_opaque;
+    const NextDMASCSINotify *scsi_notify;
+    void *scsi_opaque;
+    bool scsi_notify_in_progress;
     const NextDMASCCOps *scc_ops;
     void *scc_opaque;
     bool scc_request[2];
@@ -683,10 +686,29 @@ void next_dma_scsi_fifo_reset(NextDMAState *s)
     next_dma_clear_staging(&s->channel[NEXT_DMA_SCSI]);
 }
 
+static void next_dma_notify_scsi_ready(NextDMAState *s)
+{
+    NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
+
+    if (!s->scsi_notify || !s->scsi_notify->ready ||
+        !(s->scsi_control & NEXT_DMA_SCSI_DMAMODE) ||
+        !(c->csr & NEXT_DMA_CSR_ENABLE) ||
+        (c->csr & NEXT_DMA_CSR_COMPLETE) ||
+        s->scsi_notify_in_progress) {
+        return;
+    }
+
+    /* The callback can complete the channel and raise its DMA IRQ. */
+    s->scsi_notify_in_progress = true;
+    s->scsi_notify->ready(s->scsi_opaque);
+    s->scsi_notify_in_progress = false;
+}
+
 static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
                                uint32_t value)
 {
     NextDMAChannelState *c = &s->channel[channel];
+    bool was_enabled = c->csr & NEXT_DMA_CSR_ENABLE;
 
     if (value & NEXT_DMA_CMD_RESET) {
         if (channel == NEXT_DMA_SCC) {
@@ -716,6 +738,11 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_update_irq(s, channel);
+    if (channel == NEXT_DMA_SCSI &&
+        (value & NEXT_DMA_CMD_SETENABLE) &&
+        (!was_enabled || (value & NEXT_DMA_CMD_RESET))) {
+        next_dma_notify_scsi_ready(s);
+    }
     if (channel == NEXT_DMA_SCC) {
         next_dma_scc_schedule_request(s);
     }
@@ -885,6 +912,14 @@ void next_dma_set_scsi_control(NextDMAState *s, uint8_t control)
 {
     s->scsi_control = control;
     next_dma_floppy_schedule_request(s);
+}
+
+void next_dma_set_scsi_notify(NextDMAState *s,
+                              const NextDMASCSINotify *notify,
+                              void *opaque)
+{
+    s->scsi_notify = notify;
+    s->scsi_opaque = opaque;
 }
 
 void next_dma_set_floppy_selected(NextDMAState *s, bool selected)

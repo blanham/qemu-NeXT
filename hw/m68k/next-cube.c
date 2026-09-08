@@ -507,6 +507,15 @@ static void next_scsi_update_esp_dma(NeXTSCSI *s)
     esp_dma_enable(esp, 0, !!(s->scsi_csr_1 & SCSICSR_CPUDMA));
 }
 
+static void next_scsi_dma_ready(void *opaque)
+{
+    next_scsi_update_esp_dma(opaque);
+}
+
+static const NextDMASCSINotify next_scsi_dma_notify = {
+    .ready = next_scsi_dma_ready,
+};
+
 static void next_irq(void *opaque, int number, int level)
 {
     NeXTPC *s = NEXT_PC(opaque);
@@ -812,6 +821,7 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
     if (!sysbus_realize(sbd, errp)) {
         return;
     }
+    next_dma_set_scsi_notify(s->dma, &next_scsi_dma_notify, s);
     memory_region_add_subregion(&s->scsi_mem, 0x0,
                                 sysbus_mmio_get_region(sbd, 0));
 
