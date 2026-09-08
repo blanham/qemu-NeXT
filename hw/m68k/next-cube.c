@@ -625,10 +625,22 @@ static void nextscsi_read(void *opaque, uint8_t *buf, int len)
     next_dma_scsi_read(opaque, buf, len);
 }
 
+static int nextscsi_read_partial(void *opaque, uint8_t *buf, int len)
+{
+    DPRINTF("SCSI READ: %x\n", len);
+    return next_dma_scsi_read(opaque, buf, len);
+}
+
 static void nextscsi_write(void *opaque, uint8_t *buf, int size)
 {
     DPRINTF("SCSI WRITE: %i\n", size);
     next_dma_scsi_write(opaque, buf, size);
+}
+
+static int nextscsi_write_partial(void *opaque, uint8_t *buf, int len)
+{
+    DPRINTF("SCSI WRITE: %i\n", len);
+    return next_dma_scsi_write(opaque, buf, len);
 }
 
 static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
@@ -791,6 +803,8 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
     esp = &sysbus_esp->esp;
     esp->dma_memory_read = nextscsi_read;
     esp->dma_memory_write = nextscsi_write;
+    esp->dma_memory_read_partial = nextscsi_read_partial;
+    esp->dma_memory_write_partial = nextscsi_write_partial;
     esp->dma_opaque = s->dma;
     sysbus_esp->it_shift = 0;
     clock_set_hz(esp->clock, NEXT_ESP_CLOCK_HZ);

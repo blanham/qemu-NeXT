@@ -1094,11 +1094,11 @@ static bool next_dma_scsi_beat_fits(const NextDMAChannelState *c)
            c->limit - c->next >= NEXT_DMA_SCSI_BEAT;
 }
 
-void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
+int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
 {
     NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
     size_t remaining = len;
-    size_t committed = 0;
+    size_t accepted = 0;
     uint32_t base;
     bool access_error = false;
 
@@ -1107,7 +1107,7 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
             "disabled", next_dma_trace_int(len), 0, c->next, c->csr,
             c->next, c->next_initbuf, c->limit, c->saved_next,
             c->saved_limit);
-        return;
+        return 0;
     }
 
     base = next_dma_begin_scsi_transfer(c);
@@ -1130,6 +1130,7 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         c->scsi_stage_flushes = NEXT_DMA_SCSI_FLUSH_EDGES;
         buf += copied;
         remaining -= copied;
+        accepted += copied;
 
         if (c->scsi_stage_len != NEXT_DMA_SCSI_BEAT) {
             break;
@@ -1143,7 +1144,6 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
 
         c->scsi_stage_len = 0;
         c->scsi_stage_flushes = 0;
-        committed += NEXT_DMA_SCSI_BEAT;
         continue_segment = next_dma_advance(s, NEXT_DMA_SCSI,
                                             NEXT_DMA_SCSI_BEAT);
         if (!continue_segment && remaining) {
@@ -1152,6 +1152,7 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
                 memcpy(c->scsi_stage, buf, remaining);
                 c->scsi_stage_len = remaining;
                 c->scsi_stage_flushes = NEXT_DMA_SCSI_FLUSH_EDGES;
+                accepted += remaining;
                 buf += remaining;
                 remaining = 0;
             }
@@ -1161,11 +1162,12 @@ void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
 
     trace_next_scsi_dma_transfer(
         access_error ? "error" : (c->scsi_stage_len ? "staged" : "complete"),
-        next_dma_trace_int(len), next_dma_trace_int(committed), base, c->csr,
+        next_dma_trace_int(len), next_dma_trace_int(accepted), base, c->csr,
         c->next, c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
+    return MIN(accepted, (size_t)INT_MAX);
 }
 
-void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len)
+int next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len)
 {
     NextDMAChannelState *c = &s->channel[NEXT_DMA_SCSI];
     size_t remaining = len;
@@ -1178,7 +1180,7 @@ void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len)
             "disabled", next_dma_trace_int(len), 0, c->next, c->csr,
             c->next, c->next_initbuf, c->limit, c->saved_next,
             c->saved_limit);
-        return;
+        return 0;
     }
 
     base = next_dma_begin_scsi_transfer(c);
@@ -1215,6 +1217,7 @@ void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len)
         access_error ? "error" : "complete", next_dma_trace_int(len),
         next_dma_trace_int(transferred), base, c->csr, c->next,
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
+    return MIN(transferred, (size_t)INT_MAX);
 }
 
 void next_dma_scsi_fifo_flush(NextDMAState *s)

@@ -11,6 +11,8 @@
 /* esp.c */
 #define ESP_MAX_DEVS 7
 typedef void (*ESPDMAMemoryReadWriteFunc)(void *opaque, uint8_t *buf, int len);
+typedef int (*ESPDMAMemoryReadWritePartialFunc)(void *opaque,
+                                                uint8_t *buf, int len);
 
 #define ESP_REGS 16
 #define ESP_FIFO_SZ 16
@@ -58,6 +60,9 @@ struct ESPState {
 
     ESPDMAMemoryReadWriteFunc dma_memory_read;
     ESPDMAMemoryReadWriteFunc dma_memory_write;
+    /* Optional callbacks may return the number of bytes accepted. */
+    ESPDMAMemoryReadWritePartialFunc dma_memory_read_partial;
+    ESPDMAMemoryReadWritePartialFunc dma_memory_write_partial;
     void *dma_opaque;
     void (*dma_cb)(ESPState *s);
 

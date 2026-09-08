@@ -140,8 +140,11 @@ void esp_dma_enable(ESPState *s, int irq, int level)
         s->dma_enabled = 1;
         trace_esp_dma_enable();
         if (s->dma_cb) {
-            s->dma_cb(s);
+            void (*dma_cb)(ESPState *s) = s->dma_cb;
+
+            /* A resumed transfer may need to queue itself again. */
             s->dma_cb = NULL;
+            dma_cb(s);
         }
     } else {
         trace_esp_dma_disable();
@@ -334,6 +337,46 @@ static int esp_select(ESPState *s)
 static void esp_do_dma(ESPState *s);
 static void esp_do_nodma(ESPState *s);
 static void handle_ti(ESPState *s);
+
+static int esp_dma_memory_read(ESPState *s, uint8_t *buf, int len)
+{
+    int accepted;
+
+    if (s->dma_memory_read_partial) {
+        accepted = s->dma_memory_read_partial(s->dma_opaque, buf, len);
+        if (accepted < 0 || accepted > len) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP DMA read accepted invalid length %d/%d\n",
+                          accepted, len);
+            return 0;
+        }
+        return accepted;
+    }
+    if (s->dma_memory_read) {
+        s->dma_memory_read(s->dma_opaque, buf, len);
+    }
+    return len;
+}
+
+static int esp_dma_memory_write(ESPState *s, uint8_t *buf, int len)
+{
+    int accepted;
+
+    if (s->dma_memory_write_partial) {
+        accepted = s->dma_memory_write_partial(s->dma_opaque, buf, len);
+        if (accepted < 0 || accepted > len) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ESP DMA write accepted invalid length %d/%d\n",
+                          accepted, len);
+            return 0;
+        }
+        return accepted;
+    }
+    if (s->dma_memory_write) {
+        s->dma_memory_write(s->dma_opaque, buf, len);
+    }
+    return len;
+}
 
 static void do_command_phase(ESPState *s, bool legacy_lun)
 {
@@ -535,6 +578,7 @@ static void esp_do_dma(ESPState *s)
 {
     uint32_t len, cmdlen;
     uint8_t buf[ESP_CMDFIFO_SZ];
+    bool dma_short = false;
 
     len = esp_get_tc(s);
 
@@ -630,9 +674,12 @@ static void esp_do_dma(ESPState *s)
 
         switch (s->rregs[ESP_CMD]) {
         case CMD_TI | CMD_DMA:
-            if (s->dma_memory_read) {
+            if (s->dma_memory_read_partial || s->dma_memory_read) {
                 if (len) {
-                    s->dma_memory_read(s->dma_opaque, s->async_buf, len);
+                    uint32_t requested = len;
+
+                    len = esp_dma_memory_read(s, s->async_buf, len);
+                    dma_short = len != requested;
                     esp_set_tc(s, esp_get_tc(s) - len);
                 }
             } else {
@@ -645,6 +692,9 @@ static void esp_do_dma(ESPState *s)
             s->async_buf += len;
             s->async_len -= len;
             s->ti_size += len;
+            if (dma_short && s->async_len) {
+                s->dma_cb = handle_ti;
+            }
             break;
 
         case CMD_PAD | CMD_DMA:
@@ -685,9 +735,12 @@ static void esp_do_dma(ESPState *s)
 
         switch (s->rregs[ESP_CMD]) {
         case CMD_TI | CMD_DMA:
-            if (s->dma_memory_write) {
+            if (s->dma_memory_write_partial || s->dma_memory_write) {
                 if (len) {
-                    s->dma_memory_write(s->dma_opaque, s->async_buf, len);
+                    uint32_t requested = len;
+
+                    len = esp_dma_memory_write(s, s->async_buf, len);
+                    dma_short = len != requested;
                 }
             } else {
                 /* Copy device data to FIFO */
@@ -699,6 +752,9 @@ static void esp_do_dma(ESPState *s)
             s->async_len -= len;
             s->ti_size -= len;
             esp_set_tc(s, esp_get_tc(s) - len);
+            if (dma_short && s->async_len) {
+                s->dma_cb = handle_ti;
+            }
             break;
 
         case CMD_PAD | CMD_DMA:

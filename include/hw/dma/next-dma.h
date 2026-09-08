@@ -81,8 +81,8 @@ typedef struct NextDMASCCOps {
     bool (*write_byte)(void *opaque, unsigned channel, uint8_t value);
 } NextDMASCCOps;
 
-void next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len);
-void next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len);
+int next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len);
+int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len);
 void next_dma_scsi_fifo_reset(NextDMAState *s);
 void next_dma_scsi_fifo_flush(NextDMAState *s);
 void next_dma_set_scsi_control(NextDMAState *s, uint8_t control);
