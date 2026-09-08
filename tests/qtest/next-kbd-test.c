@@ -65,6 +65,7 @@
 #define NEXT_KEY_C        0x33
 #define NEXT_KEY_MINUS    0x1d
 #define NEXT_KEY_N        0x37
+#define NEXT_KEY_RETURN   0x2a
 #define NEXT_KEY_UP       0x80
 #define NEXT_KEY_LEFT_ARROW  0x09
 #define NEXT_KEY_DOWN_ARROW  0x0f
@@ -562,6 +563,24 @@ static void test_key_irq_and_data(void)
     csr = qtest_readl(qts, NEXT_KBD_CSR);
     g_assert_cmphex(csr & (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
 
+    qtest_quit(qts);
+}
+
+static void test_return_input_event_is_synchronous(void)
+{
+    QTestState *qts = next_cube_kbd_start();
+
+    send_key(qts, "ret", true);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID | NEXT_KEY_RETURN);
+
+    send_key(qts, "ret", false);
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_DATA), ==,
+                    NEXT_KBD_DEVICE_1 | NEXT_KBD_VALID |
+                    NEXT_KEY_UP | NEXT_KEY_RETURN);
+
+    g_assert_cmphex(qtest_readl(qts, NEXT_KBD_CSR) &
+                    (NEXT_KBD_INT | NEXT_KBD_DAV | NEXT_KBD_OVR), ==, 0);
     qtest_quit(qts);
 }
 
@@ -1622,6 +1641,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/next-cube/kbd/key-irq-and-data",
                    test_key_irq_and_data);
+    qtest_add_func("/next-cube/kbd/return-input-event-is-synchronous",
+                   test_return_input_event_is_synchronous);
     qtest_add_func("/next-cube/kbd/cursor-keys-and-rom-monitor-shortcut",
                    test_cursor_keys_and_rom_monitor_shortcut);
     qtest_add_func("/next-cube/kbd/duplicate-key-state-ignored",
