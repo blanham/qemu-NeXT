@@ -1189,6 +1189,13 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         committed += NEXT_DMA_SCSI_BEAT;
         continue_segment = next_dma_advance(s, NEXT_DMA_SCSI,
                                             NEXT_DMA_SCSI_BEAT);
+        if (continue_segment && (c->csr & NEXT_DMA_CSR_COMPLETE)) {
+            /*
+             * COMPLETE is an interrupt boundary.  The NeXT driver must
+             * acknowledge it before the promoted continuation can run.
+             */
+            break;
+        }
         if (!continue_segment && remaining) {
             if (!c->scsi_stage_len &&
                 remaining <= NEXT_DMA_SCSI_BEAT) {
@@ -1251,7 +1258,7 @@ int next_dma_scsi_read(NextDMAState *s, uint8_t *buf, size_t len)
         remaining -= chunk;
         transferred += chunk;
         continue_segment = next_dma_advance(s, NEXT_DMA_SCSI, chunk);
-        if (!continue_segment && remaining) {
+        if (!continue_segment || (c->csr & NEXT_DMA_CSR_COMPLETE)) {
             break;
         }
     }
