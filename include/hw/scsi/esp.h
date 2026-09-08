@@ -60,7 +60,11 @@ struct ESPState {
 
     ESPDMAMemoryReadWriteFunc dma_memory_read;
     ESPDMAMemoryReadWriteFunc dma_memory_write;
-    /* Optional callbacks may return the number of bytes accepted. */
+    /*
+     * Optional data-phase callbacks return the number of bytes accepted in
+     * the range 0..len. Bytes retained by a DMA staging buffer count as
+     * accepted; any remainder waits for a subsequent DMA-enable notification.
+     */
     ESPDMAMemoryReadWritePartialFunc dma_memory_read_partial;
     ESPDMAMemoryReadWritePartialFunc dma_memory_write_partial;
     void *dma_opaque;
