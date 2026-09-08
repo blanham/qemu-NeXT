@@ -744,7 +744,8 @@ static void next_dma_write_csr(NextDMAState *s, NextDMAChannel channel,
         c->csr |= NEXT_DMA_CSR_READ;
     }
     next_dma_update_irq(s, channel);
-    if (channel == NEXT_DMA_SCSI && !was_scsi_ready &&
+    if (channel == NEXT_DMA_SCSI &&
+        (!was_scsi_ready || (value & NEXT_DMA_CMD_RESET)) &&
         next_dma_scsi_ready(s)) {
         next_dma_notify_scsi_ready(s);
     }
