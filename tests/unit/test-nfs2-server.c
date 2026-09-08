@@ -28,6 +28,7 @@ struct OncRpcRequest {
     unsigned refs;
     bool retained;
     bool terminal;
+    bool tcp;
 };
 
 struct QemuSlirpRpcRegistration {
@@ -100,6 +101,7 @@ struct Fixture {
     int64_t clock_ms;
     int mutation_error;
     bool reset_on_send;
+    bool request_tcp;
     bool verifier_present;
     bool fail_verifier_set;
     uint8_t verifier[8];
@@ -176,7 +178,7 @@ const struct sockaddr_in *onc_rpc_request_peer(const OncRpcRequest *request)
 
 bool onc_rpc_request_is_tcp(const OncRpcRequest *request)
 {
-    return false;
+    return request && request->tcp;
 }
 
 OncRpcRequest *onc_rpc_request_ref(OncRpcRequest *request)
@@ -1152,6 +1154,7 @@ static OncRpcRequest *test_request_new(Fixture *f,
     request->reply = g_byte_array_new();
     request->fixture = f;
     request->refs = 1;
+    request->tcp = f->request_tcp;
     /* Keep body pointers in the decoded call inside the owned raw request. */
     g_assert_cmpint(onc_rpc_decode_call(request->data, length,
                                         &request->call), ==,
@@ -1236,6 +1239,16 @@ static void request_peer(Fixture *f, const void *data, size_t len,
         aio_poll(qemu_get_aio_context(), true);
     }
     g_assert_cmpuint(f->reply->len, >=, 24);
+}
+
+static void request_peer_transport(Fixture *f, const void *data, size_t len,
+                                   uint16_t port, bool tcp)
+{
+    bool previous = f->request_tcp;
+
+    f->request_tcp = tcp;
+    request_peer(f, data, len, port);
+    f->request_tcp = previous;
 }
 
 static void request(Fixture *f, const void *data, size_t len)
@@ -2338,6 +2351,11 @@ static void test_duplicate_cache(Fixture *f, gconstpointer opaque)
     g_assert_cmpuint(f->mutation_calls, ==, calls);
     g_assert_cmpmem(f->reply->data, f->reply->len,
                     first_reply->data, first_reply->len);
+
+    /* TCP and UDP retries with the same peer tuple and XID are distinct. */
+    request_peer_transport(f, call, len, 900, true);
+    g_assert_cmpuint(f->mutation_calls, ==, calls + 1);
+    calls++;
 
     memcpy(changed, call, len);
     stl_be_p(changed + len - 4, 1);

@@ -38,6 +38,7 @@ static bool stat_matches_handle(Nfs2Server *server,
 typedef struct NfsDuplicateEntry {
     uint32_t address;
     uint16_t port;
+    bool tcp;
     uint32_t xid;
     uint32_t program;
     uint32_t version;
@@ -194,10 +195,11 @@ static int64_t server_now_ms(Nfs2Server *server)
 static bool duplicate_matches(const NfsDuplicateEntry *entry,
                               const struct sockaddr_in *peer,
                               const OncRpcCall *call,
-                              const uint8_t digest[32])
+                              bool tcp, const uint8_t digest[32])
 {
     return !entry->abandoned && entry->address == peer->sin_addr.s_addr &&
-           entry->port == peer->sin_port && entry->xid == call->xid &&
+           entry->port == peer->sin_port && entry->tcp == tcp &&
+           entry->xid == call->xid &&
            entry->program == call->program &&
            entry->version == call->version &&
            entry->procedure == call->procedure &&
@@ -3478,7 +3480,7 @@ Nfs2Server *nfs2_server_new(const char *fsdev_id, const char *netdev_id,
             .version_low = NFS2_NFS_VERSION,
             .version_high = NFS3_VERSION,
             .port = 2049,
-            .transports = ONC_RPC_TRANSPORT_UDP,
+            .transports = ONC_RPC_TRANSPORT_UDP | ONC_RPC_TRANSPORT_TCP,
             .dispatch = nfs2_rpc_dispatch,
             .opaque = server,
         };
@@ -3514,7 +3516,6 @@ int nfs2_server_receive(Nfs2Server *server, OncRpcRequest *rpc_request,
     data = onc_rpc_request_data(rpc_request, &len);
     if (!call || !peer ||
         peer->sin_family != AF_INET || (!data && len) ||
-        onc_rpc_request_is_tcp(rpc_request) ||
         (call->program != NFS2_MOUNT_PROGRAM &&
          call->program != NFS2_NFS_PROGRAM)) {
         error_setg(errp, "invalid NFS RPC request");
@@ -3545,7 +3546,9 @@ int nfs2_server_receive(Nfs2Server *server, OncRpcRequest *rpc_request,
                 NfsDuplicateEntry *entry =
                     g_ptr_array_index(server->duplicates, i);
 
-                if (!duplicate_matches(entry, peer, call, digest)) {
+                if (!duplicate_matches(entry, peer, call,
+                                       onc_rpc_request_is_tcp(rpc_request),
+                                       digest)) {
                     continue;
                 }
                 entry->last_used = ++server->duplicate_sequence;
@@ -3592,6 +3595,7 @@ int nfs2_server_receive(Nfs2Server *server, OncRpcRequest *rpc_request,
             duplicate = g_new0(NfsDuplicateEntry, 1);
             duplicate->address = peer->sin_addr.s_addr;
             duplicate->port = peer->sin_port;
+            duplicate->tcp = onc_rpc_request_is_tcp(rpc_request);
             duplicate->xid = xid;
             duplicate->program = call->program;
             duplicate->version = call->version;

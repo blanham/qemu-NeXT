@@ -22,12 +22,18 @@ static char *test_root;
 #define PMAP_PORT 111U
 #define PMAP_DUMP 4U
 #define UDP_PROTOCOL 17U
+#define TCP_PROTOCOL 6U
 #define GUEST_IP 0x0a00020fU
 #define SLIRP_HOST_IP 0x0a000202U
 #define GUEST_RPC_PORT 40000U
 #define RPC_TEST_XID 0x12345678U
 #define RPC_TEST_TIMEOUT_US (5 * G_TIME_SPAN_SECOND)
 #define RPC_TEST_MAX_FRAMES 64U
+#define NFS_PROGRAM 100003U
+#define NFS_VERSION 3U
+#define NFS_PORT 2049U
+#define NFS_TCP_GUEST_PORT 40001U
+#define NFS_TCP_XID 0x23456789U
 
 #define ETHERNET_HEADER_LEN 14
 #define IPV4_HEADER_LEN 20
@@ -42,6 +48,14 @@ typedef struct RpcMapping {
     uint32_t protocol;
     uint32_t port;
 } RpcMapping;
+
+typedef struct TcpPacket {
+    uint32_t sequence;
+    uint32_t acknowledgment;
+    uint8_t flags;
+    const uint8_t *payload;
+    size_t payload_len;
+} TcpPacket;
 
 static void put_be16(uint8_t *buf, uint16_t value)
 {
@@ -84,6 +98,20 @@ static uint16_t internet_checksum(const uint8_t *buf, size_t len)
         sum = (sum & 0xffff) + (sum >> 16);
     }
     return ~sum;
+}
+
+static uint16_t tcp_checksum(uint32_t source, uint32_t destination,
+                             const uint8_t *tcp, size_t tcp_len)
+{
+    g_autofree uint8_t *checksum = g_malloc(12 + tcp_len);
+
+    put_be32(checksum, source);
+    put_be32(checksum + 4, destination);
+    checksum[8] = 0;
+    checksum[9] = TCP_PROTOCOL;
+    put_be16(checksum + 10, tcp_len);
+    memcpy(checksum + 12, tcp, tcp_len);
+    return internet_checksum(checksum, 12 + tcp_len);
 }
 
 static void send_all(int fd, const uint8_t *buf, size_t len)
@@ -379,6 +407,142 @@ static size_t build_pmap_success_reply(uint8_t *frame, const uint8_t *host_mac)
     return ETHERNET_HEADER_LEN + ip_len;
 }
 
+static size_t build_tcp_frame(uint8_t *frame, const uint8_t *host_mac,
+                              uint16_t source_port, uint16_t destination_port,
+                              uint32_t sequence, uint32_t acknowledgment,
+                              uint8_t flags, const uint8_t *payload,
+                              size_t payload_len)
+{
+    uint8_t *ip = frame + ETHERNET_HEADER_LEN;
+    uint8_t *tcp = ip + IPV4_HEADER_LEN;
+    size_t tcp_len = 20 + payload_len;
+    size_t ip_len = IPV4_HEADER_LEN + tcp_len;
+
+    g_assert_cmpuint(payload_len, <=, 4096 - ETHERNET_HEADER_LEN -
+                     IPV4_HEADER_LEN - 20);
+    memset(frame, 0, ETHERNET_HEADER_LEN + ip_len);
+    memcpy(frame, host_mac, sizeof(guest_mac));
+    memcpy(frame + 6, guest_mac, sizeof(guest_mac));
+    put_be16(frame + 12, 0x0800);
+
+    ip[0] = 0x45;
+    put_be16(ip + 2, ip_len);
+    ip[8] = 64;
+    ip[9] = TCP_PROTOCOL;
+    put_be32(ip + 12, GUEST_IP);
+    put_be32(ip + 16, SLIRP_HOST_IP);
+    put_be16(ip + 10, internet_checksum(ip, IPV4_HEADER_LEN));
+
+    put_be16(tcp, source_port);
+    put_be16(tcp + 2, destination_port);
+    put_be32(tcp + 4, sequence);
+    put_be32(tcp + 8, acknowledgment);
+    tcp[12] = 5 << 4;
+    tcp[13] = flags;
+    put_be16(tcp + 14, UINT16_MAX);
+    put_be16(tcp + 16, 0);
+    put_be16(tcp + 18, 0);
+    if (payload_len) {
+        memcpy(tcp + 20, payload, payload_len);
+    }
+    put_be16(tcp + 16, tcp_checksum(GUEST_IP, SLIRP_HOST_IP,
+                                    tcp, tcp_len));
+    return ETHERNET_HEADER_LEN + ip_len;
+}
+
+static bool parse_tcp_reply(const uint8_t *frame, size_t len,
+                            const uint8_t *host_mac, TcpPacket *packet)
+{
+    const uint8_t *ip;
+    const uint8_t *tcp;
+    size_t ip_header_len;
+    size_t tcp_header_len;
+    size_t ip_len;
+
+    if (len < ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + 20 ||
+        get_be16(frame + 12) != 0x0800 ||
+        memcmp(frame, guest_mac, sizeof(guest_mac)) ||
+        memcmp(frame + 6, host_mac, sizeof(guest_mac))) {
+        return false;
+    }
+    ip = frame + ETHERNET_HEADER_LEN;
+    ip_header_len = (ip[0] & 0x0f) * 4;
+    if ((ip[0] >> 4) != 4 || ip_header_len < IPV4_HEADER_LEN ||
+        len < ETHERNET_HEADER_LEN + ip_header_len + 20 ||
+        internet_checksum(ip, ip_header_len) != 0 || ip[9] != TCP_PROTOCOL ||
+        get_be32(ip + 12) != SLIRP_HOST_IP ||
+        get_be32(ip + 16) != GUEST_IP) {
+        return false;
+    }
+    ip_len = get_be16(ip + 2);
+    if (ip_len < ip_header_len + 20 ||
+        ip_len > len - ETHERNET_HEADER_LEN ||
+        (get_be16(ip + 6) & 0x3fff)) {
+        return false;
+    }
+    tcp = ip + ip_header_len;
+    if (get_be16(tcp) != NFS_PORT ||
+        get_be16(tcp + 2) != NFS_TCP_GUEST_PORT) {
+        return false;
+    }
+    tcp_header_len = (tcp[12] >> 4) * 4;
+    if (tcp_header_len < 20 || tcp_header_len > ip_len - ip_header_len) {
+        return false;
+    }
+    packet->sequence = get_be32(tcp + 4);
+    packet->acknowledgment = get_be32(tcp + 8);
+    packet->flags = tcp[13];
+    packet->payload = tcp + tcp_header_len;
+    packet->payload_len = ip_len - ip_header_len - tcp_header_len;
+    return true;
+}
+
+static bool recv_tcp_reply(int fd, uint8_t *frame, size_t capacity,
+                           gint64 deadline, const uint8_t *host_mac,
+                           TcpPacket *packet)
+{
+    size_t frame_len;
+
+    while (recv_redirector_frame(fd, frame, capacity, deadline, &frame_len)) {
+        if (parse_tcp_reply(frame, frame_len, host_mac, packet)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t build_nfs_null_record(uint8_t *record)
+{
+    uint8_t rpc[64];
+    size_t rpc_len = 40;
+
+    put_be32(rpc, NFS_TCP_XID);
+    put_be32(rpc + 4, 0);              /* CALL */
+    put_be32(rpc + 8, 2);              /* RPC version */
+    put_be32(rpc + 12, NFS_PROGRAM);
+    put_be32(rpc + 16, NFS_VERSION);
+    put_be32(rpc + 20, 0);             /* NFS NULL */
+    put_be32(rpc + 24, 0);             /* NULL credential flavor */
+    put_be32(rpc + 28, 0);             /* NULL credential length */
+    put_be32(rpc + 32, 0);             /* NULL verifier flavor */
+    put_be32(rpc + 36, 0);             /* NULL verifier length */
+    put_be32(record, UINT32_C(0x80000000) | rpc_len);
+    memcpy(record + 4, rpc, rpc_len);
+    return 4 + rpc_len;
+}
+
+static void assert_nfs_null_reply(const TcpPacket *packet)
+{
+    g_assert_cmpuint(packet->payload_len, >=, 28);
+    g_assert_cmpuint(get_be32(packet->payload), ==, 0x80000000U | 24U);
+    g_assert_cmpuint(get_be32(packet->payload + 4), ==, NFS_TCP_XID);
+    g_assert_cmpuint(get_be32(packet->payload + 8), ==, 1); /* REPLY */
+    g_assert_cmpuint(get_be32(packet->payload + 12), ==, 0); /* ACCEPTED */
+    g_assert_cmpuint(get_be32(packet->payload + 16), ==, 0); /* AUTH_NULL */
+    g_assert_cmpuint(get_be32(packet->payload + 20), ==, 0);
+    g_assert_cmpuint(get_be32(packet->payload + 24), ==, 0); /* SUCCESS */
+}
+
 static void test_pmap_dump_rejects_noncanonical_boolean(void)
 {
     if (g_test_subprocess()) {
@@ -647,7 +811,9 @@ static void test_shared_pmap_dump(void)
         { 100005, 2, UDP_PROTOCOL, 635 },
         { 100005, 3, UDP_PROTOCOL, 635 },
         { 100003, 2, UDP_PROTOCOL, 2049 },
+        { 100003, 2, TCP_PROTOCOL, 2049 },
         { 100003, 3, UDP_PROTOCOL, 2049 },
+        { 100003, 3, TCP_PROTOCOL, 2049 },
         { RPC_TEST_PROGRAM, RPC_TEST_VERSION, UDP_PROTOCOL, RPC_TEST_PORT },
     };
 
@@ -727,6 +893,97 @@ static void test_shared_pmap_dump(void)
     g_unlink(output_path);
 }
 
+static void test_tcp_nfs_rpc(void)
+{
+    g_autofree char *input_path = g_strdup_printf("%s/tcp-rpc-input",
+                                                   test_root);
+    g_autofree char *output_path = g_strdup_printf("%s/tcp-rpc-output",
+                                                    test_root);
+    uint8_t frame[4096];
+    uint8_t host_mac[6];
+    uint8_t record[68];
+    TcpPacket packet;
+    size_t frame_len;
+    size_t record_len;
+    uint32_t guest_sequence = 0x10000000;
+    uint32_t host_sequence;
+    gint64 deadline;
+    int input_fd;
+    int output_fd;
+    QTestState *qts;
+
+    qts = qtest_initf(
+        "-machine virt -nodefaults "
+        "-fsdev local,id=root,path=%s,security_model=mapped-xattr "
+        "-netdev user,id=nextnet "
+        "-device virtio-net-device,netdev=nextnet "
+        "-chardev socket,id=rpcin,path=%s,server=on,wait=off "
+        "-chardev socket,id=rpcout,path=%s,server=on,wait=off "
+        "-object filter-redirector,id=rpcinj,netdev=nextnet,"
+        "queue=rx,indev=rpcin "
+        "-object filter-redirector,id=rpccap,netdev=nextnet,"
+        "queue=tx,outdev=rpcout",
+        test_root, input_path, output_path);
+    input_fd = connect_redirector(input_path);
+    output_fd = connect_redirector(output_path);
+    object_add(qts, "nfs", true);
+
+    frame_len = build_arp_request(frame);
+    send_redirector_frame(input_fd, frame, frame_len);
+    deadline = g_get_monotonic_time() + RPC_TEST_TIMEOUT_US;
+    g_assert_true(recv_redirector_frame(output_fd, frame, sizeof(frame),
+                                        deadline, &frame_len));
+    g_assert_true(is_arp_reply(frame, frame_len));
+    memcpy(host_mac, frame + 6, sizeof(host_mac));
+
+    frame_len = build_tcp_frame(frame, host_mac, NFS_TCP_GUEST_PORT,
+                                NFS_PORT, guest_sequence, 0, 0x02, NULL, 0);
+    send_redirector_frame(input_fd, frame, frame_len);
+    deadline = g_get_monotonic_time() + RPC_TEST_TIMEOUT_US;
+    g_assert_true(recv_tcp_reply(output_fd, frame, sizeof(frame), deadline,
+                                 host_mac, &packet));
+    g_assert_cmpuint(packet.flags & 0x12, ==, 0x12); /* SYN|ACK */
+    g_assert_cmpuint(packet.acknowledgment, ==, guest_sequence + 1);
+    host_sequence = packet.sequence;
+    guest_sequence++;
+
+    frame_len = build_tcp_frame(frame, host_mac, NFS_TCP_GUEST_PORT,
+                                NFS_PORT, guest_sequence, host_sequence + 1,
+                                0x10, NULL, 0);
+    send_redirector_frame(input_fd, frame, frame_len);
+
+    record_len = build_nfs_null_record(record);
+    frame_len = build_tcp_frame(frame, host_mac, NFS_TCP_GUEST_PORT,
+                                NFS_PORT, guest_sequence, host_sequence + 1,
+                                0x18, record, record_len); /* PSH|ACK */
+    send_redirector_frame(input_fd, frame, frame_len);
+    guest_sequence += record_len;
+
+    deadline = g_get_monotonic_time() + RPC_TEST_TIMEOUT_US;
+    for (;;) {
+        g_assert_true(recv_tcp_reply(output_fd, frame, sizeof(frame),
+                                     deadline, host_mac, &packet));
+        if (!packet.payload_len) {
+            continue;
+        }
+        assert_nfs_null_reply(&packet);
+        break;
+    }
+
+    frame_len = build_tcp_frame(frame, host_mac, NFS_TCP_GUEST_PORT,
+                                NFS_PORT, guest_sequence,
+                                packet.sequence + packet.payload_len, 0x10,
+                                NULL, 0);
+    send_redirector_frame(input_fd, frame, frame_len);
+
+    object_del(qts, "nfs");
+    close(input_fd);
+    close(output_fd);
+    qtest_quit(qts);
+    g_unlink(input_path);
+    g_unlink(output_path);
+}
+
 int main(int argc, char **argv)
 {
     int ret;
@@ -752,6 +1009,7 @@ int main(int argc, char **argv)
                    test_pmap_reply_rejects_ipv4_fragments);
     qtest_add_func("nfs-server-object/shared-pmap-dump",
                    test_shared_pmap_dump);
+    qtest_add_func("nfs-server-object/tcp-nfs-rpc", test_tcp_nfs_rpc);
     ret = g_test_run();
 
     g_rmdir(test_root);
