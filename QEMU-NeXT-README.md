@@ -158,32 +158,24 @@ diagnostic failures, not acceptance evidence.
 
 ![NetBSD 10.1 installing and booting locally from NeXT SCSI](docs/boot/netbsd-scsi.gif)
 
-Authenticated result:
-`/home/blanham/projects/NeXT/lab/.worktrees/netbsd-scsi-current-lab/results/netbsd-scsi-current/netbsd-scsi-101-current-9817ee-frame-quantum-normalized.json`<br>
-QEMU commit: `9817eefa75d8dc4e1eb59c0b21dedb135287f958`<br>
+Authenticated result (QEMU commit
+`9817eefa75d8dc4e1eb59c0b21dedb135287f958`):<br>
 Installed disk SHA-256: `3206adb32525c7eb62653273197e873a44fccad868b85c2d24b1031e33295ff5`<br>
 GIF SHA-256: `9fe9cd975455c6b12fd3cfabf4c3ef33b2218fd1b39782c12c60c72f11c8d361`<br>
 Master lossless FFV1 SHA-256: `ffcd9502510eec06f7e1a7ab271e6782d3c2b5ac623a12afa33ea30951fe2dab`<br>
 Published highlight FFV1 SHA-256: `d2e4cc5c32a2f7a66a083e3bf41ad8b64010ac9f63bde4914c5daa8cb48e7c7a`
 
 The GIF is a bounded, lossless-source highlight of the accepted three-phase
-capture. The untouched master is
-`/mnt/build/netbsd-scsi-20260908-current-9817ee-frame-quantum-normalized-3phase-ffv1.mkv`;
-the published highlight and its milestone-bearing timeline are
-`/mnt/build/netbsd-scsi-20260908-current-9817ee-frame-quantum-normalized-highlight-ffv1.mkv`
-and
-`/mnt/build/netbsd-scsi-20260908-current-9817ee-frame-quantum-normalized-highlight-ffv1.mkv.timeline.json`.
+capture. The untouched master, published highlight, and milestone-bearing
+timeline are retained as private lab evidence; this public repository publishes
+the bounded GIF and its stable hashes above.
 The timeline records the accepted QMP UTC timestamps and nominal 15-fps
 master-frame selection windows used for device discovery and `md0a`, install
 completion, both ROM-disk loads, both `sd0a` transitions, both local shells,
-and the install-marker check on both boots. Its `master_start_utc` is a derived
-process-start
-anchor: `FFMPEG_START=14222709` mapped through `/proc/stat` `btime` with
-`CLK_TCK=100`, yielding `2026-09-08T12:27:03.090Z` at 10-ms precision. The
-master file's observed filesystem birth was `2026-09-08T12:27:03.927Z`, so the
-frame coordinates are nominal selection windows, not exact event-frame claims.
-The master capture remains the evidence source; the highlight exists only to
-stay within the repository GIF decoder's bounded decoded-frame policy.
+and the install-marker check on both boots. The frame coordinates are nominal
+selection windows rather than exact event-frame claims. The master capture
+remains the evidence source; the highlight exists only to stay within the
+repository GIF decoder's bounded decoded-frame policy.
 
 Authenticated inputs are ROM
 `1b753890b67095b73e104c939ddf62eca9e7d0aedde5108e3893b0ed9d8000a4`,
@@ -192,14 +184,11 @@ RAMDISK `f04fc2329d2e9282b8e4c434d18b90d69be83322da948964c7cae9be97808aee`,
 symbols `884dd06236a4cf0519b914399547a9084e56dc045f9016b8f36849e8119335e5`,
 and ISO `a0a74335c87dff3d4e2255ea70f9ddf14f02d07cad9f325a06fc080879578089`.
 
-The accepted build metadata is
-`/home/blanham/projects/NeXT/lab/.worktrees/netbsd-scsi-current-lab/results/netbsd-scsi-current/netbsd-scsi-current-build-9817eefa75.json`.
-The lab campaign runner and its read-only verifier are documented in the lab
-README; both use the exact QEMU worktree at commit
-`9817eefa75d8dc4e1eb59c0b21dedb135287f958` and the authenticated input hashes
-above. Their commands are `netbsd_scsi_campaign_cli run` for a fresh
-authenticated campaign and `netbsd_scsi_campaign_cli verify` for read-only
-revalidation of the accepted aggregate.
+The adjacent NeXT emulation lab repository documents the private campaign
+procedure and read-only verifier in its `README.md`. Reproduction and audit
+require a dedicated clean checkout at the accepted QEMU commit and the
+authenticated input hashes above; local lab paths and capture infrastructure
+are intentionally not part of this public showcase.
 
 ## Plan 9
 
