@@ -152,17 +152,20 @@ NetBSD 10.1 native SCSI install
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The official next68k RAMDISK boots with ``md0a`` as its rescue root. The
-authenticated campaign performs a CD-only manual installation to target 0
-``sd0`` with the CD at target 3, followed by two network-independent boots
-from local ``sd0a``. Both boots read the same ``/NETBSD_SCSI_INSTALLED`` file
-written during installation; the second boot is the persisted install-marker
-check, not a check for a distinct ``/NETBSD_SCSI_PERSISTED`` file. The ISO is
-not firmware-bootable, no official next68k install floppy is supplied, and the
-r2/r3 captures are diagnostic failures.
-The accepted QEMU commit is ``9817eefa75d8dc4e1eb59c0b21dedb135287f958``;
+native CD-only manual installation to target 0 ``sd0`` with the CD at
+target 3 occurred, followed by two network-independent boots from local
+``sd0a``. Persistence acceptance is withdrawn: the first boot's attempt to
+write the distinct ``/NETBSD_SCSI_PERSISTED`` marker failed because the root
+was read-only, and the second boot showed that file absent. The generic
+operator gate nevertheless accepted the aggregate, so this is a false
+acceptance rather than proof of persistence. The ISO is not firmware-bootable,
+no official next68k install floppy is supplied, and the r2/r3 captures are
+diagnostic failures.
+The tested QEMU commit is ``9817eefa75d8dc4e1eb59c0b21dedb135287f958``;
 installed-disk, GIF, and master lossless-recording SHA-256 values are
 ``3206adb32525c7eb62653273197e873a44fccad868b85c2d24b1031e33295ff5``,
 ``9fe9cd975455c6b12fd3cfabf4c3ef33b2218fd1b39782c12c60c72f11c8d361``, and
 ``ffcd9502510eec06f7e1a7ab271e6782d3c2b5ac623a12afa33ea30951fe2dab``
-respectively. The bounded published highlight FFV1 is
-``d2e4cc5c32a2f7a66a083e3bf41ad8b64010ac9f63bde4914c5daa8cb48e7c7a``.
+respectively. These hashes and the bounded published highlight FFV1
+``d2e4cc5c32a2f7a66a083e3bf41ad8b64010ac9f63bde4914c5daa8cb48e7c7a`` are
+diagnostic evidence only, not persistence acceptance.
