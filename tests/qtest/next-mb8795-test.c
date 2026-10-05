@@ -740,6 +740,79 @@ static void test_tx_single_buffer(void)
     tx_harness_stop(&harness);
 }
 
+static void test_tx_loopback_reaches_wire(void)
+{
+    /*
+     * Regression for the TFTP unicast timeout: with loopback enabled
+     * (TXMODE 0x00, the normal TPE mode programmed by NeXT if_en.c
+     * en_jam for all TPE traffic) the frame must still reach the wire.
+     * dst/src/len mirror the captured failing unicast frame (dst
+     * 52:55:80:87:0b:01, src/station 00:00:0f:00:f3:02, IPv4, len 60,
+     * TXMODE 0, RXMODE 1): the local loopback copy is correctly
+     * filtered, but the wire copy must be transmitted.  Fails on the
+     * old exclusive branch (socket stays empty).
+     */
+    static const uint8_t unicast[60] = {
+        0x52, 0x55, 0x80, 0x87, 0x0b, 0x01,
+        0x00, 0x00, 0x0f, 0x00, 0xf3, 0x02,
+        0x08, 0x00,
+        0x45, 0x00, 0x00, 0x2e, 0x00, 0x00, 0x40, 0x00,
+        0x40, 0x11, 0x00, 0x00, 0x80, 0x87, 0x0b, 0x02,
+        0x80, 0x87, 0x0b, 0x01, 0x00, 0x44, 0x00, 0x45,
+        0x00, 0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    TxHarness harness = tx_harness_start();
+    QTestState *qts = harness.qts;
+    uint8_t wire[sizeof(unicast)];
+    uint8_t rx_before[sizeof(unicast) + sizeof(rx_fcs)];
+    uint8_t rx_after[sizeof(rx_before)];
+    size_t i;
+
+    memset(rx_before, 0xa5, sizeof(rx_before));
+    qtest_memwrite(qts, NEXT_TX_BUFFER, unicast, sizeof(unicast));
+    qtest_memwrite(qts, NEXT_RX_BUFFER, rx_before, sizeof(rx_before));
+    qtest_writel(qts, NEXT_ENTX_NEXT, NEXT_TX_BUFFER);
+    qtest_writel(qts, NEXT_ENTX_LIMIT,
+                 ENTX_EOP | (NEXT_TX_BUFFER + sizeof(unicast) +
+                             ENTX_END_BIAS));
+    /* Station = frame source, as the guest programs its own MAC. */
+    for (i = 0; i < 6; i++) {
+        en_writeb(qts, EN_ADDR + i, unicast[6 + i]);
+    }
+    rx_prepare_controller(qts, 1);
+    rx_program(qts, NEXT_RX_BUFFER, NEXT_RX_BUFFER + 0x1000, 0, 0,
+               false);
+    tx_prepare_controller(qts);
+    en_writeb(qts, EN_TXMODE, 0);
+
+    qtest_writel(qts, NEXT_ENTX_CSR, DMA_SETENABLE);
+    qtest_clock_step(qts, 1);
+
+    /* Wire copy: the old exclusive loopback branch never sent this. */
+    socket_read_frame(harness.backend_fd, wire, sizeof(wire));
+    g_assert_cmpmem(wire, sizeof(wire), unicast, sizeof(unicast));
+
+    /*
+     * Local loopback copy: dst matches neither station nor broadcast
+     * under RXMODE 1, so it is filtered and RX DMA stays armed.
+     */
+    qtest_memread(qts, NEXT_RX_BUFFER, rx_after, sizeof(rx_after));
+    g_assert_cmpmem(rx_after, sizeof(rx_after),
+                    rx_before, sizeof(rx_before));
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE);
+    g_assert_cmphex(en_readb(qts, EN_RXSTAT), ==, 0);
+    g_assert_cmphex(en_readb(qts, EN_TXSTAT), ==, EN_TXSTAT_READY);
+    g_assert_cmphex(qtest_readl(qts, NEXT_ENTX_CSR) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_COMPLETE);
+
+    tx_harness_stop(&harness);
+}
+
 static void test_tx_internal_loopback(void)
 {
     TxHarness harness = tx_harness_start();
@@ -785,7 +858,16 @@ static void test_tx_internal_loopback(void)
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) &
                     (NEXT_ENRX_DMA_IRQ | NEXT_ENTX_DMA_IRQ),
                     ==, NEXT_ENRX_DMA_IRQ | NEXT_ENTX_DMA_IRQ);
-    socket_assert_empty(harness.backend_fd);
+    /*
+     * Loopback-enable still drives the wire (normal TPE mode per
+     * NeXT if_en.c en_jam); the old exclusive branch kept this empty.
+     */
+    {
+        uint8_t wire[sizeof(rx_frame)];
+
+        socket_read_frame(harness.backend_fd, wire, sizeof(wire));
+        g_assert_cmpmem(wire, sizeof(wire), rx_frame, sizeof(rx_frame));
+    }
 
     qtest_writel(qts, NEXT_ENTX_CSR, DMA_CLRCOMPLETE);
     qtest_writel(qts, NEXT_ENTX_NEXT, NEXT_TX_BUFFER);
@@ -838,7 +920,16 @@ static void tx_internal_loopback_failure(uint8_t rx_mode,
     g_assert_cmphex(qtest_readl(qts, NEXT_ENRX_CSR) &
                     (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
                     ==, expected_rx_csr);
-    socket_assert_empty(harness.backend_fd);
+    /*
+     * Wire transmission is independent of the local loopback outcome:
+     * filtered or DMA-failed copies must still reach the wire.
+     */
+    {
+        uint8_t wire[sizeof(rx_frame)];
+
+        socket_read_frame(harness.backend_fd, wire, sizeof(wire));
+        g_assert_cmpmem(wire, sizeof(wire), rx_frame, sizeof(rx_frame));
+    }
 
     tx_harness_stop(&harness);
 }
@@ -1728,6 +1819,8 @@ int main(int argc, char **argv)
                    test_tx_internal_loopback_filtered);
     qtest_add_func("/next-cube/mb8795/tx-internal-loopback-rx-failure",
                    test_tx_internal_loopback_rx_failure);
+    qtest_add_func("/next-cube/mb8795/tx-loopback-reaches-wire",
+                   test_tx_loopback_reaches_wire);
     qtest_add_func("/next-cube/mb8795/tx-two-segment",
                    test_tx_two_segment);
     qtest_add_func("/next-cube/mb8795/tx-range-rejection",

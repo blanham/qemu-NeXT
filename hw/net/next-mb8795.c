@@ -379,22 +379,22 @@ static void next_mb8795_tx_timer(void *opaque)
 
     result = next_dma_enet_tx_read(s->dma, frame, sizeof(frame), &length);
     if (result == NEXT_DMA_OK) {
-        if (s->tx_mode & NEXT_MB8795_TXMODE_NO_LBC) {
-            /*
-             * A reply cannot reach a half-duplex 10 Mb/s Ethernet MAC in
-             * the same instant that transmission completes.  In-process
-             * backends such as slirp can reply reentrantly, so hold those
-             * packets in NetQueue until the guest has had time to re-arm
-             * receive DMA.
-             */
-            s->rx_turnaround = true;
-            timer_mod(&s->rx_turnaround_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      NEXT_MB8795_RX_TURNAROUND_NS);
-            qemu_send_packet(qemu_get_queue(s->nic), frame, length);
-        } else {
+        if (!(s->tx_mode & NEXT_MB8795_TXMODE_NO_LBC)) {
+            /* TPE loopback still transmits on wire; keep local copy. */
             loopback_received = next_mb8795_receive_frame(s, frame, length);
         }
+        /*
+         * A reply cannot reach a half-duplex 10 Mb/s Ethernet MAC in
+         * the same instant that transmission completes.  In-process
+         * backends such as slirp can reply reentrantly, so hold those
+         * packets in NetQueue until the guest has had time to re-arm
+         * receive DMA.
+         */
+        s->rx_turnaround = true;
+        timer_mod(&s->rx_turnaround_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NEXT_MB8795_RX_TURNAROUND_NS);
+        qemu_send_packet(qemu_get_queue(s->nic), frame, length);
         s->tx_status |= NEXT_MB8795_TXSTAT_READY;
         if (loopback_received) {
             s->tx_status |= NEXT_MB8795_TXSTAT_TXRECV;
