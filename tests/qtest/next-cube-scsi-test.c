@@ -1549,6 +1549,140 @@ static void test_scsi_promoted_partial_tail(void)
     cleanup_test_disk(disk);
 }
 
+/*
+ * Wait for backend DMA progress as ESP transfer count change from
+ * initial_count, not NEXT advance which may reflect controller
+ * pointer churn before ESP TC is updated.
+ */
+static void wait_for_scsi_dma_progress(QTestState *qts, uint32_t initial_count)
+{
+    for (int i = 0; i < 10000; i++) {
+        uint32_t cur = read_esp_transfer_count(qts);
+        if (cur != initial_count) {
+            return;
+        }
+        qtest_clock_step(qts, 1);
+    }
+    g_error("SCSI DMA progress never observed: TC=%u NEXT=0x%x CSR=0x%x",
+            read_esp_transfer_count(qts), qtest_readl(qts, NEXT_DMA_NEXT),
+            qtest_readl(qts, NEXT_DMA_CSR));
+}
+
+
+static void test_scsi_unaligned_main_tail_boundary(gconstpointer data)
+{
+    static const uint8_t test_unit_ready[6] = { 0 };
+    static const uint8_t read_10[10] = {
+        0x28, 0, 0, 0, 0, 0, 0, 0, 4, 0,
+    };
+    enum {
+        TRANSFER_LENGTH = 2048,
+        BEFORE_LENGTH = 16,
+        AFTER_LENGTH = 8,
+        TAIL_BUFFER_LENGTH = 32,
+    };
+    guint offset = GPOINTER_TO_UINT(data);
+    size_t main_length = TRANSFER_LENGTH - offset;
+    uint8_t expected[TRANSFER_LENGTH];
+    uint8_t received[BEFORE_LENGTH + TRANSFER_LENGTH + AFTER_LENGTH];
+    uint8_t tail[TAIL_BUFFER_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    ssize_t bytes;
+    int fd;
+    int i;
+
+    G_STATIC_ASSERT((NEXT_DMA_BUFFER + TRANSFER_LENGTH) % 16 == 0);
+
+    g_assert_cmpuint(offset % 4, ==, 0);
+    g_assert_cmpuint(offset, >=, 4);
+    g_assert_cmpuint(offset, <=, 12);
+    g_assert_cmpuint(main_length + offset, ==, TRANSFER_LENGTH);
+
+    for (i = 0; i < (int)sizeof(expected); i++) {
+        expected[i] = 0x6b ^ (i * 0x35) ^ (i >> 4);
+    }
+    fd = qemu_open(disk->disk_path, O_WRONLY, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    bytes = pwrite(fd, expected, sizeof(expected), 0);
+    close(fd);
+    g_assert_cmpint(bytes, ==, sizeof(expected));
+
+    g_assert_cmphex(submit_nodata_cdb(qts, 0, test_unit_ready), ==, 0x02);
+    g_assert_cmphex(submit_nodata_cdb(qts, 0, test_unit_ready), ==, 0x00);
+
+    qtest_memset(qts, NEXT_DMA_BUFFER + offset - BEFORE_LENGTH,
+                 0xa5, BEFORE_LENGTH + main_length + AFTER_LENGTH);
+    qtest_memset(qts, NEXT_DMA_BUFFER2, 0xa5, sizeof(tail));
+    qtest_writel(qts, NEXT_INTR_MASK, NEXT_SCSI_DMA_IRQ | NEXT_SCSI_IRQ);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER + offset);
+    qtest_writel(qts, NEXT_DMA_LIMIT,
+                 NEXT_DMA_BUFFER + offset + main_length);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_DMA_BUFFER2);
+    qtest_writel(qts, NEXT_DMA_STOP,
+                 NEXT_DMA_BUFFER2 + TAIL_BUFFER_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE | DMA_DEV2M);
+
+    qtest_writeb(qts, NEXT_ESP_BUSID, 0);
+    for (i = 0; i < (int)sizeof(read_10); i++) {
+        qtest_writeb(qts, NEXT_ESP_FIFO, read_10[i]);
+    }
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_SEL);
+    qtest_readb(qts, NEXT_ESP_INTR);
+    qtest_writeb(qts, NEXT_ESP_TCLO, TRANSFER_LENGTH & 0xff);
+    qtest_writeb(qts, NEXT_ESP_TCMID, TRANSFER_LENGTH >> 8);
+    qtest_writeb(qts, NEXT_ESP_TCHI, 0);
+    qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
+    qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+    wait_for_scsi_dma_progress(qts, TRANSFER_LENGTH);
+
+    /* The main descriptor ends at a 16-byte boundary; its tail belongs
+     * in the separate bounce descriptor, not past this limit. */
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
+                    ==, DMA_ENABLE | DMA_COMPLETE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER2);
+    qtest_memread(qts, NEXT_DMA_BUFFER + offset - BEFORE_LENGTH,
+                  received, BEFORE_LENGTH + main_length + AFTER_LENGTH);
+    for (i = 0; i < (int)BEFORE_LENGTH; i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+    g_assert_cmpmem(received + BEFORE_LENGTH, main_length,
+                    expected, main_length);
+    for (i = (int)(BEFORE_LENGTH + main_length);
+         i < (int)(BEFORE_LENGTH + main_length + AFTER_LENGTH); i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+
+    /* Acknowledge the completed main descriptor, then clock out its tail. */
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_CLRCOMPLETE | DMA_DEV2M);
+    for (i = 0; i < 4; i++) {
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                        NEXT_DMA_BUFFER2);
+        assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER2,
+                                    TAIL_BUFFER_LENGTH, 0xa5);
+        qtest_writeb(qts, NEXT_SCSI_CSR,
+                     SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+        qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DMADIR);
+    }
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER2 + 16);
+    qtest_memread(qts, NEXT_DMA_BUFFER2, tail, sizeof(tail));
+    g_assert_cmpmem(tail, offset, expected + main_length, offset);
+    for (i = (int)offset; i < 16; i++) {
+        g_assert_cmphex(tail[i], ==, 0);
+    }
+    for (i = 16; i < (int)sizeof(tail); i++) {
+        g_assert_cmphex(tail[i], ==, 0xa5);
+    }
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
 static void test_scsi_read_dma_waits_for_complete_ack(void)
 {
     static const uint8_t test_unit_ready[6] = { 0 };
@@ -3694,6 +3828,15 @@ int main(int argc, char **argv)
                    test_scsi_promoted_short_tail_window);
     qtest_add_func("/next-cube/scsi/promoted-partial-tail",
                    test_scsi_promoted_partial_tail);
+    qtest_add_data_func("/next-cube/scsi/unaligned-main-tail-boundary/4",
+                        GUINT_TO_POINTER(4),
+                        test_scsi_unaligned_main_tail_boundary);
+    qtest_add_data_func("/next-cube/scsi/unaligned-main-tail-boundary/8",
+                        GUINT_TO_POINTER(8),
+                        test_scsi_unaligned_main_tail_boundary);
+    qtest_add_data_func("/next-cube/scsi/unaligned-main-tail-boundary/12",
+                        GUINT_TO_POINTER(12),
+                        test_scsi_unaligned_main_tail_boundary);
     qtest_add_func("/next-cube/scsi/read-dma-waits-for-complete-ack",
                    test_scsi_read_dma_waits_for_complete_ack);
     qtest_add_func("/next-cube/scsi/read-dma-late-enable-resumes-pending-ti",

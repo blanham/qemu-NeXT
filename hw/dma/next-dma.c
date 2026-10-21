@@ -1129,10 +1129,28 @@ out:
     }
 }
 
+static size_t next_dma_scsi_beat_len(const NextDMAChannelState *c)
+{
+    uint32_t misalign = c->next & (NEXT_DMA_SCSI_BEAT - 1);
+
+    if (misalign == 0) {
+        return NEXT_DMA_SCSI_BEAT;
+    }
+    if (c->next & 3) {
+        return 0;
+    }
+    return NEXT_DMA_SCSI_BEAT - misalign;
+}
+
 static bool next_dma_scsi_beat_fits(const NextDMAChannelState *c)
 {
+    size_t beat = next_dma_scsi_beat_len(c);
+
+    if (beat == 0) {
+        return false;
+    }
     return c->limit <= c->next ||
-           c->limit - c->next >= NEXT_DMA_SCSI_BEAT;
+           c->limit - c->next >= beat;
 }
 
 int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
@@ -1165,6 +1183,7 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
 
     while (remaining) {
+        size_t beat;
         size_t room;
         size_t copied;
         bool continue_segment;
@@ -1172,7 +1191,11 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         if (!next_dma_scsi_beat_fits(c)) {
             break;
         }
-        room = NEXT_DMA_SCSI_BEAT - c->scsi_stage_len;
+        beat = next_dma_scsi_beat_len(c);
+        if (!beat || c->scsi_stage_len >= beat) {
+            break;
+        }
+        room = beat - c->scsi_stage_len;
         copied = MIN(remaining, room);
         memcpy(c->scsi_stage + c->scsi_stage_len, buf, copied);
         c->scsi_stage_len += copied;
@@ -1181,21 +1204,21 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
         remaining -= copied;
         accepted += copied;
 
-        if (c->scsi_stage_len != NEXT_DMA_SCSI_BEAT) {
+        if (c->scsi_stage_len != beat) {
             break;
         }
         if (address_space_write(s->as, c->next, MEMTXATTRS_UNSPECIFIED,
                                 c->scsi_stage,
-                                NEXT_DMA_SCSI_BEAT) != MEMTX_OK) {
+                                beat) != MEMTX_OK) {
             access_error = true;
             break;
         }
 
         c->scsi_stage_len = 0;
         c->scsi_stage_flushes = 0;
-        committed += NEXT_DMA_SCSI_BEAT;
+        committed += beat;
         continue_segment = next_dma_advance(s, NEXT_DMA_SCSI,
-                                            NEXT_DMA_SCSI_BEAT);
+                                            beat);
         if (continue_segment && (c->csr & NEXT_DMA_CSR_COMPLETE)) {
             /*
              * COMPLETE gates the promoted memory descriptor, but a final
@@ -1203,7 +1226,9 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
              * ESP cannot finish the command that prompts the ROM to flush
              * that FIFO.  Full continuation beats still wait for the ack.
              */
-            if (remaining && remaining < NEXT_DMA_SCSI_BEAT &&
+            size_t tail_beat = next_dma_scsi_beat_len(c);
+
+            if (tail_beat && remaining && remaining < tail_beat &&
                 next_dma_scsi_beat_fits(c)) {
                 memcpy(c->scsi_stage, buf, remaining);
                 c->scsi_stage_len = remaining;
@@ -1300,6 +1325,7 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
     uint8_t beat[NEXT_DMA_SCSI_BEAT] = { 0 };
     uint32_t base;
     uint8_t staged;
+    size_t beat_len;
 
     if (!c->scsi_stage_len || !c->scsi_stage_flushes) {
         return;
@@ -1312,22 +1338,25 @@ void next_dma_scsi_fifo_flush(NextDMAState *s)
         return;
     }
 
-    base = c->next;
+    beat_len = next_dma_scsi_beat_len(c);
     staged = c->scsi_stage_len;
+    if (!beat_len || staged > beat_len) {
+        return;
+    }
+    base = c->next;
     memcpy(beat, c->scsi_stage, staged);
     if (address_space_write(s->as, base, MEMTXATTRS_UNSPECIFIED,
-                            beat, sizeof(beat)) != MEMTX_OK) {
+                            beat, beat_len) != MEMTX_OK) {
         trace_next_scsi_dma_transfer(
             "error", staged, 0, base, c->csr, c->next, c->next_initbuf,
             c->limit, c->saved_next, c->saved_limit);
         return;
     }
-
     c->scsi_stage_len = 0;
     c->scsi_stage_flushes = 0;
-    next_dma_advance(s, NEXT_DMA_SCSI, sizeof(beat));
+    next_dma_advance(s, NEXT_DMA_SCSI, beat_len);
     trace_next_scsi_dma_transfer(
-        "flush", staged, sizeof(beat), base, c->csr, c->next,
+        "flush", staged, beat_len, base, c->csr, c->next,
         c->next_initbuf, c->limit, c->saved_next, c->saved_limit);
 }
 
