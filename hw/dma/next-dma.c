@@ -1198,9 +1198,19 @@ int next_dma_scsi_write(NextDMAState *s, const uint8_t *buf, size_t len)
                                             NEXT_DMA_SCSI_BEAT);
         if (continue_segment && (c->csr & NEXT_DMA_CSR_COMPLETE)) {
             /*
-             * COMPLETE is an interrupt boundary.  The NeXT driver must
-             * acknowledge it before the promoted continuation can run.
+             * COMPLETE gates the promoted memory descriptor, but a final
+             * partial beat can still enter the staging FIFO.  Otherwise
+             * ESP cannot finish the command that prompts the ROM to flush
+             * that FIFO.  Full continuation beats still wait for the ack.
              */
+            if (remaining && remaining < NEXT_DMA_SCSI_BEAT &&
+                next_dma_scsi_beat_fits(c)) {
+                memcpy(c->scsi_stage, buf, remaining);
+                c->scsi_stage_len = remaining;
+                c->scsi_stage_flushes = NEXT_DMA_SCSI_FLUSH_EDGES;
+                accepted += remaining;
+                remaining = 0;
+            }
             break;
         }
         if (!continue_segment && remaining) {

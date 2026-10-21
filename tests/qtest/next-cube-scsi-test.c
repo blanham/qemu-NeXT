@@ -1429,6 +1429,126 @@ static void test_scsi_read_dma_16_sector_two_refills(void)
     cleanup_test_disk(disk);
 }
 
+static void test_scsi_promoted_short_tail_window(void)
+{
+    enum {
+        INQUIRY_LENGTH = 72,
+        FIRST_WINDOW_LENGTH = 64,
+        PROMOTED_WINDOW_LENGTH = 8,
+        POISON_LENGTH = 32,
+    };
+    uint8_t first[FIRST_WINDOW_LENGTH];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    bool changed = false;
+    size_t i;
+
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, FIRST_WINDOW_LENGTH);
+    qtest_memset(qts, NEXT_DMA_BUFFER2, 0xa5, POISON_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + FIRST_WINDOW_LENGTH);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_DMA_BUFFER2);
+    qtest_writel(qts, NEXT_DMA_STOP,
+                 NEXT_DMA_BUFFER2 + PROMOTED_WINDOW_LENGTH);
+    qtest_writel(qts, NEXT_DMA_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE | DMA_DEV2M);
+    issue_inquiry_dma(qts, 0, INQUIRY_LENGTH);
+
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==,
+                     PROMOTED_WINDOW_LENGTH);
+    qtest_memread(qts, NEXT_DMA_BUFFER, first, sizeof(first));
+    for (i = 0; i < sizeof(first); i++) {
+        if (first[i] != 0xa5) {
+            changed = true;
+            break;
+        }
+    }
+    g_assert_true(changed);
+
+    for (i = 0; i < 4; i++) {
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                        NEXT_DMA_BUFFER2);
+        assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER2, POISON_LENGTH,
+                                    0xa5);
+        qtest_writeb(qts, NEXT_SCSI_CSR,
+                     SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+        qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DMADIR);
+    }
+
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==,
+                     PROMOTED_WINDOW_LENGTH);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==, NEXT_DMA_BUFFER2);
+    assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER2, POISON_LENGTH, 0xa5);
+
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
+static void test_scsi_promoted_partial_tail(void)
+{
+    uint8_t expected[72];
+    uint8_t received[64];
+    TestDisk *disk = &test_disk;
+    QTestState *qts = next_cube_scsi_disk_start(disk);
+    int i;
+
+    /* Obtain the same response with an uninterrupted DMA window. */
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 96);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_SETENABLE | DMA_DEV2M);
+    issue_inquiry_dma(qts, 0, sizeof(expected));
+    for (i = 0; i < 4; i++) {
+        qtest_writeb(qts, NEXT_SCSI_CSR,
+                     SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+        qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DMADIR);
+    }
+    qtest_memread(qts, NEXT_DMA_BUFFER, expected, sizeof(expected));
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+
+    qts = next_cube_scsi_disk_start(disk);
+    qtest_memset(qts, NEXT_DMA_BUFFER, 0xa5, 64);
+    qtest_memset(qts, NEXT_DMA_BUFFER2, 0xa5, 32);
+    qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET | DMA_DEV2M);
+    qtest_writel(qts, NEXT_DMA_NEXT, NEXT_DMA_BUFFER);
+    qtest_writel(qts, NEXT_DMA_LIMIT, NEXT_DMA_BUFFER + 64);
+    qtest_writel(qts, NEXT_DMA_START, NEXT_DMA_BUFFER2);
+    qtest_writel(qts, NEXT_DMA_STOP, NEXT_DMA_BUFFER2 + 32);
+    qtest_writel(qts, NEXT_DMA_CSR,
+                 DMA_SETENABLE | DMA_SETSUPDATE | DMA_DEV2M);
+    issue_inquiry_dma(qts, 0, sizeof(expected));
+
+    /* The final partial beat can enter the FIFO without running DMA. */
+    g_assert_cmpuint(read_esp_transfer_count(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
+                    (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
+                    ==, DMA_ENABLE | DMA_COMPLETE);
+    qtest_memread(qts, NEXT_DMA_BUFFER, received, 64);
+    g_assert_cmpmem(received, 64, expected, 64);
+    for (i = 0; i < 4; i++) {
+        g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                        NEXT_DMA_BUFFER2);
+        assert_poisoned_scsi_buffer(qts, NEXT_DMA_BUFFER2, 32, 0xa5);
+        qtest_writeb(qts, NEXT_SCSI_CSR,
+                     SCSI_CSR_FIFOFL | SCSI_CSR_DMADIR);
+        qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DMADIR);
+    }
+    g_assert_cmphex(qtest_readl(qts, NEXT_DMA_NEXT), ==,
+                    NEXT_DMA_BUFFER2 + 16);
+    qtest_memread(qts, NEXT_DMA_BUFFER2, received, 32);
+    g_assert_cmpmem(received, 8, expected + 64, 8);
+    for (i = 8; i < 16; i++) {
+        g_assert_cmphex(received[i], ==, 0);
+    }
+    for (i = 16; i < 32; i++) {
+        g_assert_cmphex(received[i], ==, 0xa5);
+    }
+    qtest_quit(qts);
+    cleanup_test_disk(disk);
+}
+
 static void test_scsi_read_dma_waits_for_complete_ack(void)
 {
     static const uint8_t test_unit_ready[6] = { 0 };
@@ -3570,6 +3690,10 @@ int main(int argc, char **argv)
                    test_scsi_write_dma_16_sector_three_segments);
     qtest_add_func("/next-cube/scsi/read-dma-16-sector-two-refills",
                    test_scsi_read_dma_16_sector_two_refills);
+    qtest_add_func("/next-cube/scsi/promoted-short-tail-window",
+                   test_scsi_promoted_short_tail_window);
+    qtest_add_func("/next-cube/scsi/promoted-partial-tail",
+                   test_scsi_promoted_partial_tail);
     qtest_add_func("/next-cube/scsi/read-dma-waits-for-complete-ack",
                    test_scsi_read_dma_waits_for_complete_ack);
     qtest_add_func("/next-cube/scsi/read-dma-late-enable-resumes-pending-ti",
