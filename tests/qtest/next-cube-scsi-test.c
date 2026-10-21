@@ -158,6 +158,9 @@ static const uint8_t netbsd_cd_capacity[8] = {
 static void issue_inquiry_dma(QTestState *qts, uint8_t target,
                               uint8_t length);
 static uint32_t read_esp_transfer_count(QTestState *qts);
+static void wait_for_scsi_command_completion(QTestState *qts);
+static void wait_for_scsi_dma_complete(QTestState *qts);
+static void wait_for_scsi_transfer_consumed(QTestState *qts);
 static void assert_poisoned_scsi_buffer(QTestState *qts, hwaddr guest_buffer,
                                         size_t length, uint8_t poison);
 
@@ -470,7 +473,7 @@ static void wait_for_scsi_command_completion(QTestState *qts)
         if (status & ESP_STAT_INT) {
             return;
         }
-        qtest_clock_step(qts, 1);
+        qtest_clock_step_next(qts);
     }
 
     g_error("timed out waiting for SCSI command completion: ESP status "
@@ -605,6 +608,8 @@ static void test_scsi_write_dma(void)
     }
 
     qts = start_scsi_write_dma(disk, source);
+    wait_for_scsi_dma_complete(qts);
+    wait_for_scsi_command_completion(qts);
     assert_scsi_dma_completed(qts);
 
     qtest_writel(qts, NEXT_DMA_CSR, DMA_RESET);
@@ -631,6 +636,8 @@ static void test_scsi_dma_irq_level_invariant(void)
     TestDisk *disk = &test_disk;
     QTestState *qts = start_scsi_write_dma(disk, source);
 
+    wait_for_scsi_dma_complete(qts);
+    wait_for_scsi_command_completion(qts);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) & DMA_COMPLETE,
                     ==, DMA_COMPLETE);
     g_assert_cmphex(qtest_readl(qts, NEXT_INTR_STATUS) & NEXT_SCSI_DMA_IRQ,
@@ -964,6 +971,8 @@ static void test_scsi_read_dma_chain(void)
     qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
+    /* Wait for the first window to complete before acknowledging it. */
+    wait_for_scsi_dma_complete(qts);
     /* Acknowledge the first window before the promoted continuation runs. */
     qtest_writel(qts, NEXT_DMA_CSR, DMA_CLRCOMPLETE | DMA_DEV2M);
     wait_for_scsi_command_completion(qts);
@@ -1182,6 +1191,7 @@ static void test_scsi_read_dma_16_sector_three_segments(void)
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
 
     /* The DMA interrupt stops the current window before promotion runs. */
+    wait_for_scsi_dma_complete(qts);
     g_assert_cmpuint(read_esp_transfer_count(qts), ==,
                      SECOND_SEGMENT_LENGTH + THIRD_SEGMENT_LENGTH);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
@@ -1201,6 +1211,7 @@ static void test_scsi_read_dma_16_sector_three_segments(void)
     qtest_writel(qts, NEXT_DMA_CSR,
                  DMA_CLRCOMPLETE | DMA_SETSUPDATE | DMA_DEV2M);
 
+    wait_for_scsi_dma_complete(qts);
     g_assert_cmpuint(read_esp_transfer_count(qts), ==, THIRD_SEGMENT_LENGTH);
     g_assert_cmphex(qtest_readl(qts, NEXT_DMA_CSR) &
                     (DMA_ENABLE | DMA_SUPDATE | DMA_COMPLETE),
@@ -1561,11 +1572,44 @@ static void wait_for_scsi_dma_progress(QTestState *qts, uint32_t initial_count)
         if (cur != initial_count) {
             return;
         }
-        qtest_clock_step(qts, 1);
+        qtest_clock_step_next(qts);
     }
     g_error("SCSI DMA progress never observed: TC=%u NEXT=0x%x CSR=0x%x",
             read_esp_transfer_count(qts), qtest_readl(qts, NEXT_DMA_NEXT),
             qtest_readl(qts, NEXT_DMA_CSR));
+}
+
+static void wait_for_scsi_dma_complete(QTestState *qts)
+{
+    for (int i = 0; i < 10000; i++) {
+        uint32_t csr = qtest_readl(qts, NEXT_DMA_CSR);
+        if (csr & DMA_COMPLETE) {
+            return;
+        }
+        qtest_clock_step_next(qts);
+    }
+    g_error("timed out waiting for SCSI DMA COMPLETE: CSR 0x%08x NEXT 0x%08x TC %u",
+            qtest_readl(qts, NEXT_DMA_CSR), qtest_readl(qts, NEXT_DMA_NEXT),
+            read_esp_transfer_count(qts));
+}
+
+/*
+ * Wait until the ESP has consumed the whole transfer (TC==0).  For a
+ * partial final beat the remaining bytes stay in the SCSI staging FIFO
+ * until the guest flushes them, so DMA_COMPLETE is not the readiness
+ * signal here; TC==0 plus command completion is.
+ */
+static void wait_for_scsi_transfer_consumed(QTestState *qts)
+{
+    for (int i = 0; i < 10000; i++) {
+        if (read_esp_transfer_count(qts) == 0) {
+            return;
+        }
+        qtest_clock_step_next(qts);
+    }
+    g_error("timed out waiting for SCSI transfer consumed: TC %u CSR 0x%08x NEXT 0x%08x",
+            read_esp_transfer_count(qts), qtest_readl(qts, NEXT_DMA_CSR),
+            qtest_readl(qts, NEXT_DMA_NEXT));
 }
 
 
@@ -3018,6 +3062,16 @@ static void read_scsi_dma(QTestState *qts, uint8_t target,
     qtest_writeb(qts, NEXT_ESP_TCHI, (transfer_len >> 16) & 0xff);
     qtest_writeb(qts, NEXT_SCSI_CSR, SCSI_CSR_DATA_IN);
     qtest_writeb(qts, NEXT_ESP_CMD, ESP_CMD_TI_DMA);
+    if (transfer_len % DMA_BEAT_LENGTH) {
+        /*
+         * Partial tail stays in the staging FIFO until flushed below, so
+         * DMA_COMPLETE cannot arrive yet; TC==0 plus command completion
+         * is the readiness signal.  Full windows wait for DMA_COMPLETE.
+         */
+        wait_for_scsi_transfer_consumed(qts);
+    } else {
+        wait_for_scsi_dma_complete(qts);
+    }
     wait_for_scsi_command_completion(qts);
     finish_scsi_command(qts);
 
