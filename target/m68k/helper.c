@@ -870,6 +870,14 @@ static int get_physical_address(CPUM68KState *env, hwaddr *physical,
                 goto txfail;
             }
         }
+        /*
+         * Do not publish a writable TLB entry for a non-store
+         * translation of a valid leaf with M clear, so the first
+         * store rewalks and sets M.
+         */
+        if (!(next & M68K_DESC_MODIFIED)) {
+            *prot &= ~PAGE_WRITE;
+        }
     }
 
     if (env->mmu.tcr & M68K_TCR_PAGE_8K) {

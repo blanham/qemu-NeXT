@@ -1,0 +1,19 @@
+# M68040 MMU Modified-bit fixture (reusable Ninja, no Make).
+# Invoke from repo root:
+#   ninja -C . -f tests/tcg/m68k/system/mmu-modified.ninja
+# Produces build/mmu-test/mmu-modified.elf (preserved, not tmp).
+ninja_required_version = 1.10
+builddir = build/mmu-test
+
+rule mmu_as
+  command = m68k-suse-linux-as -m68040 -o $out $in
+  description = AS $in
+
+rule mmu_ld
+  command = m68k-suse-linux-ld -T tests/tcg/m68k/system/kernel.ld -o $out $in
+  description = LD $out
+
+build build/mmu-test/mmu-modified.o: mmu_as tests/tcg/m68k/system/mmu-modified.S
+build build/mmu-test/mmu-modified.elf: mmu_ld build/mmu-test/mmu-modified.o
+
+default build/mmu-test/mmu-modified.elf
