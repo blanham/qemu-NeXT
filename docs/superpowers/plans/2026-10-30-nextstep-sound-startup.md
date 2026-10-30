@@ -22,7 +22,7 @@ sound DMA buffer, set `DMA_SETENABLE`, write `NEXT_DMAOUT_DMAEN`, send
 `MON_SNDOUT_CTRL(SOUT_ENAB)`, and write monitor data. Without calling
 `qtest_clock_step`, assert that `next == NEXT_TEST_RAM_BASE + 4`, DMA remains
 enabled and incomplete, and underrun is clear. Register the test as
-`/next/dma/sound-output-immediate-startup-progress`.
+`/m68k/next-cube/dma/sound-output-immediate-startup-progress`.
 
 - [ ] **Step 2: Build and verify RED**
 
@@ -30,7 +30,7 @@ Run:
 
 ```sh
 ninja -C /mnt/build/NeXT/next265-sound-startup-build-20261030 qemu-system-m68k tests/qtest/next-dma-test
-/mnt/build/NeXT/next265-sound-startup-build-20261030/tests/qtest/next-dma-test -p /next/dma/sound-output-immediate-startup-progress
+/mnt/build/NeXT/next265-sound-startup-build-20261030/tests/qtest/next-dma-test -p /m68k/next-cube/dma/sound-output-immediate-startup-progress
 ```
 
 Expected: the test fails because the next register remains at the buffer start.

@@ -703,6 +703,37 @@ static void test_sound_output_frame_aligned_window(void)
     qtest_quit(qts);
 }
 
+static void test_sound_output_immediate_startup_progress(void)
+{
+    static const uint8_t samples[16] = {
+        0x10, 0x00, 0xf0, 0x00,
+        0x20, 0x00, 0xe0, 0x00,
+        0x30, 0x00, 0xd0, 0x00,
+        0x40, 0x00, 0xc0, 0x00,
+    };
+    const TestChannel *sound = &channels[NEXT_SOUND_OUT_CHANNEL];
+    QTestState *qts = next_dma_start();
+    uint64_t csr = NEXT_DMA_BASE + sound->csr;
+    uint64_t next = channel_address(sound, 0x4000);
+    uint64_t limit = channel_address(sound, 0x4004);
+
+    intercept_next_pc_inputs(qts);
+    qtest_memwrite(qts, NEXT_TEST_RAM_BASE, samples, sizeof(samples));
+    qtest_writel(qts, next, NEXT_TEST_RAM_BASE);
+    qtest_writel(qts, limit, NEXT_TEST_RAM_BASE + sizeof(samples));
+    qtest_writel(qts, csr, DMA_SETENABLE);
+
+    enable_sound_output(qts);
+
+    g_assert_cmphex(qtest_readl(qts, next), ==, NEXT_TEST_RAM_BASE + 4);
+    g_assert_cmphex(qtest_readl(qts, csr) &
+                    (DMA_ENABLE | DMA_COMPLETE | DMA_BUSEXC),
+                    ==, DMA_ENABLE);
+    g_assert_cmphex(qtest_readl(qts, NEXT_MON_CSR) & NEXT_DMAOUT_OVR,
+                    ==, 0);
+    qtest_quit(qts);
+}
+
 static void test_sound_output_direct_kickstart(void)
 {
     static const uint8_t samples[16] = {
@@ -1708,6 +1739,8 @@ int main(int argc, char **argv)
                    test_sound_output_final_segment);
     qtest_add_func("/next-cube/dma/sound-output-frame-aligned-window",
                    test_sound_output_frame_aligned_window);
+    qtest_add_func("/next-cube/dma/sound-output-immediate-startup-progress",
+                   test_sound_output_immediate_startup_progress);
     qtest_add_func("/next-cube/dma/sound-output-direct-kickstart",
                    test_sound_output_direct_kickstart);
     qtest_add_func("/next-cube/dma/sound-output-direct-kickstart-backpressure",

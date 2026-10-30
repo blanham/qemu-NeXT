@@ -373,16 +373,22 @@ void next_sound_monitor_command(NextSoundState *s, uint8_t command,
         return;
     }
     if ((command & MON_SNDOUT_CTRL_MASK) == MON_SNDOUT_CTRL_MASK) {
-        if (s->control !=
-            ((command >> 3) & (SOUT_ENAB | SOUT_DOUB | SOUT_ZERO))) {
+        uint8_t new_control =
+            (command >> 3) & (SOUT_ENAB | SOUT_DOUB | SOUT_ZERO);
+        bool was_enabled = s->control & SOUT_ENAB;
+
+        if (s->control != new_control) {
             timer_del(&s->dma_timer);
             s->dma_clock_ns = 0;
             s->dma_fraction = 0;
         }
-        s->control = (command >> 3) & (SOUT_ENAB | SOUT_DOUB | SOUT_ZERO);
+        s->control = new_control;
         if (!(s->control & SOUT_ENAB)) {
             s->pending_offset = 0;
             s->pending_length = 0;
+        } else if (!was_enabled && s->dma_enabled &&
+                   !next_dma_sound_out_complete(s->dma)) {
+            next_sound_consume_dma(s, 1, false);
         }
         next_sound_kick(s);
     }
